@@ -4,8 +4,8 @@ Date: Mon, 26 Jan 2026 17:33:31 +0800
 Subject: [PATCH] Update verl: support npugraph_ex for spec decode
 
 ---
- .../rollout/vllm_rollout/vllm_rollout_spmd.py | 22 ++++++++++++++-----
- 1 file changed, 16 insertions(+), 6 deletions(-)
+ .../rollout/vllm_rollout/vllm_rollout_spmd.py | 21 ++++++++++++++-----
+ 1 file changed, 15 insertions(+), 6 deletions(-)
 
 diff --git a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
 index c3adcaf..120a5ec 100644
@@ -37,15 +37,7 @@ index c3adcaf..120a5ec 100644
              skip_tokenizer_init=False,
              max_model_len=max_model_len,
              max_num_seqs=config.max_num_seqs,
-@@ -215,6 +215,7 @@ class vLLMRollout(BaseRollout):
-             enable_prefix_caching=config.enable_prefix_caching,
-             trust_remote_code=trust_remote_code,
-             seed=config.get("seed", 0),
-+            speculative_config=engine_kwargs.pop("speculative_config", None),
-             additional_config={
-                 "ascend_scheduler_config": {
-                     "enabled": True,
-@@ -225,6 +226,10 @@ class vLLMRollout(BaseRollout):
+@@ -224,6 +225,10 @@ class vLLMRollout(BaseRollout):
                  "num_iterations_eplb_update": 400,  # gather stable workload over 400 iterations
                  "gate_eplb": True,
                  "num_wait_worker_iterations": 30,  # wait for 30 iterations to complete the EPLB calculation
