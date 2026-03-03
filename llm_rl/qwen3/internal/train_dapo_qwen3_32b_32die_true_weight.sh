@@ -56,7 +56,6 @@ rollout_is_veto_threshold=null  # No veto
 
 loss_agg_mode="token-mean"
 
-export VLLM_SPECULATIVE_BATCH_SIZE_THRE=$((MAX_NUM_SEQS / 4))
 
 python3 -m verl.trainer.main_dapo --config-path="${CONFIG_DIR}" \
     --config-name='dapo_megatron_trainer.yaml' \

@@ -39,7 +39,6 @@ TRAIN_BATCH_SIZE=32
 GEN_BATCH_SIZE=$((TRAIN_BATCH_SIZE))
 MAX_TOKEN_LEN_PER_GPU=$(((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH) / TRAIN_CP))
 
-export VLLM_SPECULATIVE_BATCH_SIZE_THRE=$((MAX_NUM_SEQS / 4))
 
 python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     --config-name='ppo_megatron_trainer.yaml' \

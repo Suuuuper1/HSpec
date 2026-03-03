@@ -1,0 +1,29 @@
+From 32b2679e2bf8194204ee441badce6f3c401b31b1 Mon Sep 17 00:00:00 2001
+From: huyuanquan1 <huyuanquan1@huawei.com>
+Date: Fri, 27 Feb 2026 15:15:58 +0800
+Subject: [PATCH] ignore redundant logs
+
+---
+ verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index fc60fd1e..c28da03d 100644
+--- a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -74,6 +74,12 @@ from verl.workers.rollout.base import BaseRollout
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
++# ignore redundant logs
++import warnings
++from numba.core.errors import NumbaPendingDeprecationWarning
++warnings.fiterwarnings("ignore", category=NumbaPendingDeprecationWarning)
++logging.getLogger("torch._dynamo").setLevel(logging.CRITICAL)
++
+ # TODO
+ # 1. support pp in vllm
+ # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
+-- 
+2.45.1.windows.1
+

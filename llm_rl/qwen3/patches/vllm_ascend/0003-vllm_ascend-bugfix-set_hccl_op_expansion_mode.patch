@@ -15,7 +15,7 @@ index eb88afd..264ac91 100644
          return None
      hccl_config_map = {
          "dp": {"hccl_buffer_size": calculate_dp_buffer_size()},
-+        "tp": {"hccl_op_expansion": 3},
++        "tp": {"hccl_op_expansion_mode": 3},
      }
      return hccl_config_map.get(group_name, get_default_buffer_config())
  

@@ -23,7 +23,7 @@ TEST_FILE=${TEST_FILE:-"${HOME}/data/deepscaler/valid.parquet"}
 
 # configs
 NODES=8
-GPU_MEMORY_UTILIZATION=0.87
+GPU_MEMORY_UTILIZATION=0.85
 MAX_PROMPT_LENGTH=2048
 MAX_RESPONSE_LENGTH=32768
 MAX_NUM_SEQS=256
@@ -40,7 +40,6 @@ TRAIN_EP=$((NODES * 16 / TRAIN_PP))
 TRAIN_BATCH_SIZE=512
 MAX_TOKEN_LEN_PER_GPU=$(((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH) / TRAIN_CP))
 
-export VLLM_SPECULATIVE_BATCH_SIZE_THRE=$((MAX_NUM_SEQS / 4))
 
 python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     --config-name='ppo_megatron_trainer.yaml'\

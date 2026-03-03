@@ -203,6 +203,7 @@ rm -rf /root/atc_data/     # ATC编译的核心磁盘缓存
 |megatron|[0002-megatron-feature-enable_hdp.patch](patches/megatron/0002-megatron-feature-enable_hdp.patch)|在ROPE中增加HDP相关处理逻辑，`USE_HDP`开启时，使能HDP功能|
 |mindspeed|[0001-mindspeed-bugfix-builder.patch](patches/mindspeed/0001-mindspeed-bugfix-builder.patch)|兼容openeuler24.03版本下编译头文件缺失|
 |mindspeed|[0002-mindspeed-feature-enable_hdp.patch](patches/mindspeed/0002-mindspeed-feature-enable_hdp.patch)|在Ring Attention中增加HDP相关处理逻辑，`USE_HDP`开启时，使能HDP功能|
+|r1_ascend|[0001-r1_ascend-bugfix-correct_DP_initialization.patch](patches/r1_ascend/0001-r1_ascend-bugfix-correct_DP_initialization.patch)|正确初始化DP通信域，适配vllm-v0.14.0|
 |verl|[0001-verl-feature-enable_alltoall_overlap.patch](patches/verl/0001-verl-feature-enable_alltoall_overlap.patch)|根据`USE_ALLTOALL_OVERLAP`环境变量调整权重加载逻辑|
 |verl|[0002-verl-feature-set_use_tqdm_true.patch](patches/verl/0002-verl-feature-set_use_tqdm_true.patch)|开启tqdm进度条，便于实时观测推理进度|
 |verl|[0003-verl-feature-recompute_old_log_prob.patch](patches/verl/0003-verl-feature-recompute_old_log_prob.patch)|对于GRPO on-policy算法，可以使用`log_prob.detach()`代替`old_log_prob`减少一次前向计算，添加控制参数配置和开启免计算时`ppo_epochs=1`校验|
@@ -219,15 +220,17 @@ rm -rf /root/atc_data/     # ATC编译的核心磁盘缓存
 |verl|[0014-verl-feature-dapo_data_rebalance.patch](patches/verl/0014-verl-feature-dapo_data_rebalance.patch)|`data_rebalance` DAPO算法适配|
 |verl|[0015-verl-feature-hdp_binpack_optimization.patch](patches/verl/0015-verl-feature-hdp_binpack_optimization.patch)|HDP binpack 优化：提升推理/rollout 场景下的打包与负载均衡效率（HDP 相关优化）|
 |verl|[0016-verl-bugfix-hot_swap_expandable_segments.patch](patches/verl/0016-verl-bugfix-hot_swap_expandable_segments.patch)|在sleep mode下使能虚拟内存特性热切换|
-|verl|[0017-verl-bugfix-adapt_new_vllm_version.patch](0017-verl-bugfix-adapt_new_vllm_version.patch)|修复切换到vllm>=0.13.0版本引入的import error|
+|verl|[0017-verl-bugfix-adapt_new_vllm_version.patch](patches/verl/0017-verl-bugfix-adapt_new_vllm_version.patch)|修复切换到vllm>=0.13.0版本引入的import error|
+|verl|[0018-verl-bugfix-ignore_redundant_logs.patch](patches/verl/0018-verl-bugfix-ignore_redundant_logs.patch)|去除多余的警告日志|
 |vllm|[0001-vllm-feature-disable_gc.patch](patches/vllm/0001-vllm-feature-disable_gc.patch)|在decode step前关闭gc，避免因内存管理导致host bound影响推理性能|
 |vllm|[0002-vllm-feature-enable_sam_decoding.patch](patches/vllm/0002-vllm-feature-enable_sam_decoding.patch)|SAM投机推理适配vllm框架：在投机推理的配置中支持`method`为`sam`的选项|
 |vllm|[0003-vllm-bugfix-rope_registry.patch](patches/vllm/0003-vllm-bugfix-rope_registry.patch)|修复ROPE注册时import flash_attn的bug|
 |vllm_ascend|[0001-vllm_ascend-feature-bs_threshold_for_spec_decode.patch](patches/vllm_ascend/0001-vllm_ascend-feature-bs_threshold_for_spec_decode.patch)|增加投机推理特性自动开关，解决投机推理特性在batch_size过高时性能劣化的问题|
 |vllm_ascend|[0002-vllm_ascend-feature-enable_sam_decoding.patch](patches/vllm_ascend/0002-vllm_ascend-feature-enable_sam_decoding.patch)|SAM投机推理适配vllm_ascend框架|
-|vllm-ascend|[0003-vllm_ascend-bugfix-set_hccl_op_expansion_mode.patch](patches/vllm/0003-vllm_ascend-bugfix-set_hccl_op_expansion_mode.patch)|手动修改TP通信域的hccl_op_extension_mode，修复all-gather超时的问题|
-|vllm-ascend|[0004-vllm_ascend-bugfix-npugraph_ex_static_kernel_typo.patch](patches/vllm/0004-vllm_ascend-bugfix-npugraph_ex_static_kernel_typo.patch)|修复npugraph_ex启用static_kernel时的bug|
-|vllm-ascend|[0005-vllm_ascend-bugfix-align_FIA_input_for_TND_layout.patch](patches/vllm/0005-vllm_ascend-bugfix-align_FIA_input_for_TND_layout.patch)|修复CANN 8.5.0版本FIA算子在TND格式下的入参padding问题|
+|vllm-ascend|[0003-vllm_ascend-bugfix-set_hccl_op_expansion_mode.patch](patches/vllm_ascend/0003-vllm_ascend-bugfix-set_hccl_op_expansion_mode.patch)|手动修改TP通信域的hccl_op_extension_mode，修复all-gather超时的问题|
+|vllm-ascend|[0004-vllm_ascend-bugfix-npugraph_ex_static_kernel_typo.patch](patches/vllm_ascend/0004-vllm_ascend-bugfix-npugraph_ex_static_kernel_typo.patch)|修复npugraph_ex启用static_kernel时的bug|
+|vllm-ascend|[0005-vllm_ascend-bugfix-align_FIA_input_for_TND_layout.patch](patches/vllm_ascend/0005-vllm_ascend-bugfix-align_FIA_input_for_TND_layout.patch)|修复CANN 8.5.0版本FIA算子在TND格式下的入参padding问题|
+|vllm-ascend|[0006-vllm_ascend-feature-chunk_moe.patch](patches/vllm_ascend/0006-vllm_ascend-feature-chunk_moe.patch)|针对MoE计算场景分块处理优化，解决prefill阶段可能引起的峰值内存过高问题|
 |vllm_ascend|[spec_decode/sam_proposer.py](patches/vllm_ascend/spec_decode/sam_proposer.py)|SAM投机推理适配vllm_ascend框架：实现`SAMProposer`类，作为vllm调用SAM投机推理能力的接口|
 |patches|[0001-feature-model_converter.patch](patches/0001-feature-model_converter.patch) | 新增`USE_ALLTOALL_OVERLAP`开启时hf2mcore权重转换逻辑|
 

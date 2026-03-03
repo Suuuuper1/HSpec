@@ -13,11 +13,6 @@
 # limitations under the License.
 
 # Recipe features
-export VLLM_ENABLE_EXPERT_PARALLEL=1        # Enable EP in vLLM rollout.
-export ALL_TO_ALL_RESHARD=1                 # Enable EP to reshard parameters with AllToAllV (without communication redundancy).
-export USE_ALLTOALL_OVERLAP=1               # Enable to overlap communication in EP with computation to hide MoE communication latency. Should be consistent with model conversion config.
-export VLLM_ENABLE_EPLB=0                   # 0: disable eplb, 1: enable eplb
 export USE_HDP=0                            # 0: disable hdp, 1: enable hdp
 export ROLLOUT_REBALANCE_ENABLE=0           # 0: disable rollout rebalance, 1: enable rollout rebalance
-export VLLM_DP_SIZE=32                      # [TODO] configure the DP size of vLLM based on actual training configration
-export VLLM_SPECULATIVE_BATCH_SIZE_THRE=64  # [TODO] configure SAM batch size threshold based on actual training configration. Should set to -1 when using random initialized weights.
+export VLLM_SPECULATIVE_BATCH_SIZE_THRE=32  # [TODO] configure SAM batch size threshold based on actual training configration. Should set to -1 when using random initialized weights.
