@@ -18,7 +18,7 @@ index fc60fd1e..c28da03d 100644
 +# ignore redundant logs
 +import warnings
 +from numba.core.errors import NumbaPendingDeprecationWarning
-+warnings.fiterwarnings("ignore", category=NumbaPendingDeprecationWarning)
++warnings.filterwarnings("ignore", category=NumbaPendingDeprecationWarning)
 +logging.getLogger("torch._dynamo").setLevel(logging.CRITICAL)
 +
  # TODO

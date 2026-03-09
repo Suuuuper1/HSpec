@@ -46,8 +46,8 @@ index 6d82372..b1107ab 100644
                                          dtype=np.int32)
 +
 +        # adaptive SD
-+        if self.speculative_config:
-+            if self.speculative_auto_bs_thre > 0 and num_reqs > self.speculative_auto_bs_thre:
++        if self.speculative_config and self.speculative_auto_bs_thre > 0:
++            if num_reqs > self.speculative_auto_bs_thre:
 +                self.speculative_decoding_active = False
 +            else:
 +                self.speculative_decoding_active = True

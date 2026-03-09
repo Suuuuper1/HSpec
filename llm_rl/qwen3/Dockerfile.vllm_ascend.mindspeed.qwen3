@@ -46,6 +46,13 @@ RUN git clone https://gitcode.com/ascend/MindSpeed.git && \
     git checkout f6688c61bcfe45243ee5eb34c6f013b1e06eca81 && \
     python3 -m pip install -r requirements.txt
 
+# Install vllm-ascend
+RUN git clone https://github.com/vllm-project/vllm-ascend.git && \
+    cd vllm-ascend && \
+    git checkout v0.14.0rc1 && \
+    git submodule update --init --recursive
+    test -f /workspace/vllm-ascend/tools/mooncake_installer.sh
+
 # Install Mooncake
 RUN yum update -y && \
     yum install -y git vim wget net-tools gcc gcc-c++ make cmake numactl-devel jemalloc && \
@@ -70,12 +77,6 @@ RUN git clone --depth 1 $VLLM_REPO --branch $VLLM_TAG /workspace/vllm
 RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /workspace/vllm/[audio] --extra-index https://download.pytorch.org/whl/cpu/ && \
     python3 -m pip uninstall -y triton && \
     python3 -m pip cache purge
-
-# Install vllm-ascend
-RUN git clone https://github.com/vllm-project/vllm-ascend.git && \
-    cd vllm-ascend && \
-    git checkout v0.14.0rc1 && \
-    git submodule update --init --recursive
 
 # Build vllm-ascend
 RUN export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi && \

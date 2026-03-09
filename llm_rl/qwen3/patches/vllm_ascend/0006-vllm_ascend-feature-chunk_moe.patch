@@ -77,8 +77,8 @@ index 458557e9..ebb0790e 100644
 +
 +            if skip_result_store:
 +                continue
-+            chunk_end_idx = chunk_start_index + mlp_hidden_states.shape[0]
-+            final_hidden_states[chunk_start_index: chunk_end_idx, :] = res.routed_out
++            chunk_end_idx = chunk_start_index + res.routed_out.shape[0]
++            final_routed_out[chunk_start_index: chunk_end_idx, :] = res.routed_out
 +            if res.expert_tokens is not None:
 +                all_expert_tokens.append(res.expert_tokens)
 +            last_before_dispatch_evt = res.before_dispatch_evt
