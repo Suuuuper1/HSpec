@@ -101,7 +101,7 @@ cd ../..
 然后使用parquet转换脚本将其转换成json格式
 
 ```bash
-python ./utils/parquet2json.py ./tests/assets/enwiki ./tests/assets/enwiki/data.json
+python ./utils/parquet2json.py --input ./tests/assets/enwiki --output ./tests/assets/enwiki/data.json
 ```
 
 ## 模型权重准备
@@ -137,9 +137,9 @@ bash utils/weight_convert.sh --input_fp8_hf_path /data/models/DeepSeek-V3.2 --ou
 
 ```shell
 # 示例执行，2层（1moe，1dense）裁剪模型（请提前配置toml文件中相关地址）
-chmod +x ./run_train.sh
+chmod +x ./run_pretrain.sh
 NGPU=16 CONFIG_FILE="./torchtitan_npu/models/deepseek_v32/train_configs/deepseek_v32_671b_debug.toml" ./run_pretrain.sh --compile.enable
-# 64卡671B参数全量预训练拉起脚本（要在8机上同时拉起），注意要修改run_train_multinodes.sh脚本里面的IPs变量
-chmod +x ./run_train_multinodes.sh
+# 64卡671B参数全量预训练拉起脚本（要在8机上同时拉起），注意要修改run_pretrain_multinodes.sh脚本里面的IPs变量
+chmod +x ./run_pretrain_multinodes.sh
 CONFIG_FILE="./torchtitan_npu/models/deepseek_v32/train_configs/deepseek_v32_671b_128die.toml" ./run_pretrain_multinodes.sh --compile.enable
 ```
