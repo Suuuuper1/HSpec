@@ -1,0 +1,34 @@
+diff --git a/verl/experimental/agent_loop/tool_agent_loop.py b/verl/experimental/agent_loop/tool_agent_loop.py
+--- a/verl/experimental/agent_loop/tool_agent_loop.py
++++ b/verl/experimental/agent_loop/tool_agent_loop.py
+@@ -70,6 +70,7 @@
+         self.response_logprobs: list[float] = []
+         self.turn_scores: list[float] = []
+         self.tool_rewards: list[float] = []
++        self.tool_call_count: int = 0
+         self.user_turns = 0
+         self.assistant_turns = 0
+ 
+@@ -181,7 +182,13 @@
+             metrics=agent_data.metrics,
+             extra_fields={},
+         )
+-        output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
++        output.extra_fields.update(
++            {
++                "turn_scores": agent_data.turn_scores,
++                "tool_rewards": agent_data.tool_rewards,
++                "tool_call_count": agent_data.tool_call_count,
++            }
++        )
+         return output
+ 
+     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
+@@ -274,5 +281,7 @@
+         with simple_timer("tool_calls", agent_data.metrics):
+             responses = await asyncio.gather(*tasks)
+ 
++        agent_data.tool_call_count += len(tool_call_names)
++
+         # Process tool responses and update multi_modal_data
+         # Removed: agent_data.new_images_this_turn = []

@@ -20,7 +20,7 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 export VLLM_ASCEND_ENABLE_NZ=0
 
 MAX_PROMPT_LENGTH=2048
-RES_LENGTH=16384
+RES_LENGTH=32768
 ROLLOUT_BATCH_SIZE=128
 PPO_MINI_BATCH_SIZE=32
 TRAIN_TEMPERATURE=0.9
@@ -44,7 +44,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     reward_model.reward_manager=naive \
     data.train_files=train.parquet \
-    data.val_files=validation.parquet \
+    data.val_files=test.parquet \
     data.train_batch_size=$ROLLOUT_BATCH_SIZE \
     data.max_prompt_length=$MAX_PROMPT_LENGTH \
     data.max_response_length=$RES_LENGTH \
@@ -56,7 +56,7 @@ python3 -m verl.trainer.main_ppo \
     custom_reward_function.name=compute_reward \
     +custom_reward_function.reward_kwargs.sandbox_fusion_url='http://localhost:8080/common_evaluate_batch' \
     +custom_reward_function.reward_kwargs.return_dict=True \
-    +custom_reward_function.reward_kwargs.tool_call_bonus_per_call=0.005 \
+    +custom_reward_function.reward_kwargs.tool_call_bonus_per_call=0 \
     +custom_reward_function.reward_kwargs.max_rewarded_tool_calls=4 \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -90,6 +90,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_model_len=$MAX_TOKEN_LEN \
     actor_rollout_ref.rollout.temperature=$TRAIN_TEMPERATURE \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.n=4 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name=$PROJECT_NAME \
@@ -99,4 +102,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=20 \
     trainer.total_epochs=15 \
+    trainer.val_only=True \
     trainer.device=npu $@

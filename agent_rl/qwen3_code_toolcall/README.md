@@ -39,7 +39,8 @@ Atlas A2/A3 系列产品，单机八卡
 ├── patches
 │   └── verl                                              # 修改补丁总目录
 │       ├── 0001-verl-feature-improve_rl_usability.patch  # verl支持Code RL的补充性修改
-|       └── 0002-enable-tool-agent-loop.patch             # verl支持多轮工具调用的补充性修改
+|       ├── 0002-enable-tool-agent-loop.patch             # verl支持多轮工具调用的补充性修改
+|       └── 0003-toolcall-reward.patch                    # verl支持多轮工具调用Reward
 ├── figures                                               # 图表目录
 │   ├── evaluation_progress.png                           # 训练ckpts的测试折线图
 │   └── training_progress.png                             # 训练指标进度折线图   
@@ -49,6 +50,7 @@ Atlas A2/A3 系列产品，单机八卡
 ├── filter_sft_data.py                                    # 示例SFT工具调用数据集构建脚本
 ├── scalebox.py                                           # verl适配ScaleBox的自定义奖励函数文件
 ├── run_code_rl_demo.sh                                   # 示例RL训练脚本
+├── run_multi_turn_livecodebench_eval.sh                  # 示例多轮工具调用的LiveCodeBench测试脚本
 ├── run_toolcall_sft_demo.sh                              # 示例多轮工具调用SFT训练脚本
 └── README.md                                             # 说明文档
 ```
@@ -97,12 +99,14 @@ cd ..
 - 延长 `prime reward manager` 的任务超时时间，从 300s 延长至 3000s，以支持更大批量数据下的代码执行；
 - 增强训练过程中的日志打印，便于调试。
 - 支持Coding多轮工具调用的训练逻辑。
+- 增加Toolcall reward，增强训练稳定性。
 
 遵循下面的指令应用对应 patch：
 
 ```bash
 git apply patches/verl/0001-verl-feature-improve_rl_usability.patch
 git apply patches/verl/0002-enable-tool-agent-loop.patch
+git apply patches/verl/0003-toolcall-reward.patch
 ```
 
 ### 部署 ScaleBox 服务
@@ -174,14 +178,14 @@ curl 'http://localhost:8080/run_code' \
 基于 [Gen-Verse/Open-AgentRL-SFT-3K](https://huggingface.co/datasets/Gen-Verse/Open-AgentRL-SFT-3K)数据，过滤出其中包含多轮python工具调用的Coding推理数据，并将其转换格式以符合后续RL训练。下载及处理脚本为：
 
 ```bash
-python filter_sft_data.py
+python build_toolcall_sft_data.py
 ```
 
 ### RL数据构建
 基于 [PrimeIntellect/verifiable-coding-problems](https://huggingface.co/datasets/PrimeIntellect/verifiable-coding-problems) 数据，过滤其中较高质量的 Python 代码数据部分，作为RL训练数据（verifiable-coding-problems-python-only）。具体数据处理脚本为：
 
 ```bash
-python build_dataset.py
+python build_rl_dataset.py
 ```
 
 ## 工具调用微调
@@ -221,8 +225,6 @@ bash run_code_rl_demo.sh
 
 下图为训练中各个指标，图一为模型在训练数据(无重复数据)上的得分，图二为推理长度及截断比例，图三为工具调用交互轮次。
 
-可以看到在Token预算不紧张且截断比例较低的时候，模型精度随着工具调轮次用同显著增长，且模型推理长度快速爆炸。在遇到推理长度墙的时候，Reasoning Tokens会逐步侵蚀ToolCall Tokens, 使工具调用轮次趋于某一固定值。
-
 <p align="center">
   <img src="figures/training_progress.png" width="800" />
 </p>
@@ -248,21 +250,20 @@ LiveCodeBench 评测数据相关参数：
 
 | Steps | LiveCodeBench (Pass@1) |
 |-------|------------------------|
-| 0   | 12.35 |
-| 20  | 13.47 |
-| 40 | 16.07 |
-| 60 | 17.28 |
-| 80 | 18.75 |
-| 100 | 18.79 |
-| 120 | 20.74 |
-| 140 | 23.83 |
-| 160 | 25.41 |
+| 20  | 16.03 |
+| 40 | 16.74 |
+| 60 | 18.08 |
+| 80 | 18.63 |
+| 100 | 19.19 |
+| 120 | 20.14 |
+| 140 | 21.34 |
+| 160 | 24.45 |
+| 180 | 26.20 |
+| 200 | 25.97 |
+| 220 | 26.36 |
+| 240 | 28.39 |
 
 如下图可视化：
 <p align="center">
   <img src="figures/evaluation_progress.png" width="800" />
 </p>
-
-## 未来工作
-
-加入Toolcall Reward，不影响精度情况下，稳定训练中的Toolcall次数以及模型行为，减少因Token预算的紧张或截断比例过高导致的工具调用轮次的波动。

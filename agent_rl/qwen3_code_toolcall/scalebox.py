@@ -64,6 +64,9 @@ SUPPORTED_LANGUAGES = [
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+DEFAULT_TOOL_CALL_BONUS_PER_CALL = 0.005
+DEFAULT_MAX_REWARDED_TOOL_CALLS = 4
+
 
 def _parse_test_cases(ground_truth):
     """
@@ -83,9 +86,15 @@ def _parse_test_cases(ground_truth):
 
     try:
         test_cases = json.loads(test_cases)
-    except json.JSONDecodeError as e:
-        logger.error("Failed to parse test_cases JSON: %s", e)
-        return None, (0.0, [{"error": "Invalid test_cases JSON format"}])
+    except json.JSONDecodeError as e1: # For LiveCodeBench compatibility
+        try:
+            import pickle
+            import zlib
+            import base64
+            test_cases = json.loads(pickle.loads(zlib.decompress(base64.b64decode(test_cases.encode("utf-8")))))
+        except json.JSONDecodeError as e2:
+            logger.error("Failed to parse test_cases JSON: %s", e)
+            return None, (0.0, [{"error": "Invalid test_cases JSON format"}])
 
     if not test_cases or "input" not in test_cases or "output" not in test_cases:
         logger.error("Invalid test_cases structure.")
@@ -161,41 +170,29 @@ def _process_api_response(api_response, error_msg, test_cases, solution):
     return metadata
 
 
-def compute_score(
-    data_source,
-    solution_str,
-    ground_truth,
-    extra_info=None,
-    **kwargs,
-):
-    """
-    Computes the code score by executing it against test cases in a remote sandbox.
+def _get_tool_call_count(extra_info: Optional[Dict[str, Any]]) -> int:
+    if not extra_info or not isinstance(extra_info, dict):
+        return 0
+    if "tool_call_count" in extra_info:
+        try:
+            return int(extra_info["tool_call_count"])
+        except (TypeError, ValueError):
+            return 0
+    tool_calls = extra_info.get("tool_calls")
+    if isinstance(tool_calls, list):
+        return len(tool_calls)
+    tool_call_names = extra_info.get("tool_call_names")
+    if isinstance(tool_call_names, list):
+        return len(tool_call_names)
+    return 0
 
-    Args:
-        data_source (any): This parameter is not currently used.
-        solution_str (str): The string containing the code solution to be evaluated.
-            It may include a language identifier in a markdown code block (e.g., ```python).
-        ground_truth (str or dict): A JSON string or a dictionary containing the test cases.
-            It should have 'input' and 'output' keys.
-        extra_info (any, optional): Extra information passed by the framework.
-        **kwargs: Additional keyword arguments including:
-            - sandbox_fusion_url (str): The URL of the sandbox service.
-            - timeout (int): Timeout in seconds. Defaults to 30.
 
-    Returns:
-        tuple[float, list[dict]]: A tuple containing:
-            - score (float): A score from 0.0 to 1.0, representing the fraction of
-              test cases that passed.
-            - metadata_list (list[dict]): A list containing a dictionary with detailed
-              metadata about the execution, including API responses, status, errors,
-              and individual test case results.
-    """
-    # Extract config from kwargs
-    sandbox_fusion_url = kwargs.get("sandbox_fusion_url")
-    return_dict = kwargs.get("return_dict", False)
-    include_metadata = kwargs.get("include_metadata", False)
-    timeout = kwargs.get("timeout", 30)
-
+def _compute_code_score_and_metadata(
+    solution_str: str,
+    ground_truth: Any,
+    sandbox_fusion_url: Optional[str],
+    timeout: int,
+) -> Tuple[float, List[Dict[str, Any]]]:
     # 1. Extract code and language from solution_str
     # Remove <think>.*</think> tags if they exist
     solution = re.sub(r"<think>.*?</think>", "", solution_str, flags=re.DOTALL).strip()
@@ -209,12 +206,7 @@ def compute_score(
     # 2. Parse test cases
     test_cases, error_result = _parse_test_cases(ground_truth)
     if error_result is not None:
-        if return_dict:
-            result = {"score": float(error_result[0])}
-            if include_metadata:
-                result["metadata"] = json.dumps(error_result[1], ensure_ascii=True)
-            return result
-        return error_result
+        return float(error_result[0]), error_result[1]
 
     try:
         # 3. Call sandbox API
@@ -228,7 +220,7 @@ def compute_score(
 
         # 4. Process API response
         metadata = _process_api_response(api_response, error_msg, test_cases, solution)
-        score = metadata.get("score", 0.0)
+        score = float(metadata.get("score", 0.0))
         final_metadata = [metadata]
         logger.info("Sandbox Info Report: Results: %s", score)
 
@@ -236,12 +228,98 @@ def compute_score(
         score = 0.0
         final_metadata = [{"error": f"Unhandled exception: {e}"}]
 
+    return float(score), final_metadata
+
+
+def _format_score_result(
+    score: float,
+    metadata: List[Dict[str, Any]],
+    return_dict: bool,
+    include_metadata: bool,
+    extra_fields: Optional[Dict[str, Any]] = None,
+):
     if return_dict:
         result = {"score": float(score)}
+        if extra_fields:
+            result.update(extra_fields)
         if include_metadata:
-            result["metadata"] = json.dumps(final_metadata, ensure_ascii=True)
+            result["metadata"] = json.dumps(metadata, ensure_ascii=True)
         return result
-    return float(score), final_metadata
+    return float(score), metadata
+
+
+def _get_tool_call_bonus_config(kwargs: Dict[str, Any]) -> Tuple[float, int]:
+    tool_call_bonus_per_call = kwargs.get(
+        "tool_call_bonus_per_call",
+        kwargs.get("tool_call_reward", DEFAULT_TOOL_CALL_BONUS_PER_CALL),
+    )
+    try:
+        tool_call_bonus_per_call = float(tool_call_bonus_per_call)
+    except (TypeError, ValueError):
+        tool_call_bonus_per_call = DEFAULT_TOOL_CALL_BONUS_PER_CALL
+
+    max_rewarded_tool_calls = kwargs.get("max_rewarded_tool_calls", DEFAULT_MAX_REWARDED_TOOL_CALLS)
+    try:
+        max_rewarded_tool_calls = int(max_rewarded_tool_calls)
+    except (TypeError, ValueError):
+        max_rewarded_tool_calls = DEFAULT_MAX_REWARDED_TOOL_CALLS
+    max_rewarded_tool_calls = max(max_rewarded_tool_calls, 0)
+    return tool_call_bonus_per_call, max_rewarded_tool_calls
+
+
+def _compute_tool_call_bonus(
+    extra_info: Optional[Dict[str, Any]],
+    kwargs: Dict[str, Any],
+) -> Tuple[int, float, float, int]:
+    tool_call_bonus_per_call, max_rewarded_tool_calls = _get_tool_call_bonus_config(kwargs)
+    tool_call_count = max(_get_tool_call_count(extra_info), 0)
+    rewarded_tool_call_count = min(tool_call_count, max_rewarded_tool_calls)
+    tool_call_bonus = float(rewarded_tool_call_count) * tool_call_bonus_per_call
+    return tool_call_count, tool_call_bonus, tool_call_bonus_per_call, max_rewarded_tool_calls
+
+
+def compute_reward(
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info=None,
+    **kwargs,
+):
+    """
+    Computes training reward: code correctness score + tool-call bonus.
+    """
+    sandbox_fusion_url = kwargs.get("sandbox_fusion_url")
+    return_dict = kwargs.get("return_dict", False)
+    include_metadata = kwargs.get("include_metadata", False)
+    timeout = kwargs.get("timeout", 30)
+
+    base_score, final_metadata = _compute_code_score_and_metadata(
+        solution_str=solution_str,
+        ground_truth=ground_truth,
+        sandbox_fusion_url=sandbox_fusion_url,
+        timeout=timeout,
+    )
+    tool_call_count, tool_call_bonus, tool_call_bonus_per_call, max_rewarded_tool_calls = _compute_tool_call_bonus(
+        extra_info=extra_info,
+        kwargs=kwargs,
+    )
+    final_reward = float(base_score) + tool_call_bonus
+
+    return _format_score_result(
+        score=final_reward,
+        metadata=final_metadata,
+        return_dict=return_dict,
+        include_metadata=include_metadata,
+        extra_fields={
+            "code_score": float(base_score),
+            "base_score": float(base_score),  # backward-compatible alias
+            "tool_call_count": tool_call_count,
+            "tool_call_bonus": tool_call_bonus,
+            "tool_call_bonus_per_call": tool_call_bonus_per_call,
+            "max_rewarded_tool_calls": max_rewarded_tool_calls,
+            "tool_call_reward": tool_call_bonus_per_call,  # backward-compatible alias
+        },
+    )
 
 
 def _build_sandbox_payload(code: str, language: str, timeout: int, in_outs: Any) -> str:
