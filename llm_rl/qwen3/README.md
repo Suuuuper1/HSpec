@@ -173,7 +173,6 @@ modelscope download --model Qwen/Qwen3-32B --local_dir ./Qwen3-32B
 
 bash ray_start_npu.sh TRAIN_SCRIPT ENV_SCRIPT
 # 示例： bash ray_start_npu.sh ./internal/train_grpo_qwen3_235b_128die_random_init.sh ./internal/qwen3_235b_env.sh
-# 如果不需要额外的环境变量配置，则不需要该参数，示例：bash ray_start_npu.sh ./internal/train_grpo_qwen3_32b_32die_true_weight.sh
 ```
 
 注：如果更换环境CANN包版本，建议在运行前手动清除以下缓存目录，避免缓存数据干扰：
@@ -191,8 +190,8 @@ rm -rf /root/atc_data/     # ATC编译的核心磁盘缓存
 | Qwen3-235B-A22B    | 随机权重训练 GRPO算法 | `ray_start_npu.sh` | `./internal/train_grpo_qwen3_235b_128die_random_init.sh` | `./internal/qwen3_235b_env.sh` |
 | Qwen3-235B-A22B    | 真实权重训练 GRPO算法 | `ray_start_npu.sh` | `./internal/train_grpo_qwen3_235b_128die_true_weight.sh` | `./internal/qwen3_235b_env.sh` |
 | Qwen3-235B-A22B    | 真实权重训练 DAPO算法 | `ray_start_npu.sh` | `./internal/train_dapo_qwen3_235b_128die_true_weight.sh` | `./internal/qwen3_235b_env.sh` |
-| Qwen3-32B          | 真实权重训练 GRPO算法 | `ray_start_npu.sh` | `./internal/train_grpo_qwen3_32b_32die_true_weight.sh` | - |
-| Qwen3-32B          | 真实权重训练 DAPO算法 | `ray_start_npu.sh` | `./internal/train_dapo_qwen3_32b_32die_true_weight.sh` | - |
+| Qwen3-32B          | 真实权重训练 GRPO算法 | `ray_start_npu.sh` | `./internal/train_grpo_qwen3_32b_32die_true_weight.sh` | `./internal/qwen3_32b_env.sh` |
+| Qwen3-32B          | 真实权重训练 DAPO算法 | `ray_start_npu.sh` | `./internal/train_dapo_qwen3_32b_32die_true_weight.sh` | `./internal/qwen3_32b_env.sh` |
 
 ## 附录
 
