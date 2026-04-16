@@ -278,6 +278,15 @@ def _compute_tool_call_bonus(
     return tool_call_count, tool_call_bonus, tool_call_bonus_per_call, max_rewarded_tool_calls
 
 
+def _extract_common_kwargs(kwargs: Dict[str, Any]) -> Tuple[Optional[str], bool, bool, int]:
+    """Extract common kwargs shared by compute_reward and compute_score."""
+    sandbox_fusion_url = kwargs.get("sandbox_fusion_url")
+    return_dict = kwargs.get("return_dict", False)
+    include_metadata = kwargs.get("include_metadata", False)
+    timeout = kwargs.get("timeout", 30)
+    return sandbox_fusion_url, return_dict, include_metadata, timeout
+
+
 def compute_reward(
     data_source,
     solution_str,
@@ -288,10 +297,7 @@ def compute_reward(
     """
     Computes training reward: code correctness score + tool-call bonus.
     """
-    sandbox_fusion_url = kwargs.get("sandbox_fusion_url")
-    return_dict = kwargs.get("return_dict", False)
-    include_metadata = kwargs.get("include_metadata", False)
-    timeout = kwargs.get("timeout", 30)
+    sandbox_fusion_url, return_dict, include_metadata, timeout = _extract_common_kwargs(kwargs)
 
     base_score, final_metadata = _compute_code_score_and_metadata(
         solution_str=solution_str,
@@ -320,6 +326,35 @@ def compute_reward(
             "tool_call_reward": tool_call_bonus_per_call,  # backward-compatible alias
         },
     )
+
+
+def compute_score(
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info=None,
+    **kwargs,
+):
+    """
+    Computes code correctness score only (no tool-call bonus).
+    See compute_reward for full argument and return documentation.
+    """
+    # Extract config from kwargs
+    sandbox_fusion_url, return_dict, include_metadata, timeout = _extract_common_kwargs(kwargs)
+
+    score, final_metadata = _compute_code_score_and_metadata(
+        solution_str=solution_str,
+        ground_truth=ground_truth,
+        sandbox_fusion_url=sandbox_fusion_url,
+        timeout=timeout,
+    )
+
+    if return_dict:
+        result = {"score": float(score)}
+        if include_metadata:
+            result["metadata"] = json.dumps(final_metadata, ensure_ascii=True)
+        return result
+    return float(score), final_metadata
 
 
 def _build_sandbox_payload(code: str, language: str, timeout: int, in_outs: Any) -> str:

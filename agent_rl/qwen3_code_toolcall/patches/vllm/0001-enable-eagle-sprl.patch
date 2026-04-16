@@ -1,0 +1,13 @@
+diff --git a/vllm/v1/executor/abstract.py b/vllm/v1/executor/abstract.py
+index 8ada524..f820a6c 100644
+--- a/vllm/v1/executor/abstract.py
++++ b/vllm/v1/executor/abstract.py
+@@ -203,6 +203,8 @@ class Executor(ABC):
+         output = self.collective_rpc(  # type: ignore[call-overload]
+             "execute_model", args=(scheduler_output,), non_block=non_block
+         )
++        if non_block:
++            return output  # already a Future, don't subscript
+         return output[0]
+ 
+     @overload

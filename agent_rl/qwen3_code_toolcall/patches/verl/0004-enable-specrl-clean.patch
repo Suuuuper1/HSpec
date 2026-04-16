@@ -1,0 +1,301 @@
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index e449411f..6970e962 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -802,6 +802,8 @@ class AgentLoopManager:
+             ]
+         )
+         output = DataProto.concat(outputs)
++        # collect the non-cumulative (per training step) speculative decoding stats if they are there
++        spec_decode_stats = self._collect_spec_decode_stats()
+         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
+         self.sleep()
+         if self.reward_model_manager:
+@@ -811,9 +813,53 @@ class AgentLoopManager:
+         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+         timing = self._performance_metrics(metrics, output)
+
+-        output.meta_info = {"timing": timing, **outputs[0].meta_info}
++        output.meta_info = {"timing": timing, "spec_decode_stats": spec_decode_stats, **outputs[0].meta_info}
+         return output
+
++    def _collect_spec_decode_stats(self) -> dict:
++        """Collect spec decode stats from all server replicas, return per-step delta stats."""
++        try:
++            if not hasattr(self, 'server_handles') or not self.server_handles:
++                return {}
++
++            stats_list = ray.get([
++                server.compute_spec_decode_metrics.remote()
++                for server in self.server_handles
++            ])
++
++            # Only node_rank=0 servers return non-empty stats
++            # Average rates across replicas, sum counts
++            non_empty = [s for s in stats_list if s]
++            if not non_empty:
++                return {}
++            # If single replica just return it directly
++            if len(non_empty) == 1:
++                return non_empty[0]
++            # Multiple replicas: sum counts, recompute rates
++            result = {}
++            total_drafts = sum(s.get("spec_decode/num_drafts", 0) for s in non_empty)
++            total_draft_tokens = sum(s.get("spec_decode/num_draft_tokens", 0) for s in non_empty)
++            total_accepted = sum(s.get("spec_decode/num_accepted_tokens", 0) for s in non_empty)
++
++            result["spec_decode/num_drafts"] = total_drafts
++            result["spec_decode/num_draft_tokens"] = total_draft_tokens
++            result["spec_decode/num_accepted_tokens"] = total_accepted
++            result["spec_decode/draft_acceptance_rate"] = total_accepted / total_draft_tokens if total_draft_tokens > 0 else 0.0
++            result["spec_decode/mean_acceptance_length"] = 1.0 + total_accepted / total_drafts if total_drafts > 0 else 1.0
++
++            # Per-position stats
++            num_pos = len([k for k in non_empty[0] if k.startswith("spec_decode/accepted_tokens_pos_")])
++            for i in range(num_pos):
++                key_count = f"spec_decode/accepted_tokens_pos_{i}"
++                key_rate = f"spec_decode/acceptance_rate_pos_{i}"
++                total_pos = sum(s.get(key_count, 0) for s in non_empty)
++                result[key_count] = total_pos
++                result[key_rate] = total_pos / total_drafts if total_drafts > 0 else 0.0
++            return result
++        except Exception as e:
++            logger.warning(f"Could not collect spec decode stats: {e}")
++            return {}
++
+     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
+         timing = {}
+         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index ffff4aa4..fd58ca78 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -1301,6 +1301,10 @@ class RayPPOTrainer:
+                 # TODO: implement actual tflpo and theoretical tflpo
+                 n_gpus = self.resource_pool_manager.get_n_gpus()
+                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
++                # Update with the speculative decoding stats per step
++                spec_decode_stats = gen_batch_output.meta_info.pop("spec_decode_stats", {})
++                if spec_decode_stats:
++                    metrics.update(spec_decode_stats)
+                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+
+                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+diff --git a/verl/utils/vllm/utils.py b/verl/utils/vllm/utils.py
+index acf24398..5cf1fceb 100644
+--- a/verl/utils/vllm/utils.py
++++ b/verl/utils/vllm/utils.py
+@@ -15,7 +15,7 @@
+
+ from msgspec import field
+ from packaging import version as vs
+-from vllm.lora.models import LoRAModel
++from vllm.lora.lora_model import LoRAModel
+ from vllm.lora.request import LoRARequest
+ from vllm.lora.utils import get_adapter_absolute_path
+ from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index db9e234f..4ed5ffab 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -18,6 +18,7 @@ import logging
+ import os
+ from pprint import pprint
+ from typing import Any, Callable, Optional
++from concurrent.futures import Future
+
+ import cloudpickle as pickle
+ import numpy as np
+@@ -35,11 +36,13 @@ from vllm.inputs import TokensPrompt
+ from vllm.lora.request import LoRARequest
+ from vllm.outputs import RequestOutput
+ from vllm.usage.usage_lib import UsageContext
+-from vllm.utils import FlexibleArgumentParser, get_tcp_uri
++from vllm.utils.argparse_utils import FlexibleArgumentParser
++from vllm.utils.network_utils import get_tcp_uri
+ from vllm.v1.engine.async_llm import AsyncLLM
+ from vllm.v1.engine.core import EngineCoreProc
+ from vllm.v1.engine.utils import CoreEngineProcManager
+ from vllm.v1.executor.abstract import Executor
++from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+ from verl.single_controller.ray import RayClassWithInitArgs
+ from verl.utils.config import omega_conf_to_dataclass
+@@ -96,6 +99,7 @@ class ExternalZeroMQDistributedExecutor(Executor):
+         timeout: Optional[float] = None,
+         args: tuple = (),
+         kwargs: Optional[dict[str, Any]] = None,
++        non_block: bool = False,
+         **kwargs_extra: Any,
+     ) -> list[Any]:
+         if isinstance(method, str):
+@@ -115,6 +119,11 @@ class ExternalZeroMQDistributedExecutor(Executor):
+         for output in outputs:
+             if isinstance(output, Exception):
+                 raise output
++
++        if non_block:
++            future = Future()
++            future.set_result(outputs[0])  # not single_value check, always [0]
++            return future
+         return outputs
+
+     def check_health(self):
+@@ -182,6 +191,94 @@ class vLLMHttpServerBase:
+         else:
+             self._master_address = None
+             self._master_port = None
++
++        # track previous counter values for per-step delta calculation of speculative decoding
++        self._prev_spec_stats = {
++            'num_drafts': 0,
++            'num_draft_tokens': 0,
++            'num_accepted_tokens': 0,
++            'num_accepted_tokens_per_pos': None,
++        }
++
++    def compute_spec_decode_metrics(self) -> dict:
++        if self.node_rank != 0:
++            return {}
++        if not hasattr(self, 'engine'):
++            return {}
++        try:
++            logger_manager = getattr(self.engine, 'logger_manager', None)
++            if logger_manager is None:
++                return {}
++            stat_loggers = getattr(logger_manager, 'stat_loggers', None)
++            if not stat_loggers:
++                return {}
++
++            prom_logger = next(
++                (l for l in stat_loggers if isinstance(l, PrometheusStatLogger)),
++                None
++            )
++            if prom_logger is None:
++                return {}
++
++            spec_prom = getattr(prom_logger, 'spec_decoding_prom', None)
++            if spec_prom is None or not spec_prom.spec_decoding_enabled:
++                return {}
++
++            # Read cumulative counters
++            cum_drafts = prom_logger.spec_decoding_prom.counter_spec_decode_num_drafts[0]._value.get()
++            cum_draft_tokens = prom_logger.spec_decoding_prom.counter_spec_decode_num_draft_tokens[0]._value.get()
++            cum_accepted_tokens = prom_logger.spec_decoding_prom.counter_spec_decode_num_accepted_tokens[0]._value.get()
++
++            # Compute per-step deltas
++            drafts = cum_drafts - self._prev_spec_stats['num_drafts']
++            draft_tokens = cum_draft_tokens - self._prev_spec_stats['num_draft_tokens']
++            accepted_tokens = cum_accepted_tokens - self._prev_spec_stats['num_accepted_tokens']
++
++            # Update previous values
++            self._prev_spec_stats['num_drafts'] = cum_drafts
++            self._prev_spec_stats['num_draft_tokens'] = cum_draft_tokens
++            self._prev_spec_stats['num_accepted_tokens'] = cum_accepted_tokens
++
++            if draft_tokens == 0 or drafts == 0:
++                return {}
++
++            result = {
++                "spec_decode/draft_acceptance_rate":  float(accepted_tokens / draft_tokens),
++                "spec_decode/mean_acceptance_length": float(1.0 + accepted_tokens / drafts),
++                "spec_decode/num_drafts":             float(drafts),
++                "spec_decode/num_accepted_tokens":    float(accepted_tokens),
++                "spec_decode/num_draft_tokens":       float(draft_tokens),
++            }
++
++            # Per-position acceptance stats
++            per_pos_dict = getattr(
++                prom_logger.spec_decoding_prom,
++                'counter_spec_decode_num_accepted_tokens_per_pos',
++                None
++            )
++
++            if per_pos_dict is not None:
++                prev_per_pos = self._prev_spec_stats['num_accepted_tokens_per_pos']
++
++                # per_pos_dict is {engine_idx: [counter_pos0, counter_pos1, ...]}
++                per_pos_counters = per_pos_dict[0]  # engine_idx=0
++                cum_per_pos = [c._value.get() for c in per_pos_counters]
++
++                if prev_per_pos is None:
++                    prev_per_pos = [0] * len(cum_per_pos)
++
++                per_pos_delta = [cum_per_pos[i] - prev_per_pos[i] for i in range(len(cum_per_pos))]
++                self._prev_spec_stats['num_accepted_tokens_per_pos'] = cum_per_pos
++
++                for i, count in enumerate(per_pos_delta):
++                    result[f"spec_decode/accepted_tokens_pos_{i}"] = float(count)
++                if drafts > 0:
++                    for i, count in enumerate(per_pos_delta):
++                        result[f"spec_decode/acceptance_rate_pos_{i}"] = float(count / drafts)
++            return result
++        except Exception as e:
++            logger.warning(f"Could not get spec decode stats: {e}")
++            return {}
+
+     def get_master_address(self):
+         """Get master address and port for data parallel."""
+@@ -192,6 +289,36 @@ class vLLMHttpServerBase:
+         assert self._server_port is not None, "http server is not launched, port is None"
+         return self._server_address, self._server_port
+
++    async def check_spec_decode_enabled(self) -> bool:
++        """Check that speculative decoding model is enabled.
++
++        This is mainly for logging/debugging - EAGLE should be automatically
++        frozen by vLLM's architecture since it's part of the inference engine.
++
++        Returns:
++            bool: True if spec decode is frozen or not enabled, False otherwise.
++        """
++        if self.node_rank != 0:
++            return True  # Only check on master node
++
++        # Check if spec decode is enabled
++        spec_config = self.config.get("engine_kwargs", {}).get("vllm", {}).get("speculative_config")
++        if not spec_config:
++            print("Speculative decoding not enabled")
++            return True
++
++        print("=" * 80)
++        print("SPECULATIVE DECODING ENABLED")
++        print(f"  Method: {spec_config.get('method')}")
++        print(f"  Model: {spec_config.get('model')}")
++        print(f"  Num tokens: {spec_config.get('num_speculative_tokens')}")
++        print("=" * 80)
++        print("NOTE: EAGLE drafter is managed by vLLM inference engine")
++        print("      It is automatically frozen and separate from the actor model")
++        print("      Only the actor model will be trained via PPO")
++        print("=" * 80)
++        return True
++
+     async def launch_server(self, master_address: str = None, master_port: int = None):
+         if self.node_rank != 0:
+             assert master_address and master_port, "non-master node should provide master address and port"
+@@ -335,6 +462,7 @@ class vLLMHttpServerBase:
+         # 3. launch server
+         if self.node_rank == 0:
+             await self.run_server(server_args)
++            await self.check_spec_decode_enabled()
+         else:
+             await self.run_headless(server_args)
+
+@@ -347,7 +475,7 @@ class vLLMHttpServerBase:
+         engine_client = AsyncLLM.from_vllm_config(
+             vllm_config=vllm_config,
+             usage_context=usage_context,
+-            disable_log_requests=engine_args.disable_log_requests,
++            enable_log_requests=engine_args.enable_log_requests,
+             disable_log_stats=engine_args.disable_log_stats,
+         )
+
+@@ -355,7 +483,7 @@ class vLLMHttpServerBase:
+         await engine_client.reset_mm_cache()
+
+         app = build_app(args)
+-        await init_app_state(engine_client, vllm_config, app.state, args)
++        await init_app_state(engine_client, app.state, args)
+         if self.replica_rank == 0 and self.node_rank == 0:
+             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
+
