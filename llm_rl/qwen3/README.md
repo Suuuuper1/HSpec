@@ -200,6 +200,7 @@ rm -rf /root/atc_data/     # ATC编译的核心磁盘缓存
 |-------|--------|--------|
 |megatron|[0001-megatron-bugfix-state_ten_verification.patch](patches/megatron/0001-megatron-bugfix-state_ten_verification.patch)|在处理优化器状态时新增空值判断，避免因空值导致的运行异常|
 |megatron|[0002-megatron-feature-enable_hdp.patch](patches/megatron/0002-megatron-feature-enable_hdp.patch)|在ROPE中增加HDP相关处理逻辑，`USE_HDP`开启时，使能HDP功能|
+|megatron|[0003-megatron-bugfix-fix_hf_converter.patch](patches/megatron/0003-megatron-bugfix-fix_hf_converter.patch)|通过修复参数，修复调用 `converter_hf_to_mcore` 时参数报错的问题|
 |mindspeed|[0001-mindspeed-bugfix-builder.patch](patches/mindspeed/0001-mindspeed-bugfix-builder.patch)|兼容openeuler24.03版本下编译头文件缺失|
 |mindspeed|[0002-mindspeed-feature-enable_hdp.patch](patches/mindspeed/0002-mindspeed-feature-enable_hdp.patch)|在Ring Attention中增加HDP相关处理逻辑，`USE_HDP`开启时，使能HDP功能|
 |r1_ascend|[0001-r1_ascend-bugfix-correct_DP_initialization.patch](patches/r1_ascend/0001-r1_ascend-bugfix-correct_DP_initialization.patch)|正确初始化DP通信域，适配vllm-v0.14.0|
