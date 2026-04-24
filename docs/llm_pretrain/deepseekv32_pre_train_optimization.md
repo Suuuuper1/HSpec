@@ -77,7 +77,7 @@ converters = ["npu_dsa", "npu_rms_norm", "npu_permute", "npu_gmm"]
 大EP场景下，路由专家不做TP切分（TP extend EP），TorchTitan原生的MoE TP策略如下图所示：
 
 <p align="center">
-<img src="./figures/EP_optimize_before.png" width="80%">
+<img src="./figures/deepseek_v32/EP_optimize_before.png" width="80%">
 </p>
 以上策略在两个分支上都存在不合理之处：
 
@@ -86,7 +86,7 @@ converters = ["npu_dsa", "npu_rms_norm", "npu_permute", "npu_gmm"]
 
 以上不合理之处与TP域的AllGather和ReduceScatter位置安排不合理有关，可将这两个通信移动至共享专家分支，而路由专家分支不需要TP域的通信。调整后MoE的TP策略如下图所示，路由专家支路不再有冗余的计算和通信，共享专家支路为普通的TP策略：
 <p align="center">
-<img src="./figures/EP_optimize_after.png" width="80%">
+<img src="./figures/deepseek_v32/EP_optimize_after.png" width="80%">
 </p>
 
 ### 自定义CP策略
@@ -97,14 +97,14 @@ converters = ["npu_dsa", "npu_rms_norm", "npu_permute", "npu_gmm"]
 
 TorchTitan使用了torch原生提供的context parallel能力，其原理如下图所示：使用一个上下文环境包裹模型训练step，上下文内部对模型输入做sequence轴切分，同时将Attention算子替换为RingAttention或AllGatherKV实现以确保Attention计算正确。
 <p align="center">
-<img src="./figures/0f87b86a-c17c-4537-a7a3-24890a595def.png" width="30%">
+<img src="./figures/deepseek_v32/0f87b86a-c17c-4537-a7a3-24890a595def.png" width="30%">
 </p>
 
 #### 针对DSA的自定义CP
 
 DeepSeek-V3.2模型与传统稠密注意力模型不同，其内部的Lightning Indexer和DSA稀疏注意力在CP场景下都需要对Key和Value进行处理以确保计算的正确性。由于DeepSeek-V3.2内部注意力结构更加复杂，且Attention算子不再是常用的SDPA，torch原生的CP能力并不适用。在此背景下，我们在遵循torch原生CP设计逻辑的基础上，为DeepSeek-V3.2设计实现了自定义CP，其原理如下图所示：
 <p align="center">
-<img src="./figures/54676f48-d570-493b-a90f-57e4a956bb82.png" width="30%">
+<img src="./figures/deepseek_v32/54676f48-d570-493b-a90f-57e4a956bb82.png" width="30%">
 </p>
 
 CP场景下，需确保q_indexer与query分别和完整序列的k_indexer、key value进行过注意力计算，一般有两种方式达成此目的：RingAttention形式，或直接对KV做序列维度AllGather。
@@ -114,7 +114,7 @@ CP场景下，需确保q_indexer与query分别和完整序列的k_indexer、key 
 
 综合以上分析，我们实现了CP版本的DSA forward函数，仅仅是在原版代码上增加对KV的AllGather通信。以使用NPU融合算子的DSA实现为例，CP场景下的计算逻辑如下图所示：
 <p align="center">
-<img src="./figures/27cc8399-5625-4569-9363-cc428500cdcb.png" width="40%" >
+<img src="./figures/deepseek_v32/27cc8399-5625-4569-9363-cc428500cdcb.png" width="40%" >
 </p>
 值得一提的是，我们首先实现了 CustomContextParallelContext 基类，其中只进行模型输入的序列切分，用户可在子类中自定义模型前向计算的CP patch逻辑，具有较好的可扩展性。
 
@@ -134,7 +134,7 @@ TP场景下，当前默认的matmul sharding策略生成并不合理。以q_lora
 * **权重W**：从Replicate变为Shard(0)，需要Slice操作。
 * **输出Y**：由于TP策略中指定q_lora模块不做并行，因此最终该matmul输出需要调整为Replicate状态，从Partial到Replicate则需要AllReduce通信。
 <p align="center">
-<img src="./figures/ecf4872c-c7e9-4932-9705-1c785afd053c.png" width="50%" >
+<img src="./figures/deepseek_v32/ecf4872c-c7e9-4932-9705-1c785afd053c.png" width="50%" >
 </p>
 实际上，pytorch已经编写了较为完善的matmul sharding策略生成函数，可以利用该函数获取更合理的sharding策略。针对以上示例，可通过如下代码获得预期的合理策略：
 
@@ -147,7 +147,7 @@ matmul_backward算子当前也有sharding策略不合理的问题。以模型末
 * **权重W**：从Shard(1)变为Shard(0)，需要AllToAll通信。
 
 <p align="center">
-<img src="./figures/89247407-6507-4ae4-aa9b-dfee0fe484ab.png" width="70%" >
+<img src="./figures/deepseek_v32/89247407-6507-4ae4-aa9b-dfee0fe484ab.png" width="70%" >
 </p>
 
 虽然torch没有matmul反向的sharding策略生成函数，但考虑到matmul反向实际上就是计算dX和dW的两个矩阵乘，我们设计对两个矩阵乘分别调用 _mm_like_strategy 生成策略然后融合得到最终的matmul反向sharding策略。
@@ -165,7 +165,7 @@ matmul_backward算子当前也有sharding策略不合理的问题。以模型末
 FSDP2作为PyTorch分布式训练的核心演进方案，其核心流程是在每个计算步骤（前向/反向）中按需全量收集（AllGather）被切分到各设备的模型参数，计算完成后立即释放非本设备参数，从而降低模型参数及梯度相关的驻留内存。相较于FSDP1，FSDP2在分片粒度、通信重叠和内存复用方面进行了深度优化：支持参数、梯度与优化器状态的统一分片管理；采用逐层（layer-wise）收集与释放机制，实现通信与计算的相互掩盖的高效流水；同时原生适配混合精度训练与TorchTitan框架的自动化切分配置。
 
 <p align="center">
-<img src="./figures/FSDP2.png" width="60%" >
+<img src="./figures/deepseek_v32/FSDP2.png" width="60%" >
 </p>
 
 #### 零冗余权重
@@ -173,12 +173,12 @@ FSDP2作为PyTorch分布式训练的核心演进方案，其核心流程是在�
 在 MoE模型常见的大EP小TP模式部署下，尽管模型内占据主要参数量的MoE部分通过EP与流水线并行（PP）实现完全切分，各专家权重被无冗余地散布，Attention/共享专家部分的权重往往是在卡间进行冗余复制的。在此类混合并行策略导致局部参数冗余的场景下，FSDP2的优势尤为突出：通过将冗余部署的Attention权重与共享专家参数以DP域为单位进行二次分片，FSDP2能够在保持计算逻辑不变的前提下，显著削减跨DP域的参数副本数量，为更大批量或更长序列训练释放宝贵资源。
 
 <p align="center">
-<img src="./figures/TPEPFSDP.png" width="40%" >
+<img src="./figures/deepseek_v32/TPEPFSDP.png" width="40%" >
 </p>
 
 具体而言，考虑PP2TP4DP16的场景，单卡非MoE权重和梯度的总占用量约为(671B - 654B)/PP2/TP4 * 8Byte = ~18GB，考虑到其中部分权重不参与TP切分（如`qkv_a`与`indexer`），实际值将会进一步增加。DP16场景开启FSDP后，权重和梯度在各DP域间做完全均分，几乎可以完全消除相关的内存占用。最终，我们对比了如下几种切分策略，在考虑MoE极端负载不均衡的可能后选择了**PP2TP4EP64**为基础的切分方式。
 <p align="center">
-<img src="./figures/fe933026-03be-4731-b45a-2fb7acb6a2ae.png" width="80%" >
+<img src="./figures/deepseek_v32/fe933026-03be-4731-b45a-2fb7acb6a2ae.png" width="80%" >
 </p>
 
 ### Swap Optimizer
@@ -191,7 +191,7 @@ FSDP2作为PyTorch分布式训练的核心演进方案，其核心流程是在�
 * 为了降低优化器更新时的内存峰值并尽可能提升性能，以param为粒度将“优化器加载——优化器更新——优化器卸载”设计为切片流水并行的形式。
 
 <p align="center">
-<img src="./figures/ef8ed5ce-037a-47ca-8d7c-31853bdf0501.png" width="80%" >
+<img src="./figures/deepseek_v32/ef8ed5ce-037a-47ca-8d7c-31853bdf0501.png" width="80%" >
 </p>
 
 本样例在TorchTitan框架下参考并实现了SwapOptimizer特性，大大节省了训练时的device内存空间。与MindSpeed有所不同的是，TorchTitan训练中优化器只管理两个FP32动量，并且需要处理权重为DTensor的场景。
@@ -283,7 +283,7 @@ $$
 
 `SparseLightningIndexerGradKLLoss`的计算流程有五个阶段：即预处理Gather($V_0$)，矩阵乘和ReLu操作($C_1$)，以及后续$V_1$侧多个向量计算，$C_1$侧矩阵乘和后处理ScatterAdd操作($V_2$)。相较于`LightningIndexer`和`SparseFlashAttention`算子而言，该算子计算流程更为繁琐，数据依赖更加复杂，朴素的流水排布导致Cube和Vector计算过程中出现大量气泡，无法充分发挥算力优势。为了防止多个阶段的串行执行，需要提前下发 (Preload) 一次 $V_0$ 以实现流水的互相掩盖。具体流水效果图如下图所示：
 <p align="center">
-<img src="./figures/b3eb5905-9d3c-4391-b6b8-21d6d098cd0d.jpg" width="50%" >
+<img src="./figures/deepseek_v32/b3eb5905-9d3c-4391-b6b8-21d6d098cd0d.jpg" width="50%" >
 </p>
 
 #### 离散访存优化
@@ -291,7 +291,7 @@ $$
 `SparseLightningIndexerGradKLLoss`算子Gather($V_0$)和ScatterAdd($V_2$)阶段都需要采用离散访存。对于非 Sparse 场景的 Attention 算子，数据访存一般是连续的，因此单次数据搬运耗时相较于指令下发耗时更长，可实现连续的多次访存，达到较高的访存带宽。然而对于 Sparse Attention 的离散访存而言，单次访存的耗时大幅下降，甚至可能小于指令下发的耗时，这就会导致严重的指令下发阻塞，如下图所示。
 
 <p align="center">
-<img src="./figures/b97ed3e2-ca09-46f6-9f5d-2887c8bad304.png" width="50%" >
+<img src="./figures/deepseek_v32/b97ed3e2-ca09-46f6-9f5d-2887c8bad304.png" width="50%" >
 </p>
 
 基于 A3 芯片 Cube 核和 Vector 核数比为1:2的特性,利用 Vector 核发射访存指令，
@@ -300,7 +300,7 @@ $$
 针对这一问题,可以将离散的数据点两两聚合,利用srcGap参数实现成对的数据访存,提升访存带宽,如图所示。
 
 <p align="center">
-<img src="./figures/31a06a5c-c7aa-4767-8cc3-76afb6628db0.png" width="50%" >
+<img src="./figures/deepseek_v32/31a06a5c-c7aa-4767-8cc3-76afb6628db0.png" width="50%" >
 </p>
 
 #### 合轴优化
@@ -380,7 +380,7 @@ $$
 `SparseFlashAttentionScoreGrad`的计算流程包括五个阶段：$K_{index}$和$V_{index}$离散转连续的数据搬运（V0），$Q_{index}$@$K_{index}$和$d_{y}$@V（C1），计算P和$d_{s}$（V1），计算$d_{s}$@K，最后是$d_{k}$和$d_{V}$离散写出核外（V2）。严格按照计算图的基础流水排布如下图上半部分所示，多个阶段串行执行，会导致计算过程中出现大量的气泡。这里优化为在起步阶段连续发起两次V0和C1，接触后续计算的数据依赖，以实现流水的掩盖。效果如下图下半部分所示，可以看到CV间并行执行，大大减少了CV数据依赖损耗。
 
 <p align="center">
-<img src="./figures/d6dc278a-738c-47fe-8d8d-3359e612cdea.png" width="50%" >
+<img src="./figures/deepseek_v32/d6dc278a-738c-47fe-8d8d-3359e612cdea.png" width="50%" >
 </p>
 
 #### 离散访存优化
@@ -388,7 +388,7 @@ $$
 相较于传统FAG，SFAG增加了大量的离散访存，且单次访存的数据量较小，这样会导致访存指令本身的开销较大，带宽也无法充分发挥，针对此类问题，可以通过Vector核对离散数据做非连续转连续排布，以$128\times headDim$为基本块放置到workspace临时空间，而Cube侧发起计算时可以连续搬运输入数据，显著提高带宽利用率，如下图所示。
 
 <p align="center">
-<img src="./figures/62465bee-017c-492c-a0cd-597c32048123.png" width="50%" >
+<img src="./figures/deepseek_v32/62465bee-017c-492c-a0cd-597c32048123.png" width="50%" >
 </p>
 
 ## FSDP2+Torch.compile+inductor加速
@@ -407,7 +407,7 @@ FSDP2 基于 DTensor 构建，相较于传统 FSDP 提供了更细粒度的通�
 
 但需要注意的是，通算掩盖的前提是通信耗时短于计算耗时。仅靠软件层面的预取调度并不充分——若通信延迟远大于计算时间，流水线仍会产生阻塞。在这一点上，A3 超节点的高带宽互联架构发挥了关键作用，其高吞吐、低延迟的通信能力有效压缩了 AllGather 的耗时，为通算掩盖提供了硬件基础。
 <div align="center">
-  <img src="./figures/6bbabc6c-7dce-4c42-bba5-47676adba316.png" height="180">
+  <img src="./figures/deepseek_v32/6bbabc6c-7dce-4c42-bba5-47676adba316.png" height="180">
 </div>
 
 2）软硬协同下的通算全掩盖
@@ -426,12 +426,12 @@ FSDP2 基于 DTensor 构建，相较于传统 FSDP 提供了更细粒度的通�
 Inductor 编译将原本Eager模式下每个算子下发固定开销在编译期间解决，运行时host侧只剩下最精简的Kernel Launch调度，通过Profiling我们可以看出，原本linear层包含aten::t和aten::matmul两个算子，需要经过PythonDispatchMode下发具体算子，整体的host侧下发耗时为409.5us；开启compile后通过可执行python文件直接完成算子下发，同样四个操作仅需要118.8us的下发时间。
 
 <div align="center">
-  <img src="./figures/de58a796-3dd0-4ac0-966f-48f47686af16.png" height="400 px">
+  <img src="./figures/deepseek_v32/de58a796-3dd0-4ac0-966f-48f47686af16.png" height="400 px">
 </div>
 
 开启inductor后：
 <div align="center">
-  <img src="./figures/9703b1c8-4110-46b8-9c45-dc3cf782bc3a.png" height="450 px">
+  <img src="./figures/deepseek_v32/9703b1c8-4110-46b8-9c45-dc3cf782bc3a.png" height="450 px">
 </div>
 
 ### bypass自动融合
@@ -447,7 +447,7 @@ Inductor 编译将原本Eager模式下每个算子下发固定开销在编译期
 实验中我们发现，当前 NPU 上由 Inductor 自动融合生成的 Triton 算子，其编译时间和执行性能均表现较差。因此，现阶段我们暂时绕过了 Inductor 流程中的 Triton Codegen 部分，后续将接入Ascend C Codegen 以更好地支持在 NPU 上使用 Inductor 后端进行完整编译。
 
 <p align="center">
-<img src="./figures/bypass_triton.png" width="60%" >
+<img src="./figures/deepseek_v32/bypass_triton.png" width="60%" >
 </p>
 
 通过在 compile 之前清空 lowerings 和 decompositions，使得大部分Aten算子都不会被分解也不会下沉到Inductor IR，fallback到算子原始实现；此外，由于在`GraphLowering`中会对没有显式指定内存布局的反向算子添加`require_contiguous`约束，对于不连续的张量插入copy（clone）操作变为连续内存，这一操作会在反向阶段将aten算子转为单独的triton算子实现，我们对以上代码进行修改，去除对于反向算子的布局操作，所有算子均使用原始的布局，可以完全屏蔽triton算子。
@@ -459,13 +459,13 @@ Inductor 编译将原本Eager模式下每个算子下发固定开销在编译期
 我们在A3集群上预训练DeepSeek-V3.2模型实践表明，语言模型损失（lm loss）与梯度范数（grad norm）稳健收敛，表明TorchTitan框架结合TorchTitan-npu适配在大规模模型训练中的稳定性与高效性。lm loss从训练初始step1的12.25稳步下降至step37的8.37，全程保持持续递减趋势，无明显震荡；梯度同步从初始28.24平稳回落至16.03，整体趋于收敛且无异常波动。
 
 <p align="center">
-<img src="./figures/707014b7-bbcf-4d3b-8f36-ca968d1a42d4.png" width="60%" >
+<img src="./figures/deepseek_v32/707014b7-bbcf-4d3b-8f36-ca968d1a42d4.png" width="60%" >
 </p>
 
 与此同时，对DeepSeek-V3.2网络所提出的Lighting Indexer也进行了训练。在整个预训练过程中，indexer loss稳步下降，且全程保持平稳递减。结合lm loss和grad norm变化曲线证明在大规模分布式场景下精度正常，能够高效支撑DeepSeek-V3.2模型的预训练任务。
 
 <p align="center">
-<img src="./figures/7073deeb-3896-4632-a6e9-f9871147ff65.png" width="30%" >
+<img src="./figures/deepseek_v32/7073deeb-3896-4632-a6e9-f9871147ff65.png" width="30%" >
 </p>
 
 ### 性能
@@ -500,7 +500,7 @@ DeepSeek-V3.2模型在使能`DSA`融合算子后，不仅可以显著降低训�
 我们参考原始TorchTitan代码中`apply_compile`对于逐个`transformer block`进行整图编译的方式，将完整Attention部分拆分为`MLAProlog`，`inner_attention`，`MLAEpilog`三个部分，由于`inner_attention`已经使用DSA融合算子实现，host侧不需要过多的小算子下发，因此是否compile对整体性能影响不大。对于`MLAProlog`和`MLAEpilog`两个部分以及MoE部分的router、gate等进行编译，缓解小算子较多带来的host侧下发开销。
 
 <p align="center">
-<img src="./figures/9efe4f6c-acf3-432e-bafb-d1f7ec1d8eb2.png" width="40%" >
+<img src="./figures/deepseek_v32/9efe4f6c-acf3-432e-bafb-d1f7ec1d8eb2.png" width="40%" >
 </p>
 
 开启compile后，对于MLAProlog存在明显host bound的情况有明显优化，原始host侧下发时间：
@@ -521,7 +521,7 @@ TorchTitan-npu 当前主要是兼容社区的生态，将PyTorch原生简单易�
 
 PyTorch框架在图模式下的Inductor组件为此提供了基础的算子融合与编译能力，其设计兼容现有PyTorch生态，具备良好的软件继承性。然而，由于NPU与GPU在内存架构、计算单元及并行机制等方面存在本质差异，直接沿用面向GPU的优化策略难以充分发挥NPU的硬件潜力，因此现阶段通过 Bypass Triton 方式规避 Triton 后端在 NPU 上的性能不足。
 <p align="center">
-<img src="./figures/64ed8c21-7a73-4c21-b99f-3ae697fd09db.png" width="25%" >
+<img src="./figures/deepseek_v32/64ed8c21-7a73-4c21-b99f-3ae697fd09db.png" width="25%" >
 </p>
 为在继承Inductor整体流程与接口的基础上实现针对NPU的高效融合，需具备面向NPU的即时编译（JIT）算子生成能力。为此，CANN框架继承的AutoFuse组件针对NPU架构特征进行了深度优化，实现了从计算图到高效NPU算子代码的自动化映射与生成。该组件不仅保持与Inductor技术的协同与兼容，更进一步通过架构感知的融合策略、内存访问优化与指令调度等手段，显著提升了算子融合在NPU上的执行效率，从而支撑复杂模型在NPU平台上的高性能部署，因此将进一步提升inductor编译后的模型性能。
 
@@ -530,7 +530,7 @@ PyTorch框架在图模式下的Inductor组件为此提供了基础的算子融�
 [DualPipeV ](https://sail.sea.com/blog/articles/63)是一种专为大规模 MoE 模型（如 DeepSeek-V3）设计的高效流水线并行（Pipeline Parallelism, PP）调度策略，其脱胎自DeepSeek团队设计的[DualPipe](https://github.com/deepseek-ai/DualPipe)并借鉴了[InterLeave1F1B](https://arxiv.org/pdf/2104.04473)。
 
 <p align="center">
-<img src="./figures/cffbf6e5-2185-491f-988b-80a5fdeeeac3.png" width="55%" >
+<img src="./figures/deepseek_v32/cffbf6e5-2185-491f-988b-80a5fdeeeac3.png" width="55%" >
 </p>
 
 DualPipeV的核心设计理念是：一个设备上可以同时承载一个前向计算batch和一个反向计算batch，两者的通信和计算可以互相并行，以此可以很大程度上用另一个batch的计算掩盖MoE EP并行带来的通信开销。
@@ -542,7 +542,7 @@ TorchTitan社区已初步支持DualPipeV特性，但在实践中发现无法在Z
 TP 通过 AllGather 和 ReduceScatter 在层内完成跨卡同步，通信延迟直接暴露在关键路径上。Async TP 的核心思想是将通信与计算算子同时进行分解——AllGather 拆分为多个 Send/Recv，Matmul 拆分为对应的子 Matmul——使得一个子 Matmul 的计算与下一个 chunk 的数据传输并发执行，从而隐藏通信延迟。
 
 <p align="center">
-<img src="./figures/e8957bac-aebe-4cf0-b603-8cfc691de0e9.png" width="35%" >
+<img src="./figures/deepseek_v32/e8957bac-aebe-4cf0-b603-8cfc691de0e9.png" width="35%" >
 </p>
 
 在 TorchTitan-npu 中，Inductor 编译器在 FX 计算图的阶段，可以识别这种**all_gather + mutmal**或者 **matmul + reduce-scatter**这种pattern，并自动完成这一分解与重排序，无需修改模型代码。配合 A3 节点内的高带宽卡间互联，层内 TP 通信可被有效压缩并隐藏在计算窗口之中。
