@@ -1,0 +1,56 @@
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+FROM quay.io/ascend/cann:8.5.0-a3-openeuler24.03-py3.11
+
+ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+ARG SOC_VERSION="ascend910_9391"
+
+ENV SOC_VERSION=$SOC_VERSION \
+    TASK_QUEUE_ENABLE=1 \
+    OMP_NUM_THREADS=1
+
+RUN pip config set global.index-url ${PIP_INDEX_URL}
+
+WORKDIR /workspace
+
+SHELL ["/bin/bash", "-c"]
+
+# Install torch and torch-npu
+RUN python3 -m pip install torch==2.8.0 torch-npu==2.8.0.post2
+
+# MindSpeed
+RUN git clone https://gitcode.com/ascend/MindSpeed.git && \
+    cd MindSpeed    && \
+    git checkout master  && \
+    pip3 install -r requirements.txt && \
+    pip3 install -e . && \
+    cd ..
+
+# MindSpeed-LLM & Megatron-LM
+RUN git clone https://gitcode.com/Ascend/MindSpeed-LLM.git && \
+    git clone https://github.com/NVIDIA/Megatron-LM.git && \
+    cd Megatron-LM  && \
+    git checkout core_v0.12.1   && \
+    cp -r megatron ../MindSpeed-LLM/    && \
+    cd ../MindSpeed-LLM && \
+    git checkout 6fe0df7fa2ce64fffee1f6304c73a1dda161187c && \
+    mkdir logs
+
+# Install other dependencies
+RUN python3 -m pip install torchvision==0.23.0 && \
+    python3 -m pip install transformers==5.1.0 && \
+    python3 -m pip install datasets==2.16.0
+
+CMD ["/bin/bash"]
