@@ -1,6 +1,7 @@
 # cann-recipes-train
 
 ## 🚀 Latest News
+- [2026/04] 新增DeepSeek-V3模型[MXFP8/HiF8 低精度预训练](llm_pretrain/DeepSeekV3/README.md)样例。
 - [2026/04] 新增[DeepSeek-V4-Flash模型续训练0day支持](llm_pretrain/deepseekv4/README.md)（基于torchtitan框架）样例，支持**训练入图、AutoFuse**特性。
 - [2026/02] 新增DeepSeek-V3.2模型[torchtitan框架预训练](llm_pretrain/deepseekv32/README.md)样例。
 - [2026/02] 新增Qwen3系列模型RL训练使能[npugraph_ex图模式](llm_rl/qwen3/README.md)样例。
@@ -25,6 +26,7 @@ cann-recipes-train仓库旨在针对LLM与多模态模型训练业务中的典�
 |[基于ScaleBox沙盒的Code RL训练样例](agent_rl/qwen2_code_rl/README.md) |基于verl框架和ScaleBox代码沙盒，支持长上下文(2k+16k) Code RL训练，Qwen3-30B-A3B在LiveCodeBench上Pass@1从46.59提升至56.27。|
 |[DeepSeek-V3.2 Pretrain训练样例](llm_pretrain/deepseekv32/README.md) |基于torchtitan，在64卡Atlas A3集群上完成DeepSeek-V3.2模型32K长序列预训练复现。|
 |[DeepSeek-V4-Flash 续训练样例](llm_pretrain/deepseekv4/README.md) |基于torchtitan + autufuse，使能**极简切分和训练入图**，在Atlas A3 64卡集群支持DeepSeek-V4-Flash-285B模型的续训练，吞吐达成**1100tokens/p/s**。|
+|[DeepSeek-V3 MXFP8/HiF8 低精度预训练样例](llm_pretrain/DeepSeekV3/README.md) |基于MindSpeed，在 8 卡 Atlas A5 环境上完成 DeepSeek-V3 裁剪模型8k序列预训练复现。|
 
 ## 🏃 一站式平台快速体验
 「一站式平台」是为开发者提供的 NPU 环境，内部已集成完整的 CANN 环境，可以直接使用。
