@@ -1,0 +1,185 @@
+{
+ "binFileName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "VectorCore",
+ "core_type": "AIV",
+ "intercoreSync": 0,
+ "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+ "memoryStamping": [],
+ "opParaSize": 96,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "24ed361a7e6252eb38a1d1b52a82ca8fd0e825e8a943d3140d07438755e96ee4",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_10"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_20"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_30"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_11"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_21"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_31"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_12"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_22"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_32"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_13"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_23"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_33"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_14"
+  },
+  {
+   "kernelName": "AddRmsNormBias_19e35017264aa50680f35d13d8badd71_34"
+  }
+ ],
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "AddRmsNormBias/d=0,p=1/0,2/0,2/0,2/0,2/0,2/0,2",
+   "AddRmsNormBias/d=0,p=0/0,2/0,2/0,2/0,2/0,2/0,2",
+   "AddRmsNormBias/d=1,p=1/0,2/0,2/0,2/0,2/0,2/0,2",
+   "AddRmsNormBias/d=1,p=0/0,2/0,2/0,2/0,2/0,2/0,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "dc0c1939320bc54eb356606590366862e817f96589f01e7562196427bf6b69d4,8215a8dbecc525d43ec3cff8ddfd1310493baf9f24959b9514153653aa2bb799",
+  "inputs": [
+   {
+    "name": "x1",
+    "index": 0,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "x2",
+    "index": 1,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "gamma",
+    "index": 2,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "beta",
+    "index": 3,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "y",
+    "index": 0,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "rstd",
+    "index": 1,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "x",
+    "index": 2,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "epsilon",
+    "dtype": "float",
+    "value": 0.0
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/add_rms_norm_bias/AddRmsNormBias_19e35017264aa50680f35d13d8badd71.json"
+}

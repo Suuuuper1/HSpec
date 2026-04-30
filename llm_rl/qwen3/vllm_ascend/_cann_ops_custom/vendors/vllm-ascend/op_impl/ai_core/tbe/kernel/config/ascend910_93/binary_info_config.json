@@ -1,0 +1,1639 @@
+{
+  "AddRmsNormBias": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "x1",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "x2",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "gamma",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "beta",
+          "index": 3,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "rstd",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "x",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "epsilon"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "AddRmsNormBias/d=0,p=1/0,2/0,2/0,2/0,2/0,2/0,2",
+          "AddRmsNormBias/d=0,p=0/0,2/0,2/0,2/0,2/0,2/0,2",
+          "AddRmsNormBias/d=1,p=1/0,2/0,2/0,2/0,2/0,2/0,2",
+          "AddRmsNormBias/d=1,p=0/0,2/0,2/0,2/0,2/0,2/0,2"
+        ],
+        "binPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_19e35017264aa50680f35d13d8badd71.o",
+        "jsonPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_19e35017264aa50680f35d13d8badd71.json"
+      },
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "AddRmsNormBias/d=0,p=1/27,2/27,2/27,2/27,2/0,2/27,2",
+          "AddRmsNormBias/d=0,p=0/27,2/27,2/27,2/27,2/0,2/27,2",
+          "AddRmsNormBias/d=1,p=1/27,2/27,2/27,2/27,2/0,2/27,2",
+          "AddRmsNormBias/d=1,p=0/27,2/27,2/27,2/27,2/0,2/27,2"
+        ],
+        "binPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_352d2859a07d64c080e8dfc836d9897f.o",
+        "jsonPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_352d2859a07d64c080e8dfc836d9897f.json"
+      },
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "AddRmsNormBias/d=0,p=1/1,2/1,2/1,2/1,2/0,2/1,2",
+          "AddRmsNormBias/d=0,p=0/1,2/1,2/1,2/1,2/0,2/1,2",
+          "AddRmsNormBias/d=1,p=1/1,2/1,2/1,2/1,2/0,2/1,2",
+          "AddRmsNormBias/d=1,p=0/1,2/1,2/1,2/1,2/0,2/1,2"
+        ],
+        "binPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_6dc9d65746f49267d3d534b1b9ba85f9.o",
+        "jsonPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_6dc9d65746f49267d3d534b1b9ba85f9.json"
+      }
+    ]
+  },
+  "ApplyTopKTopPCustom": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "sorted_value",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "sorted_indices",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "p",
+          "index": 2,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "k",
+          "index": 3,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "ApplyTopKTopPCustom/d=0,p=1/27,2/3,2/27,2",
+          "ApplyTopKTopPCustom/d=0,p=0/27,2/3,2/27,2",
+          "ApplyTopKTopPCustom/d=1,p=1/27,2/3,2/27,2",
+          "ApplyTopKTopPCustom/d=1,p=0/27,2/3,2/27,2"
+        ],
+        "binPath": "ascend910_93/apply_top_k_top_p_custom/ApplyTopKTopPCustom_43cebf9614fe7140744842c6d08fb8c3.o",
+        "jsonPath": "ascend910_93/apply_top_k_top_p_custom/ApplyTopKTopPCustom_43cebf9614fe7140744842c6d08fb8c3.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "ApplyTopKTopPCustom/d=0,p=1/1,2/3,2/1,2",
+          "ApplyTopKTopPCustom/d=0,p=0/1,2/3,2/1,2",
+          "ApplyTopKTopPCustom/d=1,p=1/1,2/3,2/1,2",
+          "ApplyTopKTopPCustom/d=1,p=0/1,2/3,2/1,2"
+        ],
+        "binPath": "ascend910_93/apply_top_k_top_p_custom/ApplyTopKTopPCustom_7dda2b5777eadccf83fa601ee81d4452.o",
+        "jsonPath": "ascend910_93/apply_top_k_top_p_custom/ApplyTopKTopPCustom_7dda2b5777eadccf83fa601ee81d4452.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "ApplyTopKTopPCustom/d=0,p=1/0,2/3,2/0,2",
+          "ApplyTopKTopPCustom/d=0,p=0/0,2/3,2/0,2",
+          "ApplyTopKTopPCustom/d=1,p=1/0,2/3,2/0,2",
+          "ApplyTopKTopPCustom/d=1,p=0/0,2/3,2/0,2"
+        ],
+        "binPath": "ascend910_93/apply_top_k_top_p_custom/ApplyTopKTopPCustom_ca5d5d3791bee23b52d166083657676f.o",
+        "jsonPath": "ascend910_93/apply_top_k_top_p_custom/ApplyTopKTopPCustom_ca5d5d3791bee23b52d166083657676f.json"
+      }
+    ]
+  },
+  "DispatchFFNCombine": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "a",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        [
+          {
+            "name": "w1",
+            "index": 1,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        [
+          {
+            "name": "w2",
+            "index": 2,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        {
+          "name": "expertIdx",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        [
+          {
+            "name": "scale1",
+            "index": 4,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        [
+          {
+            "name": "scale2",
+            "index": 5,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        {
+          "name": "probs",
+          "index": 6,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "group"
+        },
+        {
+          "name": "M"
+        },
+        {
+          "name": "transB"
+        },
+        {
+          "name": "weightNz"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchFFNCombine/d=0,p=1/27,2/2,2/2,2/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombine/d=0,p=0/27,2/2,2/2,2/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombine/d=1,p=1/27,2/2,2/2,2/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombine/d=1,p=0/27,2/2,2/2,2/3,2/9,2/9,2/0,2/27,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_ffn_combine/DispatchFFNCombine_5de53b67da737c4d634e879263c80270.o",
+        "jsonPath": "ascend910_93/dispatch_ffn_combine/DispatchFFNCombine_5de53b67da737c4d634e879263c80270.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchFFNCombine/d=0,p=1/1,2/2,2/2,2/3,2/9,2/9,2/0,2/1,2",
+          "DispatchFFNCombine/d=0,p=0/1,2/2,2/2,2/3,2/9,2/9,2/0,2/1,2",
+          "DispatchFFNCombine/d=1,p=1/1,2/2,2/2,2/3,2/9,2/9,2/0,2/1,2",
+          "DispatchFFNCombine/d=1,p=0/1,2/2,2/2,2/3,2/9,2/9,2/0,2/1,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_ffn_combine/DispatchFFNCombine_ae8f5ad5636bbe32ba3c8f399c1f9287.o",
+        "jsonPath": "ascend910_93/dispatch_ffn_combine/DispatchFFNCombine_ae8f5ad5636bbe32ba3c8f399c1f9287.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchFFNCombine/d=0,p=1/27,2/2,29/2,29/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombine/d=0,p=0/27,2/2,29/2,29/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombine/d=1,p=1/27,2/2,29/2,29/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombine/d=1,p=0/27,2/2,29/2,29/3,2/9,2/9,2/0,2/27,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_ffn_combine/DispatchFFNCombine_b26ed26ec6fa4d1310f1ff04fbeb8442.o",
+        "jsonPath": "ascend910_93/dispatch_ffn_combine/DispatchFFNCombine_b26ed26ec6fa4d1310f1ff04fbeb8442.json"
+      }
+    ]
+  },
+  "DispatchFFNCombineBF16": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "a",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        [
+          {
+            "name": "w1",
+            "index": 1,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        [
+          {
+            "name": "w2",
+            "index": 2,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        {
+          "name": "expertIdx",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        [
+          {
+            "name": "scale1",
+            "index": 4,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        [
+          {
+            "name": "scale2",
+            "index": 5,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        {
+          "name": "probs",
+          "index": 6,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "group"
+        },
+        {
+          "name": "M"
+        },
+        {
+          "name": "transB"
+        },
+        {
+          "name": "weightNz"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchFFNCombineBF16/d=0,p=1/1,2/1,2/1,2/3,2/9,2/9,2/0,2/1,2",
+          "DispatchFFNCombineBF16/d=0,p=0/1,2/1,2/1,2/3,2/9,2/9,2/0,2/1,2",
+          "DispatchFFNCombineBF16/d=1,p=1/1,2/1,2/1,2/3,2/9,2/9,2/0,2/1,2",
+          "DispatchFFNCombineBF16/d=1,p=0/1,2/1,2/1,2/3,2/9,2/9,2/0,2/1,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16_0784c1e30cde7862f0b1a5153ed98574.o",
+        "jsonPath": "ascend910_93/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16_0784c1e30cde7862f0b1a5153ed98574.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchFFNCombineBF16/d=0,p=1/27,2/27,29/27,29/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombineBF16/d=0,p=0/27,2/27,29/27,29/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombineBF16/d=1,p=1/27,2/27,29/27,29/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombineBF16/d=1,p=0/27,2/27,29/27,29/3,2/9,2/9,2/0,2/27,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16_21a8d100fcc2c4affdffa6e1fa971f52.o",
+        "jsonPath": "ascend910_93/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16_21a8d100fcc2c4affdffa6e1fa971f52.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchFFNCombineBF16/d=0,p=1/27,2/27,2/27,2/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombineBF16/d=0,p=0/27,2/27,2/27,2/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombineBF16/d=1,p=1/27,2/27,2/27,2/3,2/9,2/9,2/0,2/27,2",
+          "DispatchFFNCombineBF16/d=1,p=0/27,2/27,2/27,2/3,2/9,2/9,2/0,2/27,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16_42315cd7c65518cf8c589315f38d74c0.o",
+        "jsonPath": "ascend910_93/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16_42315cd7c65518cf8c589315f38d74c0.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchFFNCombineBF16/d=0,p=1/1,2/1,29/1,29/3,2/9,2/9,2/0,2/1,2",
+          "DispatchFFNCombineBF16/d=0,p=0/1,2/1,29/1,29/3,2/9,2/9,2/0,2/1,2",
+          "DispatchFFNCombineBF16/d=1,p=1/1,2/1,29/1,29/3,2/9,2/9,2/0,2/1,2",
+          "DispatchFFNCombineBF16/d=1,p=0/1,2/1,29/1,29/3,2/9,2/9,2/0,2/1,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16_5c8565657db196f207b155283e93ff1a.o",
+        "jsonPath": "ascend910_93/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16_5c8565657db196f207b155283e93ff1a.json"
+      }
+    ]
+  },
+  "DispatchGmmCombineDecode": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "x",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "expert_ids",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        [
+          {
+            "name": "gmm1_permuted_weight",
+            "index": 2,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        [
+          {
+            "name": "gmm1_permuted_weight_scale",
+            "index": 3,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        [
+          {
+            "name": "gmm2_weight",
+            "index": 4,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        [
+          {
+            "name": "gmm2_weight_scale",
+            "index": 5,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        {
+          "name": "expert_scales",
+          "index": 6,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "expert_smooth_scales",
+          "index": 7,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "x_active_mask",
+          "index": 8,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "expert_token_nums",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "group_ep"
+        },
+        {
+          "name": "ep_rank_size"
+        },
+        {
+          "name": "ep_rank_id"
+        },
+        {
+          "name": "moe_expert_num"
+        },
+        {
+          "name": "share_expert_num"
+        },
+        {
+          "name": "share_expert_rank_num"
+        },
+        {
+          "name": "quant_mode"
+        },
+        {
+          "name": "global_bs"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchGmmCombineDecode/d=0,p=1/1,2/3,2/2,29/0,2/2,29/1,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=0,p=0/1,2/3,2/2,29/0,2/2,29/1,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=1/1,2/3,2/2,29/0,2/2,29/1,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=0/1,2/3,2/2,29/0,2/2,29/1,2/0,2/1,2/9,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_0386e383fa07134263a33e542ff17874.o",
+        "jsonPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_0386e383fa07134263a33e542ff17874.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchGmmCombineDecode/d=0,p=1/1,2/3,2/2,29/0,2/2,29/0,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=0,p=0/1,2/3,2/2,29/0,2/2,29/0,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=1/1,2/3,2/2,29/0,2/2,29/0,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=0/1,2/3,2/2,29/0,2/2,29/0,2/0,2/1,2/9,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_69a55149eb7390ee64422257e3b9b673.o",
+        "jsonPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_69a55149eb7390ee64422257e3b9b673.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchGmmCombineDecode/d=0,p=1/27,2/3,2/2,29/0,2/2,29/27,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=0,p=0/27,2/3,2/2,29/0,2/2,29/27,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=1/27,2/3,2/2,29/0,2/2,29/27,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=0/27,2/3,2/2,29/0,2/2,29/27,2/0,2/27,2/9,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_957bfde83de48451467420664833d6c7.o",
+        "jsonPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_957bfde83de48451467420664833d6c7.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchGmmCombineDecode/d=0,p=1/1,2/3,2/2,29/1,2/2,29/0,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=0,p=0/1,2/3,2/2,29/1,2/2,29/0,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=1/1,2/3,2/2,29/1,2/2,29/0,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=0/1,2/3,2/2,29/1,2/2,29/0,2/0,2/1,2/9,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_c52833cd5874b099333812f076a87dcb.o",
+        "jsonPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_c52833cd5874b099333812f076a87dcb.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchGmmCombineDecode/d=0,p=1/1,2/3,2/2,29/1,2/2,29/1,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=0,p=0/1,2/3,2/2,29/1,2/2,29/1,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=1/1,2/3,2/2,29/1,2/2,29/1,2/0,2/1,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=0/1,2/3,2/2,29/1,2/2,29/1,2/0,2/1,2/9,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_c5bfd4093637fcbf6f30f11988afc3b9.o",
+        "jsonPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_c5bfd4093637fcbf6f30f11988afc3b9.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchGmmCombineDecode/d=0,p=1/27,2/3,2/2,29/27,2/2,29/0,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=0,p=0/27,2/3,2/2,29/27,2/2,29/0,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=1/27,2/3,2/2,29/27,2/2,29/0,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=0/27,2/3,2/2,29/27,2/2,29/0,2/0,2/27,2/9,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80.o",
+        "jsonPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchGmmCombineDecode/d=0,p=1/27,2/3,2/2,29/27,2/2,29/27,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=0,p=0/27,2/3,2/2,29/27,2/2,29/27,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=1/27,2/3,2/2,29/27,2/2,29/27,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=0/27,2/3,2/2,29/27,2/2,29/27,2/0,2/27,2/9,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_f746e8dd36c416f689d1c8da3735cccf.o",
+        "jsonPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_f746e8dd36c416f689d1c8da3735cccf.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "DispatchGmmCombineDecode/d=0,p=1/27,2/3,2/2,29/0,2/2,29/0,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=0,p=0/27,2/3,2/2,29/0,2/2,29/0,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=1/27,2/3,2/2,29/0,2/2,29/0,2/0,2/27,2/9,2",
+          "DispatchGmmCombineDecode/d=1,p=0/27,2/3,2/2,29/0,2/2,29/0,2/0,2/27,2/9,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_f8b26c1773dc12163101eee3dc0bcabd.o",
+        "jsonPath": "ascend910_93/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_f8b26c1773dc12163101eee3dc0bcabd.json"
+      }
+    ]
+  },
+  "DispatchLayout": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "topkIdx",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "numTokensPerRank",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "numTokensPerExpert",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "isTokenInRank",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "num_tokens"
+        },
+        {
+          "name": "num_ranks"
+        },
+        {
+          "name": "num_experts"
+        },
+        {
+          "name": "num_topk"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "DispatchLayout/d=0,p=1/9,2/3,2/3,2/3,2",
+          "DispatchLayout/d=0,p=0/9,2/3,2/3,2/3,2",
+          "DispatchLayout/d=1,p=1/9,2/3,2/3,2/3,2",
+          "DispatchLayout/d=1,p=0/9,2/3,2/3,2/3,2"
+        ],
+        "binPath": "ascend910_93/dispatch_layout/DispatchLayout_1da8e5b2a72dc18017dcd9e097341a02.o",
+        "jsonPath": "ascend910_93/dispatch_layout/DispatchLayout_1da8e5b2a72dc18017dcd9e097341a02.json"
+      }
+    ]
+  },
+  "GroupedMatmulSwigluQuantWeightNzTensorList": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "x",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        [
+          {
+            "name": "weight",
+            "index": 1,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        [
+          {
+            "name": "weight_scale",
+            "index": 2,
+            "paramType": "dynamic",
+            "formatMode": "static_nd_agnostic"
+          }
+        ],
+        {
+          "name": "x_scale",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "group_list",
+          "index": 4,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "y_scale",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=1/2,2/2,29/27,2/0,2/9,2/2,2/0,2",
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=0/2,2/2,29/27,2/0,2/9,2/2,2/0,2",
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=1/2,2/2,29/27,2/0,2/9,2/2,2/0,2",
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=0/2,2/2,29/27,2/0,2/9,2/2,2/0,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/grouped_matmul_swiglu_quant_weight_nz_tensor_list/GroupedMatmulSwigluQuantWeightNzTensorList_59a1b0c9ba0c8f4dbafbf76e78f36d3a.o",
+        "jsonPath": "ascend910_93/grouped_matmul_swiglu_quant_weight_nz_tensor_list/GroupedMatmulSwigluQuantWeightNzTensorList_59a1b0c9ba0c8f4dbafbf76e78f36d3a.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=1/2,2/2,29/1,2/0,2/9,2/2,2/0,2",
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=0/2,2/2,29/1,2/0,2/9,2/2,2/0,2",
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=1/2,2/2,29/1,2/0,2/9,2/2,2/0,2",
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=0/2,2/2,29/1,2/0,2/9,2/2,2/0,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/grouped_matmul_swiglu_quant_weight_nz_tensor_list/GroupedMatmulSwigluQuantWeightNzTensorList_735bee94ebf43b20f682fe91d5acf025.o",
+        "jsonPath": "ascend910_93/grouped_matmul_swiglu_quant_weight_nz_tensor_list/GroupedMatmulSwigluQuantWeightNzTensorList_735bee94ebf43b20f682fe91d5acf025.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=1/2,2/2,29/0,2/0,2/9,2/2,2/0,2",
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=0/2,2/2,29/0,2/0,2/9,2/2,2/0,2",
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=1/2,2/2,29/0,2/0,2/9,2/2,2/0,2",
+          "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=0/2,2/2,29/0,2/0,2/9,2/2,2/0,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/grouped_matmul_swiglu_quant_weight_nz_tensor_list/GroupedMatmulSwigluQuantWeightNzTensorList_a736d6d385ece2c74b43e22e7dc52689.o",
+        "jsonPath": "ascend910_93/grouped_matmul_swiglu_quant_weight_nz_tensor_list/GroupedMatmulSwigluQuantWeightNzTensorList_a736d6d385ece2c74b43e22e7dc52689.json"
+      }
+    ]
+  },
+  "LightningIndexer": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "query",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "key",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "weights",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "actual_seq_lengths_query",
+          "index": 3,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "actual_seq_lengths_key",
+          "index": 4,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "block_table",
+          "index": 5,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sparse_indices",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "layout_query"
+        },
+        {
+          "name": "layout_key"
+        },
+        {
+          "name": "sparse_count"
+        },
+        {
+          "name": "sparse_mode"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "LightningIndexer/d=0,p=1/1,2/1,2/1,2/3,2",
+          "LightningIndexer/d=0,p=0/1,2/1,2/1,2/3,2",
+          "LightningIndexer/d=1,p=1/1,2/1,2/1,2/3,2",
+          "LightningIndexer/d=1,p=0/1,2/1,2/1,2/3,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/lightning_indexer/LightningIndexer_3661522d98ae90073032b63ce37149ea.o",
+        "jsonPath": "ascend910_93/lightning_indexer/LightningIndexer_3661522d98ae90073032b63ce37149ea.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "LightningIndexer/d=0,p=1/27,2/27,2/27,2/3,2",
+          "LightningIndexer/d=0,p=0/27,2/27,2/27,2/3,2",
+          "LightningIndexer/d=1,p=1/27,2/27,2/27,2/3,2",
+          "LightningIndexer/d=1,p=0/27,2/27,2/27,2/3,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/lightning_indexer/LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823.o",
+        "jsonPath": "ascend910_93/lightning_indexer/LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823.json"
+      }
+    ]
+  },
+  "MoeCombineNormal": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "recv_x",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "token_src_info",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "ep_recv_counts",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "recv_topk_weights",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "tp_recv_counts",
+          "index": 4,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "ep_group_name"
+        },
+        {
+          "name": "ep_world_size"
+        },
+        {
+          "name": "ep_rank_id"
+        },
+        {
+          "name": "tp_group_name"
+        },
+        {
+          "name": "tp_world_size"
+        },
+        {
+          "name": "tp_rank_id"
+        },
+        {
+          "name": "moe_expert_num"
+        },
+        {
+          "name": "global_bs"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "MoeCombineNormal/d=0,p=1/27,2/3,2/3,2/0,2/27,2",
+          "MoeCombineNormal/d=0,p=0/27,2/3,2/3,2/0,2/27,2",
+          "MoeCombineNormal/d=1,p=1/27,2/3,2/3,2/0,2/27,2",
+          "MoeCombineNormal/d=1,p=0/27,2/3,2/3,2/0,2/27,2"
+        ],
+        "binPath": "ascend910_93/moe_combine_normal/MoeCombineNormal_6d9fe24fa7ace88bf1cdaf5409c70580.o",
+        "jsonPath": "ascend910_93/moe_combine_normal/MoeCombineNormal_6d9fe24fa7ace88bf1cdaf5409c70580.json"
+      },
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "MoeCombineNormal/d=0,p=1/3,2/3,2/3,2/0,2/1,2",
+          "MoeCombineNormal/d=0,p=0/3,2/3,2/3,2/0,2/1,2",
+          "MoeCombineNormal/d=1,p=1/3,2/3,2/3,2/0,2/1,2",
+          "MoeCombineNormal/d=1,p=0/3,2/3,2/3,2/0,2/1,2"
+        ],
+        "binPath": "ascend910_93/moe_combine_normal/MoeCombineNormal_6f4ac16c0ccbe58e78d25bc5e5e40b53.o",
+        "jsonPath": "ascend910_93/moe_combine_normal/MoeCombineNormal_6f4ac16c0ccbe58e78d25bc5e5e40b53.json"
+      },
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "MoeCombineNormal/d=0,p=1/3,2/3,2/3,2/0,2/27,2",
+          "MoeCombineNormal/d=0,p=0/3,2/3,2/3,2/0,2/27,2",
+          "MoeCombineNormal/d=1,p=1/3,2/3,2/3,2/0,2/27,2",
+          "MoeCombineNormal/d=1,p=0/3,2/3,2/3,2/0,2/27,2"
+        ],
+        "binPath": "ascend910_93/moe_combine_normal/MoeCombineNormal_72824a2f29a443997868370496749955.o",
+        "jsonPath": "ascend910_93/moe_combine_normal/MoeCombineNormal_72824a2f29a443997868370496749955.json"
+      },
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "MoeCombineNormal/d=0,p=1/1,2/3,2/3,2/0,2/1,2",
+          "MoeCombineNormal/d=0,p=0/1,2/3,2/3,2/0,2/1,2",
+          "MoeCombineNormal/d=1,p=1/1,2/3,2/3,2/0,2/1,2",
+          "MoeCombineNormal/d=1,p=0/1,2/3,2/3,2/0,2/1,2"
+        ],
+        "binPath": "ascend910_93/moe_combine_normal/MoeCombineNormal_edc035badaf2b8792a99f9b8636ee23b.o",
+        "jsonPath": "ascend910_93/moe_combine_normal/MoeCombineNormal_edc035badaf2b8792a99f9b8636ee23b.json"
+      }
+    ]
+  },
+  "MoeDispatchNormal": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "x",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "topk_idx",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "send_offset",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "send_tokenIdx",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "recv_offset",
+          "index": 4,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "recv_count",
+          "index": 5,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "recv_x",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "x_scales",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "assist_info_for_combine",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "group_ep"
+        },
+        {
+          "name": "ep_world_size"
+        },
+        {
+          "name": "ep_rank_id"
+        },
+        {
+          "name": "group_tp"
+        },
+        {
+          "name": "tp_world_size"
+        },
+        {
+          "name": "tp_rank_id"
+        },
+        {
+          "name": "moe_expert_num"
+        },
+        {
+          "name": "quant_mode"
+        },
+        {
+          "name": "global_bs"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeDispatchNormal/d=0,p=1/1,2/3,2/3,2/3,2/3,2/3,2/1,2/0,2/3,2",
+          "MoeDispatchNormal/d=0,p=0/1,2/3,2/3,2/3,2/3,2/3,2/1,2/0,2/3,2",
+          "MoeDispatchNormal/d=1,p=1/1,2/3,2/3,2/3,2/3,2/3,2/1,2/0,2/3,2",
+          "MoeDispatchNormal/d=1,p=0/1,2/3,2/3,2/3,2/3,2/3,2/1,2/0,2/3,2"
+        ],
+        "binPath": "ascend910_93/moe_dispatch_normal/MoeDispatchNormal_18736f3d20e9702edde8b59fda100548.o",
+        "jsonPath": "ascend910_93/moe_dispatch_normal/MoeDispatchNormal_18736f3d20e9702edde8b59fda100548.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeDispatchNormal/d=0,p=1/27,2/3,2/3,2/3,2/3,2/3,2/27,2/0,2/3,2",
+          "MoeDispatchNormal/d=0,p=0/27,2/3,2/3,2/3,2/3,2/3,2/27,2/0,2/3,2",
+          "MoeDispatchNormal/d=1,p=1/27,2/3,2/3,2/3,2/3,2/3,2/27,2/0,2/3,2",
+          "MoeDispatchNormal/d=1,p=0/27,2/3,2/3,2/3,2/3,2/3,2/27,2/0,2/3,2"
+        ],
+        "binPath": "ascend910_93/moe_dispatch_normal/MoeDispatchNormal_28873747bc7f795b1fda2d4144535e01.o",
+        "jsonPath": "ascend910_93/moe_dispatch_normal/MoeDispatchNormal_28873747bc7f795b1fda2d4144535e01.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeDispatchNormal/d=0,p=1/1,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2",
+          "MoeDispatchNormal/d=0,p=0/1,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2",
+          "MoeDispatchNormal/d=1,p=1/1,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2",
+          "MoeDispatchNormal/d=1,p=0/1,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2"
+        ],
+        "binPath": "ascend910_93/moe_dispatch_normal/MoeDispatchNormal_b6b1b9f717cdc5f61ad71bf59b3f6f6e.o",
+        "jsonPath": "ascend910_93/moe_dispatch_normal/MoeDispatchNormal_b6b1b9f717cdc5f61ad71bf59b3f6f6e.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeDispatchNormal/d=0,p=1/27,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2",
+          "MoeDispatchNormal/d=0,p=0/27,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2",
+          "MoeDispatchNormal/d=1,p=1/27,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2",
+          "MoeDispatchNormal/d=1,p=0/27,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2"
+        ],
+        "binPath": "ascend910_93/moe_dispatch_normal/MoeDispatchNormal_cd1825d06f6ac71851ca179e07c11c69.o",
+        "jsonPath": "ascend910_93/moe_dispatch_normal/MoeDispatchNormal_cd1825d06f6ac71851ca179e07c11c69.json"
+      }
+    ]
+  },
+  "MoeGatingTopK": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "x",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "bias",
+          "index": 1,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "expert_idx",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "out",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "k"
+        },
+        {
+          "name": "k_group"
+        },
+        {
+          "name": "group_count"
+        },
+        {
+          "name": "group_select_mode"
+        },
+        {
+          "name": "renorm"
+        },
+        {
+          "name": "norm_type"
+        },
+        {
+          "name": "out_flag"
+        },
+        {
+          "name": "routed_scaling_factor"
+        },
+        {
+          "name": "eps"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "MoeGatingTopK/d=0,p=1/1,2/1,2/3,2/0,2",
+          "MoeGatingTopK/d=0,p=0/1,2/1,2/3,2/0,2",
+          "MoeGatingTopK/d=1,p=1/1,2/1,2/3,2/0,2",
+          "MoeGatingTopK/d=1,p=0/1,2/1,2/3,2/0,2"
+        ],
+        "binPath": "ascend910_93/moe_gating_top_k/MoeGatingTopK_600198027c25530951785e436a150069.o",
+        "jsonPath": "ascend910_93/moe_gating_top_k/MoeGatingTopK_600198027c25530951785e436a150069.json"
+      },
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "MoeGatingTopK/d=0,p=1/0,2/0,2/3,2/0,2",
+          "MoeGatingTopK/d=0,p=0/0,2/0,2/3,2/0,2",
+          "MoeGatingTopK/d=1,p=1/0,2/0,2/3,2/0,2",
+          "MoeGatingTopK/d=1,p=0/0,2/0,2/3,2/0,2"
+        ],
+        "binPath": "ascend910_93/moe_gating_top_k/MoeGatingTopK_81369a2fa0455f39b5d19d432d261f57.o",
+        "jsonPath": "ascend910_93/moe_gating_top_k/MoeGatingTopK_81369a2fa0455f39b5d19d432d261f57.json"
+      },
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "MoeGatingTopK/d=0,p=1/27,2/27,2/3,2/0,2",
+          "MoeGatingTopK/d=0,p=0/27,2/27,2/3,2/0,2",
+          "MoeGatingTopK/d=1,p=1/27,2/27,2/3,2/0,2",
+          "MoeGatingTopK/d=1,p=0/27,2/27,2/3,2/0,2"
+        ],
+        "binPath": "ascend910_93/moe_gating_top_k/MoeGatingTopK_85043434be9263d9775e83ed1918b0a1.o",
+        "jsonPath": "ascend910_93/moe_gating_top_k/MoeGatingTopK_85043434be9263d9775e83ed1918b0a1.json"
+      }
+    ]
+  },
+  "MoeInitRoutingCustom": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "x",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "expert_idx",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "scale",
+          "index": 2,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "offset",
+          "index": 3,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "expanded_x",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "expanded_row_idx",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "expert_tokens_count_or_cumsum",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "expanded_scale",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "active_num"
+        },
+        {
+          "name": "expert_capacity"
+        },
+        {
+          "name": "expert_num"
+        },
+        {
+          "name": "drop_pad_mode"
+        },
+        {
+          "name": "expert_tokens_num_type"
+        },
+        {
+          "name": "expert_tokens_num_flag"
+        },
+        {
+          "name": "quant_mode"
+        },
+        {
+          "name": "active_expert_range"
+        },
+        {
+          "name": "row_idx_type"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeInitRoutingCustom/d=0,p=1/1,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=0,p=0/1,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=1/1,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=0/1,2/3,2/2,2/3,2/9,2/0,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_103c6bf9757a4db3c1bbbfcf552f797b.o",
+        "jsonPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_103c6bf9757a4db3c1bbbfcf552f797b.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeInitRoutingCustom/d=0,p=1/2,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=0,p=0/2,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=1/2,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=0/2,2/3,2/2,2/3,2/9,2/0,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_6f86ac41300a95d6b875df6144a1258d.o",
+        "jsonPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_6f86ac41300a95d6b875df6144a1258d.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeInitRoutingCustom/d=0,p=1/1,2/3,2/1,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=0,p=0/1,2/3,2/1,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=1/1,2/3,2/1,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=0/1,2/3,2/1,2/3,2/9,2/0,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_83ea20a79ec31274731fe9c3378ffc21.o",
+        "jsonPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_83ea20a79ec31274731fe9c3378ffc21.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeInitRoutingCustom/d=0,p=1/27,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=0,p=0/27,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=1/27,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=0/27,2/3,2/2,2/3,2/9,2/0,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_c16c6bc489e206f21949f807202f3cb0.o",
+        "jsonPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_c16c6bc489e206f21949f807202f3cb0.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeInitRoutingCustom/d=0,p=1/0,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=0,p=0/0,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=1/0,2/3,2/2,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=0/0,2/3,2/2,2/3,2/9,2/0,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972.o",
+        "jsonPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeInitRoutingCustom/d=0,p=1/0,2/3,2/0,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=0,p=0/0,2/3,2/0,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=1/0,2/3,2/0,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=0/0,2/3,2/0,2/3,2/9,2/0,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_f0cc9094cbc1179c081bfde0b95f6b1d.o",
+        "jsonPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_f0cc9094cbc1179c081bfde0b95f6b1d.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "MoeInitRoutingCustom/d=0,p=1/27,2/3,2/27,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=0,p=0/27,2/3,2/27,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=1/27,2/3,2/27,2/3,2/9,2/0,2",
+          "MoeInitRoutingCustom/d=1,p=0/27,2/3,2/27,2/3,2/9,2/0,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_f4e5d4358d52376e96d5f6100c6fbfcd.o",
+        "jsonPath": "ascend910_93/moe_init_routing_custom/MoeInitRoutingCustom_f4e5d4358d52376e96d5f6100c6fbfcd.json"
+      }
+    ]
+  },
+  "NotifyDispatch": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "sendData",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "tokenPerExpertData",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sendDataOffset",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "recvData",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "sendCount"
+        },
+        {
+          "name": "num_tokens"
+        },
+        {
+          "name": "comm_group"
+        },
+        {
+          "name": "rank_size"
+        },
+        {
+          "name": "rank_id"
+        },
+        {
+          "name": "local_rank_size"
+        },
+        {
+          "name": "local_rank_id"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "NotifyDispatch/d=0,p=1/3,2/3,2/3,2/3,2",
+          "NotifyDispatch/d=0,p=0/3,2/3,2/3,2/3,2",
+          "NotifyDispatch/d=1,p=1/3,2/3,2/3,2/3,2",
+          "NotifyDispatch/d=1,p=0/3,2/3,2/3,2/3,2"
+        ],
+        "binPath": "ascend910_93/notify_dispatch/NotifyDispatch_9920e97c8ba4a54ee4365ff85276f3ac.o",
+        "jsonPath": "ascend910_93/notify_dispatch/NotifyDispatch_9920e97c8ba4a54ee4365ff85276f3ac.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "NotifyDispatch/d=0,p=1/0,2/0,2/0,2/0,2",
+          "NotifyDispatch/d=0,p=0/0,2/0,2/0,2/0,2",
+          "NotifyDispatch/d=1,p=1/0,2/0,2/0,2/0,2",
+          "NotifyDispatch/d=1,p=0/0,2/0,2/0,2/0,2"
+        ],
+        "binPath": "ascend910_93/notify_dispatch/NotifyDispatch_a085b489ff604df8da6725ec8ef2536d.o",
+        "jsonPath": "ascend910_93/notify_dispatch/NotifyDispatch_a085b489ff604df8da6725ec8ef2536d.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "NotifyDispatch/d=0,p=1/1,2/1,2/1,2/1,2",
+          "NotifyDispatch/d=0,p=0/1,2/1,2/1,2/1,2",
+          "NotifyDispatch/d=1,p=1/1,2/1,2/1,2/1,2",
+          "NotifyDispatch/d=1,p=0/1,2/1,2/1,2/1,2"
+        ],
+        "binPath": "ascend910_93/notify_dispatch/NotifyDispatch_f3610ca9d5dfe92ea6d7238b9819c6fc.o",
+        "jsonPath": "ascend910_93/notify_dispatch/NotifyDispatch_f3610ca9d5dfe92ea6d7238b9819c6fc.json"
+      }
+    ]
+  },
+  "SparseFlashAttention": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "query",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "key",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "value",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "sparse_indices",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "block_table",
+          "index": 4,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "actual_seq_lengths_query",
+          "index": 5,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "actual_seq_lengths_kv",
+          "index": 6,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "query_rope",
+          "index": 7,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "key_rope",
+          "index": 8,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "attention_out",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "scale_value"
+        },
+        {
+          "name": "sparse_block_size"
+        },
+        {
+          "name": "layout_query"
+        },
+        {
+          "name": "layout_kv"
+        },
+        {
+          "name": "sparse_mode"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "SparseFlashAttention/d=0,p=1/27,2/27,2/27,2/3,2/27,2",
+          "SparseFlashAttention/d=0,p=0/27,2/27,2/27,2/3,2/27,2",
+          "SparseFlashAttention/d=1,p=1/27,2/27,2/27,2/3,2/27,2",
+          "SparseFlashAttention/d=1,p=0/27,2/27,2/27,2/3,2/27,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/sparse_flash_attention/SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e.o",
+        "jsonPath": "ascend910_93/sparse_flash_attention/SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e.json"
+      },
+      {
+        "coreType": 0,
+        "simplifiedKey": [
+          "SparseFlashAttention/d=0,p=1/1,2/1,2/1,2/3,2/1,2",
+          "SparseFlashAttention/d=0,p=0/1,2/1,2/1,2/3,2/1,2",
+          "SparseFlashAttention/d=1,p=1/1,2/1,2/1,2/3,2/1,2",
+          "SparseFlashAttention/d=1,p=0/1,2/1,2/1,2/3,2/1,2"
+        ],
+        "multiKernelType": 1,
+        "binPath": "ascend910_93/sparse_flash_attention/SparseFlashAttention_7f7ea6bc29bdc5fe2c90de44422a6e0e.o",
+        "jsonPath": "ascend910_93/sparse_flash_attention/SparseFlashAttention_7f7ea6bc29bdc5fe2c90de44422a6e0e.json"
+      }
+    ]
+  }
+}

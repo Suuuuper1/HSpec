@@ -1,0 +1,292 @@
+{
+ "binFileName": "DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "MIX",
+ "intercoreSync": 1,
+ "kernelName": "DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF",
+ "memoryStamping": [],
+ "opParaSize": 672,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "56f908980222f5fc265f28753795e9b418c414a7e0f38395ca0987f1dc597aa2",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "tilingKey": 0,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80_0"
+  },
+  {
+   "tilingKey": 1,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80_1"
+  },
+  {
+   "tilingKey": 2,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80_2"
+  },
+  {
+   "tilingKey": 3,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80_3"
+  },
+  {
+   "tilingKey": 4,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80_4"
+  },
+  {
+   "tilingKey": 5,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80_5"
+  },
+  {
+   "tilingKey": 6,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80_6"
+  },
+  {
+   "tilingKey": 7,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80_7"
+  }
+ ],
+ "taskRation": "tilingKey",
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "dynamicParamMode": "folded_with_desc",
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "DispatchGmmCombineDecode/d=0,p=1/27,2/3,2/2,29/27,2/2,29/0,2/0,2/27,2/9,2",
+   "DispatchGmmCombineDecode/d=0,p=0/27,2/3,2/2,29/27,2/2,29/0,2/0,2/27,2/9,2",
+   "DispatchGmmCombineDecode/d=1,p=1/27,2/3,2/2,29/27,2/2,29/0,2/0,2/27,2/9,2",
+   "DispatchGmmCombineDecode/d=1,p=0/27,2/3,2/2,29/27,2/2,29/0,2/0,2/27,2/9,2"
+  ],
+  "dynamicParamMode": "folded_with_desc",
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "a71be63c0fa639eaee599fef91ecf989047f97327b947b27b52abbc67d9da4bd,6d86ebcc4d951141e76812a1ae422707029991623d587799de5dfc2de609d9ac",
+  "inputs": [
+   {
+    "name": "x",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "expert_ids",
+    "index": 1,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   [
+    {
+     "name": "gmm1_permuted_weight",
+     "index": 2,
+     "dtype": "int8",
+     "format": "FRACTAL_NZ",
+     "paramType": "dynamic",
+     "shape": [
+      -2
+     ],
+     "format_match_mode": "FormatAgnostic"
+    }
+   ],
+   [
+    {
+     "name": "gmm1_permuted_weight_scale",
+     "index": 3,
+     "dtype": "bfloat16",
+     "format": "ND",
+     "paramType": "dynamic",
+     "shape": [
+      -2
+     ],
+     "format_match_mode": "FormatAgnostic"
+    }
+   ],
+   [
+    {
+     "name": "gmm2_weight",
+     "index": 4,
+     "dtype": "int8",
+     "format": "FRACTAL_NZ",
+     "paramType": "dynamic",
+     "shape": [
+      -2
+     ],
+     "format_match_mode": "FormatAgnostic"
+    }
+   ],
+   [
+    {
+     "name": "gmm2_weight_scale",
+     "index": 5,
+     "dtype": "float32",
+     "format": "ND",
+     "paramType": "dynamic",
+     "shape": [
+      -2
+     ],
+     "format_match_mode": "FormatAgnostic"
+    }
+   ],
+   {
+    "name": "expert_scales",
+    "index": 6,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "expert_smooth_scales",
+    "index": 7,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "x_active_mask",
+    "index": 8,
+    "dtype": "bool",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "output",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "expert_token_nums",
+    "index": 1,
+    "dtype": "int64",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "group_ep",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "ep_rank_size",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "ep_rank_id",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "moe_expert_num",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "share_expert_num",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "share_expert_rank_num",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "quant_mode",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "global_bs",
+    "dtype": "int",
+    "value": 0
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/dispatch_gmm_combine_decode/DispatchGmmCombineDecode_ee216a2ee2379173ab5d9235c2e52b80.json"
+}

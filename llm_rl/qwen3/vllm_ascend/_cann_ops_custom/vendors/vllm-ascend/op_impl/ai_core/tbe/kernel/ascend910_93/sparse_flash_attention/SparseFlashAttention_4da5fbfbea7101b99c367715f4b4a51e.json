@@ -1,0 +1,283 @@
+{
+ "binFileName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "MIX",
+ "intercoreSync": 1,
+ "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF",
+ "memoryStamping": [],
+ "opParaSize": 120,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "b6e7dddffb5b516993fcf0748c302c99404fd710f440505992998708c21355bd",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "tilingKey": 0,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_0"
+  },
+  {
+   "tilingKey": 64,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_64"
+  },
+  {
+   "tilingKey": 32,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_32"
+  },
+  {
+   "tilingKey": 2,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_2"
+  },
+  {
+   "tilingKey": 66,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_66"
+  },
+  {
+   "tilingKey": 34,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_34"
+  },
+  {
+   "tilingKey": 576,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_576"
+  },
+  {
+   "tilingKey": 512,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_512"
+  },
+  {
+   "tilingKey": 544,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_544"
+  },
+  {
+   "tilingKey": 578,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_578"
+  },
+  {
+   "tilingKey": 514,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_514"
+  },
+  {
+   "tilingKey": 546,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e_546"
+  }
+ ],
+ "taskRation": "tilingKey",
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "SparseFlashAttention/d=0,p=1/27,2/27,2/27,2/3,2/27,2",
+   "SparseFlashAttention/d=0,p=0/27,2/27,2/27,2/3,2/27,2",
+   "SparseFlashAttention/d=1,p=1/27,2/27,2/27,2/3,2/27,2",
+   "SparseFlashAttention/d=1,p=0/27,2/27,2/27,2/3,2/27,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "3418c84c9e64f78f2889ac10570ba00e6c3723c7a50e415642a8f9851285878f,0e7c9040502c1801ad6705d1c6208f3b3a43b7233bd58c1482ddacc75d39f050",
+  "inputs": [
+   {
+    "name": "query",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "key",
+    "index": 1,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "value",
+    "index": 2,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "sparse_indices",
+    "index": 3,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "block_table",
+    "index": 4,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "actual_seq_lengths_query",
+    "index": 5,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "actual_seq_lengths_kv",
+    "index": 6,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "query_rope",
+    "index": 7,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "key_rope",
+    "index": 8,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "attention_out",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "scale_value",
+    "dtype": "float",
+    "value": 0.0
+   },
+   {
+    "name": "sparse_block_size",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "layout_query",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "layout_kv",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "sparse_mode",
+    "dtype": "int",
+    "value": 0
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/sparse_flash_attention/SparseFlashAttention_4da5fbfbea7101b99c367715f4b4a51e.json"
+}

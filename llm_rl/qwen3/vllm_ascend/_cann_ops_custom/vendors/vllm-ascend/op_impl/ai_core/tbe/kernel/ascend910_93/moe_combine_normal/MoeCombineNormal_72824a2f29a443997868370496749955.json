@@ -1,0 +1,169 @@
+{
+ "binFileName": "MoeCombineNormal_72824a2f29a443997868370496749955",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "VectorCore",
+ "core_type": "AIV",
+ "intercoreSync": 0,
+ "kernelName": "MoeCombineNormal_72824a2f29a443997868370496749955",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+ "memoryStamping": [],
+ "opParaSize": 1168,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "1042236c651b70e8d52fef55e7d8e352ee9e9467f9bf41d6339a36d5c0fbecc7",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "kernelName": "MoeCombineNormal_72824a2f29a443997868370496749955_0"
+  }
+ ],
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "MoeCombineNormal/d=0,p=1/3,2/3,2/3,2/0,2/27,2",
+   "MoeCombineNormal/d=0,p=0/3,2/3,2/3,2/0,2/27,2",
+   "MoeCombineNormal/d=1,p=1/3,2/3,2/3,2/0,2/27,2",
+   "MoeCombineNormal/d=1,p=0/3,2/3,2/3,2/0,2/27,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "4f92126a3294d076b4bd21c2d1093106490a5702179fd8a5c36b6dd22f02d396,30d815cb01b79ef5b7bd8946e54302a5a0088c5a473381807e01d825a904e111",
+  "inputs": [
+   {
+    "name": "recv_x",
+    "index": 0,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "token_src_info",
+    "index": 1,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "ep_recv_counts",
+    "index": 2,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "recv_topk_weights",
+    "index": 3,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "tp_recv_counts",
+    "index": 4,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "x",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "ep_group_name",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "ep_world_size",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "ep_rank_id",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "tp_group_name",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "tp_world_size",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "tp_rank_id",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "moe_expert_num",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "global_bs",
+    "dtype": "int",
+    "value": 0
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/moe_combine_normal/MoeCombineNormal_72824a2f29a443997868370496749955.json"
+}

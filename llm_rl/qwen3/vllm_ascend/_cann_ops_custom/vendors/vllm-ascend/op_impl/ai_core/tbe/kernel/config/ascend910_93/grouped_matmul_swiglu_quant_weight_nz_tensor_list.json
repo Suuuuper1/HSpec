@@ -1,0 +1,319 @@
+{
+  "binList": [
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=1/2,2/2,29/27,2/0,2/9,2/2,2/0,2",
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=0/2,2/2,29/27,2/0,2/9,2/2,2/0,2",
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=1/2,2/2,29/27,2/0,2/9,2/2,2/0,2",
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=0/2,2/2,29/27,2/0,2/9,2/2,2/0,2"
+      ],
+      "dynamicParamMode": "folded_with_desc",
+      "staticKey": "b0843c688215d91cb3921a12d62643b9baf059bcc4a4ff229a7f99b3f14e3beb,9b3931f786c37d8c2e4b3fc9a9b2671fff54868215a8560244193498f83237be",
+      "inputs": [
+        {
+          "name": "x",
+          "index": 0,
+          "dtype": "int8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        [
+          {
+            "name": "weight",
+            "index": 1,
+            "dtype": "int8",
+            "format": "FRACTAL_NZ",
+            "paramType": "dynamic",
+            "shape": [
+              -2
+            ],
+            "format_match_mode": "FormatAgnostic"
+          }
+        ],
+        [
+          {
+            "name": "weight_scale",
+            "index": 2,
+            "dtype": "bfloat16",
+            "format": "ND",
+            "paramType": "dynamic",
+            "shape": [
+              -2
+            ],
+            "format_match_mode": "FormatAgnostic"
+          }
+        ],
+        {
+          "name": "x_scale",
+          "index": 3,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "group_list",
+          "index": 4,
+          "dtype": "int64",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "index": 0,
+          "dtype": "int8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "y_scale",
+          "index": 1,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/grouped_matmul_swiglu_quant_weight_nz_tensor_list/GroupedMatmulSwigluQuantWeightNzTensorList_59a1b0c9ba0c8f4dbafbf76e78f36d3a.json"
+      }
+    },
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=1/2,2/2,29/1,2/0,2/9,2/2,2/0,2",
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=0/2,2/2,29/1,2/0,2/9,2/2,2/0,2",
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=1/2,2/2,29/1,2/0,2/9,2/2,2/0,2",
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=0/2,2/2,29/1,2/0,2/9,2/2,2/0,2"
+      ],
+      "dynamicParamMode": "folded_with_desc",
+      "staticKey": "56b856bb6beeb7f4750a392ec4a9bc2e871c0e5dd3ece1f85a80ca7d63a2ee1b,e7d39b2b8e60d7d3ba3f0990ca660ced4018d645ba899e9f70b7d74a8547fb12",
+      "inputs": [
+        {
+          "name": "x",
+          "index": 0,
+          "dtype": "int8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        [
+          {
+            "name": "weight",
+            "index": 1,
+            "dtype": "int8",
+            "format": "FRACTAL_NZ",
+            "paramType": "dynamic",
+            "shape": [
+              -2
+            ],
+            "format_match_mode": "FormatAgnostic"
+          }
+        ],
+        [
+          {
+            "name": "weight_scale",
+            "index": 2,
+            "dtype": "float16",
+            "format": "ND",
+            "paramType": "dynamic",
+            "shape": [
+              -2
+            ],
+            "format_match_mode": "FormatAgnostic"
+          }
+        ],
+        {
+          "name": "x_scale",
+          "index": 3,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "group_list",
+          "index": 4,
+          "dtype": "int64",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "index": 0,
+          "dtype": "int8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "y_scale",
+          "index": 1,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/grouped_matmul_swiglu_quant_weight_nz_tensor_list/GroupedMatmulSwigluQuantWeightNzTensorList_735bee94ebf43b20f682fe91d5acf025.json"
+      }
+    },
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=1/2,2/2,29/0,2/0,2/9,2/2,2/0,2",
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=0,p=0/2,2/2,29/0,2/0,2/9,2/2,2/0,2",
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=1/2,2/2,29/0,2/0,2/9,2/2,2/0,2",
+        "GroupedMatmulSwigluQuantWeightNzTensorList/d=1,p=0/2,2/2,29/0,2/0,2/9,2/2,2/0,2"
+      ],
+      "dynamicParamMode": "folded_with_desc",
+      "staticKey": "e0b4e980784563c9efc1acd943bf06ebf3b67f9bd261113a0699614ea6e40c52,0d3c114199cafa67dba48057d6111362c89acf8943997a8260af396a61ff2fc8",
+      "inputs": [
+        {
+          "name": "x",
+          "index": 0,
+          "dtype": "int8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        [
+          {
+            "name": "weight",
+            "index": 1,
+            "dtype": "int8",
+            "format": "FRACTAL_NZ",
+            "paramType": "dynamic",
+            "shape": [
+              -2
+            ],
+            "format_match_mode": "FormatAgnostic"
+          }
+        ],
+        [
+          {
+            "name": "weight_scale",
+            "index": 2,
+            "dtype": "float32",
+            "format": "ND",
+            "paramType": "dynamic",
+            "shape": [
+              -2
+            ],
+            "format_match_mode": "FormatAgnostic"
+          }
+        ],
+        {
+          "name": "x_scale",
+          "index": 3,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "group_list",
+          "index": 4,
+          "dtype": "int64",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "index": 0,
+          "dtype": "int8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "y_scale",
+          "index": 1,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/grouped_matmul_swiglu_quant_weight_nz_tensor_list/GroupedMatmulSwigluQuantWeightNzTensorList_a736d6d385ece2c74b43e22e7dc52689.json"
+      }
+    }
+  ]
+}

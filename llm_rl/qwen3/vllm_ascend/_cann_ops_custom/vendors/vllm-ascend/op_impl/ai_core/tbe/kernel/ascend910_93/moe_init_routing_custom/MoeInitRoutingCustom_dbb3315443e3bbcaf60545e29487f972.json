@@ -1,0 +1,412 @@
+{
+ "binFileName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "MIX",
+ "intercoreSync": 1,
+ "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF",
+ "memoryStamping": [],
+ "opParaSize": 712,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "7369ec52fdc7313488774f1bef8e02a0423f9be9138330bf975668f9ee25c0f4",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "tilingKey": 2000000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_2000000"
+  },
+  {
+   "tilingKey": 2300000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_2300000"
+  },
+  {
+   "tilingKey": 2301000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_2301000"
+  },
+  {
+   "tilingKey": 2302000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_2302000"
+  },
+  {
+   "tilingKey": 2310000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_2310000"
+  },
+  {
+   "tilingKey": 2311000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_2311000"
+  },
+  {
+   "tilingKey": 2312000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_2312000"
+  },
+  {
+   "tilingKey": 2100000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_2100000"
+  },
+  {
+   "tilingKey": 2200000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_2200000"
+  },
+  {
+   "tilingKey": 1200000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1200000"
+  },
+  {
+   "tilingKey": 1201000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1201000"
+  },
+  {
+   "tilingKey": 1300000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1300000"
+  },
+  {
+   "tilingKey": 1301000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1301000"
+  },
+  {
+   "tilingKey": 1000000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1000000"
+  },
+  {
+   "tilingKey": 1001000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1001000"
+  },
+  {
+   "tilingKey": 1010000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1010000"
+  },
+  {
+   "tilingKey": 1011000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1011000"
+  },
+  {
+   "tilingKey": 1020000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1020000"
+  },
+  {
+   "tilingKey": 1021000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1021000"
+  },
+  {
+   "tilingKey": 1010100,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1010100"
+  },
+  {
+   "tilingKey": 1020100,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1020100"
+  },
+  {
+   "tilingKey": 1000100,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1000100"
+  },
+  {
+   "tilingKey": 1120000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1120000"
+  },
+  {
+   "tilingKey": 1121000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1121000"
+  },
+  {
+   "tilingKey": 1111000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1111000"
+  },
+  {
+   "tilingKey": 1110000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1110000"
+  },
+  {
+   "tilingKey": 1101000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1101000"
+  },
+  {
+   "tilingKey": 1100000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1100000"
+  },
+  {
+   "tilingKey": 1110100,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1110100"
+  },
+  {
+   "tilingKey": 1120100,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1120100"
+  },
+  {
+   "tilingKey": 1100100,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "0:1",
+   "kernelName": "MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972_1100100"
+  }
+ ],
+ "taskRation": "tilingKey",
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "MoeInitRoutingCustom/d=0,p=1/0,2/3,2/2,2/3,2/9,2/0,2",
+   "MoeInitRoutingCustom/d=0,p=0/0,2/3,2/2,2/3,2/9,2/0,2",
+   "MoeInitRoutingCustom/d=1,p=1/0,2/3,2/2,2/3,2/9,2/0,2",
+   "MoeInitRoutingCustom/d=1,p=0/0,2/3,2/2,2/3,2/9,2/0,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "9cce4d62a28030f7aa730f93c6308ca16a57f3fb87ee2e053be5e9561c670b29,da80e12f072bf4b1d038228d26ba3bd99503f049c38e3d78dc8c1155d46944ef",
+  "inputs": [
+   {
+    "name": "x",
+    "index": 0,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "expert_idx",
+    "index": 1,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "scale",
+    "index": 2,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "offset",
+    "index": 3,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "expanded_x",
+    "index": 0,
+    "dtype": "int8",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "expanded_row_idx",
+    "index": 1,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "expert_tokens_count_or_cumsum",
+    "index": 2,
+    "dtype": "int64",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "expanded_scale",
+    "index": 3,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "active_num",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "expert_capacity",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "expert_num",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "drop_pad_mode",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "expert_tokens_num_type",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "expert_tokens_num_flag",
+    "dtype": "bool",
+    "value": false
+   },
+   {
+    "name": "quant_mode",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "active_expert_range",
+    "dtype": "list_int",
+    "value": []
+   },
+   {
+    "name": "row_idx_type",
+    "dtype": "int",
+    "value": 0
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/moe_init_routing_custom/MoeInitRoutingCustom_dbb3315443e3bbcaf60545e29487f972.json"
+}

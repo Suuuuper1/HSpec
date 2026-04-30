@@ -1,0 +1,146 @@
+{
+ "binFileName": "NotifyDispatch_9920e97c8ba4a54ee4365ff85276f3ac",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "MIX",
+ "intercoreSync": 1,
+ "kernelName": "NotifyDispatch_9920e97c8ba4a54ee4365ff85276f3ac",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF",
+ "memoryStamping": [],
+ "opParaSize": 624,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "2f9e34011ddbf2199d9ee599ddb63576eccd39aa0f7614094e06f7fd7fc10503",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "taskRation": "0:1",
+ "kernelList": [
+  {
+   "kernelName": "NotifyDispatch_9920e97c8ba4a54ee4365ff85276f3ac_20"
+  },
+  {
+   "kernelName": "NotifyDispatch_9920e97c8ba4a54ee4365ff85276f3ac_22"
+  },
+  {
+   "kernelName": "NotifyDispatch_9920e97c8ba4a54ee4365ff85276f3ac_23"
+  }
+ ],
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "NotifyDispatch/d=0,p=1/3,2/3,2/3,2/3,2",
+   "NotifyDispatch/d=0,p=0/3,2/3,2/3,2/3,2",
+   "NotifyDispatch/d=1,p=1/3,2/3,2/3,2/3,2",
+   "NotifyDispatch/d=1,p=0/3,2/3,2/3,2/3,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "73c907c2921ae28dfd9f40aa2b32dbcd1d3ad4ddbacf293c4476cb2cc3a93199,4c07789abbcd9b17f9c854f1b77fea496e183f8f265c0de605057c7eece64932",
+  "inputs": [
+   {
+    "name": "sendData",
+    "index": 0,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "tokenPerExpertData",
+    "index": 1,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "sendDataOffset",
+    "index": 0,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "recvData",
+    "index": 1,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "sendCount",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "num_tokens",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "comm_group",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "rank_size",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "rank_id",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "local_rank_size",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "local_rank_id",
+    "dtype": "int",
+    "value": 0
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/notify_dispatch/NotifyDispatch_9920e97c8ba4a54ee4365ff85276f3ac.json"
+}

@@ -1,0 +1,316 @@
+{
+  "binList": [
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "NotifyDispatch/d=0,p=1/3,2/3,2/3,2/3,2",
+        "NotifyDispatch/d=0,p=0/3,2/3,2/3,2/3,2",
+        "NotifyDispatch/d=1,p=1/3,2/3,2/3,2/3,2",
+        "NotifyDispatch/d=1,p=0/3,2/3,2/3,2/3,2"
+      ],
+      "staticKey": "73c907c2921ae28dfd9f40aa2b32dbcd1d3ad4ddbacf293c4476cb2cc3a93199,4c07789abbcd9b17f9c854f1b77fea496e183f8f265c0de605057c7eece64932",
+      "inputs": [
+        {
+          "name": "sendData",
+          "index": 0,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "tokenPerExpertData",
+          "index": 1,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sendDataOffset",
+          "index": 0,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "recvData",
+          "index": 1,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "sendCount",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "num_tokens",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "comm_group",
+          "dtype": "str",
+          "value": ""
+        },
+        {
+          "name": "rank_size",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "rank_id",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "local_rank_size",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "local_rank_id",
+          "dtype": "int",
+          "value": 0
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/notify_dispatch/NotifyDispatch_9920e97c8ba4a54ee4365ff85276f3ac.json"
+      }
+    },
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "NotifyDispatch/d=0,p=1/0,2/0,2/0,2/0,2",
+        "NotifyDispatch/d=0,p=0/0,2/0,2/0,2/0,2",
+        "NotifyDispatch/d=1,p=1/0,2/0,2/0,2/0,2",
+        "NotifyDispatch/d=1,p=0/0,2/0,2/0,2/0,2"
+      ],
+      "staticKey": "459725346c30e0651b4225bc018c35992f5d3d149630f868212816489c4d6461,3e4b22ea49ab8e68bae8b09143f63f6cf826d1cd929c137c54c460afc90b2140",
+      "inputs": [
+        {
+          "name": "sendData",
+          "index": 0,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "tokenPerExpertData",
+          "index": 1,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sendDataOffset",
+          "index": 0,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "recvData",
+          "index": 1,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "sendCount",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "num_tokens",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "comm_group",
+          "dtype": "str",
+          "value": ""
+        },
+        {
+          "name": "rank_size",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "rank_id",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "local_rank_size",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "local_rank_id",
+          "dtype": "int",
+          "value": 0
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/notify_dispatch/NotifyDispatch_a085b489ff604df8da6725ec8ef2536d.json"
+      }
+    },
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "NotifyDispatch/d=0,p=1/1,2/1,2/1,2/1,2",
+        "NotifyDispatch/d=0,p=0/1,2/1,2/1,2/1,2",
+        "NotifyDispatch/d=1,p=1/1,2/1,2/1,2/1,2",
+        "NotifyDispatch/d=1,p=0/1,2/1,2/1,2/1,2"
+      ],
+      "staticKey": "c5d46a451123559ad1ee6c44e0eaa0c5bf4a7e732e5494fff540b1fd23748f4f,62bfda548d33d2fe13d444b692d04cd05dfc821dec5e8e733b07518669dbc3c1",
+      "inputs": [
+        {
+          "name": "sendData",
+          "index": 0,
+          "dtype": "float16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "tokenPerExpertData",
+          "index": 1,
+          "dtype": "float16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sendDataOffset",
+          "index": 0,
+          "dtype": "float16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "recvData",
+          "index": 1,
+          "dtype": "float16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "sendCount",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "num_tokens",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "comm_group",
+          "dtype": "str",
+          "value": ""
+        },
+        {
+          "name": "rank_size",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "rank_id",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "local_rank_size",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "local_rank_id",
+          "dtype": "int",
+          "value": 0
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/notify_dispatch/NotifyDispatch_f3610ca9d5dfe92ea6d7238b9819c6fc.json"
+      }
+    }
+  ]
+}

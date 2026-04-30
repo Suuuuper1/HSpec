@@ -1,0 +1,210 @@
+{
+ "binFileName": "MoeDispatchNormal_cd1825d06f6ac71851ca179e07c11c69",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "MIX",
+ "intercoreSync": 1,
+ "kernelName": "MoeDispatchNormal_cd1825d06f6ac71851ca179e07c11c69",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF",
+ "memoryStamping": [],
+ "opParaSize": 1160,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "7bc4f5b311bf6a6a61f10112484817c7eb38323713329fefb76b6d6b9216b008",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "taskRation": "0:1",
+ "kernelList": [
+  {
+   "kernelName": "MoeDispatchNormal_cd1825d06f6ac71851ca179e07c11c69_10002"
+  }
+ ],
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "MoeDispatchNormal/d=0,p=1/27,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2",
+   "MoeDispatchNormal/d=0,p=0/27,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2",
+   "MoeDispatchNormal/d=1,p=1/27,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2",
+   "MoeDispatchNormal/d=1,p=0/27,2/3,2/3,2/3,2/3,2/3,2/2,2/0,2/3,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "7cdf0513f90495eaba1c84bfa008ff7fb9224e22d0f8b86dca2cd34d1cee83b4,ba09d7c2aa14d296b1f4124e7289a9591516231c3d8f7dd88702b8f9dbb3cde1",
+  "inputs": [
+   {
+    "name": "x",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "topk_idx",
+    "index": 1,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "send_offset",
+    "index": 2,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "send_tokenIdx",
+    "index": 3,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "recv_offset",
+    "index": 4,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "recv_count",
+    "index": 5,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "recv_x",
+    "index": 0,
+    "dtype": "int8",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "x_scales",
+    "index": 1,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "assist_info_for_combine",
+    "index": 2,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "group_ep",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "ep_world_size",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "ep_rank_id",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "group_tp",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "tp_world_size",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "tp_rank_id",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "moe_expert_num",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "quant_mode",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "global_bs",
+    "dtype": "int",
+    "value": 0
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/moe_dispatch_normal/MoeDispatchNormal_cd1825d06f6ac71851ca179e07c11c69.json"
+}

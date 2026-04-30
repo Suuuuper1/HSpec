@@ -1,0 +1,168 @@
+{
+ "binFileName": "MoeGatingTopK_81369a2fa0455f39b5d19d432d261f57",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "VectorCore",
+ "core_type": "AIV",
+ "intercoreSync": 0,
+ "kernelName": "MoeGatingTopK_81369a2fa0455f39b5d19d432d261f57",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+ "memoryStamping": [],
+ "opParaSize": 152,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "44ce989ee00c5b4419d2f058ff84b1ff161b219ee8e2c209780f01caeaa531ac",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "kernelName": "MoeGatingTopK_81369a2fa0455f39b5d19d432d261f57_0"
+  },
+  {
+   "kernelName": "MoeGatingTopK_81369a2fa0455f39b5d19d432d261f57_1"
+  },
+  {
+   "kernelName": "MoeGatingTopK_81369a2fa0455f39b5d19d432d261f57_2"
+  }
+ ],
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "MoeGatingTopK/d=0,p=1/0,2/0,2/3,2/0,2",
+   "MoeGatingTopK/d=0,p=0/0,2/0,2/3,2/0,2",
+   "MoeGatingTopK/d=1,p=1/0,2/0,2/3,2/0,2",
+   "MoeGatingTopK/d=1,p=0/0,2/0,2/3,2/0,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "c73494e5e40ea78b6ce988a3e89cea317c4052861563b6b31ee8458651dc1ebe,8cc019f67c50967bbb1a53eeb2932929619303bf3f7ef854471b078ddeffc10f",
+  "inputs": [
+   {
+    "name": "x",
+    "index": 0,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "bias",
+    "index": 1,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "y",
+    "index": 0,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "expert_idx",
+    "index": 1,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "out",
+    "index": 2,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "k",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "k_group",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "group_count",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "group_select_mode",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "renorm",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "norm_type",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "out_flag",
+    "dtype": "bool",
+    "value": false
+   },
+   {
+    "name": "routed_scaling_factor",
+    "dtype": "float",
+    "value": 0.0
+   },
+   {
+    "name": "eps",
+    "dtype": "float",
+    "value": 0.0
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/moe_gating_top_k/MoeGatingTopK_81369a2fa0455f39b5d19d432d261f57.json"
+}

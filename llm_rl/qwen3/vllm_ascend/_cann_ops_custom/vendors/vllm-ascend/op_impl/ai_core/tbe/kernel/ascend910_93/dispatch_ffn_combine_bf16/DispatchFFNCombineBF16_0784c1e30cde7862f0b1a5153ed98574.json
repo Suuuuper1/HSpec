@@ -1,0 +1,208 @@
+{
+ "binFileName": "DispatchFFNCombineBF16_0784c1e30cde7862f0b1a5153ed98574",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "MIX",
+ "intercoreSync": 1,
+ "kernelName": "DispatchFFNCombineBF16_0784c1e30cde7862f0b1a5153ed98574",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF",
+ "memoryStamping": [],
+ "opParaSize": 1160,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "4c95e1fe3f59f1482452e9b684167238a5c6791cafa2e9c70257029d08ad60bd",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "tilingKey": 1000000,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchFFNCombineBF16_0784c1e30cde7862f0b1a5153ed98574_1000000"
+  },
+  {
+   "tilingKey": 1000001,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchFFNCombineBF16_0784c1e30cde7862f0b1a5153ed98574_1000001"
+  },
+  {
+   "tilingKey": 1000010,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchFFNCombineBF16_0784c1e30cde7862f0b1a5153ed98574_1000010"
+  },
+  {
+   "tilingKey": 1000011,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "DispatchFFNCombineBF16_0784c1e30cde7862f0b1a5153ed98574_1000011"
+  }
+ ],
+ "taskRation": "tilingKey",
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "dynamicParamMode": "folded_with_desc",
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "DispatchFFNCombineBF16/d=0,p=1/1,2/1,2/1,2/3,2/9,2/9,2/0,2/1,2",
+   "DispatchFFNCombineBF16/d=0,p=0/1,2/1,2/1,2/3,2/9,2/9,2/0,2/1,2",
+   "DispatchFFNCombineBF16/d=1,p=1/1,2/1,2/1,2/3,2/9,2/9,2/0,2/1,2",
+   "DispatchFFNCombineBF16/d=1,p=0/1,2/1,2/1,2/3,2/9,2/9,2/0,2/1,2"
+  ],
+  "dynamicParamMode": "folded_with_desc",
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "a3c5946b1e737e9177569fa6d396401660f73f92a2ca257b273871ff92b9593f,ba51d32cbc68be82120ef54139ec0ae755e7ba941ebded0f1fc2f1c26ac4a9bb",
+  "inputs": [
+   {
+    "name": "a",
+    "index": 0,
+    "dtype": "float16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   [
+    {
+     "name": "w1",
+     "index": 1,
+     "dtype": "float16",
+     "format": "ND",
+     "paramType": "dynamic",
+     "shape": [
+      -2
+     ],
+     "format_match_mode": "FormatAgnostic"
+    }
+   ],
+   [
+    {
+     "name": "w2",
+     "index": 2,
+     "dtype": "float16",
+     "format": "ND",
+     "paramType": "dynamic",
+     "shape": [
+      -2
+     ],
+     "format_match_mode": "FormatAgnostic"
+    }
+   ],
+   {
+    "name": "expertIdx",
+    "index": 3,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   [
+    {
+     "name": "scale1",
+     "index": 4,
+     "dtype": "int64",
+     "format": "ND",
+     "paramType": "dynamic",
+     "shape": [
+      -2
+     ],
+     "format_match_mode": "FormatAgnostic"
+    }
+   ],
+   [
+    {
+     "name": "scale2",
+     "index": 5,
+     "dtype": "int64",
+     "format": "ND",
+     "paramType": "dynamic",
+     "shape": [
+      -2
+     ],
+     "format_match_mode": "FormatAgnostic"
+    }
+   ],
+   {
+    "name": "probs",
+    "index": 6,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "out",
+    "index": 0,
+    "dtype": "float16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "group",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "M",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "transB",
+    "dtype": "bool",
+    "value": false
+   },
+   {
+    "name": "weightNz",
+    "dtype": "bool",
+    "value": false
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16_0784c1e30cde7862f0b1a5153ed98574.json"
+}

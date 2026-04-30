@@ -1,0 +1,121 @@
+{
+ "binFileName": "ApplyTopKTopPCustom_43cebf9614fe7140744842c6d08fb8c3",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "MIX",
+ "intercoreSync": 1,
+ "kernelName": "ApplyTopKTopPCustom_43cebf9614fe7140744842c6d08fb8c3",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF",
+ "memoryStamping": [],
+ "opParaSize": 64,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "e8698eafd2535d21bdae069ef72edd4d85148b7c96241ba2a4782b03095e1dff",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "taskRation": "0:1",
+ "kernelList": [
+  {
+   "kernelName": "ApplyTopKTopPCustom_43cebf9614fe7140744842c6d08fb8c3_0"
+  },
+  {
+   "kernelName": "ApplyTopKTopPCustom_43cebf9614fe7140744842c6d08fb8c3_1"
+  },
+  {
+   "kernelName": "ApplyTopKTopPCustom_43cebf9614fe7140744842c6d08fb8c3_2"
+  }
+ ],
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "ApplyTopKTopPCustom/d=0,p=1/27,2/3,2/27,2",
+   "ApplyTopKTopPCustom/d=0,p=0/27,2/3,2/27,2",
+   "ApplyTopKTopPCustom/d=1,p=1/27,2/3,2/27,2",
+   "ApplyTopKTopPCustom/d=1,p=0/27,2/3,2/27,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "0e3ac8a36e9aae9446fe61075d6717a5ae91a750192f73e141e56b6f6e84b5ea,42706e1b36169a800fc7969ad15fb7f0e4a312cec9e5e2b06000383936b58708",
+  "inputs": [
+   {
+    "name": "sorted_value",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "sorted_indices",
+    "index": 1,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "p",
+    "index": 2,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "k",
+    "index": 3,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "out",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/apply_top_k_top_p_custom/ApplyTopKTopPCustom_43cebf9614fe7140744842c6d08fb8c3.json"
+}

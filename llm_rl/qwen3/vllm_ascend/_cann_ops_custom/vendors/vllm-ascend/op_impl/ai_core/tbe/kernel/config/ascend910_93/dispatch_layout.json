@@ -1,0 +1,93 @@
+{
+  "binList": [
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "DispatchLayout/d=0,p=1/9,2/3,2/3,2/3,2",
+        "DispatchLayout/d=0,p=0/9,2/3,2/3,2/3,2",
+        "DispatchLayout/d=1,p=1/9,2/3,2/3,2/3,2",
+        "DispatchLayout/d=1,p=0/9,2/3,2/3,2/3,2"
+      ],
+      "staticKey": "797cf079b3ca5ee9fa886cd8dc2588df5fe55ec9f79d5ad468556826e67dce7d,2fa983d0be5e665a993e5b81195ad19ebbe05ed8dbe1596ccc557b83845f17fa",
+      "inputs": [
+        {
+          "name": "topkIdx",
+          "index": 0,
+          "dtype": "int64",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "numTokensPerRank",
+          "index": 0,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "numTokensPerExpert",
+          "index": 1,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "isTokenInRank",
+          "index": 2,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "num_tokens",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "num_ranks",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "num_experts",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "num_topk",
+          "dtype": "int",
+          "value": 0
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/dispatch_layout/DispatchLayout_1da8e5b2a72dc18017dcd9e097341a02.json"
+      }
+    }
+  ]
+}

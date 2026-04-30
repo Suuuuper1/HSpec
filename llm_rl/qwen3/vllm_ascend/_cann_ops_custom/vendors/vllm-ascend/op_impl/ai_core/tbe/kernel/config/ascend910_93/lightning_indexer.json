@@ -1,0 +1,248 @@
+{
+  "binList": [
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "LightningIndexer/d=0,p=1/1,2/1,2/1,2/3,2",
+        "LightningIndexer/d=0,p=0/1,2/1,2/1,2/3,2",
+        "LightningIndexer/d=1,p=1/1,2/1,2/1,2/3,2",
+        "LightningIndexer/d=1,p=0/1,2/1,2/1,2/3,2"
+      ],
+      "staticKey": "5e876c4663fb7ada9047d2c3e96e8a333d313f1b2b7414b1a4705ef52846ba4a,9d4bd501e3bdab4f7bf58e7e46416df31f8d37604c265274c3d00a8794de15e7",
+      "inputs": [
+        {
+          "name": "query",
+          "index": 0,
+          "dtype": "float16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "key",
+          "index": 1,
+          "dtype": "float16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "weights",
+          "index": 2,
+          "dtype": "float16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "actual_seq_lengths_query",
+          "index": 3,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "optional",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "actual_seq_lengths_key",
+          "index": 4,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "optional",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "block_table",
+          "index": 5,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "optional",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sparse_indices",
+          "index": 0,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "layout_query",
+          "dtype": "str",
+          "value": ""
+        },
+        {
+          "name": "layout_key",
+          "dtype": "str",
+          "value": ""
+        },
+        {
+          "name": "sparse_count",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "sparse_mode",
+          "dtype": "int",
+          "value": 0
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/lightning_indexer/LightningIndexer_3661522d98ae90073032b63ce37149ea.json"
+      }
+    },
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "LightningIndexer/d=0,p=1/27,2/27,2/27,2/3,2",
+        "LightningIndexer/d=0,p=0/27,2/27,2/27,2/3,2",
+        "LightningIndexer/d=1,p=1/27,2/27,2/27,2/3,2",
+        "LightningIndexer/d=1,p=0/27,2/27,2/27,2/3,2"
+      ],
+      "staticKey": "bd30d0a1311f956cced6de71fdd23873b9eec210b54fc004695bb023cd60f150,7ad96724eacdf195734ae0409723d2f6450360d96062465e13df1cef04397b58",
+      "inputs": [
+        {
+          "name": "query",
+          "index": 0,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "key",
+          "index": 1,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "weights",
+          "index": 2,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "actual_seq_lengths_query",
+          "index": 3,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "optional",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "actual_seq_lengths_key",
+          "index": 4,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "optional",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "block_table",
+          "index": 5,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "optional",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sparse_indices",
+          "index": 0,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "layout_query",
+          "dtype": "str",
+          "value": ""
+        },
+        {
+          "name": "layout_key",
+          "dtype": "str",
+          "value": ""
+        },
+        {
+          "name": "sparse_count",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "sparse_mode",
+          "dtype": "int",
+          "value": 0
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/lightning_indexer/LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823.json"
+      }
+    }
+  ]
+}

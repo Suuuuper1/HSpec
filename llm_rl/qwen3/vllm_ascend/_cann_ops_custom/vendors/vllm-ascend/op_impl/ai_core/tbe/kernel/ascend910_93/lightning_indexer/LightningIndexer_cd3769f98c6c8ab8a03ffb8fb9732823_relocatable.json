@@ -1,0 +1,324 @@
+{
+ "binFileName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "MIX",
+ "intercoreSync": 1,
+ "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF",
+ "memoryStamping": [],
+ "opParaSize": 48,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "0a10cf8758ea1f6ac5610d4c1dd3e7e0224ae417efd0e979113c42ea15d0f059",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "tilingKey": 16974081,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_16974081"
+  },
+  {
+   "tilingKey": 50528513,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_50528513"
+  },
+  {
+   "tilingKey": 16980763,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_16980763"
+  },
+  {
+   "tilingKey": 50535195,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_50535195"
+  },
+  {
+   "tilingKey": 537067777,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_537067777"
+  },
+  {
+   "tilingKey": 1073938689,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1073938689"
+  },
+  {
+   "tilingKey": 570622209,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_570622209"
+  },
+  {
+   "tilingKey": 1107493121,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1107493121"
+  },
+  {
+   "tilingKey": 537074459,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_537074459"
+  },
+  {
+   "tilingKey": 1073945371,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1073945371"
+  },
+  {
+   "tilingKey": 570628891,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_570628891"
+  },
+  {
+   "tilingKey": 1107499803,
+   "kernelType": "MIX_AIC",
+   "crossCoreSync": 1,
+   "taskRation": "1:2",
+   "kernelName": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1107499803"
+  }
+ ],
+ "taskRation": "tilingKey",
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "sub_operator_params": [
+  "ffts_addr",
+  "query_in__",
+  "key_in__",
+  "weights_in__",
+  "actual_seq_lengths_query_in__",
+  "actual_seq_lengths_key_in__",
+  "block_table_in__",
+  "sparse_indices_out_",
+  "workspace",
+  "tiling"
+ ],
+ "sub_operator_kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+ "sub_operator_kernel_name": {
+  "dynamic_func_names": {
+   "16974081": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_16974081_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_16974081_mix_aiv"
+   },
+   "50528513": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_50528513_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_50528513_mix_aiv"
+   },
+   "16980763": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_16980763_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_16980763_mix_aiv"
+   },
+   "50535195": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_50535195_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_50535195_mix_aiv"
+   },
+   "537067777": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_537067777_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_537067777_mix_aiv"
+   },
+   "1073938689": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1073938689_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1073938689_mix_aiv"
+   },
+   "570622209": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_570622209_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_570622209_mix_aiv"
+   },
+   "1107493121": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1107493121_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1107493121_mix_aiv"
+   },
+   "537074459": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_537074459_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_537074459_mix_aiv"
+   },
+   "1073945371": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1073945371_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1073945371_mix_aiv"
+   },
+   "570628891": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_570628891_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_570628891_mix_aiv"
+   },
+   "1107499803": {
+    "dav-c220-cube": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1107499803_mix_aic",
+    "kernel_type": "KERNEL_TYPE_MIX_AIC_1_2",
+    "dav-c220-vec": "LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable_1107499803_mix_aiv"
+   }
+  }
+ },
+ "sub_operator_early_start_set_flag": false,
+ "sub_operator_early_start_wait_flag": false,
+ "sub_operator_call_dcci_before_kernel_start": false,
+ "sub_operator_call_dcci_after_kernel_end": false,
+ "sub_op_with_sync_all": true,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "LightningIndexer/d=0,p=1/27,2/27,2/27,2/3,2",
+   "LightningIndexer/d=0,p=0/27,2/27,2/27,2/3,2",
+   "LightningIndexer/d=1,p=1/27,2/27,2/27,2/3,2",
+   "LightningIndexer/d=1,p=0/27,2/27,2/27,2/3,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "bd30d0a1311f956cced6de71fdd23873b9eec210b54fc004695bb023cd60f150,7ad96724eacdf195734ae0409723d2f6450360d96062465e13df1cef04397b58",
+  "inputs": [
+   {
+    "name": "query",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "key",
+    "index": 1,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "weights",
+    "index": 2,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "actual_seq_lengths_query",
+    "index": 3,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "actual_seq_lengths_key",
+    "index": 4,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "block_table",
+    "index": 5,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "optional",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "sparse_indices",
+    "index": 0,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "layout_query",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "layout_key",
+    "dtype": "str",
+    "value": ""
+   },
+   {
+    "name": "sparse_count",
+    "dtype": "int",
+    "value": 0
+   },
+   {
+    "name": "sparse_mode",
+    "dtype": "int",
+    "value": 0
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/lightning_indexer/LightningIndexer_cd3769f98c6c8ab8a03ffb8fb9732823_relocatable.json"
+}
