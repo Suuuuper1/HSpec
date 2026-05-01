@@ -140,6 +140,14 @@ class EngineCoreOutput(
     trace_headers: Mapping[str, str] | None = None
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+    # HSpec: anchor hidden states for finished requests.
+    # Shape (seq_len, hidden_dim), dtype float16, numpy ndarray.
+    # Populated by the scheduler (same process as model_runner) when a
+    # request finishes; serialized to the front-end process where the
+    # output_processor reads it.
+    hspec_hidden_states: np.ndarray | None = None
+    # HSpec: exact token ids aligned 1-to-1 with ``hspec_hidden_states``.
+    hspec_token_ids: list[int] | None = None
     routed_experts: np.ndarray | None = None
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.

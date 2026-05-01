@@ -16,6 +16,7 @@ class SpecDcodeType(enum.Enum):
     SUFFIX = 5
     MEDUSA = 6
     SAM = 7
+    HSPEC = 8
 
 
 class Proposer:

@@ -215,6 +215,8 @@ class RequestState:
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         routed_experts: np.ndarray | None = None,
+        hspec_hidden_states: Any | None = None,
+        hspec_token_ids: Any | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -258,6 +260,12 @@ class RequestState:
         output = self._new_completion_output(
             new_token_ids, finish_reason, stop_reason, routed_experts
         )
+        # HSpec: hidden states belong to the child completion, not to the
+        # aggregated parent RequestOutput.
+        if hspec_hidden_states is not None and isinstance(output, CompletionOutput):
+            output.hidden_states = hspec_hidden_states
+        if hspec_token_ids is not None and isinstance(output, CompletionOutput):
+            output.hspec_token_ids = hspec_token_ids
 
         if self.parent_req is None:
             outputs = [output]
@@ -560,6 +568,14 @@ class OutputProcessor:
                 stop_reason,
                 kv_transfer_params,
                 routed_experts,
+                hspec_hidden_states=getattr(
+                    engine_core_output, "hspec_hidden_states", None
+                )
+                if (finish_reason is not None and pooling_output is None)
+                else None,
+                hspec_token_ids=getattr(engine_core_output, "hspec_token_ids", None)
+                if (finish_reason is not None and pooling_output is None)
+                else None,
             ):
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().

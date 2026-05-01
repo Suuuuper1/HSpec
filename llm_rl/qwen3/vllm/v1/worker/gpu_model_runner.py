@@ -449,6 +449,12 @@ class GPUModelRunner(
                 self.drafter = MedusaProposer(
                     vllm_config=self.vllm_config, device=self.device
                 )
+            elif self.speculative_config.method in ("history_rollout", "hspec"):
+                raise ValueError(
+                    "Speculative decoding method "
+                    f"{self.speculative_config.method!r} is not supported by "
+                    "the default GPU runner. It is expected to be provided by "
+                    "a platform plugin (e.g., vllm-ascend).")
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "

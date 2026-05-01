@@ -279,6 +279,23 @@ class MultiprocExecutor(Executor):
         self.collective_rpc("execute_dummy_batch", unique_reply_rank=self.output_rank)
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
+        # For most spec-decode methods we can safely take output only from a
+        # single worker (output_rank). However, for HSPEC the proposer relies
+        # on worker-local caches (prefetch readiness may differ by rank), so
+        # drafts might be produced on a different rank than output_rank.
+        #
+        # In that case, taking only from output_rank can silently drop drafts,
+        # resulting in scheduler_output.scheduled_spec_decode_tokens staying
+        # empty (use_spec_decode=False) even when a draft was produced.
+        spec_cfg = getattr(self.vllm_config, "speculative_config", None)
+        is_hspec = spec_cfg is not None and getattr(spec_cfg, "method", None) == "hspec"
+        if is_hspec:
+            outputs = self.collective_rpc("take_draft_token_ids")
+            for out in outputs:
+                if out is not None:
+                    return out
+            return None
+
         # OPTIMIZATION: Get output only from a single worker (output_rank)
         return self.collective_rpc(
             "take_draft_token_ids", unique_reply_rank=self.output_rank
