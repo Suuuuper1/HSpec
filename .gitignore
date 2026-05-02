@@ -3,3 +3,5 @@ __pycache__/
 .specstory/
 outputs/
 output/
+logs/
+.cache/
