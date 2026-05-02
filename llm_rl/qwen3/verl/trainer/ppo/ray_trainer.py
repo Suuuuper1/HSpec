@@ -330,6 +330,12 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self._hspec_dump_enabled = os.getenv("HSPEC_DUMP", "0") != "0"
+        self._hspec_dump_root = os.getenv("HSPEC_DUMP_DIR", "/workspace/exp/hspec_dump")
+        self._hspec_dump_epoch_meta_written: set[int] = set()
+        self._hspec_dump_tables_written: dict[int, set[str]] = defaultdict(set)
+        self._hspec_align_debug = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
+        self._hspec_align_debug_max_logs = int(os.getenv("HSPEC_ALIGN_DEBUG_MAX_LOGS", "24"))
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -474,6 +480,132 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    @staticmethod
+    def _hspec_dump_object_array(items):
+        arr = np.empty((len(items),), dtype=object)
+        arr[:] = items
+        return arr
+
+    def _hspec_dump_epoch_dir(self, epoch: int) -> str:
+        return os.path.join(self._hspec_dump_root, f"epoch_{int(epoch):04d}")
+
+    def _maybe_write_hspec_dump_epoch_meta(
+        self,
+        epoch: int,
+        active_table_version: int,
+    ) -> None:
+        if not self._hspec_dump_enabled:
+            return
+        if epoch in self._hspec_dump_epoch_meta_written:
+            return
+
+        epoch_dir = self._hspec_dump_epoch_dir(epoch)
+        os.makedirs(epoch_dir, exist_ok=True)
+        meta = {
+            "epoch": int(epoch),
+            "global_step_at_first_dump": int(self.global_steps),
+            "active_table_version": int(active_table_version),
+            "pad_token_id": int(self.tokenizer.pad_token_id),
+            "hspec_dump_root": self._hspec_dump_root,
+            "hspec_similarity_threshold": float(
+                self.config.actor_rollout_ref.rollout.get("hspec_similarity_threshold", 0.9)
+            ),
+        }
+        with open(os.path.join(epoch_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        self._hspec_dump_epoch_meta_written.add(epoch)
+
+    def _dump_hspec_rollouts_and_tables(
+        self,
+        epoch: int,
+        prompt_build_data: dict,
+    ) -> None:
+        """Dump current epoch rollouts and the active query table snapshot."""
+        if not self._hspec_dump_enabled or not prompt_build_data:
+            return
+
+        prompt_ids = list(prompt_build_data.keys())
+        active_table_version, active_table_data = self.hspec_tables.prefetch_batch(prompt_ids)
+        self._maybe_write_hspec_dump_epoch_meta(epoch, active_table_version)
+
+        epoch_dir = self._hspec_dump_epoch_dir(epoch)
+        step_rollout_dir = os.path.join(epoch_dir, "rollouts", f"step_{int(self.global_steps):08d}")
+        table_dir = os.path.join(epoch_dir, "tables")
+        os.makedirs(step_rollout_dir, exist_ok=True)
+        os.makedirs(table_dir, exist_ok=True)
+
+        written_tables = self._hspec_dump_tables_written[epoch]
+
+        for prompt_id, data in prompt_build_data.items():
+            prompt_token_ids = data.get("prompt_token_ids")
+            table_data = active_table_data.get(prompt_id)
+            table_present = table_data is not None
+
+            hidden_states_list = []
+            projected_hidden_states_list = []
+            projection_available = []
+
+            mean = None
+            components = None
+            if table_present:
+                mean = np.ascontiguousarray(table_data["mean"], dtype=np.float32)
+                components = np.ascontiguousarray(table_data["components"], dtype=np.float32)
+
+            for hs in data["hidden_states"]:
+                hs_np = np.ascontiguousarray(np.asarray(hs))
+                hidden_states_list.append(hs_np)
+                if table_present:
+                    hs_f32 = hs_np.astype(np.float32, copy=False)
+                    proj = np.ascontiguousarray((hs_f32 - mean) @ components.T, dtype=np.float32)
+                    projected_hidden_states_list.append(proj)
+                    projection_available.append(True)
+                else:
+                    projected_hidden_states_list.append(None)
+                    projection_available.append(False)
+
+            rollout_path = os.path.join(step_rollout_dir, f"{prompt_id}.npz")
+            np.savez_compressed(
+                rollout_path,
+                prompt_id=np.asarray(prompt_id),
+                prompt_token_ids=np.asarray(prompt_token_ids if prompt_token_ids is not None else [], dtype=np.int32),
+                epoch=np.asarray(int(epoch), dtype=np.int32),
+                global_step=np.asarray(int(self.global_steps), dtype=np.int32),
+                active_table_version=np.asarray(int(active_table_version), dtype=np.int32),
+                table_present=np.asarray(bool(table_present), dtype=np.bool_),
+                rewards=np.asarray(data["rewards"], dtype=np.float32),
+                response_tokens=self._hspec_dump_object_array(
+                    [np.ascontiguousarray(np.asarray(tok, dtype=np.int32)) for tok in data["tokens"]]
+                ),
+                hidden_states=self._hspec_dump_object_array(hidden_states_list),
+                projected_hidden_states=self._hspec_dump_object_array(projected_hidden_states_list),
+                projection_available=np.asarray(projection_available, dtype=np.bool_),
+            )
+
+            if table_present and prompt_id not in written_tables:
+                table_path = os.path.join(table_dir, f"{prompt_id}.npz")
+                np.savez_compressed(
+                    table_path,
+                    prompt_id=np.asarray(prompt_id),
+                    prompt_token_ids=np.asarray(prompt_token_ids if prompt_token_ids is not None else [], dtype=np.int32),
+                    epoch=np.asarray(int(epoch), dtype=np.int32),
+                    active_table_version=np.asarray(int(active_table_version), dtype=np.int32),
+                    hspec_similarity_threshold=np.asarray(
+                        float(self.config.actor_rollout_ref.rollout.get("hspec_similarity_threshold", 0.9)),
+                        dtype=np.float32,
+                    ),
+                    mean=np.ascontiguousarray(table_data["mean"], dtype=np.float32),
+                    components=np.ascontiguousarray(table_data["components"], dtype=np.float32),
+                    keys=np.ascontiguousarray(table_data["keys"]),
+                    rollout_seqs=self._hspec_dump_object_array(
+                        [np.ascontiguousarray(np.asarray(seq, dtype=np.int32)) for seq in table_data["rollout_seqs"]]
+                    ),
+                    entry_rollout_idx=np.ascontiguousarray(table_data["entry_rollout_idx"], dtype=np.int32),
+                    entry_offset=np.ascontiguousarray(table_data["entry_offset"], dtype=np.int32),
+                    n_entries=np.asarray(int(table_data["n_entries"]), dtype=np.int32),
+                    wnd_size=np.asarray(int(table_data["wnd_size"]), dtype=np.int32),
+                )
+                written_tables.add(prompt_id)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -980,6 +1112,11 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False) and self.async_rollout_mode:
+            raise NotImplementedError(
+                "HSpec rollout collection is only implemented for sync vLLM rollout in the current migration."
+            )
+
         self.global_steps = 0
 
         # load checkpoint before doing anything
@@ -1014,6 +1151,29 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+
+        if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+            from vllm_ascend.spec_decode.global_module.prefix_tree import get_history_trees
+
+            self.history_rollout_trees = get_history_trees()
+
+        if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+            from vllm_ascend.spec_decode.hspec_table import get_hspec_tables
+
+            similarity_threshold = self.config.actor_rollout_ref.rollout.get(
+                "hspec_similarity_threshold", 0.9
+            )
+            hspec_n_components = self.config.actor_rollout_ref.rollout.get(
+                "hspec_n_components", 64
+            )
+            hspec_max_entries = self.config.actor_rollout_ref.rollout.get(
+                "hspec_max_entries_per_prompt", 10000
+            )
+            self.hspec_tables = get_hspec_tables(
+                similarity_threshold=similarity_threshold,
+                n_components=hspec_n_components,
+                max_entries_per_prompt=hspec_max_entries,
+            )
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1197,6 +1357,191 @@ class RayPPOTrainer:
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
+                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        ray_history_spec_tasks = []
+                        with marked_timer("update_rollout_suffix_tree", timing_raw, color="navy"):
+                            metrics.update(self.history_rollout_trees.compute_metrics())
+                            from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
+
+                            for i in range(len(batch)):
+                                prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
+                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
+                                ray_history_spec_tasks.append(self.history_rollout_trees.delete(prompt_id))
+                                ray_history_spec_tasks.append(self.history_rollout_trees.add_tree(prompt_id))
+                            ray.get(ray_history_spec_tasks)
+                            ray_history_spec_tasks.clear()
+                            for i in range(len(batch)):
+                                batch_item = batch[i]
+                                token_level_scores = batch_item.batch["token_level_scores"]
+                                response = batch_item.batch["responses"].numpy().tolist()
+                                try:
+                                    response_length = response.index(self.tokenizer.pad_token_id)
+                                    response = response[:response_length]
+                                except Exception:
+                                    pass
+                                prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
+                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
+                                ray_history_spec_tasks.append(
+                                    self.history_rollout_trees.tree_append_node(
+                                        prompt_id, response, token_level_scores.sum().item()
+                                    )
+                                )
+                            self.history_rollout_trees.run_server()
+
+                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                        ray_hspec_tasks = []
+                        with marked_timer("update_hspec_tables", timing_raw, color="teal"):
+                            metrics.update(self.hspec_tables.compute_metrics())
+                            from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
+
+                            prompt_build_data: dict = defaultdict(
+                                lambda: {
+                                    "hidden_states": [],
+                                    "tokens": [],
+                                    "rewards": [],
+                                    "prompt_token_ids": None,
+                                }
+                            )
+                            _hspec_skip = 0
+                            _hspec_none_count = 0
+                            _hspec_empty_resp_count = 0
+                            _hspec_align_fail_count = 0
+                            _hspec_align_fail_trainer_len = 0
+                            _hspec_align_fail_upstream_hs = 0
+                            _hspec_align_fail_both = 0
+                            _hspec_align_fail_unknown = 0
+                            _hspec_align_debug_logged = 0
+
+                            for i in range(len(batch)):
+                                batch_item = batch[i]
+                                hs = batch_item.non_tensor_batch.get("rollout_hidden_states")
+                                if hs is None:
+                                    _hspec_skip += 1
+                                    _hspec_none_count += 1
+                                    continue
+
+                                hspec_tokens = batch_item.non_tensor_batch.get("rollout_hspec_tokens")
+                                if hspec_tokens is not None:
+                                    response = [int(x) for x in list(hspec_tokens)]
+                                    response_before_trim = list(response)
+                                else:
+                                    response = batch_item.batch["responses"].cpu().numpy().tolist()
+                                    response_before_trim = list(response)
+                                    try:
+                                        pad_idx = response.index(self.tokenizer.pad_token_id)
+                                        response = response[:pad_idx]
+                                    except ValueError:
+                                        pass
+
+                                if len(response) == 0:
+                                    _hspec_skip += 1
+                                    _hspec_empty_resp_count += 1
+                                    continue
+
+                                if (
+                                    hasattr(hs, "shape")
+                                    and hs.ndim == 2
+                                    and hs.shape[0] != len(response)
+                                ):
+                                    _hspec_skip += 1
+                                    _hspec_align_fail_count += 1
+                                    debug_meta = batch_item.non_tensor_batch.get("hspec_rollout_debug")
+                                    raw_response_len = None
+                                    raw_first_pad_idx = None
+                                    hs_len_debug = None
+                                    hs_source = None
+                                    response_head = None
+                                    response_tail = None
+                                    if isinstance(debug_meta, dict):
+                                        raw_response_len = debug_meta.get("raw_response_len")
+                                        raw_first_pad_idx = debug_meta.get("raw_response_first_pad_index")
+                                        hs_len_debug = debug_meta.get("hs_len")
+                                        hspec_token_len_debug = debug_meta.get("hspec_token_len")
+                                        hs_source = debug_meta.get("hs_source")
+                                        response_head = debug_meta.get("response_head")
+                                        response_tail = debug_meta.get("response_tail")
+                                    else:
+                                        hspec_token_len_debug = None
+                                    trainer_len_mismatch = (
+                                        raw_response_len is not None and int(raw_response_len) != len(response)
+                                    )
+                                    upstream_hs_mismatch = (
+                                        hspec_token_len_debug is not None
+                                        and hs_len_debug is not None
+                                        and int(hspec_token_len_debug) >= 0
+                                        and int(hs_len_debug) >= 0
+                                        and int(hs_len_debug) != int(hspec_token_len_debug)
+                                    )
+                                    if trainer_len_mismatch and upstream_hs_mismatch:
+                                        _hspec_align_fail_both += 1
+                                        align_reason = "both"
+                                    elif trainer_len_mismatch:
+                                        _hspec_align_fail_trainer_len += 1
+                                        align_reason = "trainer_trim"
+                                    elif upstream_hs_mismatch:
+                                        _hspec_align_fail_upstream_hs += 1
+                                        align_reason = "upstream_hs"
+                                    else:
+                                        _hspec_align_fail_unknown += 1
+                                        align_reason = "unknown"
+
+                                    if (
+                                        self._hspec_align_debug
+                                        and _hspec_align_debug_logged < self._hspec_align_debug_max_logs
+                                    ):
+                                        _hspec_align_debug_logged += 1
+                                        try:
+                                            prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
+                                            prompt_id_dbg = prompt_id_from_token_ids(prompt_token_ids)
+                                        except Exception:
+                                            prompt_id_dbg = "<prompt_id_error>"
+                                        print(
+                                            "HSPEC ALIGN DEBUG: "
+                                            f"epoch={epoch} step={self.global_steps} item={i} "
+                                            f"reason={align_reason} prompt_id={prompt_id_dbg} "
+                                            f"trainer_trimmed_len={len(response)} "
+                                            f"padded_response_len={len(response_before_trim)} "
+                                            f"hs_len={int(hs.shape[0])} "
+                                            f"raw_response_len={raw_response_len} "
+                                            f"hspec_token_len={hspec_token_len_debug} "
+                                            f"raw_first_pad_idx={raw_first_pad_idx} "
+                                            f"hs_source={hs_source} "
+                                            f"response_head={response_head} "
+                                            f"response_tail={response_tail}"
+                                        )
+                                    continue
+
+                                prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
+                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
+                                reward = batch_item.batch["token_level_scores"].sum().item()
+
+                                prompt_build_data[prompt_id]["hidden_states"].append(hs)
+                                prompt_build_data[prompt_id]["tokens"].append(response)
+                                prompt_build_data[prompt_id]["rewards"].append(reward)
+                                if prompt_build_data[prompt_id]["prompt_token_ids"] is None:
+                                    prompt_build_data[prompt_id]["prompt_token_ids"] = list(prompt_token_ids)
+
+                            if _hspec_skip > 0:
+                                print(
+                                    f"HSpec: skipped {_hspec_skip} samples "
+                                    f"(hs_none={_hspec_none_count}, "
+                                    f"empty_resp={_hspec_empty_resp_count}, "
+                                    f"align_fail={_hspec_align_fail_count}, "
+                                    f"align_fail_trainer_trim={_hspec_align_fail_trainer_len}, "
+                                    f"align_fail_upstream_hs={_hspec_align_fail_upstream_hs}, "
+                                    f"align_fail_both={_hspec_align_fail_both}, "
+                                    f"align_fail_unknown={_hspec_align_fail_unknown})"
+                                )
+
+                            if prompt_build_data and self._hspec_dump_enabled:
+                                with marked_timer("hspec_dump", timing_raw, color="teal"):
+                                    self._dump_hspec_rollouts_and_tables(
+                                        epoch,
+                                        dict(prompt_build_data),
+                                    )
+                            if prompt_build_data:
+                                ray_hspec_tasks = self.hspec_tables.build_tables_async(dict(prompt_build_data))
+
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
@@ -1210,6 +1555,14 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
+                        ray.get(ray_history_spec_tasks)
+
+                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                        if ray_hspec_tasks:
+                            with marked_timer("hspec_build_wait", timing_raw, color="teal"):
+                                ray.get(ray_hspec_tasks)
 
                 # validate
                 if (
@@ -1294,6 +1647,9 @@ class RayPPOTrainer:
                     )
 
                 if is_last_step:
+                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                        print(f"HSpec: final swap at epoch={epoch} step={self.global_steps}")
+                        self.hspec_tables.swap()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1303,3 +1659,7 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+            if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                print(f"HSpec: swap at epoch={epoch} (promote building -> active)")
+                self.hspec_tables.swap()

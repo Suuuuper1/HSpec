@@ -53,6 +53,14 @@ from vllm import LLM, SamplingParams
 from vllm.config.lora import LoRAConfig
 from vllm.lora.request import LoRARequest
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.spec_decode.hspec_utils import (
+    create_hspec_torch_npu_profiler,
+    hspec_clear_profile_context,
+    hspec_profile_enabled_for_step,
+    hspec_profile_output_dir,
+    hspec_record_function,
+    hspec_set_profile_context,
+)
 
 try:
     from vllm.worker.worker_base import WorkerWrapperBase
@@ -84,6 +92,11 @@ logging.getLogger("torch._dynamo").setLevel(logging.CRITICAL)
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
 # 3. simplify init logics
+
+# Print resolved speculative config once per process.
+_PRINTED_VLLM_SPEC_CONFIG = False
+_HSPEC_ALIGN_DEBUG = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
+_HSPEC_ALIGN_DEBUG_PREVIEW = int(os.getenv("HSPEC_ALIGN_DEBUG_PREVIEW", "8"))
 
 
 # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
@@ -189,6 +202,31 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
+        if self.config.use_history_spec_decode:
+            speculative_config = {
+                "method": "history_rollout",
+                "num_speculative_tokens": 5,  # no use
+                "prompt_lookup_min": 2,
+                "prompt_lookup_max": 7,
+            }
+        elif self.config.get("use_hspec_decode", False):
+            speculative_config = {
+                "method": "hspec",
+                "num_speculative_tokens": self.config.get("hspec_num_speculative_tokens", 5),
+                "hspec_similarity_threshold": self.config.get("hspec_similarity_threshold", 0.9),
+                "hspec_min_match_len": self.config.get("hspec_min_match_len", 1),
+            }
+        else:
+            speculative_config = None
+
+        if speculative_config is not None:
+            engine_kwargs["speculative_config"] = speculative_config
+
+        global _PRINTED_VLLM_SPEC_CONFIG
+        if not _PRINTED_VLLM_SPEC_CONFIG:
+            _PRINTED_VLLM_SPEC_CONFIG = True
+            logger.warning("Resolved vLLM speculative_config: %s", speculative_config)
+
         compilation_config = {}
 
         cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
@@ -264,6 +302,8 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self._hspec_align_debug = _HSPEC_ALIGN_DEBUG
+        self._hspec_align_debug_preview = _HSPEC_ALIGN_DEBUG_PREVIEW
 
         self.eplb_end()
 
@@ -337,6 +377,12 @@ class vLLMRollout(BaseRollout):
         eos_token_id = prompts.meta_info["eos_token_id"]
 
         batch_size = idx.size(0)
+        global_step = prompts.meta_info.get("global_steps")
+        profile_this_step = bool(
+            use_hspec := self.config.get("use_hspec_decode", False)
+        ) and hspec_profile_enabled_for_step(global_step)
+        profiler = None
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
         non_tensor_batch = prompts.non_tensor_batch
         if "raw_prompt_ids" not in non_tensor_batch:
@@ -367,6 +413,12 @@ class vLLMRollout(BaseRollout):
 
             input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
 
+        # used for history tree and prompt grouping in trainer
+        _vllm_inputs_list = [input_data["prompt_token_ids"] for input_data in vllm_inputs]
+        _vllm_inputs_arr = np.empty((len(_vllm_inputs_list),), dtype=object)
+        _vllm_inputs_arr[:] = _vllm_inputs_list
+        non_tensor_batch["vllm_inputs"] = _vllm_inputs_arr
+
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
@@ -396,72 +448,182 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
 
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=True,
+        if use_hspec:
+            from vllm_ascend.spec_decode.hspec_utils import (
+                hspec_clear_store,
+                hspec_flush_and_get_all,
             )
+            hspec_clear_store()
+        if profile_this_step:
+            profile_dir = os.path.join(
+                hspec_profile_output_dir(),
+                f"step_{int(global_step)}",
+            )
+            os.makedirs(profile_dir, exist_ok=True)
+            profiler = create_hspec_torch_npu_profiler(profile_dir)
+            hspec_set_profile_context(
+                enabled=True,
+                step=int(global_step),
+                req_idx=-1,
+            )
+            profiler.start()
+            try:
+                profiler.add_metadata_json(
+                    "hspec_profile_context",
+                    (
+                        f'{{"global_step": {int(global_step)}, '
+                        f'"req_scope": "all_requests", '
+                        f'"rank": {int(rank)}, '
+                        f'"mode": "{os.getenv("HSPEC_PROFILE_METHOD", "mstx")}"}}'
+                    ),
+                )
+            except Exception:
+                pass
 
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
-            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+        try:
+            with self.update_sampling_params(**kwargs):
+                with hspec_record_function("hspec/rollout/engine_generate", use_npu_stream=True):
+                    outputs = self.inference_engine.generate(
+                        prompts=vllm_inputs,
+                        sampling_params=self.sampling_params,
+                        lora_request=lora_requests,
+                        use_tqdm=True,
+                    )
 
-            response = []
-            rollout_log_probs = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
+                hs_store: dict = {}
+                if use_hspec:
+                    with hspec_record_function("hspec/rollout/hidden_state_flush", use_npu_stream=True):
+                        hs_store = hspec_flush_and_get_all()
+
+                response = []
+                rollout_log_probs = []
+                rollout_hidden_states_list: list = []
+                rollout_hspec_token_ids_list: list = []
+                rollout_debug_list: list = []
+                with hspec_record_function("hspec/rollout/output_collect"):
+                    for output in outputs:
+                        for sample_id in range(len(output.outputs)):
+                            response_ids = output.outputs[sample_id].token_ids
+                            response.append(response_ids)
+                            if self.config.calculate_log_probs:
+                                curr_log_prob = []
+                                for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                                    curr_log_prob.append(logprob[response_ids[i]].logprob)
+                                rollout_log_probs.append(curr_log_prob)
+                            if use_hspec:
+                                hs_source = "completion"
+                                hs = getattr(output.outputs[sample_id], "hidden_states", None)
+                                hspec_token_ids = getattr(output.outputs[sample_id], "hspec_token_ids", None)
+                                if hs is None:
+                                    hs_source = "store"
+                                    payload = hs_store.get(output.request_id)
+                                    if payload is not None:
+                                        hs = payload.get("hidden_states")
+                                        if hspec_token_ids is None:
+                                            hspec_token_ids = payload.get("token_ids")
+                                    else:
+                                        hs = None
+                                if hs is None:
+                                    hs_source = "none"
+                                rollout_hidden_states_list.append(hs)
+                                rollout_hspec_token_ids_list.append(hspec_token_ids)
+                                if self._hspec_align_debug:
+                                    raw_pad_idx = -1
+                                    try:
+                                        raw_pad_idx = response_ids.index(self.pad_token_id)
+                                    except ValueError:
+                                        pass
+                                    hs_len = -1
+                                    if hasattr(hs, "shape") and getattr(hs, "ndim", None) == 2:
+                                        hs_len = int(hs.shape[0])
+                                    preview = int(self._hspec_align_debug_preview)
+                                    rollout_debug_list.append(
+                                        {
+                                            "request_id": str(output.request_id),
+                                            "sample_id": int(sample_id),
+                                            "raw_response_len": int(len(response_ids)),
+                                            "raw_response_first_pad_index": int(raw_pad_idx),
+                                            "hs_len": int(hs_len),
+                                            "hspec_token_len": int(len(hspec_token_ids))
+                                            if hspec_token_ids is not None else -1,
+                                            "hs_source": hs_source,
+                                            "response_head": list(response_ids[:preview]),
+                                            "response_tail": list(response_ids[-preview:]) if response_ids else [],
+                                        }
+                                    )
+
+                with hspec_record_function("hspec/rollout/pad_concat", use_npu_stream=True):
+                    response = pad_2d_list_to_length(
+                        response, self.pad_token_id, max_length=self.config.response_length
+                    ).to(idx.device)
                     if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
+                        rollout_log_probs = pad_2d_list_to_length(
+                            rollout_log_probs, -1, max_length=self.config.response_length
+                        ).to(idx.device)
+                        rollout_log_probs = rollout_log_probs.to(torch.float32)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
-                idx.device
+                    seq = torch.cat([idx, response], dim=-1)
+        finally:
+            if profiler is not None:
+                try:
+                    torch.npu.synchronize()
+                except Exception:
+                    pass
+                try:
+                    profiler.step()
+                except Exception:
+                    pass
+                profiler.stop()
+            hspec_clear_profile_context()
+
+        with hspec_record_function("hspec/rollout/metadata_pack", use_npu_stream=True):
+            response_length = response.size(1)
+            delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+            delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+            if position_ids.dim() == 3:
+                delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(
+                    batch_size, position_ids.size(1), -1
+                )
+
+            # TODO(sgm): fix position_ids on right_pad
+            # prompt: left pad + response: right pad
+            # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+            # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+            response_position_ids = position_ids[..., -1:] + delta_position_id
+            position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+            response_attention_mask = get_response_mask(
+                response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+            )
+            attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+            batch = TensorDict(
+                {
+                    "prompts": idx,
+                    "responses": response,
+                    "input_ids": seq,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                },
+                batch_size=batch_size,
             )
             if self.config.calculate_log_probs:
-                rollout_log_probs = pad_2d_list_to_length(
-                    rollout_log_probs, -1, max_length=self.config.response_length
-                ).to(idx.device)
-                rollout_log_probs = rollout_log_probs.to(torch.float32)
+                batch["rollout_log_probs"] = rollout_log_probs
 
-            seq = torch.cat([idx, response], dim=-1)
+            if use_hspec and rollout_hidden_states_list:
+                _hs_list = list(rollout_hidden_states_list)
+                _hs_arr = np.empty((len(_hs_list),), dtype=object)
+                _hs_arr[:] = _hs_list
+                non_tensor_batch["rollout_hidden_states"] = _hs_arr
 
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
-        if position_ids.dim() == 3:  # qwen2vl mrope (batch size, 4, seq len)
-            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
+                _tok_list = list(rollout_hspec_token_ids_list)
+                _tok_arr = np.empty((len(_tok_list),), dtype=object)
+                _tok_arr[:] = _tok_list
+                non_tensor_batch["rollout_hspec_tokens"] = _tok_arr
 
-        # TODO(sgm): fix position_ids on right_pad
-        # prompt: left pad + response: right pad
-        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-        response_position_ids = position_ids[..., -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(
-            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
-        )
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
-
-        # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                "prompts": idx,
-                "responses": response,
-                "input_ids": seq,  # here input_ids become the whole sentences
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=batch_size,
-        )
-        if self.config.calculate_log_probs:
-            # we will recompute old log prob with actor
-            batch["rollout_log_probs"] = rollout_log_probs
+            if use_hspec and self._hspec_align_debug and rollout_debug_list:
+                _dbg_arr = np.empty((len(rollout_debug_list),), dtype=object)
+                _dbg_arr[:] = rollout_debug_list
+                non_tensor_batch["hspec_rollout_debug"] = _dbg_arr
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

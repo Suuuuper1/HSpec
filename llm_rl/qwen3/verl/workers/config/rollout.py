@@ -178,6 +178,16 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
 
+    # HSpec (Hidden State based Speculative Decoding)
+    # These are optional knobs; when disabled they add near-zero overhead.
+    use_hspec_decode: bool = False
+    hspec_num_speculative_tokens: int = 5
+    hspec_similarity_threshold: float = 0.9
+    hspec_min_match_len: int = 1
+    # Table build parameters (trainer-side; used by HSpecTableGroup)
+    hspec_n_components: int = 64
+    hspec_max_entries_per_prompt: int = 10000
+
     def __post_init__(self):
         """Validate the rollout config"""
         if self.expert_parallel_size > 1:

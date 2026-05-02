@@ -65,6 +65,24 @@ def run_ppo(config) -> None:
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
+    if config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+        from vllm_ascend.spec_decode.hspec_table import init_hspec_tables
+
+        similarity_threshold = config.actor_rollout_ref.rollout.get(
+            "hspec_similarity_threshold", 0.9
+        )
+        hspec_n_components = config.actor_rollout_ref.rollout.get(
+            "hspec_n_components", 64
+        )
+        hspec_max_entries = config.actor_rollout_ref.rollout.get(
+            "hspec_max_entries_per_prompt", 10000
+        )
+        init_hspec_tables(
+            similarity_threshold=similarity_threshold,
+            n_components=hspec_n_components,
+            max_entries_per_prompt=hspec_max_entries,
+        )
+
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
     if (

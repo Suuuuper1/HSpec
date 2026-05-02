@@ -293,5 +293,13 @@ profiler:
   # profile results saving path
   save_path: ${oc.select:global_profiler.save_path,null}
 
-  # specific tool config
-  tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
+# specific tool config
+tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
+
+# HSpec config
+use_hspec_decode: False
+hspec_num_speculative_tokens: 5
+hspec_similarity_threshold: 0.9
+hspec_min_match_len: 1
+hspec_n_components: 64
+hspec_max_entries_per_prompt: 10000
