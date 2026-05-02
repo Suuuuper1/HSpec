@@ -405,6 +405,20 @@ class EngineCore:
         if not self.async_scheduling and self.use_spec_decode and model_executed:
             # Take the draft token ids.
             draft_token_ids = self.model_executor.take_draft_token_ids()
+            if draft_token_ids is None:
+                # HSPEC diagnostics: if a worker produced a draft but it was not
+                # returned by the executor, the scheduler will never see spec
+                # tokens and use_spec_decode stays false.
+                spec_cfg = getattr(self.vllm_config, "speculative_config", None)
+                if (
+                    spec_cfg is not None
+                    and getattr(spec_cfg, "method", None) == "hspec"
+                    and (os.getenv("HSPEC_TRACE", "0") != "0")
+                ):
+                    logger.warning(
+                        "HSPEC TRACE EngineCore.post_step: draft_token_ids is None "
+                        "(scheduler will not schedule spec tokens next step)"
+                    )
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 

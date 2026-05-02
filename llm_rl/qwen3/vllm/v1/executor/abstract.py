@@ -230,7 +230,13 @@ class Executor(ABC):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         output: list[DraftTokenIds] = self.collective_rpc("take_draft_token_ids")
-        return output[0]
+        # Draft tokens may be produced on a subset of ranks depending on the
+        # proposer implementation and cache readiness. Pick the first non-empty
+        # result to avoid silently dropping drafts.
+        for out in output:
+            if out is not None:
+                return out
+        return None
 
     @property
     def max_concurrent_batches(self) -> int:

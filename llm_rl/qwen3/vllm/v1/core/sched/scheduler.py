@@ -1243,6 +1243,32 @@ class Scheduler(SchedulerInterface):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params:
+                # HSpec: pop accumulated hidden states for finished requests so
+                # they can be serialized to the front-end process via
+                # EngineCoreOutput.
+                hspec_hs = None
+                hspec_tok = None
+                if stopped:
+                    # Keep overhead off the hot path when HSpec is not enabled.
+                    spec_cfg = getattr(self.vllm_config, "speculative_config", None)
+                    if (
+                        spec_cfg is not None
+                        and getattr(spec_cfg, "method", None) == "hspec"
+                    ):
+                        try:
+                            hspec_utils = __import__(
+                                "vllm_ascend.spec_decode.hspec_utils",
+                                fromlist=["hspec_pop_request"],
+                            )
+                            hspec_pop_request = getattr(hspec_utils, "hspec_pop_request")
+                            hspec_payload = hspec_pop_request(req_id)
+                            if hspec_payload is not None:
+                                hspec_hs = hspec_payload.get("hidden_states")
+                                hspec_tok = hspec_payload.get("token_ids")
+                        except (ImportError, Exception):
+                            # HSpec helper is optional in non-Ascend environments.
+                            pass
+
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1257,6 +1283,8 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
+                        hspec_hidden_states=hspec_hs,
+                        hspec_token_ids=hspec_tok,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )

@@ -19,6 +19,7 @@
 
 import os
 import math
+import time
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -62,8 +63,9 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         KVCacheGroupSpec, KVCacheSpec,
                                         MambaSpec, UniformTypeKVCacheSpecs)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
-                             LogprobsLists, LogprobsTensors, ModelRunnerOutput,
-                             SamplerOutput, ECConnectorOutput,
+                             DraftTokenIds, ECConnectorOutput, LogprobsLists,
+                             LogprobsTensors, ModelRunnerOutput,
+                             SamplerOutput,
                              make_empty_encoder_model_runner_output)
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -98,6 +100,9 @@ from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
+from vllm_ascend.spec_decode.hspec_proposer import HSpecProposer
+from vllm_ascend.spec_decode.hspec_utils import hspec_record_function
+from vllm_ascend.spec_decode.interface import SpecDcodeType
 from vllm_ascend.spec_decode.medusa_proposer import MedusaProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
 from vllm_ascend.utils import (AscendDeviceType, ProfileExecuteDuration,
@@ -168,6 +173,62 @@ def graph_capture(device: torch.device):
 
 def get_tp_context(drafter):
     return getattr(drafter, "tp_group_context", nullcontext())
+
+
+# HSpec tracing helpers (aligned with HSPEC DEBUG req_idx)
+def _hspec_trace_req_idx() -> int:
+    try:
+        from vllm_ascend.spec_decode.hspec_proposer import HSPEC_DEBUG_REQ_IDX
+        return int(HSPEC_DEBUG_REQ_IDX)
+    except Exception:
+        return int(os.getenv("HSPEC_DEBUG_REQ_IDX", "3"))
+
+
+def _hspec_trace_enabled() -> bool:
+    return os.getenv("HSPEC_TRACE", "0") != "0"
+
+
+def _hspec_gen_enabled() -> bool:
+    return os.getenv("HSPEC_GEN", "0") != "0"
+
+
+def _hspec_gen_req_idx() -> int:
+    try:
+        from vllm_ascend.spec_decode.hspec_proposer import HSPEC_GEN_REQ_IDX
+        return int(HSPEC_GEN_REQ_IDX)
+    except Exception:
+        return int(os.getenv("HSPEC_GEN_REQ_IDX", os.getenv("HSPEC_DEBUG_REQ_IDX", "3")))
+
+
+def _hspec_align_debug_enabled() -> bool:
+    return os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
+
+
+def _hspec_align_debug_max_logs() -> int:
+    try:
+        return max(int(os.getenv("HSPEC_ALIGN_DEBUG_MAX_LOGS", "24")), 0)
+    except Exception:
+        return 24
+
+
+def _hspec_trace_banner(logger) -> None:
+    if not _hspec_trace_enabled():
+        return
+    key = "_HSPEC_TRACE_BANNER_PRINTED"
+    if os.getenv(key, "0") != "0":
+        return
+    os.environ[key] = "1"
+    try:
+        logger.warning(
+            "HSPEC TRACE banner: enabled=1 file=%s pid=%s req_idx=%d HSPEC_DEBUG=%s HSPEC_TRACE=%s",
+            __file__,
+            str(os.getpid()),
+            int(_hspec_trace_req_idx()),
+            os.getenv("HSPEC_DEBUG", ""),
+            os.getenv("HSPEC_TRACE", ""),
+        )
+    except Exception:
+        pass
 
 
 class ExecuteModelState(NamedTuple):
@@ -368,8 +429,8 @@ class NPUModelRunner(GPUModelRunner):
         # set at runtime based on the batch-size threshold.
         self.speculative_decoding_active = False
         self.drafter: Optional[Union[NgramProposer, EagleProposer, MtpProposer,
-                                     SuffixDecodingProposer,
-                                     MedusaProposer]] = None
+                                     SuffixDecodingProposer, MedusaProposer,
+                                     HSpecProposer]] = None
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
         if self.speculative_config:
@@ -386,6 +447,28 @@ class NPUModelRunner(GPUModelRunner):
             self.actual_seq_lengths_q = list(
                 range(self.decode_token_per_req, self.max_num_tokens + 1,
                       self.decode_token_per_req))
+        self._hspec_collect = (
+            self.speculative_config is not None
+            and getattr(self.speculative_config, "method", "") == "hspec"
+        )
+        if self._hspec_collect:
+            from vllm_ascend.spec_decode.hspec_utils import hspec_set_collection_enabled
+
+            hspec_set_collection_enabled(True)
+            logger.info("HSpec: anchor hidden-state collection enabled in model_runner")
+        self._hspec_verify_metrics_enabled = (
+            os.environ.get("HSPEC_VERIFY_METRICS", "1") != "0"
+        )
+        self._hspec_verify_report_every_calls = int(
+            os.environ.get("HSPEC_VERIFY_REPORT_EVERY_CALLS", "50")
+        )
+        self._hspec_verify_stat_calls = 0
+        self._hspec_verify_pending_verify = 0
+        self._hspec_verify_pending_accept = 0
+        self._hspec_verify_pending_accept_len_sum = 0
+        self._hspec_verify_pending_accept_advan = 0
+        self._hspec_verify_pending_reject_advan = 0
+        self._hspec_align_debug_logs = 0
         self.discard_request_indices = self._make_buffer(self.max_num_reqs,
                                                          dtype=torch.int64)
         self.num_discarded_requests = 0
@@ -393,6 +476,210 @@ class NPUModelRunner(GPUModelRunner):
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method,
                                       self.vllm_config, self.device, self)
+
+    def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+        super()._update_states(scheduler_output)
+        if (self.drafter is None
+                or getattr(self.drafter, "name", None) != SpecDcodeType.HSPEC
+                or not hasattr(self.drafter, "clear_request")):
+            return
+        for req_id in scheduler_output.finished_req_ids:
+            try:
+                self.drafter.clear_request(req_id)
+            except Exception:
+                pass
+
+    def _hspec_maybe_report_verification_metrics(
+        self,
+        verify_times: int,
+        accept_times: int,
+        accept_length_sum: int,
+        accept_times_advan: int = 0,
+        reject_times_advan: int = 0,
+    ) -> None:
+        if not self._hspec_verify_metrics_enabled:
+            return
+        if (verify_times <= 0 and accept_times <= 0
+                and accept_length_sum <= 0 and accept_times_advan <= 0
+                and reject_times_advan <= 0):
+            return
+        if not self._hspec_collect:
+            return
+
+        self._hspec_verify_stat_calls += 1
+        self._hspec_verify_pending_verify += int(verify_times)
+        self._hspec_verify_pending_accept += int(accept_times)
+        self._hspec_verify_pending_accept_len_sum += int(accept_length_sum)
+        self._hspec_verify_pending_accept_advan += int(accept_times_advan)
+        self._hspec_verify_pending_reject_advan += int(reject_times_advan)
+
+        if self._hspec_verify_report_every_calls <= 1:
+            should_flush = True
+        else:
+            should_flush = (
+                self._hspec_verify_stat_calls
+                % self._hspec_verify_report_every_calls == 0
+            )
+        if not should_flush:
+            return
+
+        vt = int(self._hspec_verify_pending_verify)
+        at = int(self._hspec_verify_pending_accept)
+        als = int(self._hspec_verify_pending_accept_len_sum)
+        ata = int(self._hspec_verify_pending_accept_advan)
+        rta = int(self._hspec_verify_pending_reject_advan)
+        if vt <= 0 and at <= 0 and als <= 0 and ata <= 0 and rta <= 0:
+            return
+
+        tables = getattr(self.drafter, "hspec_tables", None)
+        if tables is None or not hasattr(tables, "report_verification_metrics_async"):
+            return
+        try:
+            tables.report_verification_metrics_async(vt, at, als, ata, rta)
+            self._hspec_verify_pending_verify = 0
+            self._hspec_verify_pending_accept = 0
+            self._hspec_verify_pending_accept_len_sum = 0
+            self._hspec_verify_pending_accept_advan = 0
+            self._hspec_verify_pending_reject_advan = 0
+        except Exception:
+            pass
+
+    def _hspec_accumulate_hidden_states(
+        self,
+        sample_hidden_states: torch.Tensor,
+        valid_sampled_token_ids: list[list[int]],
+        spec_decode_metadata: Optional[SpecDecodeMetadata],
+        accepted_prefix_lengths: Optional[list[int]] = None,
+    ) -> None:
+        from vllm_ascend.spec_decode.hspec_utils import hspec_append_step_hs
+
+        num_reqs = self.input_batch.num_reqs
+        n = min(num_reqs, len(valid_sampled_token_ids))
+
+        if spec_decode_metadata is None:
+            for i in range(n):
+                sampled_ids = valid_sampled_token_ids[i]
+                if not sampled_ids:
+                    continue
+                req_id = self.input_batch.req_ids[i]
+                appended_count = 0
+                hspec_append_step_hs(req_id, sample_hidden_states[i].clone().half())
+                appended_count += 1
+                if (_hspec_align_debug_enabled()
+                        and appended_count != len(sampled_ids)
+                        and not hasattr(self, "_hspec_align_debug_logs")):
+                    self._hspec_align_debug_logs = 0
+                if (_hspec_align_debug_enabled()
+                        and appended_count != len(sampled_ids)
+                        and getattr(self, "_hspec_align_debug_logs", 0)
+                        < _hspec_align_debug_max_logs()):
+                    self._hspec_align_debug_logs += 1
+                    logger.warning(
+                        "HSPEC ALIGN DEBUG model_runner accumulate mismatch: "
+                        "req_id=%s mode=non_spec out_len=%d appended=%d sampled_ids=%s",
+                        str(req_id),
+                        int(len(sampled_ids)),
+                        int(appended_count),
+                        list(sampled_ids),
+                    )
+            return
+
+        num_draft_list = spec_decode_metadata.num_draft_tokens
+        bonus_indices = spec_decode_metadata.bonus_logits_indices
+        target_logits_indices = spec_decode_metadata.target_logits_indices
+        cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens
+
+        for i in range(n):
+            sampled_ids = valid_sampled_token_ids[i]
+            if not sampled_ids:
+                continue
+            req_id = self.input_batch.req_ids[i]
+            appended_count = 0
+            if num_draft_list[i] == 0:
+                bonus_idx = int(bonus_indices[i].item())
+                hspec_append_step_hs(req_id, sample_hidden_states[bonus_idx].clone().half())
+                appended_count += 1
+                if (_hspec_align_debug_enabled()
+                        and appended_count != len(sampled_ids)
+                        and getattr(self, "_hspec_align_debug_logs", 0)
+                        < _hspec_align_debug_max_logs()):
+                    self._hspec_align_debug_logs += 1
+                    logger.warning(
+                        "HSPEC ALIGN DEBUG model_runner accumulate mismatch: "
+                        "req_id=%s mode=spec_no_draft out_len=%d appended=%d bonus_idx=%d sampled_ids=%s",
+                        str(req_id),
+                        int(len(sampled_ids)),
+                        int(appended_count),
+                        int(bonus_idx),
+                        list(sampled_ids),
+                    )
+                continue
+
+            num_drafts = int(num_draft_list[i])
+            accepted = (
+                int(accepted_prefix_lengths[i])
+                if accepted_prefix_lengths is not None and i < len(accepted_prefix_lengths)
+                else 0
+            )
+            out_len = len(sampled_ids)
+
+            start = int(cu_num_draft_tokens[i - 1].item()) if i > 0 else 0
+            end = start + num_drafts
+            local_target_rows = target_logits_indices[start:end]
+
+            for j in range(min(accepted, num_drafts, out_len)):
+                row_idx = int(local_target_rows[j].item())
+                hspec_append_step_hs(req_id, sample_hidden_states[row_idx].clone().half())
+                appended_count += 1
+
+            if out_len > accepted:
+                if accepted < num_drafts:
+                    row_idx = int(local_target_rows[accepted].item())
+                    hspec_append_step_hs(req_id, sample_hidden_states[row_idx].clone().half())
+                    appended_count += 1
+                else:
+                    bonus_idx = int(bonus_indices[i].item())
+                    hspec_append_step_hs(req_id, sample_hidden_states[bonus_idx].clone().half())
+                    appended_count += 1
+
+            if (_hspec_align_debug_enabled()
+                    and appended_count != out_len
+                    and getattr(self, "_hspec_align_debug_logs", 0)
+                    < _hspec_align_debug_max_logs()):
+                self._hspec_align_debug_logs += 1
+                logger.warning(
+                    "HSPEC ALIGN DEBUG model_runner accumulate mismatch: "
+                    "req_id=%s mode=spec out_len=%d appended=%d num_drafts=%d accepted_prefix_len=%d "
+                    "local_target_rows=%d sampled_ids=%s",
+                    str(req_id),
+                    int(out_len),
+                    int(appended_count),
+                    int(num_drafts),
+                    int(accepted),
+                    int(local_target_rows.numel()),
+                    list(sampled_ids),
+                )
+
+    def _hspec_compute_accepted_prefix_lengths(
+        self,
+        scheduler_output: "SchedulerOutput",
+        valid_sampled_token_ids: list[list[int]],
+    ) -> list[int]:
+        accepted_prefix_lengths: list[int] = [0] * len(self.input_batch.req_ids)
+        scheduled = scheduler_output.scheduled_spec_decode_tokens
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            draft = scheduled.get(req_id, [])
+            if not draft:
+                continue
+            out = valid_sampled_token_ids[i] if i < len(valid_sampled_token_ids) else []
+            accepted = 0
+            for p in range(min(len(draft), len(out))):
+                if int(out[p]) == int(draft[p]):
+                    accepted += 1
+                else:
+                    break
+            accepted_prefix_lengths[i] = int(accepted)
+        return accepted_prefix_lengths
 
     def _use_aclgraph(self) -> bool:
         return self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.compilation_config.mode == CompilationMode.VLLM_COMPILE and not self.model_config.enforce_eager
@@ -813,6 +1100,22 @@ class NPUModelRunner(GPUModelRunner):
                                             num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
+        if _hspec_trace_enabled() and self.input_batch.num_reqs > 0:
+            di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1)
+            try:
+                trace_req_id = self.input_batch.req_ids[di]
+                scheduled = scheduler_output.scheduled_spec_decode_tokens.get(trace_req_id, [])
+                logger.warning(
+                    "HSPEC TRACE prepare_inputs [req_idx=%d]: req_id=%s use_spec_decode=%s "
+                    "scheduled_spec_tokens=%s (len=%d)",
+                    int(di),
+                    str(trace_req_id),
+                    str(bool(use_spec_decode)),
+                    list(scheduled),
+                    int(len(scheduled)),
+                )
+            except Exception:
+                pass
         # save logits_indices for pcp spec decode usage
         self.logits_indices = logits_indices
 
@@ -1171,6 +1474,29 @@ class NPUModelRunner(GPUModelRunner):
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        if _hspec_trace_enabled():
+            di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1) \
+                if self.input_batch.num_reqs > 0 else 0
+            if di < self.input_batch.num_reqs:
+                trace_id = self.input_batch.req_ids[di]
+                tidx = di
+                n = int(num_draft_tokens[tidx])
+                if n > 0:
+                    cu_num_draft_tokens_np = np.cumsum(num_draft_tokens, dtype=np.int32)
+                    start = 0 if tidx == 0 else int(cu_num_draft_tokens_np[tidx - 1])
+                    end = int(cu_num_draft_tokens_np[tidx])
+                    try:
+                        flat = draft_token_ids[start:end].detach().cpu().tolist()
+                    except Exception:
+                        flat = []
+                    logger.warning(
+                        "HSPEC TRACE model_runner._calc_spec_decode_metadata: "
+                        "req_id=%s req_idx=%d num_draft=%d flat_draft_token_ids=%s",
+                        str(trace_id),
+                        int(tidx),
+                        int(n),
+                        flat,
+                    )
         if self.pcp_size > 1:
             logits_indices = logits_indices_pcp
         return SpecDecodeMetadata(
@@ -1206,6 +1532,51 @@ class NPUModelRunner(GPUModelRunner):
                     valid_sampled_token_ids, sampling_metadata,
                     scheduler_output, spec_decode_metadata, positions,
                     num_scheduled_tokens, hidden_states, aux_hidden_states)
+            elif getattr(self.drafter, "name", None) == SpecDcodeType.HSPEC:
+                hs_for_hspec = (
+                    sample_hidden_states
+                    if sample_hidden_states is not None
+                    else hidden_states
+                )
+                _hspec_gen = _hspec_gen_enabled()
+                _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
+                _t0_gen = time.perf_counter_ns() if _hspec_gen else 0
+                draft_token_ids = self.drafter.generate_token_ids(
+                    valid_sampled_token_ids,
+                    sampling_metadata,
+                    scheduler_output,
+                    spec_decode_metadata,
+                    positions,
+                    num_scheduled_tokens,
+                    hs_for_hspec,
+                    attn_metadata,
+                    aux_hidden_states,
+                )
+                if _hspec_gen and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                    try:
+                        req_id = self.input_batch.req_ids[di]
+                        req_state = self.requests.get(req_id)
+                        decoded_len = len(getattr(req_state, "output_token_ids", [])) \
+                            if req_state is not None else -1
+                        dt_ms = (time.perf_counter_ns() - _t0_gen) / 1_000_000.0
+                        draft_i = (
+                            draft_token_ids[di]
+                            if draft_token_ids is not None and di < len(draft_token_ids)
+                            else []
+                        )
+                        logger.warning(
+                            "HSPEC GEN runner_propose_total [req_idx=%d] req_id=%s decoded_len=%d "
+                            "runner_propose_total_ms=%.3f draft_len=%d draft=%s",
+                            int(di),
+                            str(req_id),
+                            int(decoded_len),
+                            float(dt_ms),
+                            int(len(draft_i)),
+                            list(draft_i),
+                        )
+                    except Exception:
+                        pass
             elif isinstance(self.drafter, MedusaProposer):
                 draft_token_ids = self.drafter.generate_token_ids(
                     valid_sampled_token_ids, sampling_metadata,
@@ -1368,6 +1739,7 @@ class NPUModelRunner(GPUModelRunner):
 
         with ProfileExecuteDuration().capture_async("prepare input"):
             self._update_states(scheduler_output)
+            _hspec_trace_banner(logger)
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
                         scheduler_output,
@@ -1398,6 +1770,34 @@ class NPUModelRunner(GPUModelRunner):
              model_kwargs, ec_connector_output) = self._preprocess(scheduler_output,
                                               num_input_tokens,
                                               intermediate_tensors)
+
+            if (self._hspec_collect and self.drafter is not None
+                    and hasattr(self.drafter, "prefetch_for_batch")):
+                _hspec_gen = _hspec_gen_enabled()
+                _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
+                _t0_prefetch = time.perf_counter_ns() if _hspec_gen else 0
+                with hspec_record_function("hspec/prefetch/launch"):
+                    self.drafter.prefetch_for_batch(
+                        self.input_batch.req_ids[:self.input_batch.num_reqs])
+                if _hspec_gen and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                    try:
+                        trace_id = self.input_batch.req_ids[di]
+                        req_state = self.requests.get(trace_id)
+                        decoded_len = len(getattr(req_state, "output_token_ids", [])) \
+                            if req_state is not None else -1
+                        dt_ms = (time.perf_counter_ns() - _t0_prefetch) / 1_000_000.0
+                        logger.warning(
+                            "HSPEC GEN prefetch_launch [req_idx=%d] req_id=%s decoded_len=%d "
+                            "prefetch_launch_ms=%.3f batch_num_reqs=%d",
+                            int(di),
+                            str(trace_id),
+                            int(decoded_len),
+                            float(dt_ms),
+                            int(self.input_batch.num_reqs),
+                        )
+                    except Exception:
+                        pass
 
             # update global cos, sin
             update_cos_sin(positions)
@@ -1569,6 +1969,63 @@ class NPUModelRunner(GPUModelRunner):
 
         with ProfileExecuteDuration().capture_async("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if (_hspec_trace_enabled() and spec_decode_metadata is not None
+                and self.input_batch.num_reqs > 0):
+            di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1)
+            trace_id = self.input_batch.req_ids[di]
+            draft = scheduler_output.scheduled_spec_decode_tokens.get(trace_id, [])
+            n_draft = len(draft)
+            if n_draft > 0:
+                try:
+                    row = sampler_output.sampled_token_ids[di].detach().cpu().tolist()
+                except Exception:
+                    row = []
+                accepted = 0
+                for p in range(min(n_draft, len(row))):
+                    if row[p] == -1:
+                        break
+                    if int(row[p]) == int(draft[p]):
+                        accepted += 1
+                    else:
+                        break
+                rejected = draft[accepted:]
+                recovered_token = None
+                if accepted < n_draft and accepted < len(row) and row[accepted] != -1:
+                    recovered_token = int(row[accepted])
+                bonus_token = None
+                if accepted == n_draft and n_draft < len(row) and row[n_draft] != -1:
+                    bonus_token = int(row[n_draft])
+                req_state = self.requests.get(trace_id)
+                decoded_len = len(getattr(req_state, "output_token_ids", [])) \
+                    if req_state is not None else -1
+                try:
+                    from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
+                    prompt_id = (
+                        prompt_id_from_token_ids(req_state.prompt_token_ids)
+                        if req_state is not None else "<no_req_state>"
+                    )
+                except Exception:
+                    prompt_id = "<prompt_id_error>"
+                corr_id = f"req_id={trace_id!r} prompt_id={prompt_id!r} decoded_len={decoded_len}"
+                logger.warning(
+                    "HSPEC TRACE rejection_result [req_idx=%d] %s | "
+                    "draft(len=%d)=%s | output_row=%s | "
+                    "accepted_draft_prefix_len=%d accepted_draft=%s rejected_draft=%s "
+                    "recovered_token=%s bonus_token=%s "
+                    "(sampling: all_greedy=%s all_random=%s)",
+                    int(di),
+                    corr_id,
+                    int(n_draft),
+                    list(draft),
+                    row,
+                    int(accepted),
+                    list(draft[:accepted]),
+                    list(rejected),
+                    str(recovered_token),
+                    str(bonus_token),
+                    str(getattr(self.input_batch.sampling_metadata, "all_greedy", False)),
+                    str(getattr(self.input_batch.sampling_metadata, "all_random", False)),
+                )
 
         def propose_draft_token_ids(sampled_token_ids):
             assert self.spec_decode_common_attn_metadata is not None
@@ -1600,6 +2057,7 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states,
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
+            sample_hidden_states,
         )
 
         with ProfileExecuteDuration().capture_async("Draft"):
@@ -1615,6 +2073,24 @@ class NPUModelRunner(GPUModelRunner):
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
+                if _hspec_trace_enabled() and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1)
+                    try:
+                        trace_req_id = self.input_batch.req_ids[di]
+                        draft_i = []
+                        if self._draft_token_ids is not None and di < len(self._draft_token_ids):
+                            draft_i = list(self._draft_token_ids[di])
+                        logger.warning(
+                            "HSPEC TRACE step_proposer_out [req_idx=%d]: "
+                            "req_id=%s draft_token_ids=%s (len=%d) "
+                            "| next_step_verification_depends_on_engine_post_step",
+                            int(di),
+                            str(trace_req_id),
+                            draft_i,
+                            int(len(draft_i)),
+                        )
+                    except Exception:
+                        pass
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
@@ -1666,6 +2142,27 @@ class NPUModelRunner(GPUModelRunner):
             vocab_size=self.input_batch.vocab_size,
         )
 
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        draft_output = super().take_draft_token_ids()
+        if draft_output is None:
+            return None
+        if _hspec_trace_enabled() and self.input_batch.num_reqs > 0:
+            di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1)
+            try:
+                trace_id = self.input_batch.req_ids[di]
+                if di < len(draft_output.draft_token_ids):
+                    logger.warning(
+                        "HSPEC TRACE model_runner.take_draft_token_ids [req_idx=%d]: "
+                        "req_id=%s draft_token_ids=%s (len=%d)",
+                        int(di),
+                        str(trace_id),
+                        list(draft_output.draft_token_ids[di]),
+                        int(len(draft_output.draft_token_ids[di])),
+                    )
+            except Exception:
+                pass
+        return draft_output
+
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.
@@ -1680,12 +2177,37 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[:len(spec_decode_metadata.logits_indices)]
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
+        _hspec_gen = _hspec_gen_enabled()
+        _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
+        _t0_rej = time.perf_counter_ns() if _hspec_gen else 0
+        with hspec_record_function("hspec/verification/rejection_sampler", use_npu_stream=True):
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
+        if _hspec_gen and self.input_batch.num_reqs > 0:
+            di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+            try:
+                trace_id = self.input_batch.req_ids[di]
+                req_state = self.requests.get(trace_id)
+                decoded_len = len(getattr(req_state, "output_token_ids", [])) \
+                    if req_state is not None else -1
+                dt_ms = (time.perf_counter_ns() - _t0_rej) / 1_000_000.0
+                logger.warning(
+                    "HSPEC GEN rejection_sampler [req_idx=%d] req_id=%s decoded_len=%d "
+                    "rejection_sampler_ms=%.3f logits_shape=%s out_shape=%s",
+                    int(di),
+                    str(trace_id),
+                    int(decoded_len),
+                    float(dt_ms),
+                    str(tuple(logits.shape)) if hasattr(logits, "shape") else "<no_shape>",
+                    str(tuple(sampler_output.sampled_token_ids.shape))
+                    if hasattr(sampler_output.sampled_token_ids, "shape") else "<no_shape>",
+                )
+            except Exception:
+                pass
         if self.need_accepted_tokens:  # TODO remove this if
             self._update_states_after_model_execute(
                 sampler_output.sampled_token_ids)
@@ -1701,6 +2223,7 @@ class NPUModelRunner(GPUModelRunner):
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        sample_hidden_states: torch.Tensor | None,
     ) -> tuple[
             LogprobsLists | None,
             list[list[int]],
@@ -1738,12 +2261,98 @@ class NPUModelRunner(GPUModelRunner):
                     valid_sampled_token_ids[int(i)].clear()
             else:
                 # Includes spec decode tokens.
-                valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
-                    sampled_token_ids,
-                    self.input_batch.vocab_size,
-                    discard_sampled_tokens_req_indices,
-                    logprobs_tensors=logprobs_tensors,
+                _hspec_gen = _hspec_gen_enabled()
+                _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
+                _t0_parse = time.perf_counter_ns() if _hspec_gen else 0
+                with hspec_record_function("hspec/verification/parse_output"):
+                    valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
+                        sampled_token_ids,
+                        self.input_batch.vocab_size,
+                        discard_sampled_tokens_req_indices,
+                        logprobs_tensors=logprobs_tensors,
+                    )
+                if _hspec_gen and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                    try:
+                        trace_id = self.input_batch.req_ids[di]
+                        draft = scheduler_output.scheduled_spec_decode_tokens.get(trace_id, [])
+                        out = valid_sampled_token_ids[di] if di < len(valid_sampled_token_ids) else []
+                        dt_ms = (time.perf_counter_ns() - _t0_parse) / 1_000_000.0
+                        accepted = 0
+                        for p in range(min(len(draft), len(out))):
+                            if int(out[p]) == int(draft[p]):
+                                accepted += 1
+                            else:
+                                break
+                        req_state = self.requests.get(trace_id)
+                        decoded_len = len(getattr(req_state, "output_token_ids", [])) \
+                            if req_state is not None else -1
+                        logger.warning(
+                            "HSPEC GEN parse_output [req_idx=%d] req_id=%s decoded_len=%d "
+                            "parse_output_ms=%.3f out_len=%d out=%s accepted_draft_prefix_len=%d",
+                            int(di),
+                            str(trace_id),
+                            int(decoded_len),
+                            float(dt_ms),
+                            int(len(out)),
+                            list(out),
+                            int(accepted),
+                        )
+                    except Exception:
+                        pass
+            accepted_prefix_lengths = [0] * len(self.input_batch.req_ids)
+            if spec_decode_metadata is not None and max_gen_len > 1:
+                accepted_prefix_lengths = self._hspec_compute_accepted_prefix_lengths(
+                    scheduler_output,
+                    valid_sampled_token_ids,
                 )
+
+            accept_advan_add = 0
+            reject_advan_add = 0
+            if (self.drafter is not None
+                    and getattr(self.drafter, "name", None) == SpecDcodeType.HSPEC
+                    and hasattr(self.drafter, "update_verification_outcomes")
+                    and spec_decode_metadata is not None
+                    and max_gen_len > 1):
+                try:
+                    n = min(len(self.input_batch.req_ids), len(accepted_prefix_lengths))
+                    accept_advan_add, reject_advan_add = self.drafter.update_verification_outcomes(
+                        self.input_batch.req_ids[:n],
+                        accepted_prefix_lengths[:n],
+                    )
+                    accept_advan_add = int(accept_advan_add)
+                    reject_advan_add = int(reject_advan_add)
+                except Exception:
+                    accept_advan_add = 0
+                    reject_advan_add = 0
+
+            if (self._hspec_collect and self._hspec_verify_metrics_enabled
+                    and spec_decode_metadata is not None and max_gen_len > 1):
+                try:
+                    verify_add = 0
+                    accept_add = 0
+                    accept_len_add = 0
+                    for i, req_id in enumerate(self.input_batch.req_ids):
+                        draft = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+                        if not draft:
+                            continue
+                        verify_add += 1
+                        accepted = (
+                            accepted_prefix_lengths[i]
+                            if i < len(accepted_prefix_lengths) else 0
+                        )
+                        if accepted >= 1:
+                            accept_add += 1
+                            accept_len_add += int(accepted)
+                    self._hspec_maybe_report_verification_metrics(
+                        verify_add,
+                        accept_add,
+                        accept_len_add,
+                        accept_advan_add,
+                        reject_advan_add,
+                    )
+                except Exception:
+                    pass
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
@@ -1761,12 +2370,27 @@ class NPUModelRunner(GPUModelRunner):
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
             }
+            accepted_prefix_lengths = []
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
+        if self._hspec_collect and not self.use_async_scheduling:
+            try:
+                from vllm_ascend.spec_decode.hspec_utils import hspec_extend_step_tokens
+
+                n = min(num_sampled_tokens, len(valid_sampled_token_ids))
+                for req_idx in range(n):
+                    sampled_ids = valid_sampled_token_ids[req_idx]
+                    if not sampled_ids:
+                        continue
+                    req_id = self.input_batch.req_ids[req_idx]
+                    hspec_extend_step_tokens(req_id, sampled_ids)
+            except Exception:
+                pass
+
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
@@ -1797,6 +2421,53 @@ class NPUModelRunner(GPUModelRunner):
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
+
+        if (not self.use_async_scheduling and self.drafter is not None
+                and getattr(self.drafter, "name", None) == SpecDcodeType.HSPEC
+                and hasattr(self.drafter, "update_accept_lengths")):
+            try:
+                n = len(valid_sampled_token_ids)
+                self.drafter.update_accept_lengths(
+                    self.input_batch.req_ids[:n],
+                    [len(x) for x in valid_sampled_token_ids],
+                )
+            except Exception:
+                pass
+
+        if (self._hspec_collect and not self.use_async_scheduling
+                and sample_hidden_states is not None):
+            _hspec_gen = _hspec_gen_enabled()
+            _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
+            _t0_acc = time.perf_counter_ns() if _hspec_gen else 0
+            with hspec_record_function(
+                    "hspec/verification/accumulate_hidden_states",
+                    use_npu_stream=True):
+                self._hspec_accumulate_hidden_states(
+                    sample_hidden_states,
+                    valid_sampled_token_ids,
+                    spec_decode_metadata,
+                    accepted_prefix_lengths=accepted_prefix_lengths,
+                )
+            if _hspec_gen and self.input_batch.num_reqs > 0:
+                di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                try:
+                    trace_id = self.input_batch.req_ids[di]
+                    req_state = self.requests.get(trace_id)
+                    decoded_len = len(getattr(req_state, "output_token_ids", [])) \
+                        if req_state is not None else -1
+                    out = valid_sampled_token_ids[di] if di < len(valid_sampled_token_ids) else []
+                    dt_ms = (time.perf_counter_ns() - _t0_acc) / 1_000_000.0
+                    logger.warning(
+                        "HSPEC GEN accumulate_hidden_states [req_idx=%d] req_id=%s decoded_len=%d "
+                        "accumulate_hs_ms=%.3f accepted_len=%d",
+                        int(di),
+                        str(trace_id),
+                        int(decoded_len),
+                        float(dt_ms),
+                        int(len(out)),
+                    )
+                except Exception:
+                    pass
 
         logprobs_lists = (logprobs_tensors.tolists(cu_num_tokens)
                           if not self.use_async_scheduling

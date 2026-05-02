@@ -47,6 +47,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "sam",
+    "hspec",
     EagleModelTypes,
 ]
 
@@ -73,6 +74,11 @@ class SpeculativeConfig:
 
     If using `ngram` method, the related configuration `prompt_lookup_max` and
     `prompt_lookup_min` should be considered."""
+    # HSpec proposer configuration (optional; plugin-defined).
+    # Kept in SpeculativeConfig so EngineArgs -> SpeculativeConfig validation
+    # accepts these fields when method="hspec".
+    hspec_similarity_threshold: float | None = None
+    hspec_min_match_len: int | None = None
     draft_tensor_parallel_size: int | None = Field(default=None, ge=1)
     """The degree of the tensor parallelism for the draft model. Can only be 1
     or the same as the target model's tensor parallel size."""
@@ -273,6 +279,9 @@ class SpeculativeConfig:
                     self.quantization = self.target_model_config.quantization
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
+            elif self.method in ("hspec", "[hspec]"):
+                # Non-model proposer implemented by platform plugins.
+                self.model = "hspec"
             elif self.method == "suffix":
                 self.model = "suffix"
             elif self.method == "sam":
@@ -322,6 +331,16 @@ class SpeculativeConfig:
             # TODO: current we still need extract vocab_size from target model
             # config, in future, we may try refactor it out, and set
             # draft related config as None here.
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method in ("hspec", "[hspec]"):
+            # Non-model proposer implemented by platform plugins.
+            # No prompt-lookup parameters are required for HSpec.
+            self.method = "hspec"
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            # Keep draft configs identical to target so downstream verification
+            # and parallel-config checks pass.
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
         elif self.method == "suffix":

@@ -47,6 +47,15 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
+    # HSpec: per-request anchor hidden states collected during generation.
+    # Shape (seq_len, hidden_dim), dtype float16, numpy ndarray.
+    # Populated only when HSpec hidden-state collection is enabled;
+    # otherwise ``None``.
+    hidden_states: Any | None = None
+    # HSpec: exact token ids whose anchor hidden states were collected.
+    # This is the token sequence aligned 1-to-1 with ``hidden_states`` and is
+    # intended for trainer-side HSpec table building / offline analysis.
+    hspec_token_ids: Any | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
