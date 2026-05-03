@@ -371,9 +371,8 @@ class vLLMRollout(BaseRollout):
 
         batch_size = idx.size(0)
         global_step = prompts.meta_info.get("global_steps")
-        profile_this_step = bool(
-            use_hspec := self.config.get("use_hspec_decode", False)
-        ) and hspec_profile_enabled_for_step(global_step)
+        use_hspec = self.config.get("use_hspec_decode", False)
+        profile_this_step = hspec_profile_enabled_for_step(global_step)
         profiler = None
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
