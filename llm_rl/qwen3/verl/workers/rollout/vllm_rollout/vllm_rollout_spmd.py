@@ -202,14 +202,7 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
-        if self.config.use_history_spec_decode:
-            speculative_config = {
-                "method": "history_rollout",
-                "num_speculative_tokens": 5,  # no use
-                "prompt_lookup_min": 2,
-                "prompt_lookup_max": 7,
-            }
-        elif self.config.get("use_hspec_decode", False):
+        if self.config.get("use_hspec_decode", False):
             speculative_config = {
                 "method": "hspec",
                 "num_speculative_tokens": self.config.get("hspec_num_speculative_tokens", 5),

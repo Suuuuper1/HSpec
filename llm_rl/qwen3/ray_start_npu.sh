@@ -63,7 +63,8 @@ export VLLM_ASCEND_ENABLE_NZ=0
 export PYTHONUNBUFFERED=x
 
 ulimit -n 32768
-mkdir logs
+mkdir -p logs
+exec > ./logs/ray_start_outer.log 2>&1
 
 NNODES=8                           # [TODO] number of nodes
 NPUS_PER_NODE=16                   # the number of npus for each node
@@ -120,7 +121,7 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
       if [ "$device_count" -eq "$NNODES" ]; then
           echo "Ray cluster is ready with $device_count devices (from $npu_count NPU resources), starting Python script."
           ray status
-          bash $TRAIN_SCRIPT
+          bash $TRAIN_SCRIPT > ./logs/train_inner.log 2>&1
           break
       else
           echo "Waiting for Ray to allocate $NNODES devices. Current device count: $device_count"

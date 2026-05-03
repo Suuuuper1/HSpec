@@ -449,12 +449,14 @@ class GPUModelRunner(
                 self.drafter = MedusaProposer(
                     vllm_config=self.vllm_config, device=self.device
                 )
-            elif self.speculative_config.method in ("history_rollout", "hspec"):
-                raise ValueError(
-                    "Speculative decoding method "
-                    f"{self.speculative_config.method!r} is not supported by "
-                    "the default GPU runner. It is expected to be provided by "
-                    "a platform plugin (e.g., vllm-ascend).")
+            elif self.speculative_config.method == "hspec":
+                # Platform plugins may need to defer HSpec drafter
+                # initialization until after the base GPU runner finishes
+                # constructing core buffers and metadata. Leave the drafter
+                # unset here so subclasses (for example vllm-ascend's
+                # NPUModelRunner) can install their own proposer after
+                # super().__init__() completes.
+                pass
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "

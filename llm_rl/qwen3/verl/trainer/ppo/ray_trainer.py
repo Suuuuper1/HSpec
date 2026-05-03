@@ -1152,11 +1152,6 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
-        if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
-            from vllm_ascend.spec_decode.global_module.prefix_tree import get_history_trees
-
-            self.history_rollout_trees = get_history_trees()
-
         if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
             from vllm_ascend.spec_decode.hspec_table import get_hspec_tables
 
@@ -1357,37 +1352,6 @@ class RayPPOTrainer:
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
-                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
-                        ray_history_spec_tasks = []
-                        with marked_timer("update_rollout_suffix_tree", timing_raw, color="navy"):
-                            metrics.update(self.history_rollout_trees.compute_metrics())
-                            from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
-
-                            for i in range(len(batch)):
-                                prompt_token_ids = batch[i].non_tensor_batch["vllm_inputs"]
-                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
-                                ray_history_spec_tasks.append(self.history_rollout_trees.delete(prompt_id))
-                                ray_history_spec_tasks.append(self.history_rollout_trees.add_tree(prompt_id))
-                            ray.get(ray_history_spec_tasks)
-                            ray_history_spec_tasks.clear()
-                            for i in range(len(batch)):
-                                batch_item = batch[i]
-                                token_level_scores = batch_item.batch["token_level_scores"]
-                                response = batch_item.batch["responses"].numpy().tolist()
-                                try:
-                                    response_length = response.index(self.tokenizer.pad_token_id)
-                                    response = response[:response_length]
-                                except Exception:
-                                    pass
-                                prompt_token_ids = batch_item.non_tensor_batch["vllm_inputs"]
-                                prompt_id = prompt_id_from_token_ids(prompt_token_ids)
-                                ray_history_spec_tasks.append(
-                                    self.history_rollout_trees.tree_append_node(
-                                        prompt_id, response, token_level_scores.sum().item()
-                                    )
-                                )
-                            self.history_rollout_trees.run_server()
-
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                         ray_hspec_tasks = []
                         with marked_timer("update_hspec_tables", timing_raw, color="teal"):
@@ -1555,9 +1519,6 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-
-                    if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
-                        ray.get(ray_history_spec_tasks)
 
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                         if ray_hspec_tasks:

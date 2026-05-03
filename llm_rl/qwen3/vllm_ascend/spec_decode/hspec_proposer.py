@@ -1602,5 +1602,14 @@ class HSpecProposer(Proposer):
         num_tokens_across_dp: Optional[torch.Tensor] = None,
         aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         batch_descriptor=None,
+        dummy_compute_logits=lambda hidden_states: None,
+        use_cudagraphs: bool = False,
+        is_profile: bool = False,
+        **kwargs,
     ):
-        pass
+        # HSpec does not maintain a separate draft model. Proposal is built from
+        # target-model hidden states collected after verification, so there is no
+        # extra dummy forward / graph capture / logits warmup work to perform
+        # here. Keep this as a strict no-op while accepting the evolving vLLM /
+        # vllm-ascend drafter dummy_run keyword surface for compatibility.
+        return None
