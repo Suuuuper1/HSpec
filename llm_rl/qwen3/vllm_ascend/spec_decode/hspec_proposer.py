@@ -1374,7 +1374,7 @@ class HSpecProposer(Proposer):
             idxs_cpu = best_idxs.cpu().numpy()
             t1_copy = _now_ns() if gen_enabled else 0
 
-        # 5. Draft token retrieval (CPU-only, O(1) per request)
+        # 5. Draft token retrieval
         hit_rows = np.flatnonzero(sims_cpu >= self.similarity_threshold)
         pending = []
         for j in hit_rows.tolist():
