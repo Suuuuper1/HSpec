@@ -110,7 +110,7 @@ ROLLOUT_LENGTH_DIR="${ROLLOUT_LENGTH_DIR:-${SCRIPT_DIR}/../outputs/rl/rollout_le
 # Log/output path conventions.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/rl}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/logs}"
-export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec6.txt}"
+export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec_qwen3.txt}"
 mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
 
 {
@@ -214,7 +214,7 @@ python -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.use_hspec_decode="${USE_HSPEC_DECODE}" \
-    actor_rollout_ref.rollout.hspec_num_speculative_tokens=32 \
+    actor_rollout_ref.rollout.hspec_num_speculative_tokens=5 \
     actor_rollout_ref.rollout.hspec_similarity_threshold=0.85 \
     actor_rollout_ref.rollout.hspec_min_match_len=1 \
     actor_rollout_ref.rollout.hspec_n_components="${PCA_COMPONENTS}" \

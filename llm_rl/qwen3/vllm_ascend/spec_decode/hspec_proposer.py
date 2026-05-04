@@ -184,12 +184,24 @@ class _CachedPromptTable:
             return []
         return self.draft_prefix_tokens[entry_idx, :take].tolist()
 
-    def update_window(self, accept_length: int):
-        """Congestion-control style adaptive window"""
-        if accept_length >= self.wnd_size:
+    def update_window(
+        self,
+        accept_length: int,
+        drafted_len: int | None = None,
+    ) -> int:
+        """Congestion-control style adaptive window.
+
+        The update is performed after verification and uses the actual draft
+        length that was proposed for the request when available.
+        """
+        threshold = int(drafted_len) if drafted_len is not None else int(self.wnd_size)
+        if threshold <= 0:
+            threshold = int(self.wnd_size)
+        if accept_length >= threshold:
             self.wnd_size = min(self.wnd_size + 1, self.max_wnd)
-        elif accept_length <= 1:
+        elif accept_length < 1:
             self.wnd_size = max(self.wnd_size // 2, self.min_wnd)
+        return int(self.wnd_size)
 
 
 class _BatchedPromptTableCache:
@@ -359,11 +371,16 @@ class HSpecProposer(Proposer):
         # resolves to (version, {pid: table_data | None}).
         self._pending_fetches: List[tuple] = []
         self._pending_pids: Set[str] = set()
+        # Worker-local prompt baseline window priors. These survive cache
+        # invalidation / epoch swap and are re-applied when the next version of
+        # the same prompt is prefetched into the local cache.
+        self._prompt_wnd_priors: Dict[str, int] = {}
+        self._default_wnd_size: int = 8
 
         # Accept-length tracking (adaptive window control)
         self._accept_lengths: Dict[str, int] = {}
         # req_id -> matched entry metadata for the *next* verification step.
-        self._pending_verify_meta: Dict[str, Dict[str, int]] = {}
+        self._pending_verify_meta: Dict[str, Dict[str, Any]] = {}
         # req_id -> stable prompt_id cache to avoid repeated hashing of the
         # same prompt token ids across decode steps for a live request.
         self._req_prompt_ids: Dict[str, str] = {}
@@ -499,7 +516,7 @@ class HSpecProposer(Proposer):
                         data = table_data.get(pid)
                         if data is not None:
                             try:
-                                cached = self._build_cached_table(data)
+                                cached = self._build_cached_table(data, prompt_id=pid)
                                 self._cache[pid] = cached
                                 self._cache.move_to_end(pid)
                                 cache_mutated = True
@@ -776,7 +793,15 @@ class HSpecProposer(Proposer):
             cursor += count
         return starts, lens
 
-    def _build_cached_table(self, data: dict) -> _CachedPromptTable:
+    @staticmethod
+    def _clamp_wnd_size(wnd_size: int, min_wnd: int, max_wnd: int) -> int:
+        return max(int(min_wnd), min(int(wnd_size), int(max_wnd)))
+
+    def _build_cached_table(
+        self,
+        data: dict,
+        prompt_id: Optional[str] = None,
+    ) -> _CachedPromptTable:
         """Convert serialised table data dict → on-device cached table."""
         # NOTE: Ray may deserialize numpy arrays as non-writable (read-only)
         # views; torch.from_numpy warns about undefined behaviour on write.
@@ -806,6 +831,13 @@ class HSpecProposer(Proposer):
             entry_rollout_idx, n_entries, len(rollout_seqs))
 
         max_wnd = int(data.get("max_wnd", 28))
+        min_wnd = int(data.get("min_wnd", 2))
+        wnd_size = int(data.get("wnd_size", self._default_wnd_size))
+        if prompt_id:
+            prior = self._prompt_wnd_priors.get(prompt_id)
+            if prior is not None:
+                wnd_size = int(prior)
+        wnd_size = self._clamp_wnd_size(wnd_size, min_wnd, max_wnd)
         draft_prefix_tokens = np.zeros((n_entries, max_wnd), dtype=np.int32)
         draft_prefix_lens = np.zeros((n_entries,), dtype=np.int32)
         entry_offset = np.asarray(data["entry_offset"], dtype=np.int32)
@@ -833,9 +865,9 @@ class HSpecProposer(Proposer):
             rollout_entry_starts=rollout_entry_starts,
             rollout_entry_lens=rollout_entry_lens,
             n_entries=n_entries,
-            wnd_size=int(data.get("wnd_size", 8)),
+            wnd_size=wnd_size,
             max_wnd=max_wnd,
-            min_wnd=int(data.get("min_wnd", 2)),
+            min_wnd=min_wnd,
         )
 
     @staticmethod
@@ -1374,19 +1406,15 @@ class HSpecProposer(Proposer):
             idxs_cpu = best_idxs.cpu().numpy()
             t1_copy = _now_ns() if gen_enabled else 0
 
-        # 5. Draft token retrieval
+        # 5. Draft token retrieval (CPU-only, O(1) per request)
         hit_rows = np.flatnonzero(sims_cpu >= self.similarity_threshold)
         pending = []
         for j in hit_rows.tolist():
             i = active_batch_indices[j]
+            req_id = req_ids[i]
             cached = active_cached_tables[j]
             base_pos = active_base_positions[j]
             t0_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-
-            # Adaptive window update
-            req_id = req_ids[i]
-            accept_len = self._accept_lengths.get(req_id, 1)
-            cached.update_window(accept_len)
 
             # Draft tokens from CPU cache (sub-µs numpy slice)
             prof_this_req = prof_enabled
@@ -1417,12 +1445,17 @@ class HSpecProposer(Proposer):
                 self._entry_pending_delta_sum += delta
                 self._entry_pending_abs_delta_sum += abs_delta
                 self._pending_verify_meta[req_id] = {
+                    "prompt_id": prompt_ids[i],
                     "delta": delta,
                     "abs_delta": abs_delta,
                     "base_pos": int(base_pos),
                     "matched_pos": matched_pos,
                     "matched_rollout_idx": matched_rollout_idx,
                     "histo_ngram_match": int(histo_ngram_match),
+                    "drafted_len": int(len(draft)),
+                    "wnd_size_at_match": int(cached.wnd_size),
+                    "min_wnd": int(cached.min_wnd),
+                    "max_wnd": int(cached.max_wnd),
                 }
 
             t1_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
@@ -1531,11 +1564,51 @@ class HSpecProposer(Proposer):
     def update_accept_lengths(
         self, req_ids: List[str], accept_lengths: List[int],
     ):
-        """Update accept lengths for adaptive window control."""
+        """Record accepted lengths for stats/debugging.
+
+        Window updates are intentionally deferred to post-verification.
+        """
         for rid, al in zip(req_ids, accept_lengths):
             self._accept_lengths[rid] = al
             self._stat_accept_sum += int(al)
             self._stat_accept_count += 1
+
+    def _update_prompt_window_after_verification(
+        self,
+        prompt_id: str,
+        accept_length: int,
+        drafted_len: int,
+        wnd_size_at_match: int,
+        min_wnd: int,
+        max_wnd: int,
+    ) -> None:
+        cached = self._cache.get(prompt_id)
+        if cached is not None:
+            current_wnd = int(cached.wnd_size)
+            min_wnd = int(cached.min_wnd)
+            max_wnd = int(cached.max_wnd)
+        else:
+            current_wnd = int(
+                self._prompt_wnd_priors.get(
+                    prompt_id,
+                    self._clamp_wnd_size(wnd_size_at_match, min_wnd, max_wnd),
+                ))
+            current_wnd = self._clamp_wnd_size(current_wnd, min_wnd, max_wnd)
+
+        threshold = int(drafted_len) if int(drafted_len) > 0 else int(wnd_size_at_match)
+        if threshold <= 0:
+            threshold = current_wnd
+
+        if int(accept_length) >= threshold:
+            new_wnd = min(current_wnd + 1, int(max_wnd))
+        elif int(accept_length) < 1:
+            new_wnd = max(current_wnd // 2, int(min_wnd))
+        else:
+            new_wnd = current_wnd
+
+        self._prompt_wnd_priors[prompt_id] = int(new_wnd)
+        if cached is not None:
+            cached.wnd_size = int(new_wnd)
 
     def update_verification_outcomes(
         self,
@@ -1553,8 +1626,18 @@ class HSpecProposer(Proposer):
             meta = self._pending_verify_meta.pop(rid, None)
             if meta is None:
                 continue
+            prompt_id = str(meta.get("prompt_id", ""))
             abs_delta = int(meta["abs_delta"])
             apl = int(accepted_prefix_len)
+            if prompt_id:
+                self._update_prompt_window_after_verification(
+                    prompt_id=prompt_id,
+                    accept_length=apl,
+                    drafted_len=int(meta.get("drafted_len", 0)),
+                    wnd_size_at_match=int(meta.get("wnd_size_at_match", 0)),
+                    min_wnd=int(meta.get("min_wnd", 2)),
+                    max_wnd=int(meta.get("max_wnd", 28)),
+                )
             self._entry_pending_verify_count += 1
             self._entry_pending_accept_len_sum += apl
             self._entry_pending_abs_delta_verify[abs_delta] += 1

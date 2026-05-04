@@ -92,7 +92,7 @@ fi
 # Log/output path conventions.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/rl}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/logs}"
-export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec6.txt}"
+export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec7.txt}"
 mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
 
 {
@@ -177,7 +177,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.use_hspec_decode="${USE_HSPEC_DECODE}" \
-    actor_rollout_ref.rollout.hspec_num_speculative_tokens=32 \
+    actor_rollout_ref.rollout.hspec_num_speculative_tokens=5 \
     actor_rollout_ref.rollout.hspec_similarity_threshold=0.85 \
     actor_rollout_ref.rollout.hspec_min_match_len=1 \
     actor_rollout_ref.rollout.hspec_n_components="${PCA_COMPONENTS}" \
