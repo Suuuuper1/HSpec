@@ -544,77 +544,22 @@ class NPUModelRunner(GPUModelRunner):
         except Exception:
             pass
 
-    def _hspec_accumulate_hidden_states(
+    def _hspec_submit_accumulate_hidden_states(
         self,
         sample_hidden_states: torch.Tensor,
         valid_sampled_token_ids: list[list[int]],
         spec_decode_metadata: Optional[SpecDecodeMetadata],
         accepted_prefix_lengths: Optional[list[int]] = None,
     ) -> None:
-        from vllm_ascend.spec_decode.hspec_utils import hspec_append_selected_rows_async
+        from vllm_ascend.spec_decode.hspec_utils import hspec_submit_accumulate_task
 
-        num_reqs = self.input_batch.num_reqs
-        n = min(num_reqs, len(valid_sampled_token_ids))
-        req_to_row_indices: list[tuple[str, list[int]]] = []
-
-        if spec_decode_metadata is None:
-            for i in range(n):
-                sampled_ids = valid_sampled_token_ids[i]
-                if not sampled_ids:
-                    continue
-                req_id = self.input_batch.req_ids[i]
-                # Non-spec path emits one accepted token per request step.
-                req_to_row_indices.append((req_id, [i]))
-            if req_to_row_indices:
-                hspec_append_selected_rows_async(sample_hidden_states, req_to_row_indices)
-            return
-
-        num_draft_list = spec_decode_metadata.num_draft_tokens
-        bonus_indices = spec_decode_metadata.bonus_logits_indices
-        target_logits_indices = spec_decode_metadata.target_logits_indices
-        cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens
-
-        for i in range(n):
-            sampled_ids = valid_sampled_token_ids[i]
-            if not sampled_ids:
-                continue
-            req_id = self.input_batch.req_ids[i]
-            row_indices: list[int] = []
-            if num_draft_list[i] == 0:
-                bonus_idx = int(bonus_indices[i].item())
-                row_indices.append(bonus_idx)
-                req_to_row_indices.append((req_id, row_indices))
-                continue
-
-            num_drafts = int(num_draft_list[i])
-            accepted = (
-                int(accepted_prefix_lengths[i])
-                if accepted_prefix_lengths is not None and i < len(accepted_prefix_lengths)
-                else 0
-            )
-            out_len = len(sampled_ids)
-
-            start = int(cu_num_draft_tokens[i - 1].item()) if i > 0 else 0
-            end = start + num_drafts
-            local_target_rows = target_logits_indices[start:end]
-
-            for j in range(min(accepted, num_drafts, out_len)):
-                row_idx = int(local_target_rows[j].item())
-                row_indices.append(row_idx)
-
-            if out_len > accepted:
-                if accepted < num_drafts:
-                    row_idx = int(local_target_rows[accepted].item())
-                    row_indices.append(row_idx)
-                else:
-                    bonus_idx = int(bonus_indices[i].item())
-                    row_indices.append(bonus_idx)
-
-            if row_indices:
-                req_to_row_indices.append((req_id, row_indices))
-
-        if req_to_row_indices:
-            hspec_append_selected_rows_async(sample_hidden_states, req_to_row_indices)
+        hspec_submit_accumulate_task(
+            req_ids=list(self.input_batch.req_ids),
+            sample_hidden_states=sample_hidden_states,
+            valid_sampled_token_ids=valid_sampled_token_ids,
+            spec_decode_metadata=spec_decode_metadata,
+            accepted_prefix_lengths=accepted_prefix_lengths,
+        )
 
     def _hspec_compute_accepted_prefix_lengths(
         self,
@@ -2398,7 +2343,7 @@ class NPUModelRunner(GPUModelRunner):
             with hspec_record_function(
                     "hspec/verification/accumulate_hidden_states",
                     use_npu_stream=True):
-                self._hspec_accumulate_hidden_states(
+                self._hspec_submit_accumulate_hidden_states(
                     sample_hidden_states,
                     valid_sampled_token_ids,
                     spec_decode_metadata,
