@@ -18,9 +18,11 @@ This module provides helper functions for hidden state collection and processing
 """
 
 from contextlib import contextmanager, nullcontext
+import atexit
 import logging
 import hashlib
 import os
+import queue
 import struct
 import threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -872,14 +874,141 @@ def validate_hidden_state_alignment(
 import threading as _threading
 
 _hspec_store_lock = _threading.Lock()
+_hspec_store_cond = _threading.Condition(_hspec_store_lock)
 
-# Device-side accumulation buffers:  req_id -> list of (hidden_dim,) tensors
-_hspec_device_buffers: Dict[str, List[torch.Tensor]] = {}
+# Host-side accumulation buffers: req_id -> list of CPU tensors with shape
+# (chunk_len, hidden_dim). Device-to-host copies are submitted asynchronously
+# so hidden-state collection does not block the decode hot path.
+_hspec_host_buffers: Dict[str, List[torch.Tensor]] = {}
 # Token-side accumulation buffers: req_id -> list of accepted/generated token ids
 _hspec_token_buffers: Dict[str, List[int]] = {}
 
 # Whether collection is enabled (set by model_runner at init)
 _hspec_collection_enabled: bool = False
+
+
+class _HSpecAsyncCopyTask:
+
+    __slots__ = (
+        "req_slices",
+        "cpu_tensor",
+        "event",
+        "device_tensor_ref",
+    )
+
+    def __init__(
+        self,
+        req_slices: List[Tuple[str, int, int]],
+        cpu_tensor: torch.Tensor,
+        event: Any,
+        device_tensor_ref: Optional[torch.Tensor],
+    ) -> None:
+        self.req_slices = req_slices
+        self.cpu_tensor = cpu_tensor
+        self.event = event
+        # Keep the source device tensor alive until the async copy completes.
+        self.device_tensor_ref = device_tensor_ref
+
+
+_hspec_async_queue: "queue.SimpleQueue[_HSpecAsyncCopyTask | None]" = queue.SimpleQueue()
+_hspec_async_thread: Optional[_threading.Thread] = None
+_hspec_async_transfer_streams: Dict[str, Any] = {}
+_hspec_async_pending_total: int = 0
+_hspec_async_pending_by_req: Dict[str, int] = {}
+
+
+def _hspec_async_copy_worker() -> None:
+    global _hspec_async_pending_total
+
+    while True:
+        task = _hspec_async_queue.get()
+        if task is None:
+            return
+        try:
+            if task.event is not None:
+                task.event.synchronize()
+
+            with _hspec_store_cond:
+                for req_id, start, end in task.req_slices:
+                    if req_id not in _hspec_host_buffers:
+                        _hspec_host_buffers[req_id] = []
+                    _hspec_host_buffers[req_id].append(task.cpu_tensor[start:end])
+
+                    pending = _hspec_async_pending_by_req.get(req_id, 0) - 1
+                    if pending > 0:
+                        _hspec_async_pending_by_req[req_id] = pending
+                    else:
+                        _hspec_async_pending_by_req.pop(req_id, None)
+
+                _hspec_async_pending_total = max(
+                    _hspec_async_pending_total - len(task.req_slices), 0)
+                _hspec_store_cond.notify_all()
+        except Exception:
+            logger.exception("HSpec async copy worker failed")
+            with _hspec_store_cond:
+                for req_id, _, _ in task.req_slices:
+                    pending = _hspec_async_pending_by_req.get(req_id, 0) - 1
+                    if pending > 0:
+                        _hspec_async_pending_by_req[req_id] = pending
+                    else:
+                        _hspec_async_pending_by_req.pop(req_id, None)
+                _hspec_async_pending_total = max(
+                    _hspec_async_pending_total - len(task.req_slices), 0)
+                _hspec_store_cond.notify_all()
+
+
+def _hspec_ensure_async_worker() -> None:
+    global _hspec_async_thread
+    if _hspec_async_thread is not None and _hspec_async_thread.is_alive():
+        return
+    _hspec_async_thread = _threading.Thread(
+        target=_hspec_async_copy_worker,
+        name="hspec_async_copy_worker",
+        daemon=True,
+    )
+    _hspec_async_thread.start()
+
+
+def _hspec_shutdown_async_worker() -> None:
+    thread = _hspec_async_thread
+    if thread is None or not thread.is_alive():
+        return
+    try:
+        _hspec_async_queue.put(None)
+        thread.join(timeout=1.0)
+    except Exception:
+        pass
+
+
+atexit.register(_hspec_shutdown_async_worker)
+
+
+def _hspec_get_transfer_stream(device: torch.device):
+    key = str(device)
+    stream = _hspec_async_transfer_streams.get(key)
+    if stream is not None:
+        return stream
+    if device.type == "npu":
+        import torch_npu  # type: ignore
+
+        stream = torch_npu.npu.Stream(device=device)
+    else:
+        stream = None
+    _hspec_async_transfer_streams[key] = stream
+    return stream
+
+
+def _hspec_wait_pending_for_req(req_id: str) -> None:
+    req_id = str(req_id)
+    with _hspec_store_cond:
+        while _hspec_async_pending_by_req.get(req_id, 0) > 0:
+            _hspec_store_cond.wait(timeout=0.05)
+
+
+def _hspec_wait_pending_all() -> None:
+    with _hspec_store_cond:
+        while _hspec_async_pending_total > 0:
+            _hspec_store_cond.wait(timeout=0.05)
 
 
 def hspec_set_collection_enabled(enabled: bool):
@@ -913,9 +1042,77 @@ def hspec_append_step_hs(req_id: str, hidden_state: torch.Tensor):
         return
     req_id = str(req_id)
     with _hspec_store_lock:
-        if req_id not in _hspec_device_buffers:
-            _hspec_device_buffers[req_id] = []
-        _hspec_device_buffers[req_id].append(hidden_state)
+        if req_id not in _hspec_host_buffers:
+            _hspec_host_buffers[req_id] = []
+        _hspec_host_buffers[req_id].append(hidden_state.unsqueeze(0).cpu())
+
+
+def hspec_append_selected_rows_async(
+    sample_hidden_states: torch.Tensor,
+    req_to_row_indices: List[Tuple[str, List[int]]],
+) -> None:
+    """Asynchronously copy selected hidden-state rows into the HSpec store."""
+    global _hspec_async_pending_total
+
+    if not _hspec_collection_enabled:
+        return
+    if sample_hidden_states is None or not req_to_row_indices:
+        return
+
+    req_slices: List[Tuple[str, int, int]] = []
+    flat_indices: List[int] = []
+    for req_id, row_indices in req_to_row_indices:
+        if not row_indices:
+            continue
+        start = len(flat_indices)
+        flat_indices.extend(int(idx) for idx in row_indices)
+        end = len(flat_indices)
+        req_slices.append((str(req_id), start, end))
+
+    if not req_slices:
+        return
+
+    _hspec_ensure_async_worker()
+
+    device = sample_hidden_states.device
+    gather_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
+    selected_rows = sample_hidden_states.index_select(0, gather_indices).detach()
+
+    cpu_tensor: torch.Tensor
+    event = None
+    if device.type == "npu":
+        import torch_npu  # type: ignore
+
+        transfer_stream = _hspec_get_transfer_stream(device)
+        current_stream = torch_npu.npu.current_stream(device)
+        transfer_stream.wait_stream(current_stream)
+        with torch_npu.npu.stream(transfer_stream):
+            cpu_tensor = torch.empty(
+                selected_rows.shape,
+                dtype=selected_rows.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            cpu_tensor.copy_(selected_rows, non_blocking=True)
+            event = torch_npu.npu.Event()
+            event.record(transfer_stream)
+    else:
+        cpu_tensor = selected_rows.cpu()
+
+    with _hspec_store_cond:
+        for req_id, _, _ in req_slices:
+            _hspec_async_pending_by_req[req_id] = (
+                _hspec_async_pending_by_req.get(req_id, 0) + 1)
+        _hspec_async_pending_total += len(req_slices)
+
+    _hspec_async_queue.put(
+        _HSpecAsyncCopyTask(
+            req_slices=req_slices,
+            cpu_tensor=cpu_tensor,
+            event=event,
+            device_tensor_ref=selected_rows if event is not None else None,
+        )
+    )
 
 
 def hspec_extend_step_tokens(req_id: str, token_ids: List[int]) -> None:
@@ -945,23 +1142,22 @@ def hspec_flush_and_get_all() -> Dict[str, Dict[str, Any]]:
             'token_ids': list[int],
         }``.
     """
+    _hspec_wait_pending_all()
     with _hspec_store_lock:
         result: Dict[str, Dict[str, Any]] = {}
-        all_req_ids = set(_hspec_device_buffers.keys()) | set(_hspec_token_buffers.keys())
+        all_req_ids = set(_hspec_host_buffers.keys()) | set(_hspec_token_buffers.keys())
         for req_id in all_req_ids:
-            tensors = _hspec_device_buffers.get(req_id, [])
+            tensors = _hspec_host_buffers.get(req_id, [])
             token_ids = list(_hspec_token_buffers.get(req_id, []))
             cpu_array = None
             if tensors:
-                # Stack all step tensors → (seq_len, hidden_dim)
-                stacked = torch.stack(tensors)
-                # Single device→host transfer per request
-                cpu_array = stacked.to(dtype=torch.float16).cpu().numpy()
+                stacked = torch.cat(tensors, dim=0)
+                cpu_array = stacked.to(dtype=torch.float16).numpy()
             result[str(req_id)] = {
                 "hidden_states": cpu_array,
                 "token_ids": token_ids,
             }
-        _hspec_device_buffers.clear()
+        _hspec_host_buffers.clear()
         _hspec_token_buffers.clear()
         return result
 
@@ -977,17 +1173,18 @@ def hspec_pop_request(req_id: str) -> Optional[Dict[str, Any]]:
         or ``None`` if no data is stored for *req_id*.
     """
     req_id = str(req_id)
+    _hspec_wait_pending_for_req(req_id)
     with _hspec_store_lock:
-        has_hs = req_id in _hspec_device_buffers
+        has_hs = req_id in _hspec_host_buffers
         has_tok = req_id in _hspec_token_buffers
         if not has_hs and not has_tok:
             return None
-        tensors = _hspec_device_buffers.pop(req_id, [])
+        tensors = _hspec_host_buffers.pop(req_id, [])
         token_ids = list(_hspec_token_buffers.pop(req_id, []))
         cpu_array = None
         if tensors:
-            stacked = torch.stack(tensors)
-            cpu_array = stacked.to(dtype=torch.float16).cpu().numpy()
+            stacked = torch.cat(tensors, dim=0)
+            cpu_array = stacked.to(dtype=torch.float16).numpy()
         return {
             "hidden_states": cpu_array,
             "token_ids": token_ids,
@@ -996,11 +1193,11 @@ def hspec_pop_request(req_id: str) -> Optional[Dict[str, Any]]:
 
 def hspec_clear_store():
     """Clear all stored hidden states (both device and CPU)."""
+    _hspec_wait_pending_all()
     with _hspec_store_lock:
-        # Explicitly delete tensors to free device memory promptly
-        for tensors in _hspec_device_buffers.values():
+        for tensors in _hspec_host_buffers.values():
             tensors.clear()
-        _hspec_device_buffers.clear()
+        _hspec_host_buffers.clear()
         _hspec_token_buffers.clear()
 
 
