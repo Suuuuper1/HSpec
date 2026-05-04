@@ -48,8 +48,8 @@ export HSPEC_ADVAN_NGRAM="${HSPEC_ADVAN_NGRAM:-1}"
 export HSPEC_GEN="${HSPEC_GEN:-0}"
 export HSPEC_GEN_REQ_IDX="${HSPEC_GEN_REQ_IDX:-0}"
 export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
-export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-12}"
-export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile-19}"
+export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,30,31}"
+export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_new-3}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
 export HSPEC_PROFILE_ANALYSE="${HSPEC_PROFILE_ANALYSE:-1}"
@@ -57,7 +57,7 @@ export HSPEC_PROFILE_WITH_STACK="${HSPEC_PROFILE_WITH_STACK:-0}"
 export HSPEC_PROFILE_MEMORY="${HSPEC_PROFILE_MEMORY:-0}"
 
 # Keep rollout strictly sync; current migrated HSpec path assumes sync vLLM rollout.
-export USE_HSPEC_DECODE="${USE_HSPEC_DECODE:-True}"
+export USE_HSPEC_DECODE="${USE_HSPEC_DECODE:-1}"
 export VLLM_SPECULATIVE_BATCH_SIZE_THRE="${VLLM_SPECULATIVE_BATCH_SIZE_THRE:--1}"
 
 # Logging behavior from the original script.
@@ -92,7 +92,7 @@ fi
 # Log/output path conventions.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/rl}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/logs}"
-export OUT="${OUT:-/workspace/output/train_grpo_hspec.txt}"
+export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec6.txt}"
 mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
 
 {
