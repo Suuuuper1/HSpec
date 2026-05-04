@@ -551,10 +551,11 @@ class NPUModelRunner(GPUModelRunner):
         spec_decode_metadata: Optional[SpecDecodeMetadata],
         accepted_prefix_lengths: Optional[list[int]] = None,
     ) -> None:
-        from vllm_ascend.spec_decode.hspec_utils import hspec_append_step_hs
+        from vllm_ascend.spec_decode.hspec_utils import hspec_append_selected_rows_async
 
         num_reqs = self.input_batch.num_reqs
         n = min(num_reqs, len(valid_sampled_token_ids))
+        req_to_row_indices: list[tuple[str, list[int]]] = []
 
         if spec_decode_metadata is None:
             for i in range(n):
@@ -562,26 +563,10 @@ class NPUModelRunner(GPUModelRunner):
                 if not sampled_ids:
                     continue
                 req_id = self.input_batch.req_ids[i]
-                appended_count = 0
-                hspec_append_step_hs(req_id, sample_hidden_states[i].clone().half())
-                appended_count += 1
-                if (_hspec_align_debug_enabled()
-                        and appended_count != len(sampled_ids)
-                        and not hasattr(self, "_hspec_align_debug_logs")):
-                    self._hspec_align_debug_logs = 0
-                if (_hspec_align_debug_enabled()
-                        and appended_count != len(sampled_ids)
-                        and getattr(self, "_hspec_align_debug_logs", 0)
-                        < _hspec_align_debug_max_logs()):
-                    self._hspec_align_debug_logs += 1
-                    logger.warning(
-                        "HSPEC ALIGN DEBUG model_runner accumulate mismatch: "
-                        "req_id=%s mode=non_spec out_len=%d appended=%d sampled_ids=%s",
-                        str(req_id),
-                        int(len(sampled_ids)),
-                        int(appended_count),
-                        list(sampled_ids),
-                    )
+                # Non-spec path emits one accepted token per request step.
+                req_to_row_indices.append((req_id, [i]))
+            if req_to_row_indices:
+                hspec_append_selected_rows_async(sample_hidden_states, req_to_row_indices)
             return
 
         num_draft_list = spec_decode_metadata.num_draft_tokens
@@ -594,25 +579,11 @@ class NPUModelRunner(GPUModelRunner):
             if not sampled_ids:
                 continue
             req_id = self.input_batch.req_ids[i]
-            appended_count = 0
+            row_indices: list[int] = []
             if num_draft_list[i] == 0:
                 bonus_idx = int(bonus_indices[i].item())
-                hspec_append_step_hs(req_id, sample_hidden_states[bonus_idx].clone().half())
-                appended_count += 1
-                if (_hspec_align_debug_enabled()
-                        and appended_count != len(sampled_ids)
-                        and getattr(self, "_hspec_align_debug_logs", 0)
-                        < _hspec_align_debug_max_logs()):
-                    self._hspec_align_debug_logs += 1
-                    logger.warning(
-                        "HSPEC ALIGN DEBUG model_runner accumulate mismatch: "
-                        "req_id=%s mode=spec_no_draft out_len=%d appended=%d bonus_idx=%d sampled_ids=%s",
-                        str(req_id),
-                        int(len(sampled_ids)),
-                        int(appended_count),
-                        int(bonus_idx),
-                        list(sampled_ids),
-                    )
+                row_indices.append(bonus_idx)
+                req_to_row_indices.append((req_id, row_indices))
                 continue
 
             num_drafts = int(num_draft_list[i])
@@ -629,36 +600,21 @@ class NPUModelRunner(GPUModelRunner):
 
             for j in range(min(accepted, num_drafts, out_len)):
                 row_idx = int(local_target_rows[j].item())
-                hspec_append_step_hs(req_id, sample_hidden_states[row_idx].clone().half())
-                appended_count += 1
+                row_indices.append(row_idx)
 
             if out_len > accepted:
                 if accepted < num_drafts:
                     row_idx = int(local_target_rows[accepted].item())
-                    hspec_append_step_hs(req_id, sample_hidden_states[row_idx].clone().half())
-                    appended_count += 1
+                    row_indices.append(row_idx)
                 else:
                     bonus_idx = int(bonus_indices[i].item())
-                    hspec_append_step_hs(req_id, sample_hidden_states[bonus_idx].clone().half())
-                    appended_count += 1
+                    row_indices.append(bonus_idx)
 
-            if (_hspec_align_debug_enabled()
-                    and appended_count != out_len
-                    and getattr(self, "_hspec_align_debug_logs", 0)
-                    < _hspec_align_debug_max_logs()):
-                self._hspec_align_debug_logs += 1
-                logger.warning(
-                    "HSPEC ALIGN DEBUG model_runner accumulate mismatch: "
-                    "req_id=%s mode=spec out_len=%d appended=%d num_drafts=%d accepted_prefix_len=%d "
-                    "local_target_rows=%d sampled_ids=%s",
-                    str(req_id),
-                    int(out_len),
-                    int(appended_count),
-                    int(num_drafts),
-                    int(accepted),
-                    int(local_target_rows.numel()),
-                    list(sampled_ids),
-                )
+            if row_indices:
+                req_to_row_indices.append((req_id, row_indices))
+
+        if req_to_row_indices:
+            hspec_append_selected_rows_async(sample_hidden_states, req_to_row_indices)
 
     def _hspec_compute_accepted_prefix_lengths(
         self,
