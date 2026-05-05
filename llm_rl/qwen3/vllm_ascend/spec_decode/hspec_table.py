@@ -44,7 +44,6 @@ class PromptTableData:
         "rollout_seqs",
         "entry_rollout_idx",
         "entry_offset",
-        "entry_wnd_sizes",
         "rewards",
         "n_entries",
         "max_entries",
@@ -69,13 +68,11 @@ class PromptTableData:
         self.keys = np.empty((max_entries, num_components), dtype=np.float16)
         self.entry_rollout_idx = np.empty(max_entries, dtype=np.int32)
         self.entry_offset = np.empty(max_entries, dtype=np.int32)
-        self.entry_wnd_sizes = np.full(max_entries, initial_wnd, dtype=np.uint8)
         self.rewards = np.empty(max_entries, dtype=np.float32)
         self.rollout_seqs: List[np.ndarray] = []
         self.n_entries = 0
 
-        # Prompt-level default window. Online decoding uses per-entry window
-        # control and initializes each entry from this value.
+        # Adaptive window control
         self.wnd_size = initial_wnd
         self.max_wnd = max_wnd
         self.min_wnd = min_wnd
@@ -121,7 +118,6 @@ class PromptTableData:
         self.entry_rollout_idx[start:end] = rollout_idx
         # Value shift: offset starts at 1 (y[1]) for t=0, ... , y[L-1] is dropped.
         self.entry_offset[start:end] = np.arange(1, n_add + 1, dtype=np.int32)
-        self.entry_wnd_sizes[start:end] = np.uint8(self.wnd_size)
         self.rewards[start:end] = reward
         self.n_entries = end
         return n_add
@@ -133,7 +129,6 @@ class PromptTableData:
             self.keys = np.ascontiguousarray(self.keys[:n_entries])
             self.entry_rollout_idx = np.ascontiguousarray(self.entry_rollout_idx[:n_entries])
             self.entry_offset = np.ascontiguousarray(self.entry_offset[:n_entries])
-            self.entry_wnd_sizes = np.ascontiguousarray(self.entry_wnd_sizes[:n_entries])
             self.rewards = np.ascontiguousarray(self.rewards[:n_entries])
             self.max_entries = n_entries
 
@@ -148,13 +143,14 @@ class PromptTableData:
         Args:
             query_z:            (K,) PCA-projected query (no normalisation).
             threshold:          raw dot-product threshold.
-            accept_length:      legacy compatibility argument, unused.
+            accept_length:      previous accept length (for window control).
 
         Returns:
             (draft_tokens, best_similarity).
         """
         if self.n_entries == 0:
             return [], 0.0
+        self._update_wnd(accept_length)
 
         # Dot-product similarity
         sims = self.keys[:self.n_entries].astype(np.float32).dot(
@@ -163,7 +159,7 @@ class PromptTableData:
         best_idx = int(np.argmax(sims))
         best_sim = float(sims[best_idx])
         if best_sim >= threshold:
-            draft = self.get_draft_tokens(best_idx, self.get_entry_window(best_idx))
+            draft = self.get_draft_tokens(best_idx, self.wnd_size)
             return draft, best_sim
         return [], best_sim
 
@@ -175,46 +171,6 @@ class PromptTableData:
         offset = int(self.entry_offset[entry_idx])
         seq = self.rollout_seqs[rollout_idx]
         return seq[offset:offset + max_tokens].tolist()
-
-    def get_entry_window(self, entry_idx: int) -> int:
-        if entry_idx < 0 or entry_idx >= self.n_entries:
-            return int(self.wnd_size)
-        wnd = int(self.entry_wnd_sizes[entry_idx])
-        if wnd < self.min_wnd:
-            return int(self.min_wnd)
-        if wnd > self.max_wnd:
-            return int(self.max_wnd)
-        return wnd
-
-    def update_entry_window(
-        self,
-        entry_idx: int,
-        accept_length: int,
-        proposed_wnd: Optional[int] = None,
-    ) -> None:
-        """Update only the matched entry's draft window.
-
-        ``proposed_wnd`` should be the window used when the draft was emitted.
-        When multiple requests hit the same entry before feedback is applied, we
-        merge updates conservatively against the entry's current window.
-        """
-        if entry_idx < 0 or entry_idx >= self.n_entries:
-            return
-
-        current_wnd = self.get_entry_window(entry_idx)
-        base_wnd = int(proposed_wnd) if proposed_wnd is not None else current_wnd
-        if base_wnd < self.min_wnd:
-            base_wnd = int(self.min_wnd)
-        elif base_wnd > self.max_wnd:
-            base_wnd = int(self.max_wnd)
-
-        if accept_length >= base_wnd:
-            merged_wnd = max(current_wnd, min(base_wnd + 1, self.max_wnd))
-        elif accept_length <= 0:
-            merged_wnd = min(current_wnd, max(base_wnd // 2, self.min_wnd))
-        else:
-            merged_wnd = current_wnd
-        self.entry_wnd_sizes[entry_idx] = np.uint8(merged_wnd)
 
     def _update_wnd(self, accept_length: int):
         if accept_length >= self.wnd_size:
@@ -448,7 +404,6 @@ class HSpecTableGroup:
             "rollout_seqs": [s.tolist() for s in table.rollout_seqs],
             "entry_rollout_idx": np.ascontiguousarray(table.entry_rollout_idx[:table.n_entries]),
             "entry_offset": np.ascontiguousarray(table.entry_offset[:table.n_entries]),
-            "entry_wnd_sizes": np.ascontiguousarray(table.entry_wnd_sizes[:table.n_entries]),
             "n_entries": table.n_entries,
             "wnd_size": table.wnd_size,
         }
@@ -519,7 +474,6 @@ class HSpecTableGroup:
                 "rollout_seqs": [np.ascontiguousarray(s) for s in table.rollout_seqs],
                 "entry_rollout_idx": np.ascontiguousarray(table.entry_rollout_idx[:table.n_entries]),
                 "entry_offset": np.ascontiguousarray(table.entry_offset[:table.n_entries]),
-                "entry_wnd_sizes": np.ascontiguousarray(table.entry_wnd_sizes[:table.n_entries]),
                 "n_entries": table.n_entries,
                 "wnd_size": table.wnd_size,
                 "max_wnd": table.max_wnd,
@@ -686,14 +640,12 @@ class HSpecTableGroup:
                 key_norm_sample = float(np.linalg.norm(keys_np[0]))
             # Sample value (first entry's draft tokens)
             draft_sample = None
-            entry0_wnd = None
             if t.n_entries > 0:
-                entry0_wnd = int(t.get_entry_window(0))
                 ridx = int(t.entry_rollout_idx[0])
                 off = int(t.entry_offset[0])
                 seq = t.rollout_seqs[ridx] if ridx < len(t.rollout_seqs) else None
                 if seq is not None:
-                    draft_sample = seq[off: off + min(5, entry0_wnd)].tolist()
+                    draft_sample = seq[off: off + min(5, t.wnd_size)].tolist()
             info[label] = {
                 "n_entries": t.n_entries,
                 "pca_mean_shape": list(t.pca_params.mean.shape),
@@ -705,7 +657,6 @@ class HSpecTableGroup:
                 "rollout_seqs_count": len(t.rollout_seqs),
                 "rollout_seq_lens": [len(s) for s in t.rollout_seqs],
                 "wnd_size": t.wnd_size,
-                "entry0_wnd_size": entry0_wnd,
                 "max_wnd": t.max_wnd,
                 "min_wnd": t.min_wnd,
                 "draft_sample_entry0": draft_sample,
