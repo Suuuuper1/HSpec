@@ -135,6 +135,10 @@ class _CachedPromptTable:
         "wnd_size",
         "max_wnd",
         "min_wnd",
+        "entry_bias",
+        "entry_hits",
+        "entry_blend_horizon",
+        "max_entry_bias",
     )
 
     def __init__(
@@ -156,6 +160,10 @@ class _CachedPromptTable:
         wnd_size: int = 8,
         max_wnd: int = 28,
         min_wnd: int = 2,
+        entry_bias: np.ndarray | None = None,
+        entry_hits: np.ndarray | None = None,
+        entry_blend_horizon: int = 4,
+        max_entry_bias: int = 8,
     ):
         self.mean_cpu = mean_cpu                      # (D,) float32, CPU
         self.components_t_cpu = components_t_cpu      # (D,K) float32, CPU
@@ -174,6 +182,18 @@ class _CachedPromptTable:
         self.wnd_size = wnd_size
         self.max_wnd = max_wnd
         self.min_wnd = min_wnd
+        self.entry_bias = (
+            entry_bias
+            if entry_bias is not None
+            else np.zeros((n_entries,), dtype=np.int8)
+        )
+        self.entry_hits = (
+            entry_hits
+            if entry_hits is not None
+            else np.zeros((n_entries,), dtype=np.uint16)
+        )
+        self.entry_blend_horizon = max(int(entry_blend_horizon), 1)
+        self.max_entry_bias = max(int(max_entry_bias), 0)
 
     def get_draft_tokens(self, entry_idx: int, max_tokens: int) -> List[int]:
         """O(1) slice into the rollout token buffer."""
@@ -202,6 +222,60 @@ class _CachedPromptTable:
         elif accept_length < 1:
             self.wnd_size = max(self.wnd_size // 2, self.min_wnd)
         return int(self.wnd_size)
+
+    def get_entry_state(self, entry_idx: int) -> tuple[int, int]:
+        if entry_idx < 0 or entry_idx >= self.n_entries:
+            return (0, 0)
+        return (int(self.entry_bias[entry_idx]), int(self.entry_hits[entry_idx]))
+
+    def get_effective_window(self, entry_idx: int) -> int:
+        """Prompt baseline window plus blended entry-level bias."""
+        if entry_idx < 0 or entry_idx >= self.n_entries:
+            return int(self.wnd_size)
+        bias = int(self.entry_bias[entry_idx])
+        hits = int(self.entry_hits[entry_idx])
+        if bias == 0 or hits <= 0:
+            return int(self.wnd_size)
+        scale = min(hits, self.entry_blend_horizon)
+        blended_bias = int((bias * scale) / self.entry_blend_horizon)
+        eff_wnd = int(self.wnd_size) + blended_bias
+        if eff_wnd < self.min_wnd:
+            eff_wnd = int(self.min_wnd)
+        elif eff_wnd > self.max_wnd:
+            eff_wnd = int(self.max_wnd)
+        return int(eff_wnd)
+
+    def update_entry_bias_after_verification(
+        self,
+        entry_idx: int,
+        accept_length: int,
+        drafted_len: int,
+    ) -> tuple[int, int]:
+        """Update entry-local bias after true verification feedback."""
+        if entry_idx < 0 or entry_idx >= self.n_entries:
+            return (0, 0)
+        current_hits = int(self.entry_hits[entry_idx])
+        if current_hits < np.iinfo(np.uint16).max:
+            self.entry_hits[entry_idx] = current_hits + 1
+        current_bias = int(self.entry_bias[entry_idx])
+        delta = 0
+        drafted_len = int(drafted_len)
+        accept_length = int(accept_length)
+        if drafted_len > 0:
+            if accept_length >= drafted_len:
+                delta = 2
+            elif accept_length < 1:
+                delta = -2
+            elif accept_length + 1 < drafted_len:
+                delta = -1
+        if delta != 0 and self.max_entry_bias > 0:
+            current_bias += delta
+            if current_bias > self.max_entry_bias:
+                current_bias = self.max_entry_bias
+            elif current_bias < -self.max_entry_bias:
+                current_bias = -self.max_entry_bias
+            self.entry_bias[entry_idx] = current_bias
+        return (int(self.entry_bias[entry_idx]), int(self.entry_hits[entry_idx]))
 
 
 class _BatchedPromptTableCache:
@@ -376,6 +450,14 @@ class HSpecProposer(Proposer):
         # the same prompt is prefetched into the local cache.
         self._prompt_wnd_priors: Dict[str, int] = {}
         self._default_wnd_size: int = 8
+        self._entry_blend_horizon: int = max(
+            int(os.environ.get("HSPEC_ENTRY_BLEND_HORIZON", "4")),
+            1,
+        )
+        self._entry_bias_cap: int = max(
+            int(os.environ.get("HSPEC_ENTRY_BIAS_CAP", "8")),
+            0,
+        )
 
         # Accept-length tracking (adaptive window control)
         self._accept_lengths: Dict[str, int] = {}
@@ -433,11 +515,13 @@ class HSpecProposer(Proposer):
 
         logger.info(
             "HSpec proposer initialised: threshold=%.3f, max_draft=%d, cache_cap=%d, "
-            "fully_batched_match=1, numba_rebuild=%s",
+            "fully_batched_match=1, numba_rebuild=%s, entry_blend_horizon=%d, entry_bias_cap=%d",
             self.similarity_threshold,
             self.max_draft_tokens,
             self._max_cache_size,
             str(bool(self._use_numba_rebuild)),
+            int(self._entry_blend_horizon),
+            int(self._entry_bias_cap),
         )
 
         if self._use_numba_rebuild:
@@ -840,6 +924,8 @@ class HSpecProposer(Proposer):
         wnd_size = self._clamp_wnd_size(wnd_size, min_wnd, max_wnd)
         draft_prefix_tokens = np.zeros((n_entries, max_wnd), dtype=np.int32)
         draft_prefix_lens = np.zeros((n_entries,), dtype=np.int32)
+        entry_bias = np.zeros((n_entries,), dtype=np.int8)
+        entry_hits = np.zeros((n_entries,), dtype=np.uint16)
         entry_offset = np.asarray(data["entry_offset"], dtype=np.int32)
         for entry_idx in range(n_entries):
             ridx = int(entry_rollout_idx[entry_idx])
@@ -868,6 +954,10 @@ class HSpecProposer(Proposer):
             wnd_size=wnd_size,
             max_wnd=max_wnd,
             min_wnd=min_wnd,
+            entry_bias=entry_bias,
+            entry_hits=entry_hits,
+            entry_blend_horizon=self._entry_blend_horizon,
+            max_entry_bias=min(self._entry_bias_cap, max(0, max_wnd - min_wnd)),
         )
 
     @staticmethod
@@ -1414,28 +1504,31 @@ class HSpecProposer(Proposer):
             req_id = req_ids[i]
             cached = active_cached_tables[j]
             base_pos = active_base_positions[j]
+            matched_entry_idx = int(idxs_cpu[j])
+            effective_wnd = min(
+                cached.get_effective_window(matched_entry_idx),
+                int(self.max_draft_tokens),
+            )
             t0_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
 
             # Draft tokens from CPU cache (sub-µs numpy slice)
             prof_this_req = prof_enabled
             with (hspec_record_function("hspec/proposal/draft_retrieve")
                   if prof_this_req else nullcontext()):
-                draft = cached.get_draft_tokens(int(idxs_cpu[j]), cached.wnd_size)
-            if len(draft) > self.max_draft_tokens:
-                draft = draft[:self.max_draft_tokens]
+                draft = cached.get_draft_tokens(matched_entry_idx, effective_wnd)
             results[i] = draft
             self._stat_hits += 1
             self._stat_total_draft_len += len(draft)
-            pending.append((i, sims_cpu[j], idxs_cpu[j], cached, base_pos))
+            pending.append((i, sims_cpu[j], idxs_cpu[j], cached, base_pos, effective_wnd))
 
             if draft:
-                matched_entry_idx = int(idxs_cpu[j])
                 matched_rollout_idx = int(cached.entry_rollout_idx[matched_entry_idx])
                 matched_pos = int(cached.entry_offset[matched_entry_idx]) - 1
                 delta = int(matched_pos - int(base_pos))
                 abs_delta = abs(delta)
                 req_state = req_states[i]
                 current_tokens = list(getattr(req_state, "output_token_ids", [])) if req_state is not None else []
+                entry_bias, entry_hits = cached.get_entry_state(matched_entry_idx)
                 histo_ngram_match = self._has_same_histo_ngram(
                     current_tokens,
                     cached.rollout_seqs[matched_rollout_idx],
@@ -1452,8 +1545,12 @@ class HSpecProposer(Proposer):
                     "matched_pos": matched_pos,
                     "matched_rollout_idx": matched_rollout_idx,
                     "histo_ngram_match": int(histo_ngram_match),
+                    "matched_entry_idx": matched_entry_idx,
                     "drafted_len": int(len(draft)),
                     "wnd_size_at_match": int(cached.wnd_size),
+                    "effective_wnd_at_match": int(effective_wnd),
+                    "entry_bias_at_match": int(entry_bias),
+                    "entry_hits_at_match": int(entry_hits),
                     "min_wnd": int(cached.min_wnd),
                     "max_wnd": int(cached.max_wnd),
                 }
@@ -1496,19 +1593,25 @@ class HSpecProposer(Proposer):
                 best_idx_val = None
                 n_entries = None
                 wnd_size = None
+                prompt_wnd = None
+                entry_bias = None
+                entry_hits = None
                 if trace_pending_j is not None:
                     # Find the pending slot for this batch index
                     if trace_pending_j < len(pending) and pending[trace_pending_j][0] == di:
                         sim_val = float(sims_cpu[trace_pending_j])
                         best_idx_val = int(idxs_cpu[trace_pending_j])
                         n_entries = int(pending[trace_pending_j][3].n_entries)
-                        wnd_size = int(pending[trace_pending_j][3].wnd_size)
+                        prompt_wnd = int(pending[trace_pending_j][3].wnd_size)
+                        wnd_size = int(pending[trace_pending_j][5])
+                        entry_bias, entry_hits = pending[trace_pending_j][3].get_entry_state(best_idx_val)
 
                 draft = results[di] if di < len(results) else []
                 td = getattr(self, "_hspec_gen_timing", {}) if hasattr(self, "_hspec_gen_timing") else {}
                 logger.warning(
                     "HSPEC GEN proposer_breakdown [req_idx=%d] req_id=%s prompt_id=%s decoded_len=%d "
-                    "anchor_norm=%s sim=%s best_idx=%s n_entries=%s wnd_size=%s draft_len=%d "
+                    "anchor_norm=%s sim=%s best_idx=%s n_entries=%s prompt_wnd=%s eff_wnd=%s "
+                    "entry_bias=%s entry_hits=%s draft_len=%d "
                     "draft=%s timing_ms=%s",
                     int(di),
                     str(req_id),
@@ -1518,7 +1621,10 @@ class HSpecProposer(Proposer):
                     "None" if sim_val is None else f"{sim_val:.6f}",
                     "None" if best_idx_val is None else str(best_idx_val),
                     "None" if n_entries is None else str(n_entries),
+                    "None" if prompt_wnd is None else str(prompt_wnd),
                     "None" if wnd_size is None else str(wnd_size),
+                    "None" if entry_bias is None else str(entry_bias),
+                    "None" if entry_hits is None else str(entry_hits),
                     int(len(draft)),
                     list(draft),
                     td,
@@ -1531,13 +1637,16 @@ class HSpecProposer(Proposer):
                 di = min(HSPEC_DEBUG_REQ_IDX, batch_size - 1) if batch_size else 0
                 # Matched + draft for chosen request only
                 matched_line = None
-                for j, (i, _, _, cached, _) in enumerate(pending):
+                for j, (i, _, _, cached, _, eff_wnd) in enumerate(pending):
                     if i != di or sims_cpu[j] < self.similarity_threshold:
                         continue
+                    entry_bias, entry_hits = cached.get_entry_state(int(idxs_cpu[j]))
                     matched_line = (
                         f"matched [req_idx={di}] prompt_id={prompt_ids[di]!r} "
                         f"sim={float(sims_cpu[j]):.4f} best_idx={int(idxs_cpu[j])} "
-                        f"wnd_size={cached.wnd_size} draft_tokens={list(results[di])}"
+                        f"prompt_wnd={cached.wnd_size} eff_wnd={eff_wnd} "
+                        f"entry_bias={entry_bias} entry_hits={entry_hits} "
+                        f"draft_tokens={list(results[di])}"
                     )
                     break
                 if matched_line is None:
@@ -1610,6 +1719,22 @@ class HSpecProposer(Proposer):
         if cached is not None:
             cached.wnd_size = int(new_wnd)
 
+    def _update_entry_state_after_verification(
+        self,
+        prompt_id: str,
+        entry_idx: int,
+        accept_length: int,
+        drafted_len: int,
+    ) -> None:
+        cached = self._cache.get(prompt_id)
+        if cached is None:
+            return
+        cached.update_entry_bias_after_verification(
+            entry_idx=entry_idx,
+            accept_length=int(accept_length),
+            drafted_len=int(drafted_len),
+        )
+
     def update_verification_outcomes(
         self,
         req_ids: List[str],
@@ -1637,6 +1762,12 @@ class HSpecProposer(Proposer):
                     wnd_size_at_match=int(meta.get("wnd_size_at_match", 0)),
                     min_wnd=int(meta.get("min_wnd", 2)),
                     max_wnd=int(meta.get("max_wnd", 28)),
+                )
+                self._update_entry_state_after_verification(
+                    prompt_id=prompt_id,
+                    entry_idx=int(meta.get("matched_entry_idx", -1)),
+                    accept_length=apl,
+                    drafted_len=int(meta.get("drafted_len", 0)),
                 )
             self._entry_pending_verify_count += 1
             self._entry_pending_accept_len_sum += apl
