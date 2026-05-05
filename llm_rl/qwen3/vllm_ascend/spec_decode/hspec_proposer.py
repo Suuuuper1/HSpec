@@ -458,6 +458,26 @@ class HSpecProposer(Proposer):
             int(os.environ.get("HSPEC_ENTRY_BIAS_CAP", "8")),
             0,
         )
+        # Cheap local-window cap driven by entry-position mismatch.
+        self._abs_delta_cap_enabled: bool = (
+            os.environ.get("HSPEC_ABS_DELTA_CAP", "1") != "0"
+        )
+        self._abs_delta_safe_threshold: int = max(
+            int(os.environ.get("HSPEC_ABS_DELTA_SAFE_THRESHOLD", "2")),
+            0,
+        )
+        self._abs_delta_mid_threshold: int = max(
+            int(os.environ.get("HSPEC_ABS_DELTA_MID_THRESHOLD", "64")),
+            self._abs_delta_safe_threshold,
+        )
+        self._abs_delta_mid_cap: int = max(
+            int(os.environ.get("HSPEC_ABS_DELTA_MID_CAP", "8")),
+            1,
+        )
+        self._abs_delta_far_cap: int = max(
+            int(os.environ.get("HSPEC_ABS_DELTA_FAR_CAP", "4")),
+            1,
+        )
 
         # Accept-length tracking (adaptive window control)
         self._accept_lengths: Dict[str, int] = {}
@@ -515,13 +535,19 @@ class HSpecProposer(Proposer):
 
         logger.info(
             "HSpec proposer initialised: threshold=%.3f, max_draft=%d, cache_cap=%d, "
-            "fully_batched_match=1, numba_rebuild=%s, entry_blend_horizon=%d, entry_bias_cap=%d",
+            "fully_batched_match=1, numba_rebuild=%s, entry_blend_horizon=%d, entry_bias_cap=%d, "
+            "abs_delta_cap=%s safe<=%d mid<=%d mid_cap=%d far_cap=%d",
             self.similarity_threshold,
             self.max_draft_tokens,
             self._max_cache_size,
             str(bool(self._use_numba_rebuild)),
             int(self._entry_blend_horizon),
             int(self._entry_bias_cap),
+            str(bool(self._abs_delta_cap_enabled)),
+            int(self._abs_delta_safe_threshold),
+            int(self._abs_delta_mid_threshold),
+            int(self._abs_delta_mid_cap),
+            int(self._abs_delta_far_cap),
         )
 
         if self._use_numba_rebuild:
@@ -965,6 +991,29 @@ class HSpecProposer(Proposer):
         # After accepting `decoded_len` response tokens, the next query uses the
         # anchor at local key position `decoded_len - 1`.
         return max(int(decoded_len) - 1, 0)
+
+    def _apply_abs_delta_cap(
+        self,
+        window: int,
+        abs_delta: int,
+        min_wnd: int,
+    ) -> int:
+        """Apply a cheap piecewise cap using matched-position distance.
+
+        This runs only after the best entry has been selected, so it does not
+        affect batched similarity matching.
+        """
+        wnd = int(window)
+        if not self._abs_delta_cap_enabled:
+            return wnd
+        abs_delta = int(abs_delta)
+        if abs_delta <= int(self._abs_delta_safe_threshold):
+            return wnd
+        if abs_delta <= int(self._abs_delta_mid_threshold):
+            cap = max(int(min_wnd), min(int(self._abs_delta_mid_cap), int(self.max_draft_tokens)))
+        else:
+            cap = max(int(min_wnd), min(int(self._abs_delta_far_cap), int(self.max_draft_tokens)))
+        return min(wnd, int(cap))
 
     def _build_batched_table_tensors(
         self,
@@ -1505,9 +1554,17 @@ class HSpecProposer(Proposer):
             cached = active_cached_tables[j]
             base_pos = active_base_positions[j]
             matched_entry_idx = int(idxs_cpu[j])
-            effective_wnd = min(
+            matched_pos = int(cached.entry_offset[matched_entry_idx]) - 1
+            delta = int(matched_pos - int(base_pos))
+            abs_delta = abs(delta)
+            base_effective_wnd = min(
                 cached.get_effective_window(matched_entry_idx),
                 int(self.max_draft_tokens),
+            )
+            effective_wnd = self._apply_abs_delta_cap(
+                window=base_effective_wnd,
+                abs_delta=abs_delta,
+                min_wnd=int(cached.min_wnd),
             )
             t0_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
 
@@ -1523,9 +1580,6 @@ class HSpecProposer(Proposer):
 
             if draft:
                 matched_rollout_idx = int(cached.entry_rollout_idx[matched_entry_idx])
-                matched_pos = int(cached.entry_offset[matched_entry_idx]) - 1
-                delta = int(matched_pos - int(base_pos))
-                abs_delta = abs(delta)
                 req_state = req_states[i]
                 current_tokens = list(getattr(req_state, "output_token_ids", [])) if req_state is not None else []
                 entry_bias, entry_hits = cached.get_entry_state(matched_entry_idx)
@@ -1548,7 +1602,9 @@ class HSpecProposer(Proposer):
                     "matched_entry_idx": matched_entry_idx,
                     "drafted_len": int(len(draft)),
                     "wnd_size_at_match": int(cached.wnd_size),
+                    "base_effective_wnd_at_match": int(base_effective_wnd),
                     "effective_wnd_at_match": int(effective_wnd),
+                    "abs_delta_cap_applied": int(effective_wnd < base_effective_wnd),
                     "entry_bias_at_match": int(entry_bias),
                     "entry_hits_at_match": int(entry_hits),
                     "min_wnd": int(cached.min_wnd),
@@ -1594,8 +1650,10 @@ class HSpecProposer(Proposer):
                 n_entries = None
                 wnd_size = None
                 prompt_wnd = None
+                base_eff_wnd = None
                 entry_bias = None
                 entry_hits = None
+                abs_delta = None
                 if trace_pending_j is not None:
                     # Find the pending slot for this batch index
                     if trace_pending_j < len(pending) and pending[trace_pending_j][0] == di:
@@ -1605,13 +1663,17 @@ class HSpecProposer(Proposer):
                         prompt_wnd = int(pending[trace_pending_j][3].wnd_size)
                         wnd_size = int(pending[trace_pending_j][5])
                         entry_bias, entry_hits = pending[trace_pending_j][3].get_entry_state(best_idx_val)
+                        meta = self._pending_verify_meta.get(req_id)
+                        if meta is not None:
+                            base_eff_wnd = int(meta.get("base_effective_wnd_at_match", wnd_size))
+                            abs_delta = int(meta.get("abs_delta", 0))
 
                 draft = results[di] if di < len(results) else []
                 td = getattr(self, "_hspec_gen_timing", {}) if hasattr(self, "_hspec_gen_timing") else {}
                 logger.warning(
                     "HSPEC GEN proposer_breakdown [req_idx=%d] req_id=%s prompt_id=%s decoded_len=%d "
                     "anchor_norm=%s sim=%s best_idx=%s n_entries=%s prompt_wnd=%s eff_wnd=%s "
-                    "entry_bias=%s entry_hits=%s draft_len=%d "
+                    "base_eff_wnd=%s abs_delta=%s entry_bias=%s entry_hits=%s draft_len=%d "
                     "draft=%s timing_ms=%s",
                     int(di),
                     str(req_id),
@@ -1623,6 +1685,8 @@ class HSpecProposer(Proposer):
                     "None" if n_entries is None else str(n_entries),
                     "None" if prompt_wnd is None else str(prompt_wnd),
                     "None" if wnd_size is None else str(wnd_size),
+                    "None" if base_eff_wnd is None else str(base_eff_wnd),
+                    "None" if abs_delta is None else str(abs_delta),
                     "None" if entry_bias is None else str(entry_bias),
                     "None" if entry_hits is None else str(entry_hits),
                     int(len(draft)),
@@ -1641,10 +1705,13 @@ class HSpecProposer(Proposer):
                     if i != di or sims_cpu[j] < self.similarity_threshold:
                         continue
                     entry_bias, entry_hits = cached.get_entry_state(int(idxs_cpu[j]))
+                    meta = self._pending_verify_meta.get(req_ids[di], {})
                     matched_line = (
                         f"matched [req_idx={di}] prompt_id={prompt_ids[di]!r} "
                         f"sim={float(sims_cpu[j]):.4f} best_idx={int(idxs_cpu[j])} "
                         f"prompt_wnd={cached.wnd_size} eff_wnd={eff_wnd} "
+                        f"base_eff_wnd={meta.get('base_effective_wnd_at_match', eff_wnd)} "
+                        f"abs_delta={meta.get('abs_delta', 0)} "
                         f"entry_bias={entry_bias} entry_hits={entry_hits} "
                         f"draft_tokens={list(results[di])}"
                     )
