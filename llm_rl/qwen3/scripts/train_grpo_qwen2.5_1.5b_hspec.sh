@@ -29,7 +29,7 @@ export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export HSPEC_DEBUG="${HSPEC_DEBUG:-0}"
 export HSPEC_TRACE="${HSPEC_TRACE:-0}"
 export HSPEC_DUMP="${HSPEC_DUMP:-0}"
-export HSPEC_PROFILE="${HSPEC_PROFILE:-0}"
+export HSPEC_PROFILE="${HSPEC_PROFILE:-0}" 
 export HSPEC_DUMP_DIR="${HSPEC_DUMP_DIR:-/workspace/exp/hspec_dump-rollout_1024}"
 
 # Core HSpec knobs.
@@ -48,8 +48,8 @@ export HSPEC_ADVAN_NGRAM="${HSPEC_ADVAN_NGRAM:-1}"
 export HSPEC_GEN="${HSPEC_GEN:-0}"
 export HSPEC_GEN_REQ_IDX="${HSPEC_GEN_REQ_IDX:-0}"
 export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
-export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,30,31}"
-export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_new-3}"
+export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,31,63,91}"
+export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_new-4}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
 export HSPEC_PROFILE_ANALYSE="${HSPEC_PROFILE_ANALYSE:-1}"
@@ -69,8 +69,8 @@ export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 
 # Keep original model / dataset defaults.
 export MODEL_PATH="${MODEL_PATH:-/home/data/Qwen2.5-1.5B-Instruct}"
-export TRAIN_FILE="${TRAIN_FILE:-/workspace/cann-recipes-train/llm_rl/qwen3/dataset/gsm8k/train.parquet}"
-export TEST_FILE="${TEST_FILE:-/workspace/cann-recipes-train/llm_rl/qwen3/dataset/gsm8k/test.parquet}"
+export TRAIN_FILE="${TRAIN_FILE:-/home/xy/gsm8k/train.parquet}"
+export TEST_FILE="${TEST_FILE:-/home/xy/gsm8k/test.parquet}"
 
 # Keep original dump-mode behavior for batch sizing.
 if [ "${HSPEC_DUMP}" = "0" ]; then
@@ -92,7 +92,7 @@ fi
 # Log/output path conventions.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/rl}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/logs}"
-export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec8.txt}"
+export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec11.txt}"
 mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
 
 {
