@@ -22,7 +22,7 @@ fi
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 
-# Keep the original HSpec debug/tracing/profile switches.
+# HSpec debug / tracing / profiling switches.
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
@@ -48,79 +48,78 @@ export HSPEC_ADVAN_NGRAM="${HSPEC_ADVAN_NGRAM:-1}"
 export HSPEC_GEN="${HSPEC_GEN:-0}"
 export HSPEC_GEN_REQ_IDX="${HSPEC_GEN_REQ_IDX:-0}"
 export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
-export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,30,31}"
-export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_new-3}"
+export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,31,63,91}"
+export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_new-4}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
 export HSPEC_PROFILE_ANALYSE="${HSPEC_PROFILE_ANALYSE:-1}"
 export HSPEC_PROFILE_WITH_STACK="${HSPEC_PROFILE_WITH_STACK:-0}"
 export HSPEC_PROFILE_MEMORY="${HSPEC_PROFILE_MEMORY:-0}"
 
-# Keep rollout strictly sync; current migrated HSpec path assumes sync vLLM rollout.
 export USE_HSPEC_DECODE="${USE_HSPEC_DECODE:-1}"
 export VLLM_SPECULATIVE_BATCH_SIZE_THRE="${VLLM_SPECULATIVE_BATCH_SIZE_THRE:--1}"
 
-# Logging behavior from the original script.
+# Logging behavior.
 export HSPEC_LOG_EVERY_CALLS="${HSPEC_LOG_EVERY_CALLS:-50}"
 export HSPEC_LOG_EVERY_S="${HSPEC_LOG_EVERY_S:-5}"
 export HSPEC_LOG_LEVEL="${HSPEC_LOG_LEVEL:-INFO}"
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 
-# original model / dataset defaults.
-CONFIG_DIR=${CONFIG_DIR:-"${HOME}/verl/trainer/config"}
-export MODEL_PATH="${MODEL_PATH:-/home/data/Qwen3-30B-A3B}"
-export TRAIN_FILE="${TRAIN_FILE:-/data/deepscaler/train.parquet}"
-export TEST_FILE="${TEST_FILE:-/data/deepscaler/test.parquet}"
-DISTCP_PATH=${DISTCP_PATH:-"/home/data/Qwen3-30B-A3B_megatron"}
+# model / dataset defaults.
+CONFIG_DIR="${CONFIG_DIR:-${HOME}/verl/trainer/config}"
+MODEL_PATH="${MODEL_PATH:-/home/data/Qwen3-30B-A3B}"
+TRAIN_FILE="${TRAIN_FILE:-/home/xy/gsm8k/train.parquet}"
+TEST_FILE="${TEST_FILE:-/home/xy/gsm8k/test.parquet}"
+DISTCP_PATH="${DISTCP_PATH:-/home/data/Qwen3-30B-A3B_megatron}"
 
-# configs
-NODES=1
-GPU_MEMORY_UTILIZATION=0.87
-MAX_PROMPT_LENGTH=1024
-MAX_RESPONSE_LENGTH=16384 # 16384
-MAX_NUM_SEQS=64
-ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-0.9}
+NODES="${NODES:-1}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.6}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-128}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
+ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.3}"
+INFER_TP="${INFER_TP:-4}"
 
-INFER_TP=4
-INFER_DP=$((NODES * 16 / INFER_TP))
+# dump-mode behavior for batch sizes and rollout count.
+if [ "${HSPEC_DUMP}" = "0" ]; then
+    TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
+    PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
+    PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-8}"
+    LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-40}"
+    ROLLOUT_N="${ROLLOUT_N:-5}"
+else
+    TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+    PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
+    PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}"
+    LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}"
+    ROLLOUT_N="${ROLLOUT_N:-5}"
+fi
 
-TRAIN_BATCH_SIZE=64
-GEN_BATCH_SIZE=$((TRAIN_BATCH_SIZE))
-ROLLOUT_LOG_PATH="${VLLM_DYNAMIC_RL_LOG_PATH:-${SCRIPT_DIR}/../outputs/rl/test.txt}"
-ROLLOUT_LENGTH_DIR="${ROLLOUT_LENGTH_DIR:-${SCRIPT_DIR}/../outputs/rl/rollout_length}"
-
-# Keep original dump-mode behavior for batch sizing.
-#if [ "${HSPEC_DUMP}" = "0" ]; then
-#    export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
-#    export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
-#    export PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-8}"
-#    export LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="$#{LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-40}"
-#    export ROLLOUT_N="${ROLLOUT_N:-5}"
-#else
-#    export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
-#    export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
-#    export PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}"
-#    export LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="$#{LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}"
-#    export ROLLOUT_N="${ROLLOUT_N:-5}"
-#    export TRAIN_FILE="${TRAIN_FILE:-/workspace/cann-recipes-train/llm_rl/#qwen3/dataset/gsm8k/train.parquet}"
-#    export TEST_FILE="${TEST_FILE:-/workspace/cann-recipes-train/llm_rl/qwen3/#dataset/gsm8k/test.parquet}"
-#fi
-
-# Log/output path conventions.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/rl}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/logs}"
-export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec_qwen3.txt}"
-mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
+ROLL_LEN_ROOT="${ROLL_LEN_ROOT:-${OUTPUT_ROOT}/rollout_length}"
+TB_ROOT="${TB_ROOT:-${OUTPUT_ROOT}/tensorboard}"
+RUN_NAME="${RUN_NAME:-qwen2.5_1.5b_hspec_single}"
+ROLLOUT_LENGTH_DIR="${ROLLOUT_LENGTH_DIR:-${ROLL_LEN_ROOT}/${RUN_NAME}}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-${TB_ROOT}/${RUN_NAME}}"
+ROLLOUT_LOG_PATH="${ROLLOUT_LOG_PATH:-${LOG_DIR}/${RUN_NAME}.log}"
+OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec11.txt}"
+
+mkdir -p "${LOG_DIR}" "${ROLL_LEN_ROOT}" "${TB_ROOT}" "${ROLLOUT_LENGTH_DIR}" "$(dirname "${OUT}")"
 
 {
     echo
     echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') hspec single run ====="
     echo "project_root=${PROJECT_ROOT}"
+    echo "config_dir=${CONFIG_DIR}"
     echo "model_path=${MODEL_PATH}"
     echo "train_file=${TRAIN_FILE}"
     echo "test_file=${TEST_FILE}"
-    echo "log_path=${OUT}"
+    echo "out=${OUT}"
+    echo "rollout_log_path=${ROLLOUT_LOG_PATH}"
+    echo "rollout_length_dir=${ROLLOUT_LENGTH_DIR}"
+    echo "tensorboard_dir=${TENSORBOARD_DIR}"
     echo "use_hspec_decode=${USE_HSPEC_DECODE}"
     echo "hspec_profile=${HSPEC_PROFILE}"
     echo "hspec_dump=${HSPEC_DUMP}"
@@ -130,10 +129,98 @@ mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
 
 set -x
 
-python -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
+env \
+    VLLM_DYNAMIC_RL_LOG_PATH="${ROLLOUT_LOG_PATH}" \
+    ROLLOUT_LENGTH_DIR="${ROLLOUT_LENGTH_DIR}" \
+    TENSORBOARD_DIR="${TENSORBOARD_DIR}" \
+    python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     --config-name='ppo_megatron_trainer.yaml' \
-    ray_kwargs.ray_init.num_cpus=128 \
+    algorithm.adv_estimator=grpo \
+    data.train_files="${TRAIN_FILE}" \
+    data.val_files="${TEST_FILE}" \
+    data.train_batch_size="${TRAIN_BATCH_SIZE}" \
+    data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
+    data.max_response_length="${MAX_RESPONSE_LENGTH}" \
+    data.filter_overlong_prompts=True \
+    data.truncation='error' \
+    data.shuffle=False \
+    actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.load_weight=True \
+    actor_rollout_ref.actor.optim.lr=5e-7 \
+    actor_rollout_ref.actor.optim.clip_grad=10000 \
+    actor_rollout_ref.model.use_remove_padding=False \
+    actor_rollout_ref.actor.entropy_coeff=0.001 \
+    actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
+    actor_rollout_ref.actor.megatron.sequence_parallel=True \
+    actor_rollout_ref.actor.megatron.expert_model_parallel_size=4 \
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
+    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=4 \
+    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1 \
+    actor_rollout_ref.actor.megatron.param_offload=True \
+    actor_rollout_ref.actor.megatron.grad_offload=True \
+    actor_rollout_ref.actor.megatron.optimizer_offload=False \
+    actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
+    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
+    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=block \
+    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
+    actor_rollout_ref.actor.megatron.dist_checkpointing_path="${DISTCP_PATH}" \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${INFER_TP}" \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}" \
+    actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
+    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.max_num_seqs="${MAX_NUM_SEQS}" \
+    actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
+    actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE}" \
+    actor_rollout_ref.rollout.top_k=-1 \
+    actor_rollout_ref.rollout.top_p=1.0 \
+    actor_rollout_ref.rollout.ignore_eos=False \
+    actor_rollout_ref.rollout.mode=sync \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
+    actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    actor_rollout_ref.rollout.use_hspec_decode="${USE_HSPEC_DECODE}" \
+    actor_rollout_ref.rollout.hspec_num_speculative_tokens=5 \
+    actor_rollout_ref.rollout.hspec_similarity_threshold=0.85 \
+    actor_rollout_ref.rollout.hspec_min_match_len=1 \
+    actor_rollout_ref.rollout.hspec_n_components="${PCA_COMPONENTS}" \
+    actor_rollout_ref.rollout.hspec_max_entries_per_prompt=10000 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=False \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
+    actor_rollout_ref.ref.load_weight=True \
+    actor_rollout_ref.ref.megatron.param_offload=True \
+    actor_rollout_ref.ref.megatron.use_dist_checkpointing=True \
+    actor_rollout_ref.ref.megatron.dist_checkpointing_path="${DISTCP_PATH}" \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    trainer.balance_batch=False \
+    trainer.device=npu \
+    trainer.val_before_train=False \
+    trainer.critic_warmup=0 \
+    trainer.logger=['console','tensorboard'] \
+    trainer.project_name='verl_grpo_gsm8k_hspec_validate' \
+    trainer.experiment_name='qwen_hspec_validate_small' \
+    trainer.n_gpus_per_node=16 \
+    trainer.nnodes="${NODES}" \
+    trainer.save_freq=-1 \
+    trainer.test_freq=1 \
+    trainer.total_epochs=5 \
+    +trainer.rollout_length_dir="${ROLLOUT_LENGTH_DIR}" \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_rotary_pos_emb=True \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_swiglu=True \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.pipeline_num_transformer_layers=[[11],[13],[13],[11]] \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type='alltoall' \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_alltoall_overlap_comm=True \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 \
     +ray_kwargs.ray_init.address=local \
+    ray_kwargs.ray_init.num_cpus=128 \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DEBUG='"'"${HSPEC_DEBUG}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DEBUG_MAX_REQS='"2"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DEBUG_MAX_SAMPLES='"4"' \
@@ -165,90 +252,6 @@ python -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
     +ray_kwargs.ray_init.runtime_env.env_vars.MATCH_WND='"'"${MATCH_WND}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ADVAN_NGRAM='"'"${HSPEC_ADVAN_NGRAM}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_SPECULATIVE_BATCH_SIZE_THRE='"'"${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"'"' \
-    algorithm.adv_estimator=grpo \
-    data.train_files="${TRAIN_FILE}" \
-    data.val_files="${TEST_FILE}" \
-    data.train_batch_size="${TRAIN_BATCH_SIZE}" \
-    data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
-    data.max_response_length="${MAX_RESPONSE_LENGTH}" \
-    data.filter_overlong_prompts=True \
-    data.truncation='error' \
-    +data.dataset_fraction=0.004\
-    custom_reward_function.path=deepscaler.py \
-    custom_reward_function.name=compute_score \
-    actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
-    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.load_weight=True \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.clip_grad=10000 \
-    actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_BATCH_SIZE}" \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.megatron.sequence_parallel=True \
-    actor_rollout_ref.actor.megatron.expert_model_parallel_size=4 \
-    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
-    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=4 \
-    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1 \
-    actor_rollout_ref.actor.megatron.param_offload=True \
-    actor_rollout_ref.actor.megatron.grad_offload=True \
-    actor_rollout_ref.actor.megatron.optimizer_offload=False \
-    actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
-    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
-    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=block \
-    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
-    actor_rollout_ref.actor.megatron.dist_checkpointing_path="${DISTCP_PATH}" \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=${INFER_TP} \
-    actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
-    actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
-    actor_rollout_ref.rollout.enforce_eager=False \
-    actor_rollout_ref.rollout.max_num_seqs=${MAX_NUM_SEQS} \
-    actor_rollout_ref.rollout.n=8 \
-    actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE} \
-    actor_rollout_ref.rollout.top_k=-1 \
-    actor_rollout_ref.rollout.top_p=0.9 \
-    actor_rollout_ref.rollout.ignore_eos=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
-    actor_rollout_ref.rollout.mode=sync \
-    actor_rollout_ref.rollout.enable_chunked_prefill=False \
-    actor_rollout_ref.rollout.use_hspec_decode="${USE_HSPEC_DECODE}" \
-    actor_rollout_ref.rollout.hspec_num_speculative_tokens=5 \
-    actor_rollout_ref.rollout.hspec_similarity_threshold=0.85 \
-    actor_rollout_ref.rollout.hspec_min_match_len=1 \
-    actor_rollout_ref.rollout.hspec_n_components="${PCA_COMPONENTS}" \
-    actor_rollout_ref.rollout.hspec_max_entries_per_prompt=10000 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=False \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.ref.megatron.param_offload=True \
-    actor_rollout_ref.ref.load_weight=True \
-    actor_rollout_ref.ref.megatron.use_dist_checkpointing=True \
-    actor_rollout_ref.ref.megatron.dist_checkpointing_path="${DISTCP_PATH}" \
-    algorithm.kl_ctrl.kl_coef=0.001 \
-    trainer.balance_batch=False \
-    trainer.device=npu \
-    trainer.val_before_train=False \
-    trainer.critic_warmup=0 \
-    trainer.logger=['console','tensorboard'] \
-    trainer.project_name='qwen_hspec_validate_deepscaler' \
-    trainer.experiment_name='qwen3_30b_verl_true_weights' \
-    trainer.n_gpus_per_node=16 \
-    trainer.nnodes=${NODES} \
-    trainer.save_freq=-1 \
-    trainer.test_freq=1 \
-    trainer.total_epochs=5 \
-    +trainer.rollout_length_dir="${ROLLOUT_LENGTH_DIR}" \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_rotary_pos_emb=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_swiglu=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.pipeline_num_transformer_layers=[[11],[13],[13],[11]] \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type='alltoall' \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_alltoall_overlap_comm=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 \
     > "${OUT}" 2>&1 "$@"
 
 echo "OK: training finished. See log at ${OUT}"

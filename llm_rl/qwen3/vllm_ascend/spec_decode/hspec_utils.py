@@ -123,20 +123,21 @@ def hspec_record_function(name: str, use_npu_stream: bool = False):
 
     method = hspec_profile_method()
     if method == "mstx":
-        try:
-            import torch_npu
+        import torch_npu
 
-            stream = torch_npu.npu.current_stream() if use_npu_stream else None
-            domain = hspec_profile_domain()
+        stream = torch_npu.npu.current_stream() if use_npu_stream else None
+        domain = hspec_profile_domain()
+        try:
             range_id = torch_npu.npu.mstx.range_start(name, stream, domain=domain)
+        except Exception:
+            # Fallback to record_function only when mstx setup itself fails.
+            pass
+        else:
             try:
                 yield
             finally:
                 torch_npu.npu.mstx.range_end(range_id, domain=domain)
             return
-        except Exception:
-            # Fallback to record_function if mstx is unavailable.
-            pass
 
     with _record_function(name):
         yield

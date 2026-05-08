@@ -190,6 +190,11 @@ class vLLMRollout(BaseRollout):
             )
 
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+        if load_format == "dummy":
+            logger.warning(
+                "vLLM rollout is using load_format='dummy' (random weights). "
+                "This is intended only for smoke tests and will produce meaningless responses/rewards."
+            )
 
         # copy it to avoid secretly modifying the engine config
         engine_kwargs = config.get("engine_kwargs", {}).get("vllm", {}) or {}

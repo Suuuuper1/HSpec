@@ -16,24 +16,6 @@ from vllm_ascend.ops.triton.reject_sample import (
 from vllm_ascend.sample.sampler import apply_top_k_top_p
 
 
-def _should_use_triton_random_rejection_path(
-    draft_probs: Optional[torch.Tensor],
-) -> bool:
-    """Whether the Ascend Triton random rejection path is safe to use.
-
-    HSpec / ngram style proposers do not provide ``draft_probs``. In the current
-    Ascend stack, routing those lookup-style speculative methods through the
-    Triton random rejection + block-verify kernels is unstable and can trigger
-    asynchronous ACL failures that only surface at the next sync point
-    (typically ``output_token_ids.cpu().numpy()`` in ``parse_output``).
-
-    For ``draft_probs is None``, fall back to the proven PyTorch path. This is
-    still a framework-level fix: the verifier remains fully functional, but we
-    avoid the buggy kernel family for unsupported lookup-style drafts.
-    """
-    return HAS_TRITON and draft_probs is not None
-
-
 def apply_sampling_constraints(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     cu_num_draft_tokens: torch.Tensor,  # [batch_size]
@@ -123,12 +105,8 @@ def rejection_sample(
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
 
-    use_triton_random_path = _should_use_triton_random_rejection_path(
-        draft_probs)
-    # Block verify is an Ascend-specific optimization for probabilistic draft
-    # models. Do not enable it for lookup-style proposals (e.g. HSpec / ngram),
-    # which do not carry draft probabilities.
-    using_block_verify = (max_spec_len >= 3 and draft_probs is not None)
+    # When num_speculative_tokens>=3, using block verify.
+    using_block_verify = max_spec_len >= 3
 
     # Create output buffer.
     output_token_ids = torch.empty(
@@ -200,7 +178,7 @@ def rejection_sample(
     )
     if not using_block_verify:
         # Rejection sampling for random sampling requests.
-        if use_triton_random_path:
+        if HAS_TRITON:
             rejection_random_sample_kernel[(grid, )](
                 output_token_ids,
                 cu_num_draft_tokens,
@@ -235,7 +213,7 @@ def rejection_sample(
             )
     else:
         # MagicMTP: Improving acceptance rate with Block Verify.
-        if use_triton_random_path:
+        if HAS_TRITON:
             rejection_random_sample_block_verify_kernel[(grid, )](
                 output_token_ids,
                 cu_num_draft_tokens,
