@@ -173,7 +173,7 @@ env \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}" \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
-    actor_rollout_ref.rollout.load_format=megatron \
+    actor_rollout_ref.rollout.load_format=auto \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_num_seqs="${MAX_NUM_SEQS}" \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \

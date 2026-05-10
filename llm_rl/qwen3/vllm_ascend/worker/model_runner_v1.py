@@ -1355,6 +1355,16 @@ class NPUModelRunner(GPUModelRunner):
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
+        hspec_cu_num_draft_tokens_cpu = [
+            int(x) for x in cu_num_draft_tokens.tolist()
+        ]
+        hspec_target_logits_indices_cpu = [
+            int(x) for x in target_logits_indices.tolist()
+        ]
+        hspec_bonus_logits_indices_cpu = [
+            int(x) for x in bonus_logits_indices.tolist()
+        ]
+
         # TODO: Optimize the CPU -> NPU copy.
         cu_num_draft_tokens = (
             torch.from_numpy(cu_num_draft_tokens).pin_memory().to(
@@ -1400,7 +1410,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
         if self.pcp_size > 1:
             logits_indices = logits_indices_pcp
-        return SpecDecodeMetadata(
+        metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
             cu_num_draft_tokens=cu_num_draft_tokens,
@@ -1409,6 +1419,10 @@ class NPUModelRunner(GPUModelRunner):
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
         )
+        metadata._hspec_cu_num_draft_tokens_cpu = hspec_cu_num_draft_tokens_cpu
+        metadata._hspec_target_logits_indices_cpu = hspec_target_logits_indices_cpu
+        metadata._hspec_bonus_logits_indices_cpu = hspec_bonus_logits_indices_cpu
+        return metadata
 
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
     def propose_draft_token_ids(

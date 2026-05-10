@@ -948,6 +948,107 @@ _hspec_async_pending_total: int = 0
 _hspec_async_pending_by_req: Dict[str, int] = {}
 
 
+def _hspec_use_legacy_async_accumulate() -> bool:
+    """Whether to use the old background-thread NPU accumulation path."""
+    return os.getenv("HSPEC_ASYNC_HS_ACCUMULATE", "0") != "0"
+
+
+def _hspec_use_async_copy_stream() -> bool:
+    """Whether HSpec D2H copies may run on a separate NPU stream."""
+    return os.getenv("HSPEC_ASYNC_HS_COPY_STREAM", "0") != "0"
+
+
+def _hspec_metadata_to_list(metadata: Any, cache_attr: str,
+                            tensor_attr: str) -> List[int]:
+    cached = getattr(metadata, cache_attr, None)
+    if cached is not None:
+        return [int(x) for x in cached]
+    tensor = getattr(metadata, tensor_attr)
+    return [int(x) for x in tensor.detach().cpu().tolist()]
+
+
+def _hspec_compute_req_slices(
+    req_ids: List[str],
+    valid_sampled_token_ids: List[List[int]],
+    spec_decode_metadata: Any = None,
+    accepted_prefix_lengths: Optional[List[int]] = None,
+) -> Tuple[List[Tuple[str, int, int]], List[int], List[str]]:
+    req_to_row_indices: List[Tuple[str, List[int]]] = []
+    n = min(len(req_ids), len(valid_sampled_token_ids))
+
+    if spec_decode_metadata is None:
+        for i in range(n):
+            sampled_ids = valid_sampled_token_ids[i]
+            if sampled_ids:
+                req_to_row_indices.append((str(req_ids[i]), [i]))
+    else:
+        num_draft_list = spec_decode_metadata.num_draft_tokens
+        bonus_indices = _hspec_metadata_to_list(
+            spec_decode_metadata,
+            "_hspec_bonus_logits_indices_cpu",
+            "bonus_logits_indices",
+        )
+        target_logits_indices = _hspec_metadata_to_list(
+            spec_decode_metadata,
+            "_hspec_target_logits_indices_cpu",
+            "target_logits_indices",
+        )
+        cu_num_draft_tokens = _hspec_metadata_to_list(
+            spec_decode_metadata,
+            "_hspec_cu_num_draft_tokens_cpu",
+            "cu_num_draft_tokens",
+        )
+
+        for i in range(n):
+            sampled_ids = valid_sampled_token_ids[i]
+            if not sampled_ids:
+                continue
+
+            row_indices: List[int] = []
+            if num_draft_list[i] == 0:
+                row_indices.append(int(bonus_indices[i]))
+                req_to_row_indices.append((str(req_ids[i]), row_indices))
+                continue
+
+            num_drafts = int(num_draft_list[i])
+            accepted = (
+                int(accepted_prefix_lengths[i])
+                if accepted_prefix_lengths is not None and i < len(accepted_prefix_lengths)
+                else 0
+            )
+            out_len = len(sampled_ids)
+
+            start = int(cu_num_draft_tokens[i - 1]) if i > 0 else 0
+            end = start + num_drafts
+            local_target_rows = target_logits_indices[start:end]
+
+            for j in range(min(accepted, num_drafts, out_len)):
+                row_indices.append(int(local_target_rows[j]))
+
+            if out_len > accepted:
+                if accepted < num_drafts:
+                    row_indices.append(int(local_target_rows[accepted]))
+                else:
+                    row_indices.append(int(bonus_indices[i]))
+
+            if row_indices:
+                req_to_row_indices.append((str(req_ids[i]), row_indices))
+
+    flat_indices: List[int] = []
+    req_slices: List[Tuple[str, int, int]] = []
+    pending_req_ids: List[str] = []
+    for req_id, row_indices in req_to_row_indices:
+        if not row_indices:
+            continue
+        start = len(flat_indices)
+        flat_indices.extend(row_indices)
+        end = len(flat_indices)
+        req_slices.append((req_id, start, end))
+        pending_req_ids.append(req_id)
+
+    return req_slices, flat_indices, pending_req_ids
+
+
 def _hspec_finish_pending(req_ids: List[str]) -> None:
     global _hspec_async_pending_total
 
@@ -994,72 +1095,19 @@ def _hspec_accumulate_worker() -> None:
             if task.producer_event is not None:
                 task.producer_event.synchronize()
 
-            req_to_row_indices: List[Tuple[str, List[int]]] = []
             req_ids = list(task.req_ids)
             valid_sampled_token_ids = task.valid_sampled_token_ids
-            n = min(len(req_ids), len(valid_sampled_token_ids))
-            spec_decode_metadata = task.spec_decode_metadata
-
-            if spec_decode_metadata is None:
-                for i in range(n):
-                    sampled_ids = valid_sampled_token_ids[i]
-                    if sampled_ids:
-                        req_to_row_indices.append((req_ids[i], [i]))
-            else:
-                num_draft_list = spec_decode_metadata.num_draft_tokens
-                bonus_indices = spec_decode_metadata.bonus_logits_indices.cpu().tolist()
-                target_logits_indices = spec_decode_metadata.target_logits_indices.cpu().tolist()
-                cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens.cpu().tolist()
-                accepted_prefix_lengths = task.accepted_prefix_lengths
-
-                for i in range(n):
-                    sampled_ids = valid_sampled_token_ids[i]
-                    if not sampled_ids:
-                        continue
-
-                    row_indices: List[int] = []
-                    if num_draft_list[i] == 0:
-                        row_indices.append(int(bonus_indices[i]))
-                        req_to_row_indices.append((req_ids[i], row_indices))
-                        continue
-
-                    num_drafts = int(num_draft_list[i])
-                    accepted = (
-                        int(accepted_prefix_lengths[i])
-                        if accepted_prefix_lengths is not None and i < len(accepted_prefix_lengths)
-                        else 0
-                    )
-                    out_len = len(sampled_ids)
-
-                    start = int(cu_num_draft_tokens[i - 1]) if i > 0 else 0
-                    end = start + num_drafts
-                    local_target_rows = target_logits_indices[start:end]
-
-                    for j in range(min(accepted, num_drafts, out_len)):
-                        row_indices.append(int(local_target_rows[j]))
-
-                    if out_len > accepted:
-                        if accepted < num_drafts:
-                            row_indices.append(int(local_target_rows[accepted]))
-                        else:
-                            row_indices.append(int(bonus_indices[i]))
-
-                    if row_indices:
-                        req_to_row_indices.append((req_ids[i], row_indices))
-
-            if not req_to_row_indices:
+            req_slices, flat_indices, pending_req_ids = _hspec_compute_req_slices(
+                req_ids,
+                valid_sampled_token_ids,
+                task.spec_decode_metadata,
+                task.accepted_prefix_lengths,
+            )
+            if not pending_req_ids:
                 _hspec_finish_pending(list(task.req_ids))
                 continue
 
             device = task.sample_hidden_states.device
-            flat_indices: List[int] = []
-            req_slices: List[Tuple[str, int, int]] = []
-            for req_id, row_indices in req_to_row_indices:
-                start = len(flat_indices)
-                flat_indices.extend(row_indices)
-                end = len(flat_indices)
-                req_slices.append((req_id, start, end))
-
             gather_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
             transfer_stream = _hspec_get_transfer_stream(device)
             with torch.npu.stream(transfer_stream) if device.type == "npu" else nullcontext():
@@ -1209,14 +1257,6 @@ def hspec_submit_accumulate_task(
 
     _hspec_ensure_async_worker()
 
-    device = sample_hidden_states.device
-    producer_event = None
-    if device.type == "npu":
-        import torch_npu  # type: ignore
-
-        producer_event = torch_npu.npu.Event()
-        producer_event.record(torch_npu.npu.current_stream(device))
-
     pending_req_ids: List[str] = []
     for req_id, sampled_ids in zip(req_ids, valid_sampled_token_ids):
         if sampled_ids:
@@ -1224,10 +1264,72 @@ def hspec_submit_accumulate_task(
     if not pending_req_ids:
         return
 
+    legacy_async = _hspec_use_legacy_async_accumulate()
+    req_slices: List[Tuple[str, int, int]] = []
+    flat_indices: List[int] = []
+    if not legacy_async:
+        req_slices, flat_indices, pending_req_ids = _hspec_compute_req_slices(
+            [str(req_id) for req_id in req_ids],
+            [[int(x) for x in sampled_ids] for sampled_ids in valid_sampled_token_ids],
+            spec_decode_metadata,
+            [int(x) for x in accepted_prefix_lengths]
+            if accepted_prefix_lengths is not None else None,
+        )
+        if not pending_req_ids:
+            return
+
     with _hspec_store_cond:
         for req_id in pending_req_ids:
             _hspec_async_pending_by_req[req_id] = _hspec_async_pending_by_req.get(req_id, 0) + 1
         _hspec_async_pending_total += len(pending_req_ids)
+
+    device = sample_hidden_states.device
+    if not legacy_async:
+        try:
+            gather_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
+            selected_rows = sample_hidden_states.index_select(0, gather_indices).detach()
+            if device.type == "npu":
+                import torch_npu  # type: ignore
+
+                current_stream = torch_npu.npu.current_stream(device)
+                if _hspec_use_async_copy_stream():
+                    copy_stream = _hspec_get_transfer_stream(device)
+                    copy_stream.wait_stream(current_stream)
+                else:
+                    copy_stream = current_stream
+                with torch.npu.stream(copy_stream):
+                    cpu_tensor = torch.empty(
+                        selected_rows.shape,
+                        dtype=selected_rows.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    cpu_tensor.copy_(selected_rows, non_blocking=True)
+                    copy_event = torch_npu.npu.Event()
+                    copy_event.record(copy_stream)
+            else:
+                cpu_tensor = selected_rows.cpu()
+                copy_event = None
+
+            _hspec_copy_queue.put(
+                _HSpecAsyncCopyTask(
+                    req_slices=req_slices,
+                    cpu_tensor=cpu_tensor,
+                    event=copy_event,
+                    device_tensor_ref=selected_rows if copy_event is not None else None,
+                )
+            )
+        except Exception:
+            logger.exception("HSpec main-thread async copy submit failed")
+            _hspec_finish_pending(pending_req_ids)
+        return
+
+    producer_event = None
+    if device.type == "npu":
+        import torch_npu  # type: ignore
+
+        producer_event = torch_npu.npu.Event()
+        producer_event.record(torch_npu.npu.current_stream(device))
 
     _hspec_accumulate_queue.put(
         _HSpecAsyncAccumulateTask(
