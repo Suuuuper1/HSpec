@@ -29,7 +29,7 @@ export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export HSPEC_DEBUG="${HSPEC_DEBUG:-0}"
 export HSPEC_TRACE="${HSPEC_TRACE:-0}"
 export HSPEC_DUMP="${HSPEC_DUMP:-0}"
-export HSPEC_PROFILE="${HSPEC_PROFILE:-0}"
+export HSPEC_PROFILE="${HSPEC_PROFILE:-1}" 
 export HSPEC_DUMP_DIR="${HSPEC_DUMP_DIR:-/workspace/exp/hspec_dump-rollout_1024}"
 
 # Core HSpec knobs.
@@ -49,7 +49,7 @@ export HSPEC_GEN="${HSPEC_GEN:-0}"
 export HSPEC_GEN_REQ_IDX="${HSPEC_GEN_REQ_IDX:-0}"
 export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
 export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,31,63,91}"
-export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_new-4}"
+export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_new-30b}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
 export HSPEC_PROFILE_ANALYSE="${HSPEC_PROFILE_ANALYSE:-1}"
@@ -104,7 +104,7 @@ RUN_NAME="${RUN_NAME:-qwen2.5_1.5b_hspec_single}"
 ROLLOUT_LENGTH_DIR="${ROLLOUT_LENGTH_DIR:-${ROLL_LEN_ROOT}/${RUN_NAME}}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${TB_ROOT}/${RUN_NAME}}"
 ROLLOUT_LOG_PATH="${ROLLOUT_LOG_PATH:-${LOG_DIR}/${RUN_NAME}.log}"
-OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec11.txt}"
+OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b.txt}"
 
 mkdir -p "${LOG_DIR}" "${ROLL_LEN_ROOT}" "${TB_ROOT}" "${ROLLOUT_LENGTH_DIR}" "$(dirname "${OUT}")"
 
@@ -173,6 +173,7 @@ env \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}" \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
+    actor_rollout_ref.rollout.load_format=auto \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_num_seqs="${MAX_NUM_SEQS}" \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \

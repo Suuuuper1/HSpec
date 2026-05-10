@@ -109,6 +109,41 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> list[in
     return token_ids
 
 
+def _build_hspec_store_index(hs_store: dict) -> tuple[dict[str, Any], dict[str, Any]]:
+    by_key: dict[str, Any] = {}
+    by_prefix: dict[str, Any] = {}
+    for key, payload in hs_store.items():
+        key_str = str(key)
+        by_key[key_str] = payload
+        if "-" in key_str:
+            by_prefix.setdefault(key_str.rsplit("-", 1)[0] + "-", payload)
+    return by_key, by_prefix
+
+
+def _lookup_hspec_store_payload(
+    hs_store_index: tuple[dict[str, Any], dict[str, Any]],
+    request_id: Any,
+    sample_id: int,
+    num_samples: int,
+) -> Any:
+    by_key, by_prefix = hs_store_index
+    req_id = str(request_id)
+
+    payload = by_key.get(req_id)
+    if payload is not None:
+        return payload
+
+    prefixes: list[str] = []
+    if num_samples > 1:
+        prefixes.append(f"{int(sample_id)}_{req_id}-")
+    prefixes.append(f"{req_id}-")
+    for prefix in prefixes:
+        payload = by_prefix.get(prefix)
+        if payload is not None:
+            return payload
+    return None
+
+
 if is_version_ge(pkg="vllm", minver="0.7.3"):
     VLLMHijack.hijack()
 
@@ -488,9 +523,11 @@ class vLLMRollout(BaseRollout):
                     )
 
                 hs_store: dict = {}
+                hs_store_index: tuple[dict[str, Any], dict[str, Any]] = ({}, {})
                 if use_hspec:
                     with hspec_record_function("hspec/rollout/hidden_state_flush", use_npu_stream=True):
                         hs_store = hspec_flush_and_get_all()
+                    hs_store_index = _build_hspec_store_index(hs_store)
 
                 response = []
                 rollout_log_probs = []
@@ -513,7 +550,12 @@ class vLLMRollout(BaseRollout):
                                 hspec_token_ids = getattr(output.outputs[sample_id], "hspec_token_ids", None)
                                 if hs is None:
                                     hs_source = "store"
-                                    payload = hs_store.get(output.request_id)
+                                    payload = _lookup_hspec_store_payload(
+                                        hs_store_index,
+                                        output.request_id,
+                                        sample_id,
+                                        len(output.outputs),
+                                    )
                                     if payload is not None:
                                         hs = payload.get("hidden_states")
                                         if hspec_token_ids is None:

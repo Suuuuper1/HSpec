@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -1243,12 +1244,13 @@ class Scheduler(SchedulerInterface):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params:
-                # HSpec: pop accumulated hidden states for finished requests so
-                # they can be serialized to the front-end process via
-                # EngineCoreOutput.
+                # HSpec rollout consumes hidden states after LLM.generate()
+                # through hspec_flush_and_get_all().  Popping here waits for
+                # async device-to-host copies and can stall one TP rank while
+                # peer ranks continue scheduling the next wave.
                 hspec_hs = None
                 hspec_tok = None
-                if stopped:
+                if stopped and os.getenv("HSPEC_ATTACH_ON_FINISH", "0") != "0":
                     # Keep overhead off the hot path when HSpec is not enabled.
                     spec_cfg = getattr(self.vllm_config, "speculative_config", None)
                     if (

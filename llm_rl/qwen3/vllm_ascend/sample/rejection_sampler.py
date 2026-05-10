@@ -327,7 +327,7 @@ def sample_recovered_tokens(
         q[i] = torch.where(has_draft_mask[i], temp_q, q[i])
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
-    if _should_use_triton_random_rejection_path(draft_probs):
+    if HAS_TRITON:
         sample_recovered_tokens_kernel[(batch_size, max_spec_len)](
             recovered_token_ids,
             cu_num_draft_tokens,
