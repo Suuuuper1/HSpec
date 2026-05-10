@@ -954,8 +954,13 @@ def _hspec_use_legacy_async_accumulate() -> bool:
 
 
 def _hspec_use_async_copy_stream() -> bool:
-    """Whether HSpec D2H copies may run on a separate NPU stream."""
-    return os.getenv("HSPEC_ASYNC_HS_COPY_STREAM", "0") != "0"
+    """Whether HSpec D2H copies may run on a separate NPU stream.
+
+    The default path keeps NPU kernels on the caller's stream, then moves only
+    the host copy to a transfer stream. This preserves HCCL/kernel ordering
+    while hiding most D2H latency behind the next decode wave.
+    """
+    return os.getenv("HSPEC_ASYNC_HS_COPY_STREAM", "1") != "0"
 
 
 def _hspec_metadata_to_list(metadata: Any, cache_attr: str,
@@ -1049,6 +1054,20 @@ def _hspec_compute_req_slices(
     return req_slices, flat_indices, pending_req_ids
 
 
+def _hspec_contiguous_index_slice(
+    indices: List[int],
+) -> Optional[Tuple[int, int]]:
+    if not indices:
+        return None
+    start = int(indices[0])
+    if start < 0:
+        return None
+    for offset, index in enumerate(indices):
+        if int(index) != start + offset:
+            return None
+    return start, len(indices)
+
+
 def _hspec_finish_pending(req_ids: List[str]) -> None:
     global _hspec_async_pending_total
 
@@ -1140,7 +1159,7 @@ def _hspec_accumulate_worker() -> None:
             _hspec_finish_pending(list(task.req_ids))
 
 
-def _hspec_ensure_async_worker() -> None:
+def _hspec_ensure_async_worker(start_accumulate_worker: bool = False) -> None:
     global _hspec_copy_thread, _hspec_accumulate_thread
     if _hspec_copy_thread is None or not _hspec_copy_thread.is_alive():
         _hspec_copy_thread = _threading.Thread(
@@ -1149,6 +1168,8 @@ def _hspec_ensure_async_worker() -> None:
             daemon=True,
         )
         _hspec_copy_thread.start()
+    if not start_accumulate_worker:
+        return
     if _hspec_accumulate_thread is not None and _hspec_accumulate_thread.is_alive():
         return
     _hspec_accumulate_thread = _threading.Thread(
@@ -1247,15 +1268,19 @@ def hspec_submit_accumulate_task(
     spec_decode_metadata: Any = None,
     accepted_prefix_lengths: Optional[List[int]] = None,
 ) -> None:
-    """Submit full HSpec accumulation work to a background thread."""
+    """Submit HSpec hidden-state accumulation work.
+
+    The normal path computes the CPU-side row mapping on the caller, enqueues
+    the selected-row gather on the caller's stream, and performs the D2H copy
+    asynchronously.  The legacy full background-NPU path is kept only behind
+    ``HSPEC_ASYNC_HS_ACCUMULATE=1`` for debugging/experiments.
+    """
     global _hspec_async_pending_total
 
     if not _hspec_collection_enabled:
         return
     if sample_hidden_states is None or not req_ids:
         return
-
-    _hspec_ensure_async_worker()
 
     pending_req_ids: List[str] = []
     for req_id, sampled_ids in zip(req_ids, valid_sampled_token_ids):
@@ -1265,6 +1290,8 @@ def hspec_submit_accumulate_task(
         return
 
     legacy_async = _hspec_use_legacy_async_accumulate()
+    _hspec_ensure_async_worker(start_accumulate_worker=legacy_async)
+
     req_slices: List[Tuple[str, int, int]] = []
     flat_indices: List[int] = []
     if not legacy_async:
@@ -1286,8 +1313,13 @@ def hspec_submit_accumulate_task(
     device = sample_hidden_states.device
     if not legacy_async:
         try:
-            gather_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
-            selected_rows = sample_hidden_states.index_select(0, gather_indices).detach()
+            contiguous_slice = _hspec_contiguous_index_slice(flat_indices)
+            if contiguous_slice is not None:
+                start, length = contiguous_slice
+                selected_rows = sample_hidden_states.narrow(0, start, length).detach()
+            else:
+                gather_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
+                selected_rows = sample_hidden_states.index_select(0, gather_indices).detach()
             if device.type == "npu":
                 import torch_npu  # type: ignore
 
