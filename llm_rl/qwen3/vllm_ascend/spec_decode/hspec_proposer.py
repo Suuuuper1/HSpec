@@ -579,6 +579,58 @@ class HSpecProposer(Proposer):
         # Fire new async fetches for cache misses
         self._fire_prefetch_async(prompt_ids)
 
+    def prefetch_prompt_token_ids_batch(
+        self,
+        prompt_token_ids_batch: List[List[int]],
+    ) -> int:
+        """Fire async prefetch for a known prompt-token batch.
+
+        This is called before ``LLM.generate()`` starts. When ``max_num_seqs``
+        splits one rollout batch into several scheduler waves, later-wave
+        requests do not have live ``req_id`` state during the first wave. Their
+        tables can still be warmed by stable prompt ids computed from the input
+        token ids, avoiding several baseline decode steps after each wave
+        enters the scheduler.
+        """
+        if not prompt_token_ids_batch:
+            return 0
+
+        prompt_ids: List[str] = []
+        for token_ids in prompt_token_ids_batch:
+            try:
+                if token_ids:
+                    prompt_ids.append(prompt_id_from_token_ids(token_ids))
+            except Exception:
+                logger.debug("HSpec: failed to build prompt_id for prefetch",
+                             exc_info=True)
+        if not prompt_ids:
+            return 0
+
+        self._poll_pending()
+        for pid in set(prompt_ids):
+            self._not_in_table.discard(pid)
+        before = len(self._pending_pids)
+        self._fire_prefetch_async(prompt_ids, include_absent=True)
+        return max(len(self._pending_pids) - before, 0)
+
+    def prefetch_prompt_ids_batch(self, prompt_ids: List[str]) -> int:
+        """Fire async prefetch for stable prompt ids.
+
+        This is the lowest-overhead warmup path for rollout-level prefetch:
+        the caller computes prompt ids once and the worker only schedules table
+        actor fetches.
+        """
+        prompt_ids = [str(pid) for pid in prompt_ids if pid]
+        if not prompt_ids:
+            return 0
+
+        self._poll_pending()
+        for pid in set(prompt_ids):
+            self._not_in_table.discard(pid)
+        before = len(self._pending_pids)
+        self._fire_prefetch_async(prompt_ids, include_absent=True)
+        return max(len(self._pending_pids) - before, 0)
+
     def _poll_pending(self) -> None:
         """Non-blocking: consume any ready prefetch futures.
 
@@ -664,7 +716,11 @@ class HSpecProposer(Proposer):
             self._cache_generation += 1
             self._batched_table_cache = None
 
-    def _fire_prefetch_async(self, prompt_ids: List[str]) -> None:
+    def _fire_prefetch_async(
+        self,
+        prompt_ids: List[str],
+        include_absent: bool = False,
+    ) -> None:
         """Fire async Ray futures for uncached prompts – **non-blocking**.
 
         Futures are appended to ``_pending_fetches`` and polled later
@@ -673,7 +729,9 @@ class HSpecProposer(Proposer):
         """
         missing = [
             pid for pid in set(prompt_ids)
-            if pid not in self._cache and pid not in self._not_in_table and pid not in self._pending_pids
+            if pid not in self._cache
+            and (include_absent or pid not in self._not_in_table)
+            and pid not in self._pending_pids
         ]
         if not missing:
             return
@@ -1355,6 +1413,7 @@ class HSpecProposer(Proposer):
                 ]
 
         if active_batch_indices and batch_table_cache is not None:
+            self._stat_queries += len(active_batch_indices)
             t0_cast = _now_ns() if gen_enabled else 0
             with (hspec_record_function("hspec/proposal/anchor_gather", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
@@ -1623,7 +1682,6 @@ class HSpecProposer(Proposer):
                 })
                 self._hspec_gen_timing = td
 
-        self._stat_queries += len(pending)
         self._maybe_log_metrics()
 
         # HSPEC_GEN: per-token breakdown log for one traced request only.

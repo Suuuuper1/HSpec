@@ -489,6 +489,40 @@ class NPUModelRunner(GPUModelRunner):
             except Exception:
                 pass
 
+    def hspec_prefetch_prompt_token_ids_batch(
+        self,
+        prompt_token_ids_batch: list[list[int]],
+    ) -> int:
+        """Warm HSpec proposer cache for a full rollout input batch.
+
+        This non-blocking hook is called before ``LLM.generate()``. It starts
+        table prefetches for prompts that may only enter the scheduler in later
+        waves when ``max_num_seqs`` is smaller than the logical rollout batch.
+        """
+        if (not self._hspec_collect or self.drafter is None
+                or getattr(self.drafter, "name", None) != SpecDcodeType.HSPEC
+                or not hasattr(self.drafter,
+                               "prefetch_prompt_token_ids_batch")):
+            return 0
+        try:
+            return int(self.drafter.prefetch_prompt_token_ids_batch(
+                prompt_token_ids_batch))
+        except Exception:
+            logger.debug("HSpec: prompt-token prefetch failed", exc_info=True)
+            return 0
+
+    def hspec_prefetch_prompt_ids_batch(self, prompt_ids: list[str]) -> int:
+        """Warm HSpec proposer cache from stable prompt ids."""
+        if (not self._hspec_collect or self.drafter is None
+                or getattr(self.drafter, "name", None) != SpecDcodeType.HSPEC
+                or not hasattr(self.drafter, "prefetch_prompt_ids_batch")):
+            return 0
+        try:
+            return int(self.drafter.prefetch_prompt_ids_batch(prompt_ids))
+        except Exception:
+            logger.debug("HSpec: prompt-id prefetch failed", exc_info=True)
+            return 0
+
     def _hspec_maybe_report_verification_metrics(
         self,
         verify_times: int,

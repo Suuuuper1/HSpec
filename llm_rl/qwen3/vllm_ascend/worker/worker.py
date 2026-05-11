@@ -350,6 +350,23 @@ class NPUWorker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    def hspec_prefetch_prompt_token_ids_batch(
+        self,
+        prompt_token_ids_batch: list[list[int]],
+    ) -> int:
+        if self.model_runner is None or not hasattr(
+                self.model_runner, "hspec_prefetch_prompt_token_ids_batch"):
+            return 0
+        return int(self.model_runner.hspec_prefetch_prompt_token_ids_batch(
+            prompt_token_ids_batch))
+
+    def hspec_prefetch_prompt_ids_batch(self, prompt_ids: list[str]) -> int:
+        if self.model_runner is None or not hasattr(
+                self.model_runner, "hspec_prefetch_prompt_ids_batch"):
+            return 0
+        return int(self.model_runner.hspec_prefetch_prompt_ids_batch(
+            prompt_ids))
+
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()

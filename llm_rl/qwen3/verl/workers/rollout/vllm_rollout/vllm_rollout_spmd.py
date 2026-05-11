@@ -60,6 +60,7 @@ from vllm_ascend.spec_decode.hspec_utils import (
     hspec_profile_output_dir,
     hspec_record_function,
     hspec_set_profile_context,
+    prompt_id_from_token_ids,
 )
 
 try:
@@ -142,6 +143,37 @@ def _lookup_hspec_store_payload(
         if payload is not None:
             return payload
     return None
+
+
+def _hspec_prefetch_rollout_prompts(
+    inference_engine: LLM,
+    vllm_inputs: list[dict[str, Any]],
+) -> None:
+    """Warm worker-local HSpec proposer caches before scheduling starts.
+
+    When ``max_num_seqs`` is below the logical rollout batch size, vLLM admits
+    requests in several scheduler waves. Waiting until each wave reaches the
+    model runner to prefetch its table causes baseline decode steps. This hook
+    starts non-blocking table prefetches for the full rollout batch up front.
+    """
+    if os.getenv("HSPEC_FULL_BATCH_PREFETCH", "1") == "0":
+        return
+
+    prompt_ids = [
+        prompt_id_from_token_ids(list(input_data.get("prompt_token_ids", [])))
+        for input_data in vllm_inputs
+        if input_data.get("prompt_token_ids")
+    ]
+    if not prompt_ids:
+        return
+
+    try:
+        inference_engine.llm_engine.collective_rpc(
+            "hspec_prefetch_prompt_ids_batch",
+            args=(prompt_ids,),
+        )
+    except Exception:
+        logger.debug("HSpec rollout prompt prefetch failed", exc_info=True)
 
 
 if is_version_ge(pkg="vllm", minver="0.7.3"):
@@ -514,6 +546,12 @@ class vLLMRollout(BaseRollout):
 
         try:
             with self.update_sampling_params(**kwargs):
+                if use_hspec:
+                    with hspec_record_function("hspec/rollout/full_batch_prefetch"):
+                        _hspec_prefetch_rollout_prompts(
+                            self.inference_engine,
+                            vllm_inputs,
+                        )
                 with hspec_record_function("hspec/rollout/engine_generate", use_npu_stream=True):
                     outputs = self.inference_engine.generate(
                         prompts=vllm_inputs,
