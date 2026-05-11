@@ -29,7 +29,7 @@ export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export HSPEC_DEBUG="${HSPEC_DEBUG:-0}"
 export HSPEC_TRACE="${HSPEC_TRACE:-0}"
 export HSPEC_DUMP="${HSPEC_DUMP:-0}"
-export HSPEC_PROFILE="${HSPEC_PROFILE:-1}"
+export HSPEC_PROFILE="${HSPEC_PROFILE:-0}"
 export HSPEC_DUMP_DIR="${HSPEC_DUMP_DIR:-/workspace/exp/hspec_dump-rollout_1024}"
 
 # Core HSpec knobs.
@@ -43,13 +43,15 @@ export HSPEC_ALIGN_DEBUG_PREVIEW="${HSPEC_ALIGN_DEBUG_PREVIEW:-8}"
 export HSPEC_ENTRY="${HSPEC_ENTRY:-0}"
 export MATCH_WND="${MATCH_WND:-16}"
 export HSPEC_ADVAN_NGRAM="${HSPEC_ADVAN_NGRAM:-1}"
+export HSPEC_ASYNC_HS_ACCUMULATE="${HSPEC_ASYNC_HS_ACCUMULATE:-0}"
+export HSPEC_ASYNC_HS_COPY_STREAM="${HSPEC_ASYNC_HS_COPY_STREAM:-1}"
 
 # Per-step HSpec breakdown / profiler controls.
 export HSPEC_GEN="${HSPEC_GEN:-0}"
 export HSPEC_GEN_REQ_IDX="${HSPEC_GEN_REQ_IDX:-0}"
 export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
 export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,31,63,91}"
-export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_vllm_batch}"
+export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_batch}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
 export HSPEC_PROFILE_ANALYSE="${HSPEC_PROFILE_ANALYSE:-1}"
@@ -92,7 +94,7 @@ fi
 # Log/output path conventions.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/rl}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/logs}"
-export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec14.txt}"
+export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec15.txt}"
 mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
 
 {
@@ -145,6 +147,8 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ENTRY='"'"${HSPEC_ENTRY}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.MATCH_WND='"'"${MATCH_WND}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ADVAN_NGRAM='"'"${HSPEC_ADVAN_NGRAM}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_ACCUMULATE='"'"${HSPEC_ASYNC_HS_ACCUMULATE}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_COPY_STREAM='"'"${HSPEC_ASYNC_HS_COPY_STREAM}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_SPECULATIVE_BATCH_SIZE_THRE='"'"${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"'"' \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \
@@ -160,7 +164,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_coeff=0.001 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
-    actor_rollout_ref.rollout.temperature=0.3 \
+    actor_rollout_ref.rollout.temperature=0.9 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -178,7 +182,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.use_hspec_decode="${USE_HSPEC_DECODE}" \
-    actor_rollout_ref.rollout.hspec_num_speculative_tokens=5 \
+    actor_rollout_ref.rollout.hspec_num_speculative_tokens=15 \
     actor_rollout_ref.rollout.hspec_similarity_threshold=0.85 \
     actor_rollout_ref.rollout.hspec_min_match_len=1 \
     actor_rollout_ref.rollout.hspec_n_components="${PCA_COMPONENTS}" \
