@@ -112,16 +112,10 @@ def _ns_to_ms(ns: int) -> float:
     return float(ns) / 1_000_000.0
 
 
-# Worker-local cached prompt table (CPU refs + optional per-prompt device refs)
+# Worker-local cached prompt table (on-device tensors + CPU refs)
 
 class _CachedPromptTable:
-    """Per-prompt cached table data.
-
-    The hot matching path uses batched device tensors built from the CPU refs.
-    Per-prompt device tensors are only kept when explicitly enabled for legacy
-    debugging; keeping them by default duplicates H2D traffic and can interfere
-    with target-model decode kernels.
-    """
+    """Per-prompt cached table data with on-device query tensors."""
 
     __slots__ = (
         "mean_cpu",
@@ -451,20 +445,6 @@ class HSpecProposer(Proposer):
         # resolves to (version, {pid: table_data | None}).
         self._pending_fetches: List[tuple] = []
         self._pending_pids: Set[str] = set()
-        # Ready Ray payloads live here until an active scheduler wave needs the
-        # prompt.  This decouples full-rollout prefetch from hot-path cache
-        # materialization and prevents later-wave prompts from being built on
-        # the current wave.
-        self._prefetched_table_data: Dict[str, Optional[dict]] = {}
-        self._prefetched_table_version: Dict[str, int] = {}
-        self._refreshing_pids: Set[str] = set()
-        self._cache_prompt_device_tensors = (
-            os.environ.get("HSPEC_CACHE_PROMPT_DEVICE_TENSORS", "0") == "1"
-        )
-        self._full_batch_prefetch_chunk_size = max(
-            int(os.environ.get("HSPEC_FULL_BATCH_PREFETCH_CHUNK_SIZE", "0")),
-            0,
-        )
         # Worker-local prompt baseline window priors. These survive cache
         # invalidation / epoch swap and are re-applied when the next version of
         # the same prompt is prefetched into the local cache.
@@ -594,10 +574,9 @@ class HSpecProposer(Proposer):
         if not prompt_ids:
             return
 
-        # Fire new async fetches for cache misses.  Do not consume ready
-        # futures here: this hook runs immediately before target-model forward,
-        # and even CPU-side Ray deserialization can delay the decode launch.
-        # Ready futures are consumed after forward for active prompts only.
+        # Consume any futures that became ready since last call
+        self._poll_pending()
+        # Fire new async fetches for cache misses
         self._fire_prefetch_async(prompt_ids)
 
     def prefetch_prompt_token_ids_batch(
@@ -627,20 +606,11 @@ class HSpecProposer(Proposer):
         if not prompt_ids:
             return 0
 
+        self._poll_pending()
         for pid in set(prompt_ids):
             self._not_in_table.discard(pid)
-        self._drop_prefetch_state_for_prompt_ids(set(prompt_ids))
         before = len(self._pending_pids)
-        chunk_size = int(self._full_batch_prefetch_chunk_size)
-        if chunk_size > 0:
-            for start in range(0, len(prompt_ids), chunk_size):
-                self._fire_prefetch_async(
-                    prompt_ids[start:start + chunk_size],
-                    include_absent=True,
-                    refresh_cached=True,
-                )
-        else:
-            self._fire_prefetch_async(prompt_ids, include_absent=True, refresh_cached=True)
+        self._fire_prefetch_async(prompt_ids, include_absent=True)
         return max(len(self._pending_pids) - before, 0)
 
     def prefetch_prompt_ids_batch(self, prompt_ids: List[str]) -> int:
@@ -654,47 +624,35 @@ class HSpecProposer(Proposer):
         if not prompt_ids:
             return 0
 
+        self._poll_pending()
         for pid in set(prompt_ids):
             self._not_in_table.discard(pid)
-        self._drop_prefetch_state_for_prompt_ids(set(prompt_ids))
         before = len(self._pending_pids)
-        chunk_size = int(self._full_batch_prefetch_chunk_size)
-        if chunk_size > 0:
-            for start in range(0, len(prompt_ids), chunk_size):
-                self._fire_prefetch_async(
-                    prompt_ids[start:start + chunk_size],
-                    include_absent=True,
-                    refresh_cached=True,
-                )
-        else:
-            self._fire_prefetch_async(prompt_ids, include_absent=True, refresh_cached=True)
+        self._fire_prefetch_async(prompt_ids, include_absent=True)
         return max(len(self._pending_pids) - before, 0)
 
-    def _poll_pending(self, needed_prompt_ids: Optional[Set[str]] = None) -> None:
-        """Non-blocking: stage ready prefetch futures on CPU.
+    def _poll_pending(self) -> None:
+        """Non-blocking: consume any ready prefetch futures.
 
-        ``ray.wait(timeout=0)`` returns immediately.  When ``needed_prompt_ids``
-        is provided, ready futures for unrelated later scheduler waves remain
-        pending so this decode wave does not pay their deserialization cost.
+        Uses ``ray.wait(timeout=0)`` which returns immediately with
+        whatever futures are already completed.
         """
         if not self._pending_fetches:
             return
 
         import ray as _ray
 
+        cache_mutated = False
         all_futures = [f for f, _ in self._pending_fetches]
         ready_refs, _ = _ray.wait(all_futures, num_returns=len(all_futures), timeout=0)
         if not ready_refs:
             return
         ready_set = set(ready_refs)
-        needed = {str(pid) for pid in needed_prompt_ids or set() if pid}
 
+        version_bumped = False
         still_pending: List[tuple] = []
         for future, pids in self._pending_fetches:
             if future not in ready_set:
-                still_pending.append((future, pids))
-                continue
-            if needed and not any(pid in needed for pid in pids):
                 still_pending.append((future, pids))
                 continue
 
@@ -710,76 +668,44 @@ class HSpecProposer(Proposer):
                     if version > self._cache_version:
                         # Epoch swap detected → invalidate old cache
                         self._cache.clear()
-                        self._prefetched_table_data.clear()
-                        self._prefetched_table_version.clear()
-                        self._refreshing_pids.clear()
                         self._not_in_table.clear()
                         self._cache_version = version
-                        self._cache_generation += 1
-                        self._batched_table_cache = None
+                        version_bumped = True
+                        cache_mutated = True
 
-                    # Stage fresh data.  Do not build _CachedPromptTable here:
-                    # a partition future can include later-wave prompts that
-                    # are not useful for the current decode wave.
+                    # Populate cache with fresh data
                     for pid in pids:
                         data = table_data.get(pid)
-                        self._prefetched_table_data[pid] = data
-                        self._prefetched_table_version[pid] = int(version)
-                        if data is None:
+                        if data is not None:
+                            try:
+                                cached = self._build_cached_table(data, prompt_id=pid)
+                                self._cache[pid] = cached
+                                self._cache.move_to_end(pid)
+                                cache_mutated = True
+                            except Exception:
+                                self._not_in_table.add(pid)
+                                cache_mutated = True
+                        else:
                             self._not_in_table.add(pid)
+                            cache_mutated = True
             except Exception:
                 # On error mark prompts as absent to avoid infinite retry
                 for pid in pids:
                     self._not_in_table.add(pid)
+                cache_mutated = True
 
             # Remove consumed pids from pending set
             for pid in pids:
                 self._pending_pids.discard(pid)
-                self._refreshing_pids.discard(pid)
 
         self._pending_fetches = still_pending
 
-        # Do not abandon other pending futures on version bump.  They may have
-        # been fired by the same full-rollout prefetch call; stale futures are
-        # filtered individually by their returned version when consumed.
-
-    def _materialize_prompt_tables(self, prompt_ids: Set[str]) -> None:
-        """Build worker-local prompt caches for active prompts only."""
-        if not self._prefetched_table_data or not prompt_ids:
-            return
-
-        cache_mutated = False
-        for pid in {str(pid) for pid in prompt_ids if pid}:
-            if pid not in self._prefetched_table_data:
-                continue
-            data = self._prefetched_table_data.pop(pid)
-            version = int(self._prefetched_table_version.pop(pid, self._cache_version))
-            if version < self._cache_version:
-                continue
-            if version > self._cache_version:
-                self._cache.clear()
-                self._prefetched_table_data.clear()
-                self._prefetched_table_version.clear()
-                self._refreshing_pids.clear()
-                self._not_in_table.clear()
-                self._cache_version = version
-                cache_mutated = True
-            if data is None:
-                self._not_in_table.add(pid)
-                if self._cache.pop(pid, None) is not None:
-                    cache_mutated = True
-                self._refreshing_pids.discard(pid)
-                continue
-            try:
-                cached = self._build_cached_table(data, prompt_id=pid)
-                self._cache[pid] = cached
-                self._cache.move_to_end(pid)
-                self._refreshing_pids.discard(pid)
-                cache_mutated = True
-            except Exception:
-                self._not_in_table.add(pid)
-                self._refreshing_pids.discard(pid)
-                cache_mutated = True
+        # On epoch swap, abandon remaining (likely stale) pending
+        # futures.  Their Ray ObjectRefs are GC'd harmlessly.  Fresh
+        # fetches will be fired by the next _fire_prefetch_async() call.
+        if version_bumped and self._pending_fetches:
+            self._pending_fetches = []
+            self._pending_pids.clear()
 
         # LRU eviction
         while len(self._cache) > self._max_cache_size:
@@ -790,35 +716,10 @@ class HSpecProposer(Proposer):
             self._cache_generation += 1
             self._batched_table_cache = None
 
-    def _drop_prefetch_state_for_prompt_ids(self, prompt_ids: Set[str]) -> None:
-        """Forget staged or in-flight fetch state for explicitly refreshed prompts."""
-        if not prompt_ids:
-            return
-        refresh = {str(pid) for pid in prompt_ids if pid}
-        if not refresh:
-            return
-
-        for pid in refresh:
-            self._prefetched_table_data.pop(pid, None)
-            self._prefetched_table_version.pop(pid, None)
-            self._refreshing_pids.discard(pid)
-        if not self._pending_fetches:
-            return
-
-        still_pending: List[tuple] = []
-        self._pending_pids.difference_update(refresh)
-        for future, pids in self._pending_fetches:
-            kept_pids = [pid for pid in pids if pid not in refresh]
-            if kept_pids:
-                still_pending.append((future, kept_pids))
-                self._pending_pids.update(kept_pids)
-        self._pending_fetches = still_pending
-
     def _fire_prefetch_async(
         self,
         prompt_ids: List[str],
         include_absent: bool = False,
-        refresh_cached: bool = False,
     ) -> None:
         """Fire async Ray futures for uncached prompts – **non-blocking**.
 
@@ -826,19 +727,12 @@ class HSpecProposer(Proposer):
         by ``_poll_pending()``.  Prompts already cached, pending, or
         known-absent are skipped.
         """
-        seen: Set[str] = set()
-        missing = []
-        for pid in prompt_ids:
-            pid = str(pid)
-            if not pid or pid in seen:
-                continue
-            seen.add(pid)
-            if ((not refresh_cached and pid in self._cache)
-                    or (not include_absent and pid in self._not_in_table)
-                    or pid in self._pending_pids
-                    or pid in self._prefetched_table_data):
-                continue
-            missing.append(pid)
+        missing = [
+            pid for pid in set(prompt_ids)
+            if pid not in self._cache
+            and (include_absent or pid not in self._not_in_table)
+            and pid not in self._pending_pids
+        ]
         if not missing:
             return
 
@@ -847,8 +741,6 @@ class HSpecProposer(Proposer):
             for future, pids in new_futures:
                 self._pending_fetches.append((future, pids))
                 self._pending_pids.update(pids)
-                if refresh_cached:
-                    self._refreshing_pids.update(pids)
             if new_futures:
                 self._stat_prefetch_fired += len(new_futures)
         except Exception:
@@ -916,8 +808,6 @@ class HSpecProposer(Proposer):
         cached_tables: List[_CachedPromptTable] = []
         with hspec_record_function("hspec/proposal/build_batch_indices_cached_tables"):
             for i, pid in enumerate(prompt_ids):
-                if pid in self._refreshing_pids:
-                    continue
                 prompt_table = self._cache.get(pid)
                 if prompt_table is None or prompt_table.n_entries <= 0:
                     continue
@@ -1091,14 +981,9 @@ class HSpecProposer(Proposer):
         keys_np = np.array(data["keys"], dtype=np.float32, copy=True)
         components_t_cpu = np.ascontiguousarray(comp_np.transpose(1, 0))
 
-        if self._cache_prompt_device_tensors:
-            mean = torch.from_numpy(mean_np).to(self.device, non_blocking=True)
-            components = torch.from_numpy(comp_np).to(self.device, non_blocking=True)
-            keys = torch.from_numpy(keys_np).to(self.device, non_blocking=True)
-        else:
-            mean = torch.empty((0,), dtype=torch.float32)
-            components = torch.empty((0, 0), dtype=torch.float32)
-            keys = torch.empty((0, 0), dtype=torch.float32)
+        mean = torch.from_numpy(mean_np).to(self.device, non_blocking=True)
+        components = torch.from_numpy(comp_np).to(self.device, non_blocking=True)
+        keys = torch.from_numpy(keys_np).to(self.device, non_blocking=True)
 
         # Ensure rollout_seqs are numpy arrays on CPU
         rollout_seqs = []
@@ -1211,9 +1096,9 @@ class HSpecProposer(Proposer):
             empty_bool = torch.empty((0,), dtype=torch.bool, device=device)
             return empty, empty, empty, empty_long, empty_bool
 
-        k_max = max(int(cached.components_t_cpu.shape[1]) for cached in cached_tables)
+        k_max = max(int(cached.components.shape[0]) for cached in cached_tables)
         m_max = max(int(cached.n_entries) for cached in cached_tables)
-        hidden_dim = int(cached_tables[0].mean_cpu.shape[0])
+        hidden_dim = int(cached_tables[0].mean.shape[0])
         # Rebuild on CPU to avoid many tiny NPU slice/copy kernels, then upload
         with (hspec_record_function("hspec/proposal/rebuild_on_cpu")
               if prof_enabled else nullcontext()):
@@ -1473,9 +1358,7 @@ class HSpecProposer(Proposer):
         # that might have arrived after the early prefetch.
         t0_poll = _now_ns() if gen_enabled else 0
         with hspec_record_function("hspec/proposal/poll_pending"):
-            active_prompt_ids = {str(pid) for pid in prompt_ids if pid}
-            self._poll_pending(active_prompt_ids)
-            self._materialize_prompt_tables(active_prompt_ids)
+            self._poll_pending()
         t1_poll = _now_ns() if gen_enabled else 0
 
         t0_fire = _now_ns() if gen_enabled else 0
@@ -1658,7 +1541,7 @@ class HSpecProposer(Proposer):
                             # Get similarity for this entry (if keys available)
                             try:
                                 # Use the projected anchor_hs to compute similarity
-                                if trace_anchor is not None and cached_for_debug.keys.numel() > 0:
+                                if trace_anchor is not None:
                                     hs_f = trace_anchor.float()
                                     z = (hs_f - cached_for_debug.mean) @ cached_for_debug.components.T
                                     # z = F.normalize(z, dim=0)
