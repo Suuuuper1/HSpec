@@ -556,7 +556,8 @@ def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=Fal
             for k in list(ssd.keys()):
                 if "output_layer" in k:
                     ssd.pop(k)
-        if os.getenv('USE_ALLTOALL_OVERLAP', '0') == '1':
+        has_fused_expert_weights = any("mlp.experts.weight" in key for key in ssd)
+        if has_fused_expert_weights:
             new_ssd = dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
             sd = unwrap_model(model).state_dict()
             for key in list(ssd.keys()):

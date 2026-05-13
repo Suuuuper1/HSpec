@@ -372,10 +372,29 @@ class RayPPOTrainer:
             collate_fn = default_collate_fn
 
         num_workers = self.config.data["dataloader_num_workers"]
+        train_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        train_multiple = train_batch_size
+        if train_multiple > 0:
+            train_len = len(self.train_dataset)
+            aligned_train_len = train_len - train_len % train_multiple
+            if 0 < aligned_train_len < train_len:
+                if hasattr(self.train_dataset, "dataframe"):
+                    self.train_dataset.dataframe = self.train_dataset.dataframe.select(range(aligned_train_len))
+                    if train_sampler is not None:
+                        train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+                    print(
+                        f"[DataAlign] floor train dataset to batch multiple: "
+                        f"{train_len} -> {aligned_train_len}"
+                    )
+                else:
+                    print(
+                        f"[DataAlign] skip train dataset flooring for dataset type "
+                        f"{type(self.train_dataset).__name__}"
+                    )
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            batch_size=train_batch_size,
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
