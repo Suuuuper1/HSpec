@@ -117,6 +117,7 @@ class RLHFDataset(Dataset):
         self.filter_prompts = config.get("filter_prompts", True)
         self.serialize_dataset = False
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
+        self.dataset_fraction = config.get("dataset_fraction", None)
 
         self._download()
         self._read_files_and_tokenize()
@@ -137,6 +138,14 @@ class RLHFDataset(Dataset):
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         print(f"dataset len: {len(self.dataframe)}")
+        if self.dataset_fraction is not None:
+            fraction = float(self.dataset_fraction)
+            if not 0 < fraction <= 1:
+                raise ValueError(f"data.dataset_fraction must be in (0, 1], got {fraction}")
+            sampled_len = max(1, int(len(self.dataframe) * fraction))
+            if sampled_len < len(self.dataframe):
+                self.dataframe = self.dataframe.select(range(sampled_len))
+            print(f"Sampled dataset len: {len(self.dataframe)} (fraction: {fraction})")
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 

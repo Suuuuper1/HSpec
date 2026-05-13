@@ -77,7 +77,7 @@ GEN_BATCH_SIZE=$((TRAIN_BATCH_SIZE))
 ROLLOUT_LOG_PATH=${VLLM_DYNAMIC_RL_LOG_PATH:-outputs/rl/test.txt}
 ROLLOUT_LENGTH_DIR=${ROLLOUT_LENGTH_DIR:-outputs/rl/rollout_length}
 
-OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b.txt}"
+OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b-1.txt}"
 
 mkdir -p "$(dirname "${ROLLOUT_LOG_PATH}")" "${ROLLOUT_LENGTH_DIR}"
 {
@@ -110,6 +110,7 @@ python3 -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
     data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
     data.max_response_length="${MAX_RESPONSE_LENGTH}" \
+    data.val_batch_size=16 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=False \

@@ -300,7 +300,7 @@ class vLLMRollout(BaseRollout):
             torch._dynamo.config.log_compilation_metrics = False
             compilation_config["compilation_config"] = {
                 "cudagraph_capture_sizes": cudagraph_capture_sizes,
-                "cudagraph_mode": "FULL",
+                "cudagraph_mode": "PIECEWISE",
             }
 
         self.dynamic_eplb = int(os.environ.get("VLLM_ENABLE_EPLB", "0")) == 1
@@ -360,7 +360,7 @@ class vLLMRollout(BaseRollout):
 
         # supporting adding any sampling params from the config file
         for k in config.keys():
-            if hasattr(SamplingParams(), str(k)) and k != "seed":
+            if hasattr(SamplingParams(), str(k)) and k not in ("seed", "n"):
                 kwargs[k] = config.get(k)
         kwargs["n"] = 1  # already repeat in ray_trainer
         print(f"kwargs: {kwargs}")
@@ -752,7 +752,7 @@ class vLLMRollout(BaseRollout):
             model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
             model = model_runner.get_model()
             patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
+            loaded_params = model.load_weights(weights)
 
             model_config = model_runner.vllm_config.model_config
             device_config = model_runner.vllm_config.device_config
@@ -762,6 +762,13 @@ class vLLMRollout(BaseRollout):
             )
             target_device = torch.device(load_device)
             process_weights_after_loading(model, model_config, target_device)
+            loaded_count = len(loaded_params) if loaded_params is not None else -1
+            logger.warning("vLLM rollout loaded %s parameters from actor weights", loaded_count)
+            if loaded_count == 0:
+                raise RuntimeError(
+                    "vLLM rollout weight synchronization loaded 0 parameters. "
+                    "Generation would continue with dummy/random weights."
+                )
 
 
 # https://github.com/vllm-project/vllm/issues/13175
