@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-export ASCEND_LAUNCH_BLOCKING=1
+# export ASCEND_LAUNCH_BLOCKING=1
 
 # Model and dataset
 HOME=$(pwd)
@@ -144,6 +144,7 @@ python3 -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
     actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.cudagraph_capture_sizes='[4,8,16,24,32,48,64]' \
     actor_rollout_ref.rollout.max_num_seqs=${MAX_NUM_SEQS} \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE} \
