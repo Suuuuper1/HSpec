@@ -9,3 +9,4 @@ logs/
 llm_rl/qwen3/HSpec_Tips.md
 llm_rl/qwen3/file_list.md
 tensorboard_log/
+.cursorindexingignore

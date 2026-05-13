@@ -46,14 +46,13 @@ export HSPEC_ADVAN_NGRAM="${HSPEC_ADVAN_NGRAM:-1}"
 export HSPEC_ASYNC_HS_ACCUMULATE="${HSPEC_ASYNC_HS_ACCUMULATE:-0}"
 export HSPEC_ASYNC_HS_COPY_STREAM="${HSPEC_ASYNC_HS_COPY_STREAM:-1}"
 export HSPEC_FULL_BATCH_PREFETCH="${HSPEC_FULL_BATCH_PREFETCH:-1}"
-export HSPEC_CACHE_PROMPT_DEVICE_TENSORS="${HSPEC_CACHE_PROMPT_DEVICE_TENSORS:-0}"
 
 # Per-step HSpec breakdown / profiler controls.
 export HSPEC_GEN="${HSPEC_GEN:-0}"
 export HSPEC_GEN_REQ_IDX="${HSPEC_GEN_REQ_IDX:-0}"
 export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
 export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,31,63,91}"
-export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_batch-optim_again_prefetch}"
+export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_batch-optim_prefetch}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
 export HSPEC_PROFILE_ANALYSE="${HSPEC_PROFILE_ANALYSE:-1}"
@@ -92,8 +91,6 @@ else
     export MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
     export ROLLOUT_N="${ROLLOUT_N:-5}"
 fi
-
-export HSPEC_FULL_BATCH_PREFETCH_CHUNK_SIZE="${HSPEC_FULL_BATCH_PREFETCH_CHUNK_SIZE:-${MAX_NUM_SEQS}}"
 
 # Log/output path conventions.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/rl}"
@@ -154,8 +151,6 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_ACCUMULATE='"'"${HSPEC_ASYNC_HS_ACCUMULATE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_COPY_STREAM='"'"${HSPEC_ASYNC_HS_COPY_STREAM}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_FULL_BATCH_PREFETCH='"'"${HSPEC_FULL_BATCH_PREFETCH}"'"' \
-    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_FULL_BATCH_PREFETCH_CHUNK_SIZE='"'"${HSPEC_FULL_BATCH_PREFETCH_CHUNK_SIZE}"'"' \
-    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_CACHE_PROMPT_DEVICE_TENSORS='"'"${HSPEC_CACHE_PROMPT_DEVICE_TENSORS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_SPECULATIVE_BATCH_SIZE_THRE='"'"${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"'"' \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \
