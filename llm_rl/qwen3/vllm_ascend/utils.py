@@ -474,6 +474,21 @@ def update_default_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         update_cudagraph_capture_sizes(vllm_config, new_cudagraph_capture_sizes)
 
 
+def _get_positive_int_env(name: str, default: int | None = None) -> int | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected a positive integer", name, value)
+        return default
+    if parsed <= 0:
+        logger.warning("Ignoring invalid %s=%r; expected a positive integer", name, value)
+        return default
+    return parsed
+
+
 def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     """Update ACL graph capture sizes based on hardware limitations"""
     # NOTE: Currently, we can only capture 1800 graphs at most,
@@ -521,6 +536,7 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         ]
     )
 
+    moe_model = is_moe_model(vllm_config)
     if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
         # TODO: Find out whether we need to take into account the pp_size
         parallel_factor = (
@@ -529,7 +545,7 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
             + int(parallel_config.enable_expert_parallel)
             + int(vllm_config.additional_config.get("multistream_overlap_shared_expert", False))
         )
-        if is_moe_model(vllm_config):
+        if moe_model:
             parallel_factor += parallel_config.data_parallel_size > 1
         else:
             # When AIV mode is enabled, the allreduce operator of the dense
@@ -572,14 +588,49 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
             "increase the number of supported shapes, set HCCL_OP_EXPANSION_MODE=AIV."
         )
 
+    max_num_batch_sizes = max(1, int(max_num_batch_sizes))
+    raw_max_num_batch_sizes = max_num_batch_sizes
+    env_graph_cap = _get_positive_int_env("VLLM_ASCEND_MAX_ACLGRAPH_SIZES")
+    if env_graph_cap is not None:
+        max_num_batch_sizes = min(max_num_batch_sizes, env_graph_cap)
+        if max_num_batch_sizes != raw_max_num_batch_sizes:
+            logger.warning(
+                "Capping ACL graph batch-size count from %d to %d via "
+                "VLLM_ASCEND_MAX_ACLGRAPH_SIZES to avoid Ascend stream exhaustion",
+                raw_max_num_batch_sizes,
+                max_num_batch_sizes,
+            )
+    elif moe_model and parallel_config.tensor_parallel_size > 1:
+        # The analytical stream estimate is optimistic for MoE rollout on
+        # Ascend when many PIECEWISE graph variants are captured.  In RL jobs
+        # the same worker process later allocates additional HCCL streams for
+        # real allgather/alltoall work; capturing too close to the hardware
+        # stream limit can make the first generation fail with EI0007
+        # "Failed to allocate resource[stream]".  Keep a conservative default
+        # for MoE+TP, while allowing explicit override for tuned environments.
+        moe_tp_cap = _get_positive_int_env("VLLM_ASCEND_MOE_TP_ACLGRAPH_SIZE_CAP", 7)
+        if moe_tp_cap is not None:
+            max_num_batch_sizes = min(max_num_batch_sizes, moe_tp_cap)
+        if max_num_batch_sizes != raw_max_num_batch_sizes:
+            logger.warning(
+                "Capping ACL graph batch-size count for MoE+TP from %d to %d "
+                "(override with VLLM_ASCEND_MOE_TP_ACLGRAPH_SIZE_CAP or "
+                "VLLM_ASCEND_MAX_ACLGRAPH_SIZES)",
+                raw_max_num_batch_sizes,
+                max_num_batch_sizes,
+            )
+
     # If original sizes exceed maximum, sample a representative subset
     if max_num_batch_sizes < len(original_sizes):
         # Sample uniformly from original sizes
-        step = (len(original_sizes) - 1) / (max_num_batch_sizes - 1)
-        indices = [round(i * step) for i in range(max_num_batch_sizes)]
+        if max_num_batch_sizes == 1:
+            indices = [len(original_sizes) - 1]
+        else:
+            step = (len(original_sizes) - 1) / (max_num_batch_sizes - 1)
+            indices = [round(i * step) for i in range(max_num_batch_sizes)]
 
-        # Ensure first and last elements are preserved
-        indices[0], indices[-1] = 0, len(original_sizes) - 1
+            # Ensure first and last elements are preserved
+            indices[0], indices[-1] = 0, len(original_sizes) - 1
 
         sampled_sizes = [original_sizes[i] for i in indices]
         update_cudagraph_capture_sizes(vllm_config, sampled_sizes)

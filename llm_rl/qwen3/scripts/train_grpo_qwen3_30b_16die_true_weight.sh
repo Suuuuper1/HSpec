@@ -77,6 +77,8 @@ GEN_BATCH_SIZE=$((TRAIN_BATCH_SIZE))
 ROLLOUT_LOG_PATH=${VLLM_DYNAMIC_RL_LOG_PATH:-outputs/rl/test.txt}
 ROLLOUT_LENGTH_DIR=${ROLLOUT_LENGTH_DIR:-outputs/rl/rollout_length}
 
+OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b.txt}"
+
 mkdir -p "$(dirname "${ROLLOUT_LOG_PATH}")" "${ROLLOUT_LENGTH_DIR}"
 {
     echo
@@ -142,6 +144,7 @@ python3 -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
     actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.cudagraph_capture_sizes='[4,8,16,24,32,48,64]' \
     actor_rollout_ref.rollout.max_num_seqs=${MAX_NUM_SEQS} \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE} \
@@ -149,10 +152,6 @@ python3 -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.top_p=0.9 \
     actor_rollout_ref.rollout.ignore_eos=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
-    actor_rollout_ref.rollout.spec_method='dynamic_rl' \
-    actor_rollout_ref.rollout.eagle3_draft_model='/home/data/Qwen3-30B-moe-eagle3' \
-    actor_rollout_ref.rollout.spec_num_speculative_tokens=4 \
-    actor_rollout_ref.rollout.speculative_token_tree="'[(0,),(0,0),(0,0,0),(0,0,0,0)]'" \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.megatron.param_offload=True \
     actor_rollout_ref.ref.load_weight=True \
@@ -181,7 +180,8 @@ python3 -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type='alltoall' \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_alltoall_overlap_comm=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 $@ >> "${ROLLOUT_LOG_PATH}" 2>&1
+    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 \
+    > "${OUT}" 2>&1 "$@"
 
     # actor_rollout_ref.rollout.spec_method='dynamic_rl' \
     # actor_rollout_ref.rollout.eagle3_draft_model='/home/data/Qwen3-30B-moe-eagle3' \
