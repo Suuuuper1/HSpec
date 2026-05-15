@@ -100,6 +100,68 @@ _HSPEC_ALIGN_DEBUG = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
 _HSPEC_ALIGN_DEBUG_PREVIEW = int(os.getenv("HSPEC_ALIGN_DEBUG_PREVIEW", "8"))
 
 
+def _get_model_hidden_size(model_runner: Any) -> int | None:
+    model_config = getattr(getattr(model_runner, "vllm_config", None), "model_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    hidden_size = getattr(hf_text_config, "hidden_size", None)
+    if hidden_size is None:
+        hidden_size = getattr(getattr(model_config, "hf_config", None), "hidden_size", None)
+    return int(hidden_size) if hidden_size is not None else None
+
+
+def _replace_parameter_view(model: torch.nn.Module, name: str, data: torch.Tensor) -> None:
+    parts = name.split(".")
+    parent = model.get_submodule(".".join(parts[:-1])) if len(parts) > 1 else model
+    param_name = parts[-1]
+    old_param = getattr(parent, param_name)
+    new_param = torch.nn.Parameter(data, requires_grad=False)
+    if hasattr(old_param, "weight_loader"):
+        new_param.weight_loader = old_param.weight_loader
+    setattr(parent, param_name, new_param)
+
+
+def _prepare_ascend_moe_weights_for_reload(model: torch.nn.Module, hidden_size: int | None) -> int:
+    """Put Ascend MoE weights in the layout expected by vLLM's weight_loader.
+
+    vllm-ascend keeps unquantized MoE weights in runtime layout after initial
+    model loading. Runtime actor weight sync must write through a transposed
+    view of the same storage so captured ACL graphs keep seeing updated
+    weights at the original addresses.
+    """
+    if hidden_size is None:
+        return 0
+
+    converted = 0
+    for name, param in list(model.named_parameters()):
+        if param.ndim != 3:
+            continue
+        if name.endswith("w2_weight") and param.shape[2] == hidden_size:
+            _replace_parameter_view(model, name, param.data.transpose(1, 2))
+            converted += 1
+        elif name.endswith("w13_weight") and param.shape[1] == hidden_size:
+            _replace_parameter_view(model, name, param.data.transpose(1, 2))
+            converted += 1
+    return converted
+
+
+def _restore_ascend_moe_weights_after_reload(model: torch.nn.Module, hidden_size: int | None) -> int:
+    """Restore Ascend MoE runtime layout without allocating new weight storage."""
+    if hidden_size is None:
+        return 0
+
+    converted = 0
+    for name, param in list(model.named_parameters()):
+        if param.ndim != 3:
+            continue
+        if name.endswith("w2_weight") and param.shape[1] == hidden_size:
+            _replace_parameter_view(model, name, param.data.transpose(1, 2))
+            converted += 1
+        elif name.endswith("w13_weight") and param.shape[2] == hidden_size:
+            _replace_parameter_view(model, name, param.data.transpose(1, 2))
+            converted += 1
+    return converted
+
+
 # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
 def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> list[int]:
     # remove the left padding in the prompt token_id
@@ -258,9 +320,9 @@ class vLLMRollout(BaseRollout):
 
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
         if load_format == "dummy":
-            logger.warning(
-                "vLLM rollout is using load_format='dummy' (random weights). "
-                "This is intended only for smoke tests and will produce meaningless responses/rewards."
+            logger.info(
+                "vLLM rollout initializes with load_format='dummy'. This is expected for "
+                "hybrid-engine training only if actor weights are synchronized before generation."
             )
 
         # copy it to avoid secretly modifying the engine config
@@ -747,23 +809,22 @@ class vLLMRollout(BaseRollout):
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
-            from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
             model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
             model = model_runner.get_model()
             patch_vllm_moe_model_weight_loader(model)
+            hidden_size = _get_model_hidden_size(model_runner)
+            moe_reloader_views = _prepare_ascend_moe_weights_for_reload(model, hidden_size)
             loaded_params = model.load_weights(weights)
-
-            model_config = model_runner.vllm_config.model_config
-            device_config = model_runner.vllm_config.device_config
-            load_config = model_runner.vllm_config.load_config
-            load_device = (
-                device_config.device if load_config.device is None else load_config.device
-            )
-            target_device = torch.device(load_device)
-            process_weights_after_loading(model, model_config, target_device)
+            moe_runtime_views = _restore_ascend_moe_weights_after_reload(model, hidden_size)
             loaded_count = len(loaded_params) if loaded_params is not None else -1
-            logger.warning("vLLM rollout loaded %s parameters from actor weights", loaded_count)
+            logger.warning(
+                "vLLM rollout loaded %s parameters from actor weights "
+                "(ascend_moe_reload_views=%s, ascend_moe_runtime_views=%s)",
+                loaded_count,
+                moe_reloader_views,
+                moe_runtime_views,
+            )
             if loaded_count == 0:
                 raise RuntimeError(
                     "vLLM rollout weight synchronization loaded 0 parameters. "

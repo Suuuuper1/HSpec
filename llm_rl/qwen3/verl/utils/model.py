@@ -556,17 +556,19 @@ def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=Fal
             for k in list(ssd.keys()):
                 if "output_layer" in k:
                     ssd.pop(k)
-        has_fused_expert_weights = any("mlp.experts.weight" in key for key in ssd)
-        if has_fused_expert_weights:
-            new_ssd = dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
-            sd = unwrap_model(model).state_dict()
-            for key in list(ssd.keys()):
-                if "mlp.experts.weight" in key:
-                    with torch.no_grad():
-                        ssd[key].data.copy_(new_ssd[key])   # param update
-                        sd[key].copy_(new_ssd[key])         # tensor update
-        else:
-            dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
+        new_ssd = dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
+        sd = unwrap_model(model).state_dict()
+        with torch.no_grad():
+            for key, loaded_tensor in new_ssd.items():
+                if key not in sd or not torch.is_tensor(loaded_tensor):
+                    continue
+                sd[key].copy_(loaded_tensor)
+                sharded_tensor = ssd.get(key)
+                if hasattr(sharded_tensor, "data") and torch.is_tensor(sharded_tensor.data):
+                    if sharded_tensor.data.shape == loaded_tensor.shape and (
+                        sharded_tensor.data.data_ptr() != sd[key].data_ptr()
+                    ):
+                        sharded_tensor.data.copy_(loaded_tensor)
             
     return
 

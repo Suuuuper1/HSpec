@@ -77,7 +77,7 @@ GEN_BATCH_SIZE=$((TRAIN_BATCH_SIZE))
 ROLLOUT_LOG_PATH=${VLLM_DYNAMIC_RL_LOG_PATH:-outputs/rl/test.txt}
 ROLLOUT_LENGTH_DIR=${ROLLOUT_LENGTH_DIR:-outputs/rl/rollout_length}
 
-OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b-1.txt}"
+OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b-2.txt}"
 
 mkdir -p "$(dirname "${ROLLOUT_LOG_PATH}")" "${ROLLOUT_LENGTH_DIR}"
 {
