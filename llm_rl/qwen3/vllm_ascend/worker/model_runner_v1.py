@@ -424,10 +424,18 @@ class NPUModelRunner(GPUModelRunner):
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
+        '''
         self.speculative_auto_bs_thre = int(os.environ.get('VLLM_SPECULATIVE_BATCH_SIZE_THRE', "-1"))
         # Indicates whether speculative decoding is active, 
         # set at runtime based on the batch-size threshold.
         self.speculative_decoding_active = False
+        '''
+        # Keep speculative decoding always enabled once configured. The older
+        # adaptive-SD batch-size gate disabled the whole batch whenever the
+        # active request count crossed a threshold, which creates long ordinary
+        # decode stretches for RL rollout batches with request refill.
+        self.speculative_auto_bs_thre = int(os.environ.get('VLLM_SPECULATIVE_BATCH_SIZE_THRE', "-1"))
+        self.speculative_decoding_active = bool(self.speculative_config)
         self.drafter: Optional[Union[NgramProposer, EagleProposer, MtpProposer,
                                      SuffixDecodingProposer, MedusaProposer,
                                      HSpecProposer]] = None
@@ -752,6 +760,7 @@ class NPUModelRunner(GPUModelRunner):
             ],
                                         dtype=np.int32)
 
+        '''
         # adaptive SD
         if self.speculative_config and self.speculative_auto_bs_thre > 0:
             if num_reqs > self.speculative_auto_bs_thre:
@@ -768,6 +777,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_state = AscendAttentionState.DecodeOnly
             total_num_scheduled_tokens = num_reqs
             self.decode_token_per_req = 1
+        '''
 
         req_indices = np.repeat(self.arange_np[:num_reqs],
                                 num_scheduled_tokens)
@@ -990,9 +1000,11 @@ class NPUModelRunner(GPUModelRunner):
 
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
+        '''
         # Adaptive SD
         if self.speculative_config and not self.speculative_decoding_active:
             use_spec_decode = False
+        '''
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -1768,11 +1780,13 @@ class NPUModelRunner(GPUModelRunner):
         uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
             scheduler_output.total_num_scheduled_tokens
             == self.input_batch.num_reqs * max_query_len)
-        # Adaptive SD
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        '''
+        # Adaptive SD
         if self.speculative_config and not self.speculative_decoding_active:
             uniform_decode = True
             total_num_scheduled_tokens = self.input_batch.num_reqs
+        '''
         has_lora = len(self.input_batch.lora_id_to_lora_request) > 0
         aclgraph_runtime_mode, batch_descriptor = \
             self.cudagraph_dispatcher.dispatch(num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora)
@@ -2010,7 +2024,10 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         with ProfileExecuteDuration().capture_async("Draft"):
+            '''
             if self.speculative_config and self.speculative_decoding_active and not self.with_prefill:
+            '''
+            if self.speculative_config and self.spec_decode_common_attn_metadata is not None:
                 use_padded_batch_for_eagle = self.speculative_config and \
                     self.speculative_config.use_eagle() and \
                     not self.speculative_config.disable_padded_drafter_batch
