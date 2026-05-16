@@ -38,6 +38,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+from vllm_ascend.spec_decode.hspec_utils import hspec_sync_debug
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -167,6 +168,7 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
+                hspec_sync_debug("dp_actor.forward_micro_batch.rmpad.model_forward.before", logger_obj=logger)
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -175,6 +177,7 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+                hspec_sync_debug("dp_actor.forward_micro_batch.rmpad.model_forward.after", logger_obj=logger)
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -188,11 +191,13 @@ class DataParallelPPOActor(BasePPOActor):
                     inplace_backward = True
                     if calculate_entropy:
                         inplace_backward = False
+                    hspec_sync_debug("dp_actor.forward_micro_batch.rmpad.logprobs.before", logger_obj=logger)
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
                     )
+                    hspec_sync_debug("dp_actor.forward_micro_batch.rmpad.logprobs.after", logger_obj=logger)
 
                     # compute entropy
                     if calculate_entropy:
@@ -206,19 +211,23 @@ class DataParallelPPOActor(BasePPOActor):
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
                     # gather and unpad for the ulysses sp
+                    hspec_sync_debug("dp_actor.forward_micro_batch.rmpad.sp_gather_log_probs.before", logger_obj=logger)
                     log_probs = gather_outputs_and_unpad(
                         log_probs,
                         gather_dim=0,
                         unpad_dim=0,
                         padding_size=pad_size,
                     )
+                    hspec_sync_debug("dp_actor.forward_micro_batch.rmpad.sp_gather_log_probs.after", logger_obj=logger)
                     if calculate_entropy:
+                        hspec_sync_debug("dp_actor.forward_micro_batch.rmpad.sp_gather_entropy.before", logger_obj=logger)
                         entropy_rmpad = gather_outputs_and_unpad(
                             entropy_rmpad,
                             gather_dim=0,
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+                        hspec_sync_debug("dp_actor.forward_micro_batch.rmpad.sp_gather_entropy.after", logger_obj=logger)
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
                     full_entropy = pad_input(
@@ -245,6 +254,7 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
+                hspec_sync_debug("dp_actor.forward_micro_batch.dense.model_forward.before", logger_obj=logger)
                 output = self.actor_module(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -253,6 +263,7 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+                hspec_sync_debug("dp_actor.forward_micro_batch.dense.model_forward.after", logger_obj=logger)
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
@@ -263,7 +274,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    hspec_sync_debug("dp_actor.forward_micro_batch.dense.logprobs.before", logger_obj=logger)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    hspec_sync_debug("dp_actor.forward_micro_batch.dense.logprobs.after", logger_obj=logger)
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
@@ -313,7 +326,9 @@ class DataParallelPPOActor(BasePPOActor):
             torch.Tensor: the log_prob tensor
         """
         # set to eval
+        hspec_sync_debug("dp_actor.compute_log_prob.enter", logger_obj=logger)
         self.actor_module.eval()
+        hspec_sync_debug("dp_actor.compute_log_prob.eval.after", logger_obj=logger)
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
@@ -333,12 +348,16 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs_lst = []
         entropy_lst = []
         for micro_batch in micro_batches:
+            hspec_sync_debug("dp_actor.compute_log_prob.micro_batch.to_device.before", logger_obj=logger)
             micro_batch = micro_batch.to(get_device_id())
+            hspec_sync_debug("dp_actor.compute_log_prob.micro_batch.to_device.after", logger_obj=logger)
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
+                hspec_sync_debug("dp_actor.compute_log_prob.micro_batch.forward.before", logger_obj=logger)
                 entropy, log_probs = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                 )
+                hspec_sync_debug("dp_actor.compute_log_prob.micro_batch.forward.after", logger_obj=logger)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
@@ -349,16 +368,21 @@ class DataParallelPPOActor(BasePPOActor):
             entropys = torch.concat(entropy_lst, dim=0)
 
         if use_dynamic_bsz:
+            hspec_sync_debug("dp_actor.compute_log_prob.restore_dynamic_batch.before", logger_obj=logger)
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            hspec_sync_debug("dp_actor.compute_log_prob.restore_dynamic_batch.after", logger_obj=logger)
 
+        hspec_sync_debug("dp_actor.compute_log_prob.exit", logger_obj=logger)
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
+        hspec_sync_debug("dp_actor.update_policy.enter", logger_obj=logger)
         self.actor_module.train()
+        hspec_sync_debug("dp_actor.update_policy.train.after", logger_obj=logger)
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
@@ -402,9 +426,12 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                hspec_sync_debug("dp_actor.update_policy.optimizer_zero_grad.after", logger_obj=logger)
 
                 for micro_batch in micro_batches:
+                    hspec_sync_debug("dp_actor.update_policy.micro_batch.to_device.before", logger_obj=logger)
                     micro_batch = micro_batch.to(get_device_id())
+                    hspec_sync_debug("dp_actor.update_policy.micro_batch.to_device.after", logger_obj=logger)
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
@@ -423,9 +450,11 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
+                    hspec_sync_debug("dp_actor.update_policy.micro_batch.forward.before", logger_obj=logger)
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+                    hspec_sync_debug("dp_actor.update_policy.micro_batch.forward.after", logger_obj=logger)
 
                     if on_policy:
                         old_log_prob = log_prob.detach()
@@ -484,7 +513,9 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+                    hspec_sync_debug("dp_actor.update_policy.micro_batch.backward.before", logger_obj=logger)
                     loss.backward()
+                    hspec_sync_debug("dp_actor.update_policy.micro_batch.backward.after", logger_obj=logger)
 
                     micro_batch_metrics.update(
                         {
@@ -496,8 +527,11 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
+                hspec_sync_debug("dp_actor.update_policy.optimizer_step.before", logger_obj=logger)
                 grad_norm = self._optimizer_step()
+                hspec_sync_debug("dp_actor.update_policy.optimizer_step.after", logger_obj=logger)
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        hspec_sync_debug("dp_actor.update_policy.exit", logger_obj=logger)
         return metrics

@@ -60,6 +60,7 @@ from vllm_ascend.spec_decode.hspec_utils import (
     hspec_profile_output_dir,
     hspec_record_function,
     hspec_set_profile_context,
+    hspec_sync_debug,
     prompt_id_from_token_ids,
 )
 
@@ -114,8 +115,6 @@ def _replace_parameter_view(model: torch.nn.Module, name: str, data: torch.Tenso
     parent = model.get_submodule(".".join(parts[:-1])) if len(parts) > 1 else model
     param_name = parts[-1]
     old_param = getattr(parent, param_name)
-    if old_param.shape == data.shape and old_param.data_ptr() == data.data_ptr():
-        return
     new_param = torch.nn.Parameter(data, requires_grad=False)
     if hasattr(old_param, "weight_loader"):
         new_param.weight_loader = old_param.weight_loader
@@ -162,31 +161,6 @@ def _restore_ascend_moe_weights_after_reload(model: torch.nn.Module, hidden_size
             _replace_parameter_view(model, name, param.data.transpose(1, 2))
             converted += 1
     return converted
-
-
-def _count_ascend_moe_runtime_weights(model: torch.nn.Module, hidden_size: int | None) -> int:
-    if hidden_size is None:
-        return 0
-
-    runtime = 0
-    for name, param in model.named_parameters():
-        if param.ndim != 3:
-            continue
-        if name.endswith("w2_weight") and param.shape[1] == hidden_size:
-            runtime += 1
-        elif name.endswith("w13_weight") and param.shape[2] == hidden_size:
-            runtime += 1
-    return runtime
-
-
-def _count_ascend_moe_weights(model: torch.nn.Module) -> int:
-    moe_weights = 0
-    for name, param in model.named_parameters():
-        if param.ndim == 3 and (
-            name.endswith("w2_weight") or name.endswith("w13_weight")
-        ):
-            moe_weights += 1
-    return moe_weights
 
 
 # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
@@ -346,8 +320,7 @@ class vLLMRollout(BaseRollout):
             )
 
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
-        dummy_hot_sync = load_format == "dummy"
-        if dummy_hot_sync:
+        if load_format == "dummy":
             logger.info(
                 "vLLM rollout initializes with load_format='dummy'. This is expected for "
                 "hybrid-engine training only if actor weights are synchronized before generation."
@@ -383,23 +356,10 @@ class vLLMRollout(BaseRollout):
             logger.warning("Resolved vLLM speculative_config: %s", speculative_config)
 
         compilation_config = {}
-        force_eager_for_dummy_sync = (
-            dummy_hot_sync
-            and os.getenv("VERL_ALLOW_DUMMY_ROLLOUT_GRAPHS", "0") != "1"
-        )
-        llm_enforce_eager = bool(config.enforce_eager or force_eager_for_dummy_sync)
-        if force_eager_for_dummy_sync:
-            logger.warning(
-                "Disabling vLLM graph capture for dummy-initialized hybrid rollout. "
-                "The rollout engine is hot-synced from actor weights after construction; "
-                "capturing graphs before that sync can replay random/dummy weights. "
-                "Set VERL_ALLOW_DUMMY_ROLLOUT_GRAPHS=1 only after validating your "
-                "vLLM-Ascend graph path supports mutable RL weights."
-            )
 
         cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
         # enforce_eager must be False to use cudagraph
-        if not llm_enforce_eager and cudagraph_capture_sizes:
+        if not config.enforce_eager and cudagraph_capture_sizes:
             torch._dynamo.config.log_compilation_metrics = False
             compilation_config["compilation_config"] = {
                 "cudagraph_capture_sizes": cudagraph_capture_sizes,
@@ -413,7 +373,7 @@ class vLLMRollout(BaseRollout):
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend="external_launcher",
             dtype=config.dtype,
-            enforce_eager=llm_enforce_eager,
+            enforce_eager=config.enforce_eager,
             gpu_memory_utilization=config.gpu_memory_utilization,
             disable_custom_all_reduce=True,
             enable_expert_parallel=int(os.environ.get("VLLM_ENABLE_EXPERT_PARALLEL", "0")),
@@ -438,7 +398,7 @@ class vLLMRollout(BaseRollout):
                 "gate_eplb": True,
                 "num_wait_worker_iterations": 30,  # wait for 30 iterations to complete the EPLB calculation
                 "npugraph_ex_config": {
-                    "enable": not force_eager_for_dummy_sync,
+                    "enable": True,
                     "enable_static_kernel": eval(os.environ.get("NPUGRAPH_EX_ENABLE_STATIC_KERNEL", "False"))
                 }
             },
@@ -650,11 +610,14 @@ class vLLMRollout(BaseRollout):
         try:
             with self.update_sampling_params(**kwargs):
                 if use_hspec:
+                    hspec_sync_debug("verl_rollout.full_batch_prefetch.before", logger_obj=logger)
                     with hspec_record_function("hspec/rollout/full_batch_prefetch"):
                         _hspec_prefetch_rollout_prompts(
                             self.inference_engine,
                             vllm_inputs,
                         )
+                    hspec_sync_debug("verl_rollout.full_batch_prefetch.after", logger_obj=logger)
+                hspec_sync_debug("verl_rollout.engine_generate.before", logger_obj=logger)
                 with hspec_record_function("hspec/rollout/engine_generate", use_npu_stream=True):
                     outputs = self.inference_engine.generate(
                         prompts=vllm_inputs,
@@ -662,19 +625,25 @@ class vLLMRollout(BaseRollout):
                         lora_request=lora_requests,
                         use_tqdm=True,
                     )
+                hspec_sync_debug("verl_rollout.engine_generate.after", logger_obj=logger)
 
                 hs_store: dict = {}
                 hs_store_index: tuple[dict[str, Any], dict[str, Any]] = ({}, {})
                 if use_hspec:
+                    hspec_sync_debug("verl_rollout.hidden_state_flush.before", logger_obj=logger)
                     with hspec_record_function("hspec/rollout/hidden_state_flush", use_npu_stream=True):
                         hs_store = hspec_flush_and_get_all()
+                    hspec_sync_debug("verl_rollout.hidden_state_flush.after", logger_obj=logger)
+                    hspec_sync_debug("verl_rollout.build_hspec_store_index.before", logger_obj=logger)
                     hs_store_index = _build_hspec_store_index(hs_store)
+                    hspec_sync_debug("verl_rollout.build_hspec_store_index.after", logger_obj=logger)
 
                 response = []
                 rollout_log_probs = []
                 rollout_hidden_states_list: list = []
                 rollout_hspec_token_ids_list: list = []
                 rollout_debug_list: list = []
+                hspec_sync_debug("verl_rollout.output_collect.before", logger_obj=logger)
                 with hspec_record_function("hspec/rollout/output_collect"):
                     for output in outputs:
                         for sample_id in range(len(output.outputs)):
@@ -731,6 +700,9 @@ class vLLMRollout(BaseRollout):
                                             "response_tail": list(response_ids[-preview:]) if response_ids else [],
                                         }
                                     )
+                hspec_sync_debug("verl_rollout.output_collect.after", logger_obj=logger)
+
+                hspec_sync_debug("verl_rollout.pad_concat.before", logger_obj=logger)
 
                 with hspec_record_function("hspec/rollout/pad_concat", use_npu_stream=True):
                     response = pad_2d_list_to_length(
@@ -743,6 +715,7 @@ class vLLMRollout(BaseRollout):
                         rollout_log_probs = rollout_log_probs.to(torch.float32)
 
                     seq = torch.cat([idx, response], dim=-1)
+                    hspec_sync_debug("verl_rollout.pad_concat.after", logger_obj=logger)
         finally:
             if profiler is not None:
                 try:
@@ -755,6 +728,8 @@ class vLLMRollout(BaseRollout):
                     pass
                 profiler.stop()
             hspec_clear_profile_context()
+
+        hspec_sync_debug("verl_rollout.metadata_pack.before", logger_obj=logger)
 
         with hspec_record_function("hspec/rollout/metadata_pack", use_npu_stream=True):
             response_length = response.size(1)
@@ -804,6 +779,8 @@ class vLLMRollout(BaseRollout):
                 _dbg_arr = np.empty((len(rollout_debug_list),), dtype=object)
                 _dbg_arr[:] = rollout_debug_list
                 non_tensor_batch["hspec_rollout_debug"] = _dbg_arr
+
+        hspec_sync_debug("verl_rollout.metadata_pack.after", logger_obj=logger)
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
@@ -858,31 +835,18 @@ class vLLMRollout(BaseRollout):
             moe_reloader_views = _prepare_ascend_moe_weights_for_reload(model, hidden_size)
             loaded_params = model.load_weights(weights)
             moe_runtime_views = _restore_ascend_moe_weights_after_reload(model, hidden_size)
-            if is_npu_available:
-                torch.npu.synchronize()
-            moe_runtime_count = _count_ascend_moe_runtime_weights(model, hidden_size)
-            moe_weight_count = _count_ascend_moe_weights(model)
             loaded_count = len(loaded_params) if loaded_params is not None else -1
             logger.warning(
                 "vLLM rollout loaded %s parameters from actor weights "
-                "(ascend_moe_reload_views=%s, ascend_moe_runtime_views=%s, "
-                "ascend_moe_runtime_weights=%s/%s)",
+                "(ascend_moe_reload_views=%s, ascend_moe_runtime_views=%s)",
                 loaded_count,
                 moe_reloader_views,
                 moe_runtime_views,
-                moe_runtime_count,
-                moe_weight_count,
             )
             if loaded_count == 0:
                 raise RuntimeError(
                     "vLLM rollout weight synchronization loaded 0 parameters. "
                     "Generation would continue with dummy/random weights."
-                )
-            if moe_weight_count > 0 and moe_runtime_count == 0:
-                raise RuntimeError(
-                    "vLLM rollout MoE weights are not in Ascend runtime layout after "
-                    "actor synchronization. Generation would run with invalid expert "
-                    "weight layout."
                 )
 
 

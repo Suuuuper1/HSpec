@@ -101,7 +101,7 @@ from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.hspec_proposer import HSpecProposer
-from vllm_ascend.spec_decode.hspec_utils import hspec_record_function
+from vllm_ascend.spec_decode.hspec_utils import hspec_record_function, hspec_sync_debug
 from vllm_ascend.spec_decode.interface import SpecDcodeType
 from vllm_ascend.spec_decode.medusa_proposer import MedusaProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
@@ -1737,9 +1737,11 @@ class NPUModelRunner(GPUModelRunner):
                 _hspec_gen = _hspec_gen_enabled()
                 _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
                 _t0_prefetch = time.perf_counter_ns() if _hspec_gen else 0
+                hspec_sync_debug("model_runner.prefetch_for_batch.before", logger_obj=logger)
                 with hspec_record_function("hspec/prefetch/launch"):
                     self.drafter.prefetch_for_batch(
                         self.input_batch.req_ids[:self.input_batch.num_reqs])
+                hspec_sync_debug("model_runner.prefetch_for_batch.after", logger_obj=logger)
                 if _hspec_gen and self.input_batch.num_reqs > 0:
                     di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
                     try:
@@ -1798,6 +1800,7 @@ class NPUModelRunner(GPUModelRunner):
                 generators=self.input_batch.sampling_metadata.generators)
 
         # Run forward pass
+        hspec_sync_debug("model_runner.forward.before", logger_obj=logger)
         with ProfileExecuteDuration().capture_async("forward"):
             with set_ascend_forward_context(
                     attn_metadata,
@@ -1813,14 +1816,17 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = self._generate_process_reqs_hidden_states(
                     num_input_tokens, input_ids, positions,
                     intermediate_tensors, inputs_embeds, model_kwargs)
+                hspec_sync_debug("model_runner.forward.model_call.after", logger_obj=logger)
 
             self.maybe_wait_for_kv_save()
+            hspec_sync_debug("model_runner.forward.kv_save.after", logger_obj=logger)
             finished_sending, finished_recving = self.get_finished_kv_transfer(
                 scheduler_output)
 
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
+        hspec_sync_debug("model_runner.forward.after", logger_obj=logger)
 
         kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending,
@@ -1858,9 +1864,14 @@ class NPUModelRunner(GPUModelRunner):
                         self.debugger.stop()
                         self.debugger.step()
                     return pool_output
+                hspec_sync_debug("model_runner.postprocess.sample_hidden_states.before", logger_obj=logger)
                 sample_hidden_states = hidden_states[logits_indices]
+                hspec_sync_debug("model_runner.postprocess.sample_hidden_states.after", logger_obj=logger)
+                hspec_sync_debug("model_runner.postprocess.compute_logits.before", logger_obj=logger)
                 logits = self.model.compute_logits(sample_hidden_states)
+                hspec_sync_debug("model_runner.postprocess.compute_logits.after", logger_obj=logger)
             if broadcast_pp_output:
+                hspec_sync_debug("model_runner.postprocess.pp_broadcast.before", logger_obj=logger)
                 model_output_broadcast_data = {
                     "logits": logits.contiguous(),
                 } if logits is not None else {}
@@ -1869,6 +1880,7 @@ class NPUModelRunner(GPUModelRunner):
                                         src=len(get_pp_group().ranks) - 1)
                 assert model_output_broadcast_data is not None
                 logits = model_output_broadcast_data["logits"]
+                hspec_sync_debug("model_runner.postprocess.pp_broadcast.after", logger_obj=logger)
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
@@ -1930,8 +1942,10 @@ class NPUModelRunner(GPUModelRunner):
                                   self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
+        hspec_sync_debug("model_runner.sample_tokens.sample.before", logger_obj=logger)
         with ProfileExecuteDuration().capture_async("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        hspec_sync_debug("model_runner.sample_tokens.sample.after", logger_obj=logger)
         if (_hspec_trace_enabled() and spec_decode_metadata is not None
                 and self.input_batch.num_reqs > 0):
             di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1)
@@ -1992,6 +2006,7 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert self.spec_decode_common_attn_metadata is not None
+            hspec_sync_debug("model_runner.propose_draft_token_ids.before", logger_obj=logger)
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
@@ -2004,8 +2019,12 @@ class NPUModelRunner(GPUModelRunner):
                 aux_hidden_states,
                 sample_hidden_states
             )
+            hspec_sync_debug("model_runner.propose_draft_token_ids.after", logger_obj=logger)
+            hspec_sync_debug("model_runner.copy_draft_token_ids_to_cpu.before", logger_obj=logger)
             self._copy_draft_token_ids_to_cpu(scheduler_output)
+            hspec_sync_debug("model_runner.copy_draft_token_ids_to_cpu.after", logger_obj=logger)
 
+        hspec_sync_debug("model_runner.bookkeeping_sync.before", logger_obj=logger)
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -2022,6 +2041,7 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
             sample_hidden_states,
         )
+        hspec_sync_debug("model_runner.bookkeeping_sync.after", logger_obj=logger)
 
         with ProfileExecuteDuration().capture_async("Draft"):
             '''
@@ -2136,16 +2156,20 @@ class NPUModelRunner(GPUModelRunner):
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[:self.input_batch.num_reqs]
-            return self.sampler(
+            hspec_sync_debug("model_runner.sample.base_sampler.before", logger_obj=logger)
+            sampler_output = self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            hspec_sync_debug("model_runner.sample.base_sampler.after", logger_obj=logger)
+            return sampler_output
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[:len(spec_decode_metadata.logits_indices)]
         _hspec_gen = _hspec_gen_enabled()
         _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
         _t0_rej = time.perf_counter_ns() if _hspec_gen else 0
+        hspec_sync_debug("model_runner.sample.rejection_sampler.before", logger_obj=logger)
         with hspec_record_function("hspec/verification/rejection_sampler", use_npu_stream=True):
             sampler_output = self.rejection_sampler(
                 spec_decode_metadata,
@@ -2153,6 +2177,7 @@ class NPUModelRunner(GPUModelRunner):
                 logits,
                 sampling_metadata,
             )
+        hspec_sync_debug("model_runner.sample.rejection_sampler.after", logger_obj=logger)
         if _hspec_gen and self.input_batch.num_reqs > 0:
             di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
             try:
@@ -2230,6 +2255,7 @@ class NPUModelRunner(GPUModelRunner):
                 _hspec_gen = _hspec_gen_enabled()
                 _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
                 _t0_parse = time.perf_counter_ns() if _hspec_gen else 0
+                hspec_sync_debug("model_runner.bookkeeping.parse_output.before", logger_obj=logger)
                 with hspec_record_function("hspec/verification/parse_output"):
                     valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
                         sampled_token_ids,
@@ -2237,6 +2263,7 @@ class NPUModelRunner(GPUModelRunner):
                         discard_sampled_tokens_req_indices,
                         logprobs_tensors=logprobs_tensors,
                     )
+                hspec_sync_debug("model_runner.bookkeeping.parse_output.after", logger_obj=logger)
                 if _hspec_gen and self.input_batch.num_reqs > 0:
                     di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
                     try:
@@ -2281,11 +2308,13 @@ class NPUModelRunner(GPUModelRunner):
                     and spec_decode_metadata is not None
                     and max_gen_len > 1):
                 try:
+                    hspec_sync_debug("model_runner.bookkeeping.update_verification_outcomes.before", logger_obj=logger)
                     n = min(len(self.input_batch.req_ids), len(accepted_prefix_lengths))
                     accept_advan_add, reject_advan_add = self.drafter.update_verification_outcomes(
                         self.input_batch.req_ids[:n],
                         accepted_prefix_lengths[:n],
                     )
+                    hspec_sync_debug("model_runner.bookkeeping.update_verification_outcomes.after", logger_obj=logger)
                     accept_advan_add = int(accept_advan_add)
                     reject_advan_add = int(reject_advan_add)
                 except Exception:
@@ -2347,6 +2376,7 @@ class NPUModelRunner(GPUModelRunner):
             try:
                 from vllm_ascend.spec_decode.hspec_utils import hspec_extend_step_tokens
 
+                hspec_sync_debug("model_runner.bookkeeping.extend_step_tokens.before", logger_obj=logger)
                 n = min(num_sampled_tokens, len(valid_sampled_token_ids))
                 for req_idx in range(n):
                     sampled_ids = valid_sampled_token_ids[req_idx]
@@ -2354,6 +2384,7 @@ class NPUModelRunner(GPUModelRunner):
                         continue
                     req_id = self.input_batch.req_ids[req_idx]
                     hspec_extend_step_tokens(req_id, sampled_ids)
+                hspec_sync_debug("model_runner.bookkeeping.extend_step_tokens.after", logger_obj=logger)
             except Exception:
                 pass
 
@@ -2405,6 +2436,7 @@ class NPUModelRunner(GPUModelRunner):
             _hspec_gen = _hspec_gen_enabled()
             _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
             _t0_acc = time.perf_counter_ns() if _hspec_gen else 0
+            hspec_sync_debug("model_runner.bookkeeping.accumulate_hidden_states.before", logger_obj=logger)
             with hspec_record_function(
                     "hspec/verification/accumulate_hidden_states",
                     use_npu_stream=True):
@@ -2414,6 +2446,7 @@ class NPUModelRunner(GPUModelRunner):
                     spec_decode_metadata,
                     accepted_prefix_lengths=accepted_prefix_lengths,
                 )
+            hspec_sync_debug("model_runner.bookkeeping.accumulate_hidden_states.after", logger_obj=logger)
             if _hspec_gen and self.input_batch.num_reqs > 0:
                 di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
                 try:

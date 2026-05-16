@@ -27,6 +27,7 @@ from vllm_ascend.spec_decode.hspec_utils import (
     PromptPCAParams,
     fit_pca_multi_sequence,
     fit_pca_single_sequence,
+    hspec_sync_debug,
     stable_partition_id,
 )
 
@@ -269,6 +270,7 @@ class HSpecTableGroup:
             rewards:            [float] per rollout.
         """
         # ① Validate & filter
+        hspec_sync_debug(f"hspec_table.build_prompt_table.validate.before prompt={prompt_id}", logger_obj=logger)
         valid_hs: List[np.ndarray] = []
         valid_tok: List[Any] = []
         valid_rew: List[float] = []
@@ -293,22 +295,27 @@ class HSpecTableGroup:
             valid_rew.append(rew)
 
         if not valid_hs:
+            hspec_sync_debug(f"hspec_table.build_prompt_table.validate.empty prompt={prompt_id}", logger_obj=logger)
             return
+        hspec_sync_debug(f"hspec_table.build_prompt_table.validate.after prompt={prompt_id}", logger_obj=logger)
 
         # PCA fit  (single-sequence for PPO, multi for GRPO)
         num_components = self.n_components
         try:
+            hspec_sync_debug(f"hspec_table.build_prompt_table.pca.before prompt={prompt_id}", logger_obj=logger)
             if len(valid_hs) == 1:
                 pca_params, proj = fit_pca_single_sequence(prompt_id, valid_hs[0], num_components)
                 proj_list = [proj]
             else:
                 pca_params, proj_list = fit_pca_multi_sequence(prompt_id, valid_hs, num_components)
+            hspec_sync_debug(f"hspec_table.build_prompt_table.pca.after prompt={prompt_id}", logger_obj=logger)
         except Exception as exc:
             logger.warning("HSpec PCA failed for %s: %s", prompt_id, exc)
             self._discard_count += len(valid_hs)
             return
 
         # Create table & populate with projected keys + token refs
+        hspec_sync_debug(f"hspec_table.build_prompt_table.populate.before prompt={prompt_id}", logger_obj=logger)
         table = PromptTableData(pca_params=pca_params, max_entries=self.max_entries)
         for proj, tok, rew in zip(proj_list, valid_tok, valid_rew):
             tok_arr = (np.asarray(tok, dtype=np.int32)
@@ -319,6 +326,7 @@ class HSpecTableGroup:
         table.compact()
         self._building[prompt_id] = table
         self._build_count += 1
+        hspec_sync_debug(f"hspec_table.build_prompt_table.populate.after prompt={prompt_id}", logger_obj=logger)
 
     def build_tables_batch(self, prompt_data_dict: Dict[str, Dict]):
         """Build tables for a *batch* of prompts (one remote call per partition).
@@ -330,6 +338,7 @@ class HSpecTableGroup:
                 'rewards':       List[float],
             }}``
         """
+        hspec_sync_debug("hspec_table.build_tables_batch.before", logger_obj=logger)
         for prompt_id, data in prompt_data_dict.items():
             self.build_prompt_table(
                 prompt_id,
@@ -337,6 +346,7 @@ class HSpecTableGroup:
                 data["tokens"],
                 data["rewards"],
             )
+        hspec_sync_debug("hspec_table.build_tables_batch.after", logger_obj=logger)
 
     # Query
 

@@ -20,6 +20,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from verl import DataProto
 from verl.protocol import all_gather_data_proto
 from verl.utils.ulysses import get_ulysses_sequence_parallel_group, set_ulysses_sequence_parallel_group
+from vllm_ascend.spec_decode.hspec_utils import hspec_collective_debug, hspec_sync_debug
 
 from .base import BaseShardingManager
 
@@ -35,19 +36,27 @@ class FSDPUlyssesShardingManager(BaseShardingManager):
         self.seed_offset = 12345
 
     def __enter__(self):
+        hspec_sync_debug("fsdp_ulysses_sharding.__enter__.before")
         if self.device_mesh is not None:
             # We have a global SP group
             # so we have to change to use model-specific sp group
             self.prev_sp_group = get_ulysses_sequence_parallel_group()
             set_ulysses_sequence_parallel_group(self.device_mesh["sp"].get_group())
             # TODO: check how to set seed for each model
+            hspec_collective_debug(
+                "fsdp_ulysses_sharding.__enter__.set_sp_group",
+                group=self.device_mesh["sp"].get_group(),
+            )
+        hspec_sync_debug("fsdp_ulysses_sharding.__enter__.after")
 
     def __exit__(self, exc_type, exc_value, traceback):
+        hspec_sync_debug("fsdp_ulysses_sharding.__exit__.before")
         # restore random states
         if self.device_mesh is not None:
             # revert to previous sp group
             set_ulysses_sequence_parallel_group(self.prev_sp_group)
             # TODO: check how to set seed for each model
+        hspec_sync_debug("fsdp_ulysses_sharding.__exit__.after")
 
     def preprocess_data(self, data: DataProto) -> DataProto:
         """
@@ -58,7 +67,15 @@ class FSDPUlyssesShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             group = self.device_mesh["sp"].get_group()
 
+            hspec_collective_debug(
+                f"fsdp_ulysses_sharding.preprocess_data.before len={len(data)}",
+                group=group,
+            )
             all_gather_data_proto(data=data, process_group=group)
+            hspec_collective_debug(
+                f"fsdp_ulysses_sharding.preprocess_data.after len={len(data)}",
+                group=group,
+            )
         return data
 
     def postprocess_data(self, data: DataProto) -> DataProto:
@@ -66,7 +83,9 @@ class FSDPUlyssesShardingManager(BaseShardingManager):
         Split the data to follow FSDP partition
         """
         if self.device_mesh is not None:
+            hspec_sync_debug("fsdp_ulysses_sharding.postprocess_data.before")
             sp_size = self.device_mesh["sp"].size()
             sp_rank = self.device_mesh["sp"].get_local_rank()
             data = data.chunk(chunks=sp_size)[sp_rank]
+            hspec_sync_debug("fsdp_ulysses_sharding.postprocess_data.after")
         return data

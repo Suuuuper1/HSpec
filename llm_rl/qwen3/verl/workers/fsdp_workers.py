@@ -59,6 +59,7 @@ from verl.utils.device import (
     get_torch_device,
     set_expandable_segments,
 )
+from vllm_ascend.spec_decode.hspec_utils import hspec_install_distributed_debug_hooks, hspec_sync_debug
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import (
@@ -152,6 +153,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
+        hspec_install_distributed_debug_hooks(logger_obj=logger)
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -635,11 +637,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        hspec_sync_debug("fsdp_worker.rollout_mode.enter", logger_obj=logger)
+        hspec_sync_debug("fsdp_worker.rollout_mode.empty_cache.before", logger_obj=logger)
         aggressive_empty_cache(force_sync=True)
+        hspec_sync_debug("fsdp_worker.rollout_mode.empty_cache.after", logger_obj=logger)
 
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
         if self._is_offload_param:
+            hspec_sync_debug("fsdp_worker.rollout_mode.load_fsdp_model_to_gpu.before", logger_obj=logger)
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            hspec_sync_debug("fsdp_worker.rollout_mode.load_fsdp_model_to_gpu.after", logger_obj=logger)
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
         peft_config = None
@@ -654,11 +661,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
+            hspec_sync_debug("fsdp_worker.rollout_mode.state_dict.before", logger_obj=logger)
             params = self.actor_module_fsdp.state_dict()
+            hspec_sync_debug("fsdp_worker.rollout_mode.state_dict.after", logger_obj=logger)
 
+        hspec_sync_debug("fsdp_worker.rollout_mode.convert_weight_keys.before", logger_obj=logger)
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         )
+        hspec_sync_debug("fsdp_worker.rollout_mode.convert_weight_keys.after", logger_obj=logger)
 
         # Special handling for LoRA with sleep_level=2:
         # When sleep_level=2, base model weights are destroyed during each sleep cycle.
@@ -677,7 +688,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
         if self._is_offload_param:
+            hspec_sync_debug("fsdp_worker.rollout_mode.offload_fsdp_model_to_cpu.before", logger_obj=logger)
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            hspec_sync_debug("fsdp_worker.rollout_mode.offload_fsdp_model_to_cpu.after", logger_obj=logger)
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
         set_expandable_segments(False)
@@ -692,7 +705,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
         if self.config.rollout.free_cache_engine:
+            hspec_sync_debug("fsdp_worker.rollout_mode.resume_weights.before", logger_obj=logger)
             await self.rollout.resume(tags=["weights"])
+            hspec_sync_debug("fsdp_worker.rollout_mode.resume_weights.after", logger_obj=logger)
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
@@ -703,36 +718,51 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
             del base_model_params, per_tensor_base_params
 
+        hspec_sync_debug("fsdp_worker.rollout_mode.update_weights.before", logger_obj=logger)
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+        hspec_sync_debug("fsdp_worker.rollout_mode.update_weights.after", logger_obj=logger)
         log_gpu_memory_usage("After update_weights", logger=logger)
         del params, per_tensor_param
+        hspec_sync_debug("fsdp_worker.rollout_mode.post_update_empty_cache.before", logger_obj=logger)
         aggressive_empty_cache(force_sync=True)
+        hspec_sync_debug("fsdp_worker.rollout_mode.post_update_empty_cache.after", logger_obj=logger)
         if self.config.rollout.free_cache_engine:
+            hspec_sync_debug("fsdp_worker.rollout_mode.resume_kv_cache.before", logger_obj=logger)
             await self.rollout.resume(tags=["kv_cache"])
+            hspec_sync_debug("fsdp_worker.rollout_mode.resume_kv_cache.after", logger_obj=logger)
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
+        hspec_sync_debug("fsdp_worker.rollout_mode.exit", logger_obj=logger)
 
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
+        hspec_sync_debug("fsdp_worker.trainer_mode.enter", logger_obj=logger)
         if self.config.rollout.free_cache_engine:
             log_gpu_memory_usage("Before rollout offload", logger=logger)
+            hspec_sync_debug("fsdp_worker.trainer_mode.rollout_release.before", logger_obj=logger)
             await self.rollout.release()
+            hspec_sync_debug("fsdp_worker.trainer_mode.rollout_release.after", logger_obj=logger)
             log_gpu_memory_usage("After rollout offload", logger=logger)
 
+        hspec_sync_debug("fsdp_worker.trainer_mode.module_train.before", logger_obj=logger)
         self.actor_module_fsdp.train()
+        hspec_sync_debug("fsdp_worker.trainer_mode.module_train.after", logger_obj=logger)
 
         # add empty cache after each compute
+        hspec_sync_debug("fsdp_worker.trainer_mode.empty_cache.before", logger_obj=logger)
         aggressive_empty_cache(force_sync=True)
+        hspec_sync_debug("fsdp_worker.trainer_mode.empty_cache.after", logger_obj=logger)
 
         set_expandable_segments(True)
 
         # restore random states
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
+        hspec_sync_debug("fsdp_worker.trainer_mode.exit", logger_obj=logger)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -849,17 +879,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        hspec_sync_debug("fsdp_worker.update_actor.enter", logger_obj=logger)
         if self._is_offload_param:
+            hspec_sync_debug("fsdp_worker.update_actor.load_fsdp_model_to_gpu.before", logger_obj=logger)
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            hspec_sync_debug("fsdp_worker.update_actor.load_fsdp_model_to_gpu.after", logger_obj=logger)
         if self._is_offload_optimizer:
+            hspec_sync_debug("fsdp_worker.update_actor.load_fsdp_optimizer.before", logger_obj=logger)
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+            hspec_sync_debug("fsdp_worker.update_actor.load_fsdp_optimizer.after", logger_obj=logger)
 
+        hspec_sync_debug("fsdp_worker.update_actor.ulysses_context.enter.before", logger_obj=logger)
         with self.ulysses_sharding_manager:
+            hspec_sync_debug("fsdp_worker.update_actor.ulysses_context.enter.after", logger_obj=logger)
+            hspec_sync_debug("fsdp_worker.update_actor.data_to_cpu.before", logger_obj=logger)
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+            hspec_sync_debug("fsdp_worker.update_actor.data_to_cpu.after", logger_obj=logger)
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
+                hspec_sync_debug("fsdp_worker.update_actor.update_policy.before", logger_obj=logger)
                 metrics = self.actor.update_policy(data=data)
+                hspec_sync_debug("fsdp_worker.update_actor.update_policy.after", logger_obj=logger)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -877,15 +918,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
 
+            hspec_sync_debug("fsdp_worker.update_actor.output_to_cpu.before", logger_obj=logger)
             output = output.to("cpu")
+            hspec_sync_debug("fsdp_worker.update_actor.output_to_cpu.after", logger_obj=logger)
+        hspec_sync_debug("fsdp_worker.update_actor.ulysses_context.exit.after", logger_obj=logger)
 
         if self._is_offload_param:
+            hspec_sync_debug("fsdp_worker.update_actor.offload_fsdp_model_to_cpu.before", logger_obj=logger)
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            hspec_sync_debug("fsdp_worker.update_actor.offload_fsdp_model_to_cpu.after", logger_obj=logger)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
         if self._is_offload_optimizer:
+            hspec_sync_debug("fsdp_worker.update_actor.offload_fsdp_optimizer.before", logger_obj=logger)
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            hspec_sync_debug("fsdp_worker.update_actor.offload_fsdp_optimizer.after", logger_obj=logger)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        hspec_sync_debug("fsdp_worker.update_actor.exit", logger_obj=logger)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
@@ -893,7 +942,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
+        hspec_sync_debug("fsdp_worker.generate_sequences.enter", logger_obj=logger)
+        hspec_sync_debug("fsdp_worker.generate_sequences.prompts_to_device.before", logger_obj=logger)
         prompts = prompts.to(get_device_id())
+        hspec_sync_debug("fsdp_worker.generate_sequences.prompts_to_device.after", logger_obj=logger)
 
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
@@ -913,13 +965,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             loop.run_until_complete(self.rollout_mode())
+            hspec_sync_debug("fsdp_worker.generate_sequences.rollout_mode.after", logger_obj=logger)
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
+            hspec_sync_debug("fsdp_worker.generate_sequences.rollout_generate.before", logger_obj=logger)
             output = self.rollout.generate_sequences(prompts=prompts)
+            hspec_sync_debug("fsdp_worker.generate_sequences.rollout_generate.after", logger_obj=logger)
 
         if self._is_actor:
+            hspec_sync_debug("fsdp_worker.generate_sequences.trainer_mode.before", logger_obj=logger)
             loop.run_until_complete(self.trainer_mode())
+            hspec_sync_debug("fsdp_worker.generate_sequences.trainer_mode.after", logger_obj=logger)
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         # We calculate the average timing across all ranks
@@ -936,10 +993,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             }
         )
         output.meta_info["timing"] = timing_generate
+        hspec_sync_debug("fsdp_worker.generate_sequences.output_to_cpu.before", logger_obj=logger)
         output = output.to("cpu")
+        hspec_sync_debug("fsdp_worker.generate_sequences.output_to_cpu.after", logger_obj=logger)
 
         # clear kv cache
         get_torch_device().empty_cache()
+        hspec_sync_debug("fsdp_worker.generate_sequences.exit", logger_obj=logger)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -948,8 +1008,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
+        hspec_sync_debug("fsdp_worker.compute_log_prob.enter", logger_obj=logger)
         if self._is_offload_param:
+            hspec_sync_debug("fsdp_worker.compute_log_prob.load_fsdp_model_to_gpu.before", logger_obj=logger)
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            hspec_sync_debug("fsdp_worker.compute_log_prob.load_fsdp_model_to_gpu.after", logger_obj=logger)
 
         # Support all hardwares
         from contextlib import nullcontext
@@ -962,36 +1025,50 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
+        hspec_sync_debug("fsdp_worker.compute_log_prob.ulysses_context.enter.before", logger_obj=logger)
         with self.ulysses_sharding_manager:
+            hspec_sync_debug("fsdp_worker.compute_log_prob.ulysses_context.enter.after", logger_obj=logger)
             with adapter_ctx:
+                hspec_sync_debug("fsdp_worker.compute_log_prob.actor_forward.before", logger_obj=logger)
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                hspec_sync_debug("fsdp_worker.compute_log_prob.actor_forward.after", logger_obj=logger)
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},
             )
+        hspec_sync_debug("fsdp_worker.compute_log_prob.ulysses_context.exit.after", logger_obj=logger)
 
+        hspec_sync_debug("fsdp_worker.compute_log_prob.output_to_cpu.before", logger_obj=logger)
         output = output.to("cpu")
+        hspec_sync_debug("fsdp_worker.compute_log_prob.output_to_cpu.after", logger_obj=logger)
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
         if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            hspec_sync_debug("fsdp_worker.compute_log_prob.reshard.before", logger_obj=logger)
             self.actor.actor_module._handle.reshard(True)
+            hspec_sync_debug("fsdp_worker.compute_log_prob.reshard.after", logger_obj=logger)
 
         if self._is_offload_param:
+            hspec_sync_debug("fsdp_worker.compute_log_prob.offload_fsdp_model_to_cpu.before", logger_obj=logger)
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            hspec_sync_debug("fsdp_worker.compute_log_prob.offload_fsdp_model_to_cpu.after", logger_obj=logger)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
+        hspec_sync_debug("fsdp_worker.compute_log_prob.exit", logger_obj=logger)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
+        hspec_sync_debug("fsdp_worker.compute_ref_log_prob.enter", logger_obj=logger)
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
             data = self.compute_log_prob(data)
             # this old_log_probs is in fact ref_log_prob
             data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
+            hspec_sync_debug("fsdp_worker.compute_ref_log_prob.lora_exit", logger_obj=logger)
             return data
         assert self._is_ref
         # else:
@@ -1002,21 +1079,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        hspec_sync_debug("fsdp_worker.compute_ref_log_prob.ulysses_context.enter.before", logger_obj=logger)
         with self.ulysses_sharding_manager:
+            hspec_sync_debug("fsdp_worker.compute_ref_log_prob.ulysses_context.enter.after", logger_obj=logger)
+            hspec_sync_debug("fsdp_worker.compute_ref_log_prob.data_to_cpu.before", logger_obj=logger)
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
+            hspec_sync_debug("fsdp_worker.compute_ref_log_prob.data_to_cpu.after", logger_obj=logger)
+            hspec_sync_debug("fsdp_worker.compute_ref_log_prob.ref_forward.before", logger_obj=logger)
             output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            hspec_sync_debug("fsdp_worker.compute_ref_log_prob.ref_forward.after", logger_obj=logger)
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
+        hspec_sync_debug("fsdp_worker.compute_ref_log_prob.ulysses_context.exit.after", logger_obj=logger)
 
+        hspec_sync_debug("fsdp_worker.compute_ref_log_prob.output_to_cpu.before", logger_obj=logger)
         output = output.to("cpu")
+        hspec_sync_debug("fsdp_worker.compute_ref_log_prob.output_to_cpu.after", logger_obj=logger)
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
         if self.world_size > 1:
             if fsdp_version(self.ref_policy.actor_module) == 1:
+                hspec_sync_debug("fsdp_worker.compute_ref_log_prob.reshard_fsdp1.before", logger_obj=logger)
                 self.ref_policy.actor_module._handle.reshard(True)
+                hspec_sync_debug("fsdp_worker.compute_ref_log_prob.reshard_fsdp1.after", logger_obj=logger)
             elif fsdp_version(self.ref_policy.actor_module) == 2:
+                hspec_sync_debug("fsdp_worker.compute_ref_log_prob.reshard_fsdp2.before", logger_obj=logger)
                 self.ref_policy.actor_module.reshard()
+                hspec_sync_debug("fsdp_worker.compute_ref_log_prob.reshard_fsdp2.after", logger_obj=logger)
 
+        hspec_sync_debug("fsdp_worker.compute_ref_log_prob.exit", logger_obj=logger)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1137,6 +1228,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
+        hspec_install_distributed_debug_hooks(logger_obj=logger)
         self.config: FSDPCriticConfig = config
 
         # build device mesh for Ulysses Sequence Parallel
@@ -1565,6 +1657,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
+        hspec_install_distributed_debug_hooks(logger_obj=logger)
 
         # build device mesh for Ulysses Sequence Parallel
         world_size = torch.distributed.get_world_size()

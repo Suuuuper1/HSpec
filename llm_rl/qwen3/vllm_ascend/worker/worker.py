@@ -56,6 +56,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+from vllm_ascend.spec_decode.hspec_utils import hspec_install_distributed_debug_hooks, hspec_sync_debug
 from vllm_ascend.utils import (AscendDeviceType, check_ascend_device_type,
                                enable_sp, get_ascend_device_type,
                                register_ascend_customop)
@@ -132,17 +133,24 @@ class NPUWorker(WorkerBase):
         self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
 
     def sleep(self, level: int = 1) -> None:
+        hspec_sync_debug(f"npu_worker.sleep.enter level={level}", logger_obj=logger)
         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
+        hspec_sync_debug(f"npu_worker.sleep.mem_get_info_before.after level={level}", logger_obj=logger)
         # Save the buffers before level 2 sleep
         if level == 2:
+            hspec_sync_debug("npu_worker.sleep.save_buffers.before", logger_obj=logger)
             model = self.model_runner.model
             self._sleep_saved_buffers = {
                 name: buffer.cpu().clone()
                 for name, buffer in model.named_buffers()
             }
+            hspec_sync_debug("npu_worker.sleep.save_buffers.after", logger_obj=logger)
         allocator = CaMemAllocator.get_instance()
+        hspec_sync_debug(f"npu_worker.sleep.allocator_sleep.before level={level}", logger_obj=logger)
         allocator.sleep(offload_tags=("weights", ) if level == 1 else tuple())
+        hspec_sync_debug(f"npu_worker.sleep.allocator_sleep.after level={level}", logger_obj=logger)
         free_bytes_after_sleep, total = torch.npu.mem_get_info()
+        hspec_sync_debug(f"npu_worker.sleep.mem_get_info_after.after level={level}", logger_obj=logger)
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
         assert freed_bytes >= 0, "Memory usage increased after sleeping."
@@ -150,22 +158,52 @@ class NPUWorker(WorkerBase):
             "Sleep mode freed %.2f GiB memory, "
             "%.2f GiB memory is still in use.", freed_bytes / GiB_bytes,
             used_bytes / GiB_bytes)
+        hspec_sync_debug(f"npu_worker.sleep.exit level={level}", logger_obj=logger)
 
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
+        hspec_sync_debug(f"npu_worker.wake_up.enter tags={tags}", logger_obj=logger)
         if envs_ascend.VLLM_ASCEND_ENABLE_NZ:
             raise ValueError(
                 "FRACTAL_NZ mode is enabled. This may cause model parameter precision issues "
                 "in the RL scenarios. Please set VLLM_ASCEND_ENABLE_NZ=0.")
         allocator = CaMemAllocator.get_instance()
+        hspec_sync_debug(f"npu_worker.wake_up.allocator_wake_up.before tags={tags}", logger_obj=logger)
         allocator.wake_up(tags=tags)
+        hspec_sync_debug(f"npu_worker.wake_up.allocator_wake_up.after tags={tags}", logger_obj=logger)
+
+        hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
+        model = self.model_runner.model
+        if tags is None or "weights" in tags:
+            hspec_sync_debug("npu_worker.wake_up.transpose_moe_weights.before", logger_obj=logger)
+            for name, param in model.named_parameters():
+                if 'w2_weight' in name and param.shape[2] == hidden_size:
+                    parts = name.split('.')
+                    param_name = parts[-1]
+                    parent_module = model.get_submodule(".".join(parts[:-1]))
+
+                    w2_data = param.transpose(1, 2)
+                    w2_data = torch.nn.Parameter(w2_data, requires_grad=False)
+                    setattr(parent_module, param_name, w2_data)
+                elif 'w13_weight' in name and param.shape[1] == hidden_size:
+                    parts = name.split('.')
+                    param_name = parts[-1]
+                    parent_module = model.get_submodule(".".join(parts[:-1]))
+
+                    w13_data = param.transpose(1, 2)
+                    w13_data = torch.nn.Parameter(w13_data,
+                                                  requires_grad=False)
+                    setattr(parent_module, param_name, w13_data)
+            hspec_sync_debug("npu_worker.wake_up.transpose_moe_weights.after", logger_obj=logger)
 
         # Restore the buffers after level 2 sleep
         if len(self._sleep_saved_buffers):
-            model = self.model_runner.model
+            hspec_sync_debug("npu_worker.wake_up.restore_buffers.before", logger_obj=logger)
             for name, buffer in model.named_buffers():
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
+            hspec_sync_debug("npu_worker.wake_up.restore_buffers.after", logger_obj=logger)
+        hspec_sync_debug(f"npu_worker.wake_up.exit tags={tags}", logger_obj=logger)
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
@@ -483,6 +521,7 @@ class NPUWorker(WorkerBase):
             self.parallel_config.prefill_context_parallel_size,
             self.parallel_config.decode_context_parallel_size)
         init_ascend_model_parallel(self.parallel_config)
+        hspec_install_distributed_debug_hooks(logger_obj=logger)
         ensure_kv_transfer_initialized(self.vllm_config)
         ensure_ec_transfer_initialized(self.vllm_config)
 
