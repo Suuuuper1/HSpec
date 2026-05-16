@@ -77,7 +77,7 @@ GEN_BATCH_SIZE=$((TRAIN_BATCH_SIZE))
 ROLLOUT_LOG_PATH=${VLLM_DYNAMIC_RL_LOG_PATH:-outputs/rl/test.txt}
 ROLLOUT_LENGTH_DIR=${ROLLOUT_LENGTH_DIR:-outputs/rl/rollout_length}
 
-OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b-2.txt}"
+OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b-3.txt}"
 
 mkdir -p "$(dirname "${ROLLOUT_LOG_PATH}")" "${ROLLOUT_LENGTH_DIR}"
 {
@@ -110,7 +110,6 @@ python3 -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
     data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
     data.max_response_length="${MAX_RESPONSE_LENGTH}" \
-    data.val_batch_size=16 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=False \
@@ -145,7 +144,6 @@ python3 -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
     actor_rollout_ref.rollout.enforce_eager=False \
-    actor_rollout_ref.rollout.cudagraph_capture_sizes='[4,8,16,24,32,48,64]' \
     actor_rollout_ref.rollout.max_num_seqs=${MAX_NUM_SEQS} \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE} \
@@ -188,3 +186,5 @@ python3 -m verl.trainer.main_ppo  --config-path="${CONFIG_DIR}" \
     # actor_rollout_ref.rollout.eagle3_draft_model='/home/data/Qwen3-30B-moe-eagle3' \
     # actor_rollout_ref.rollout.spec_num_speculative_tokens=4 \
     # actor_rollout_ref.rollout.speculative_token_tree="'[(0,),(0,0),(0,0,0),(0,0,0,0)]'" \
+    # actor_rollout_ref.rollout.cudagraph_capture_sizes='[4,8,16,24,32,48,64]' \
+    # data.val_batch_size=16 \

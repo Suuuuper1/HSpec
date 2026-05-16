@@ -386,6 +386,7 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            async_scheduling=False,
             additional_config={
                 "ascend_scheduler_config": {
                     "enabled": True,
@@ -404,6 +405,14 @@ class vLLMRollout(BaseRollout):
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,
+        )
+        # vLLM may expose logits for padded vocabulary rows from tensor
+        # parallel output heads. Those rows are not tokenizer tokens and must
+        # not be sampled; otherwise rollout text can degenerate into invalid
+        # or nonsensical token streams.
+        _monkey_patch_compute_logits(
+            self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model(),
+            len(tokenizer),
         )
 
         kwargs = dict(
@@ -809,21 +818,26 @@ class vLLMRollout(BaseRollout):
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+            from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
             model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
             model = model_runner.get_model()
             patch_vllm_moe_model_weight_loader(model)
-            hidden_size = _get_model_hidden_size(model_runner)
-            moe_reloader_views = _prepare_ascend_moe_weights_for_reload(model, hidden_size)
             loaded_params = model.load_weights(weights)
-            moe_runtime_views = _restore_ascend_moe_weights_after_reload(model, hidden_size)
+
+            model_config = model_runner.vllm_config.model_config
+            device_config = model_runner.vllm_config.device_config
+            load_config = model_runner.vllm_config.load_config
+            load_device = (
+                device_config.device if load_config.device is None else load_config.device
+            )
+            target_device = torch.device(load_device)
+            process_weights_after_loading(model, model_config, target_device)
+
             loaded_count = len(loaded_params) if loaded_params is not None else -1
             logger.warning(
-                "vLLM rollout loaded %s parameters from actor weights "
-                "(ascend_moe_reload_views=%s, ascend_moe_runtime_views=%s)",
+                "vLLM rollout loaded %s parameters from actor weights",
                 loaded_count,
-                moe_reloader_views,
-                moe_runtime_views,
             )
             if loaded_count == 0:
                 raise RuntimeError(

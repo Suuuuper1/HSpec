@@ -551,24 +551,35 @@ def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=Fal
     # strict = StrictHandling.IGNORE_ALL if is_value_model else StrictHandling.ASSUME_OK_UNEXPECTED
     strict = StrictHandling.ASSUME_OK_UNEXPECTED
     for model in parallel_model:
-        ssd = unwrap_model(model).sharded_state_dict()
+        unwrapped_model = unwrap_model(model)
+        ssd = unwrapped_model.sharded_state_dict()
         if is_value_model:
             for k in list(ssd.keys()):
                 if "output_layer" in k:
                     ssd.pop(k)
-        new_ssd = dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
-        sd = unwrap_model(model).state_dict()
-        with torch.no_grad():
-            for key, loaded_tensor in new_ssd.items():
-                if key not in sd or not torch.is_tensor(loaded_tensor):
-                    continue
-                sd[key].copy_(loaded_tensor)
-                sharded_tensor = ssd.get(key)
-                if hasattr(sharded_tensor, "data") and torch.is_tensor(sharded_tensor.data):
-                    if sharded_tensor.data.shape == loaded_tensor.shape and (
-                        sharded_tensor.data.data_ptr() != sd[key].data_ptr()
+        loaded_state_dict = dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
+        unwrapped_model.load_state_dict(loaded_state_dict, strict=False)
+
+        if os.getenv("USE_ALLTOALL_OVERLAP", "0") == "1":
+            sd = unwrapped_model.state_dict()
+            with torch.no_grad():
+                for key in list(ssd.keys()):
+                    if "mlp.experts.weight" not in key:
+                        continue
+                    loaded_tensor = loaded_state_dict.get(key)
+                    if loaded_tensor is None or not torch.is_tensor(loaded_tensor):
+                        continue
+                    sharded_tensor = ssd.get(key)
+                    if (
+                        hasattr(sharded_tensor, "data")
+                        and torch.is_tensor(sharded_tensor.data)
+                        and sharded_tensor.data.shape == loaded_tensor.shape
                     ):
                         sharded_tensor.data.copy_(loaded_tensor)
+                    if key not in sd or not torch.is_tensor(sd[key]) or sd[key].shape != loaded_tensor.shape:
+                        continue
+                    if sd[key].data_ptr() != loaded_tensor.data_ptr():
+                        sd[key].copy_(loaded_tensor)
             
     return
 

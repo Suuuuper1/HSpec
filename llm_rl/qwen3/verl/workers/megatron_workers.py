@@ -108,6 +108,32 @@ def set_random_seed(seed):
 
 
 class MegatronWorker(Worker):
+    def _maybe_apply_qwen3_moe_runtime_env(self):
+        """Fill required Qwen3-MoE runtime envs when launch scripts omit them.
+
+        Qwen3-MoE rollout uses vLLM expert parallel and the all-to-all
+        reshaping path in this stack. Keep explicit user/script values intact;
+        only provide the defaults needed for correct runtime layout.
+        """
+        if getattr(self.hf_config, "model_type", None) != "qwen3_moe":
+            return
+
+        if "USE_ALLTOALL_OVERLAP" not in os.environ:
+            os.environ["USE_ALLTOALL_OVERLAP"] = "1"
+
+        if "ALL_TO_ALL_RESHARD" not in os.environ:
+            os.environ["ALL_TO_ALL_RESHARD"] = "1"
+
+        if self._is_rollout:
+            if "VLLM_ENABLE_EXPERT_PARALLEL" not in os.environ:
+                os.environ["VLLM_ENABLE_EXPERT_PARALLEL"] = "1"
+
+            if "VLLM_DP_SIZE" not in os.environ:
+                rollout_tp = max(1, int(self.config.rollout.tensor_model_parallel_size))
+                rollout_pp = max(1, int(self.config.rollout.pipeline_model_parallel_size))
+                infer_world_size = rollout_tp * rollout_pp
+                os.environ["VLLM_DP_SIZE"] = str(max(1, self.world_size // infer_world_size))
+
     def _init_hf_config_and_tf_config(
         self,
         model_path,
@@ -314,6 +340,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self.config.model.get("trust_remote_code", False),
             self.config.actor.megatron.use_mbridge,
         )
+        self._maybe_apply_qwen3_moe_runtime_env()
         self.generation_config = get_generation_config(self.local_path)
 
         if self._is_actor or self._is_rollout:
@@ -455,7 +482,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # For sync mode, we directly switch to trainer mode here.
         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
         if rollout_config.mode == "sync" and self._is_actor:
-            loop = asyncio.get_event_loop()
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             loop.run_until_complete(self.trainer_mode())
 
         # Revert to dummy_compile after rollout is built
