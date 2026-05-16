@@ -29,6 +29,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from transformers import PreTrainedTokenizer
 
 from verl.utils.device import get_device_name, get_torch_device
+from vllm_ascend.spec_decode.hspec_utils import hspec_collective_debug
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
@@ -288,7 +289,17 @@ def allgather_dict_tensors(tensors: dict[str, torch.Tensor] | TensorDict, size, 
     for key in sorted_keys:
         val = tensors_as_dict[key]
         output[key] = [torch.empty_like(val) for _ in range(size)]
+        hspec_collective_debug(
+            f"allgather_dict_tensors.key={key}.before dim={dim}",
+            group=group,
+            tensor=val,
+        )
         torch.distributed.all_gather(output[key], val, group=group, async_op=False)
+        hspec_collective_debug(
+            f"allgather_dict_tensors.key={key}.after dim={dim}",
+            group=group,
+            tensor=val,
+        )
         output[key] = torch.cat(output[key], dim=dim)
 
     if is_tensor_dict:

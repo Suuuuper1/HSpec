@@ -47,6 +47,13 @@ export HSPEC_ASYNC_HS_ACCUMULATE="${HSPEC_ASYNC_HS_ACCUMULATE:-0}"
 export HSPEC_ASYNC_HS_COPY_STREAM="${HSPEC_ASYNC_HS_COPY_STREAM:-1}"
 export HSPEC_FULL_BATCH_PREFETCH="${HSPEC_FULL_BATCH_PREFETCH:-1}"
 export HSPEC_SYNC_DEBUG="${HSPEC_SYNC_DEBUG:-1}"
+export HSPEC_SYNC_PRINT="${HSPEC_SYNC_PRINT:-0}"
+export HSPEC_DIST_HOOK_DEBUG="${HSPEC_DIST_HOOK_DEBUG:-1}"
+export HSPEC_DIST_HOOK_STACK="${HSPEC_DIST_HOOK_STACK:-1}"
+export HSPEC_BREADCRUMB_DEBUG="${HSPEC_BREADCRUMB_DEBUG:-1}"
+export HSPEC_BREADCRUMB_DIR="${HSPEC_BREADCRUMB_DIR:-/tmp/hspec_debug_breadcrumbs}"
+export HSPEC_BREADCRUMB_FSYNC="${HSPEC_BREADCRUMB_FSYNC:-0}"
+export HSPEC_NCCL_TIMEOUT="${HSPEC_NCCL_TIMEOUT:-120}"
 
 # Per-step HSpec breakdown / profiler controls.
 export HSPEC_GEN="${HSPEC_GEN:-0}"
@@ -111,12 +118,36 @@ mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
     echo "hspec_profile=${HSPEC_PROFILE}"
     echo "hspec_dump=${HSPEC_DUMP}"
     echo "hspec_sync_debug=${HSPEC_SYNC_DEBUG}"
+    echo "hspec_sync_print=${HSPEC_SYNC_PRINT}"
+    echo "hspec_dist_hook_debug=${HSPEC_DIST_HOOK_DEBUG}"
+    echo "hspec_breadcrumb_dir=${HSPEC_BREADCRUMB_DIR}"
+    echo "hspec_breadcrumb_fsync=${HSPEC_BREADCRUMB_FSYNC}"
+    echo "hspec_nccl_timeout=${HSPEC_NCCL_TIMEOUT}"
     echo "pca_components=${PCA_COMPONENTS}"
     echo "vllm_spec_batch_threshold=${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"
 } >> "${OUT}"
 
 set -x
 
+dump_hspec_breadcrumbs_on_failure() {
+    {
+        echo
+        echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') hspec last breadcrumbs after failure ====="
+        echo "dir=${HSPEC_BREADCRUMB_DIR}"
+        if [ -d "${HSPEC_BREADCRUMB_DIR}" ]; then
+            find "${HSPEC_BREADCRUMB_DIR}" -maxdepth 1 -type f -name 'rank_*_pid_*.last' -print \
+                | sort \
+                | while IFS= read -r file; do
+                    echo "--- ${file} ---"
+                    sed -n '1,20p' "${file}" || true
+                done
+        else
+            echo "breadcrumb directory not found"
+        fi
+    } >> "${OUT}" 2>&1
+}
+
+set +e
 python -m verl.trainer.main_ppo \
     ray_kwargs.ray_init.num_cpus=128 \
     +ray_kwargs.ray_init.address=local \
@@ -154,6 +185,12 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_COPY_STREAM='"'"${HSPEC_ASYNC_HS_COPY_STREAM}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_FULL_BATCH_PREFETCH='"'"${HSPEC_FULL_BATCH_PREFETCH}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SYNC_DEBUG='"'"${HSPEC_SYNC_DEBUG}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SYNC_PRINT='"'"${HSPEC_SYNC_PRINT}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DIST_HOOK_DEBUG='"'"${HSPEC_DIST_HOOK_DEBUG}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DIST_HOOK_STACK='"'"${HSPEC_DIST_HOOK_STACK}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_BREADCRUMB_DEBUG='"'"${HSPEC_BREADCRUMB_DEBUG}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_BREADCRUMB_DIR='"'"${HSPEC_BREADCRUMB_DIR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_BREADCRUMB_FSYNC='"'"${HSPEC_BREADCRUMB_FSYNC}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_SPECULATIVE_BATCH_SIZE_THRE='"'"${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"'"' \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \
@@ -164,6 +201,7 @@ python -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.nccl_timeout="${HSPEC_NCCL_TIMEOUT}" \
     actor_rollout_ref.actor.optim.lr=5e-7 \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.actor.entropy_coeff=0.001 \
@@ -206,5 +244,14 @@ python -m verl.trainer.main_ppo \
     trainer.test_freq=2 \
     trainer.total_epochs=5 \
     > "${OUT}" 2>&1 "$@"
+train_status=$?
+set +x
+set -e
+
+if [ "${train_status}" -ne 0 ]; then
+    dump_hspec_breadcrumbs_on_failure || true
+    echo "FAILED: training exited with status ${train_status}. See log at ${OUT}" >&2
+    exit "${train_status}"
+fi
 
 echo "OK: training finished. See log at ${OUT}"

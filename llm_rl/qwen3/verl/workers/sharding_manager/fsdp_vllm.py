@@ -46,6 +46,7 @@ from verl.utils.model import check_exclude_modules, check_target_modules, conver
 from verl.utils.profiler import GPUMemoryLogger, log_gpu_memory_usage, simple_timer
 from verl.utils.torch_functional import check_device_is_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
+from vllm_ascend.spec_decode.hspec_utils import hspec_collective_debug, hspec_sync_debug
 
 from .base import BaseShardingManager
 
@@ -127,6 +128,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __enter__(self):
+        hspec_sync_debug("fsdp_vllm_sharding.__enter__.before", logger_obj=logger)
         def __collect_lora_params() -> OrderedDict:
             """
             collect lora params or full params if base model is not ready in vllm
@@ -193,23 +195,35 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         # vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/device_allocator/cumem.py#L103
         self.timing = {}
         with simple_timer("reshard", self.timing):
+            hspec_sync_debug("fsdp_vllm_sharding.__enter__.empty_cache.before", logger_obj=logger)
             get_torch_device().empty_cache()
+            hspec_sync_debug("fsdp_vllm_sharding.__enter__.empty_cache.after", logger_obj=logger)
 
             log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
             if self.offload_param:
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.load_fsdp_model_to_gpu.before", logger_obj=logger)
                 load_fsdp_model_to_gpu(self.module)
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.load_fsdp_model_to_gpu.after", logger_obj=logger)
 
             peft_config = None
             peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
             if hasattr(peft_model, "peft_config"):
                 peft_config = peft_model.peft_config.get("default", None)
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.collect_lora_params.before", logger_obj=logger)
                 params = __collect_lora_params()
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.collect_lora_params.after", logger_obj=logger)
             else:
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.state_dict.before", logger_obj=logger)
                 params = self.module.state_dict()
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.state_dict.after", logger_obj=logger)
+            hspec_sync_debug("fsdp_vllm_sharding.__enter__.convert_weight_keys.before", logger_obj=logger)
             params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+            hspec_sync_debug("fsdp_vllm_sharding.__enter__.convert_weight_keys.after", logger_obj=logger)
 
             if self.offload_param:
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.offload_fsdp_model_to_cpu.before", logger_obj=logger)
                 offload_fsdp_model_to_cpu(self.module)
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.offload_fsdp_model_to_cpu.after", logger_obj=logger)
             log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
 
             # vllm need to set _set_allocator_settings to False
@@ -217,22 +231,30 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             set_expandable_segments(False)
 
             if self.rollout_config.free_cache_engine:
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.wake_up_weights.before", logger_obj=logger)
                 if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
                     self.inference_engine.wake_up(tags=["weights"])
                 else:
                     self.inference_engine.wake_up()
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.wake_up_weights.after", logger_obj=logger)
 
             # update model params
+            hspec_sync_debug("fsdp_vllm_sharding.__enter__.update_params.before", logger_obj=logger)
             self.update_params(params, peft_config=peft_config)
+            hspec_sync_debug("fsdp_vllm_sharding.__enter__.update_params.after", logger_obj=logger)
             log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
             del params
+            hspec_sync_debug("fsdp_vllm_sharding.__enter__.post_update_empty_cache.before", logger_obj=logger)
             get_torch_device().empty_cache()
+            hspec_sync_debug("fsdp_vllm_sharding.__enter__.post_update_empty_cache.after", logger_obj=logger)
 
             if (
                 self.rollout_config.free_cache_engine
                 and "tags" in inspect.signature(self.inference_engine.wake_up).parameters
             ):
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.wake_up_kv_cache.before", logger_obj=logger)
                 self.inference_engine.wake_up(tags=["kv_cache"])
+                hspec_sync_debug("fsdp_vllm_sharding.__enter__.wake_up_kv_cache.after", logger_obj=logger)
 
             log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
 
@@ -240,16 +262,24 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             if self.device_mesh is not None:
                 self.torch_random_states = get_torch_device().get_rng_state()
                 get_torch_device().set_rng_state(self.gen_random_states)
+        hspec_sync_debug("fsdp_vllm_sharding.__enter__.after", logger_obj=logger)
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __exit__(self, exc_type, exc_value, traceback):
+        hspec_sync_debug("fsdp_vllm_sharding.__exit__.before", logger_obj=logger)
         if self.rollout_config.free_cache_engine:
+            hspec_sync_debug("fsdp_vllm_sharding.__exit__.sleep.before", logger_obj=logger)
             self.inference_engine.sleep(level=VLLM_SLEEP_LEVEL)
+            hspec_sync_debug("fsdp_vllm_sharding.__exit__.sleep.after", logger_obj=logger)
 
+        hspec_sync_debug("fsdp_vllm_sharding.__exit__.module_train.before", logger_obj=logger)
         self.module.train()
+        hspec_sync_debug("fsdp_vllm_sharding.__exit__.module_train.after", logger_obj=logger)
 
         # add empty cache after each compute
+        hspec_sync_debug("fsdp_vllm_sharding.__exit__.empty_cache.before", logger_obj=logger)
         get_torch_device().empty_cache()
+        hspec_sync_debug("fsdp_vllm_sharding.__exit__.empty_cache.after", logger_obj=logger)
 
         # _set_allocator_settings to True is required by fsdp2 to avoid oom
         logger.debug("fsdp vllm sharding_manager _set_allocator_settings to True")
@@ -259,6 +289,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.gen_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.torch_random_states)
+        hspec_sync_debug("fsdp_vllm_sharding.__exit__.after", logger_obj=logger)
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def preprocess_data(self, data: DataProto) -> DataProto:
@@ -269,7 +300,17 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         # TODO: Current impl doesn't consider FSDP with torch micro-dp
         group = vllm_ps.get_tensor_model_parallel_group().device_group
 
+        hspec_collective_debug(
+            f"fsdp_vllm_sharding.preprocess_data.before len={len(data)}",
+            group=group,
+            logger_obj=logger,
+        )
         all_gather_data_proto(data=data, process_group=group)
+        hspec_collective_debug(
+            f"fsdp_vllm_sharding.preprocess_data.after len={len(data)}",
+            group=group,
+            logger_obj=logger,
+        )
         return data
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
@@ -278,7 +319,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.tp_size == 1:
             return data
 
-        return data.chunk(chunks=self.tp_size)[self.tp_rank]
+        hspec_sync_debug("fsdp_vllm_sharding.postprocess_data.before", logger_obj=logger)
+        data = data.chunk(chunks=self.tp_size)[self.tp_rank]
+        hspec_sync_debug("fsdp_vllm_sharding.postprocess_data.after", logger_obj=logger)
+        return data
 
     def update_params(self, updated_params, peft_config=None):
         """Update model parameters in the vLLM inference engine.

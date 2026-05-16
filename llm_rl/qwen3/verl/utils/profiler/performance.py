@@ -24,6 +24,7 @@ from codetiming import Timer
 
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.logger import DecoratorLoggerBase
+from vllm_ascend.spec_decode.hspec_utils import hspec_collective_debug
 
 
 def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str]:
@@ -217,7 +218,15 @@ def reduce_timing(
         key_list.append(key)
         timing_list.append(timing_raw[key])
     timing_list = torch.tensor(timing_list, dtype=torch.float32, device=get_device_id())
+    hspec_collective_debug(
+        f"reduce_timing.all_reduce.before keys={key_list}",
+        tensor=timing_list,
+    )
     torch.distributed.all_reduce(timing_list, op=reduce_op)
+    hspec_collective_debug(
+        f"reduce_timing.all_reduce.after keys={key_list}",
+        tensor=timing_list,
+    )
     timing_list = [tensor.item() for tensor in timing_list.to("cpu")]
     timing_generate = {key_list[i]: timing_list[i] for i in range(len(key_list))}
     return timing_generate
@@ -231,7 +240,15 @@ def topk_reduce_ratio_min_max(timing: float, k: int = 10) -> tuple[float, float,
     world_size = dist.get_world_size()
     timing_tensor = torch.tensor(timing, dtype=torch.float32, device=get_device_id())
     tensor_list = [torch.zeros(1, dtype=torch.float32, device=get_device_id()) for _ in range(world_size)]
+    hspec_collective_debug(
+        "topk_reduce_ratio_min_max.all_gather.before",
+        tensor=timing_tensor,
+    )
     torch.distributed.all_gather(tensor_list, timing_tensor)
+    hspec_collective_debug(
+        "topk_reduce_ratio_min_max.all_gather.after",
+        tensor=timing_tensor,
+    )
     tensor_stack = torch.stack(tensor_list)
     timing_min = tensor_stack.min().cpu().item()
     timing_max = tensor_stack.max().cpu().item()

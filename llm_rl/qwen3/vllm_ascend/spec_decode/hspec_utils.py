@@ -19,12 +19,15 @@ This module provides helper functions for hidden state collection and processing
 
 from contextlib import contextmanager, nullcontext
 import atexit
+import inspect
 import logging
 import hashlib
 import os
 import queue
 import struct
+import sys
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -40,13 +43,125 @@ logger.setLevel(os.getenv("HSPEC_LOG_LEVEL", os.getenv("VERL_LOGGING_LEVEL", "WA
 
 _hspec_profile_local = threading.local()
 _HSPEC_SYNC_DEBUG = os.getenv("HSPEC_SYNC_DEBUG", "0") != "0"
+_HSPEC_SYNC_PRINT = os.getenv("HSPEC_SYNC_PRINT", "0") != "0"
+_HSPEC_DIST_HOOK_DEBUG = os.getenv("HSPEC_DIST_HOOK_DEBUG", os.getenv("HSPEC_SYNC_DEBUG", "0")) != "0"
+_HSPEC_DIST_HOOK_STACK = os.getenv("HSPEC_DIST_HOOK_STACK", "1") != "0"
+_HSPEC_BREADCRUMB_DEBUG = os.getenv("HSPEC_BREADCRUMB_DEBUG", os.getenv("HSPEC_SYNC_DEBUG", "0")) != "0"
+_HSPEC_BREADCRUMB_DIR = os.getenv("HSPEC_BREADCRUMB_DIR", "/tmp/hspec_debug_breadcrumbs")
+_HSPEC_BREADCRUMB_FSYNC = os.getenv("HSPEC_BREADCRUMB_FSYNC", "0") != "0"
+_hspec_dist_hook_local = threading.local()
+
+
+def _hspec_debug_emit(
+    log: logging.Logger,
+    message: str,
+    *args: Any,
+    level: int = logging.WARNING,
+) -> None:
+    if args:
+        message = message % args
+    log.log(level, message)
+    if _HSPEC_SYNC_PRINT:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(f"[{ts}] {message}", file=sys.stderr, flush=True)
+
+
+def _hspec_write_breadcrumb(
+    label: str,
+    *,
+    group: Optional[Any] = None,
+    tensor: Optional[Any] = None,
+) -> None:
+    if not _HSPEC_BREADCRUMB_DEBUG:
+        return
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    except Exception:
+        rank = -1
+    try:
+        os.makedirs(_HSPEC_BREADCRUMB_DIR, exist_ok=True)
+        path = os.path.join(_HSPEC_BREADCRUMB_DIR, f"rank_{rank}_pid_{os.getpid()}.last")
+        tensor_msg = "" if tensor is None else f"\ntensor={_hspec_tensor_desc(tensor)}"
+        payload = (
+            f"time={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\n"
+            f"pid={os.getpid()} thread={threading.get_ident()}\n"
+            f"{_hspec_rank_info(group)}\n"
+            f"label={label}"
+            f"{tensor_msg}\n"
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            if _HSPEC_BREADCRUMB_FSYNC:
+                os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
+def _hspec_rank_info(group: Optional[Any] = None) -> str:
+    try:
+        if not torch.distributed.is_initialized():
+            return "rank=-1 world=-1 group_rank=-1 group_world=-1"
+        rank = torch.distributed.get_rank()
+        world = torch.distributed.get_world_size()
+        if group is None:
+            group_rank = rank
+            group_world = world
+        else:
+            try:
+                group_rank = torch.distributed.get_rank(group=group)
+            except Exception:
+                group_rank = "?"
+            try:
+                group_world = torch.distributed.get_world_size(group=group)
+            except Exception:
+                group_world = "?"
+        return f"rank={rank} world={world} group_rank={group_rank} group_world={group_world}"
+    except Exception as exc:
+        return f"rank_info_error={type(exc).__name__}:{exc}"
+
+
+def _hspec_tensor_desc(obj: Any) -> str:
+    try:
+        if isinstance(obj, torch.Tensor):
+            return (
+                f"shape={tuple(obj.shape)} numel={obj.numel()} "
+                f"dtype={obj.dtype} device={obj.device}"
+            )
+        if isinstance(obj, (list, tuple)):
+            parts = []
+            for item in obj[:2]:
+                parts.append(_hspec_tensor_desc(item))
+            suffix = "" if len(obj) <= 2 else f", ... len={len(obj)}"
+            return "[" + "; ".join(parts) + suffix + "]"
+        return f"type={type(obj).__name__}"
+    except Exception as exc:
+        return f"desc_error={type(exc).__name__}:{exc}"
+
+
+def _hspec_collective_caller() -> str:
+    if not _HSPEC_DIST_HOOK_STACK:
+        return "caller=disabled"
+    try:
+        frame = inspect.currentframe()
+        if frame is None:
+            return "caller=unknown"
+        frame = frame.f_back
+        while frame is not None:
+            filename = frame.f_code.co_filename.replace("\\", "/")
+            if not filename.endswith("hspec_utils.py"):
+                return f"caller={filename}:{frame.f_lineno}:{frame.f_code.co_name}"
+            frame = frame.f_back
+    except Exception as exc:
+        return f"caller_error={type(exc).__name__}:{exc}"
+    return "caller=unknown"
 
 
 def hspec_sync_debug(label: str, *, logger_obj: Optional[logging.Logger] = None) -> None:
     """Force an NPU synchronization when HSPEC_SYNC_DEBUG is enabled.
 
-    The log line before the synchronize identifies the operation that may hang
-    or surface an async HCCL error; the after line confirms completion.
+    Success is intentionally silent. The latest label is persisted to a small
+    per-rank breadcrumb file; only failures print to the training log.
     """
     if not _HSPEC_SYNC_DEBUG:
         return
@@ -55,23 +170,123 @@ def hspec_sync_debug(label: str, *, logger_obj: Optional[logging.Logger] = None)
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
     except Exception:
         rank = -1
+    _hspec_write_breadcrumb(f"sync {label}")
     npu_mod = getattr(torch, "npu", None)
     if npu_mod is None:
-        #log.warning("HSPEC_SYNC_DEBUG skip %s rank=%s reason=no_torch_npu", label, rank)
         return
     try:
         if hasattr(npu_mod, "is_available") and not npu_mod.is_available():
-            #log.warning("HSPEC_SYNC_DEBUG skip %s rank=%s reason=npu_unavailable", label, rank)
             return
     except Exception:
         pass
     try:
-        #log.warning("HSPEC_SYNC_DEBUG before %s rank=%s", label, rank)
         npu_mod.synchronize()
-        #log.warning("HSPEC_SYNC_DEBUG after %s rank=%s", label, rank)
     except Exception:
-        log.exception("HSPEC_SYNC_DEBUG failed at %s rank=%s", label, rank)
+        _hspec_debug_emit(log, "HSPEC_SYNC_DEBUG failed at %s rank=%s", label, rank)
         raise
+
+
+def hspec_collective_debug(
+    label: str,
+    *,
+    group: Optional[Any] = None,
+    tensor: Optional[Any] = None,
+    logger_obj: Optional[logging.Logger] = None,
+) -> None:
+    if not _HSPEC_DIST_HOOK_DEBUG:
+        return
+    _hspec_write_breadcrumb(f"collective {label}", group=group, tensor=tensor)
+
+
+def hspec_install_distributed_debug_hooks(logger_obj: Optional[logging.Logger] = None) -> None:
+    """Track Python-visible torch.distributed collectives in debug mode.
+
+    Normal collectives are silent and only update the per-rank breadcrumb file.
+    Python exceptions print a compact failure line. C++-internal FSDP collectives
+    may not pass through these Python functions, so high-level worker sync
+    breadcrumbs are still useful.
+    """
+    if not _HSPEC_DIST_HOOK_DEBUG:
+        return
+    dist = getattr(torch, "distributed", None)
+    if dist is None or getattr(dist, "_hspec_debug_hooks_installed", False):
+        return
+
+    log = logger_obj if logger_obj is not None else logger
+
+    def _group_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Optional[Any]:
+        if "group" in kwargs:
+            return kwargs.get("group")
+        return None
+
+    def _primary_tensor(name: str, args: tuple[Any, ...]) -> Any:
+        if not args:
+            return None
+        if name in ("all_gather", "all_gather_object") and len(args) > 1:
+            return args[1]
+        if name in ("all_gather_into_tensor", "gather") and len(args) > 1:
+            return args[1]
+        if name in ("all_reduce", "broadcast", "reduce", "reduce_scatter_tensor"):
+            return args[0]
+        if name == "all_to_all" and len(args) > 1:
+            return args[1]
+        if name == "barrier":
+            return None
+        return args[0]
+
+    def _wrap(name: str) -> None:
+        if not hasattr(dist, name):
+            return
+        original = getattr(dist, name)
+        if getattr(original, "_hspec_debug_wrapped", False):
+            return
+
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            if getattr(_hspec_dist_hook_local, "active", False):
+                return original(*args, **kwargs)
+            group = _group_from_call(args, kwargs)
+            tensor = _primary_tensor(name, args)
+            caller = _hspec_collective_caller()
+            async_op = kwargs.get("async_op", None)
+            label = f"torch.distributed.{name} async_op={async_op} {caller}"
+            try:
+                _hspec_dist_hook_local.active = True
+                hspec_collective_debug(f"before {label}", group=group, tensor=tensor, logger_obj=log)
+                result = original(*args, **kwargs)
+                hspec_collective_debug(f"after {label}", group=group, tensor=tensor, logger_obj=log)
+                return result
+            except Exception:
+                _hspec_write_breadcrumb(f"exception {label}", group=group, tensor=tensor)
+                _hspec_debug_emit(
+                    log,
+                    "HSPEC_DIST_DEBUG failed %s %s %s",
+                    label,
+                    _hspec_rank_info(group),
+                    _hspec_tensor_desc(tensor),
+                )
+                raise
+            finally:
+                _hspec_dist_hook_local.active = False
+
+        wrapped._hspec_debug_wrapped = True  # type: ignore[attr-defined]
+        wrapped._hspec_debug_original = original  # type: ignore[attr-defined]
+        setattr(dist, name, wrapped)
+
+    for collective_name in (
+        "all_gather",
+        "all_gather_into_tensor",
+        "all_gather_object",
+        "all_reduce",
+        "barrier",
+        "broadcast",
+        "reduce",
+        "reduce_scatter_tensor",
+        "all_to_all",
+        "gather",
+    ):
+        _wrap(collective_name)
+    setattr(dist, "_hspec_debug_hooks_installed", True)
+    _hspec_write_breadcrumb("distributed debug hooks installed")
 
 
 def _parse_profile_steps(value: str) -> set[int]:
@@ -1365,7 +1580,7 @@ def hspec_submit_accumulate_task(
                     copy_stream.wait_stream(current_stream)
                 else:
                     copy_stream = current_stream
-                torch.npu.synchronize()
+                hspec_sync_debug("hspec_utils.accumulate.submit_d2h_copy.before", logger_obj=logger)
                 with torch.npu.stream(copy_stream):
                     cpu_tensor = torch.empty(
                         selected_rows.shape,
@@ -1376,7 +1591,7 @@ def hspec_submit_accumulate_task(
                     cpu_tensor.copy_(selected_rows, non_blocking=True)
                     copy_event = torch_npu.npu.Event()
                     copy_event.record(copy_stream)
-                torch.npu.synchronize()
+                hspec_sync_debug("hspec_utils.accumulate.submit_d2h_copy.after", logger_obj=logger)
             else:
                 cpu_tensor = selected_rows.cpu()
                 copy_event = None
@@ -1398,10 +1613,10 @@ def hspec_submit_accumulate_task(
     if device.type == "npu":
         import torch_npu  # type: ignore
 
-        torch.npu.synchronize()
+        hspec_sync_debug("hspec_utils.accumulate.legacy_record_event.before", logger_obj=logger)
         producer_event = torch_npu.npu.Event()
         producer_event.record(torch_npu.npu.current_stream(device))
-        torch.npu.synchronize()
+        hspec_sync_debug("hspec_utils.accumulate.legacy_record_event.after", logger_obj=logger)
 
     _hspec_accumulate_queue.put(
         _HSpecAsyncAccumulateTask(

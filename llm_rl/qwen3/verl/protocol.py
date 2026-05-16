@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.py_functional import union_two_dict
 from verl.utils.torch_functional import allgather_dict_tensors
+from vllm_ascend.spec_decode.hspec_utils import hspec_collective_debug, hspec_sync_debug
 
 __all__ = ["DataProto", "union_tensor_dict"]
 
@@ -1251,10 +1252,24 @@ def all_gather_data_proto(data: DataProto, process_group):
     group_size = torch.distributed.get_world_size(group=process_group)
     assert isinstance(data, DataProto)
     prev_device = data.batch.device
+    hspec_collective_debug(
+        f"all_gather_data_proto.enter batch_keys={sorted(data.batch.keys())} "
+        f"non_tensor_keys={sorted(data.non_tensor_batch.keys())}",
+        group=process_group,
+    )
+    hspec_sync_debug("all_gather_data_proto.to_device.before")
     data = data.to(get_device_id())
+    hspec_sync_debug("all_gather_data_proto.to_device.after")
+    hspec_collective_debug("all_gather_data_proto.tensor_allgather.before", group=process_group)
     data.batch = allgather_dict_tensors(data.batch.contiguous(), size=group_size, group=process_group, dim=0)
+    hspec_collective_debug("all_gather_data_proto.tensor_allgather.after", group=process_group)
+    hspec_sync_debug("all_gather_data_proto.to_prev_device.before")
     data = data.to(prev_device)
+    hspec_sync_debug("all_gather_data_proto.to_prev_device.after")
     # all gather non_tensor_batch
     all_non_tensor_batch = [None for _ in range(group_size)]
+    hspec_collective_debug("all_gather_data_proto.object_allgather.before", group=process_group)
     torch.distributed.all_gather_object(all_non_tensor_batch, data.non_tensor_batch, group=process_group)
+    hspec_collective_debug("all_gather_data_proto.object_allgather.after", group=process_group)
     data.non_tensor_batch = {k: np.concatenate([d[k] for d in all_non_tensor_batch]) for k in data.non_tensor_batch}
+    hspec_collective_debug("all_gather_data_proto.exit", group=process_group)

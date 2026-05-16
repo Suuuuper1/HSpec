@@ -728,7 +728,7 @@ class vLLMRollout(BaseRollout):
                     pass
                 profiler.stop()
             hspec_clear_profile_context()
-            
+
         hspec_sync_debug("verl_rollout.metadata_pack.before", logger_obj=logger)
 
         with hspec_record_function("hspec/rollout/metadata_pack", use_npu_stream=True):
@@ -779,7 +779,7 @@ class vLLMRollout(BaseRollout):
                 _dbg_arr = np.empty((len(rollout_debug_list),), dtype=object)
                 _dbg_arr[:] = rollout_debug_list
                 non_tensor_batch["hspec_rollout_debug"] = _dbg_arr
-        
+
         hspec_sync_debug("verl_rollout.metadata_pack.after", logger_obj=logger)
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
