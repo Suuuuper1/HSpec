@@ -36,8 +36,42 @@ except Exception:  # pragma: no cover - fallback for older torch variants
     from torch.autograd.profiler import record_function as _record_function
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("HSPEC_LOG_LEVEL", os.getenv("VERL_LOGGING_LEVEL", "WARN")))
 
 _hspec_profile_local = threading.local()
+_HSPEC_SYNC_DEBUG = os.getenv("HSPEC_SYNC_DEBUG", "0") != "0"
+
+
+def hspec_sync_debug(label: str, *, logger_obj: Optional[logging.Logger] = None) -> None:
+    """Force an NPU synchronization when HSPEC_SYNC_DEBUG is enabled.
+
+    The log line before the synchronize identifies the operation that may hang
+    or surface an async HCCL error; the after line confirms completion.
+    """
+    if not _HSPEC_SYNC_DEBUG:
+        return
+    log = logger_obj if logger_obj is not None else logger
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    except Exception:
+        rank = -1
+    npu_mod = getattr(torch, "npu", None)
+    if npu_mod is None:
+        #log.warning("HSPEC_SYNC_DEBUG skip %s rank=%s reason=no_torch_npu", label, rank)
+        return
+    try:
+        if hasattr(npu_mod, "is_available") and not npu_mod.is_available():
+            #log.warning("HSPEC_SYNC_DEBUG skip %s rank=%s reason=npu_unavailable", label, rank)
+            return
+    except Exception:
+        pass
+    try:
+        #log.warning("HSPEC_SYNC_DEBUG before %s rank=%s", label, rank)
+        npu_mod.synchronize()
+        #log.warning("HSPEC_SYNC_DEBUG after %s rank=%s", label, rank)
+    except Exception:
+        log.exception("HSPEC_SYNC_DEBUG failed at %s rank=%s", label, rank)
+        raise
 
 
 def _parse_profile_steps(value: str) -> set[int]:
@@ -1313,6 +1347,7 @@ def hspec_submit_accumulate_task(
     device = sample_hidden_states.device
     if not legacy_async:
         try:
+            hspec_sync_debug("hspec_utils.accumulate.compute_selected_rows.before", logger_obj=logger)
             contiguous_slice = _hspec_contiguous_index_slice(flat_indices)
             if contiguous_slice is not None:
                 start, length = contiguous_slice
@@ -1320,6 +1355,7 @@ def hspec_submit_accumulate_task(
             else:
                 gather_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
                 selected_rows = sample_hidden_states.index_select(0, gather_indices).detach()
+            hspec_sync_debug("hspec_utils.accumulate.compute_selected_rows.after", logger_obj=logger)
             if device.type == "npu":
                 import torch_npu  # type: ignore
 
@@ -1329,6 +1365,7 @@ def hspec_submit_accumulate_task(
                     copy_stream.wait_stream(current_stream)
                 else:
                     copy_stream = current_stream
+                torch.npu.synchronize()
                 with torch.npu.stream(copy_stream):
                     cpu_tensor = torch.empty(
                         selected_rows.shape,
@@ -1339,6 +1376,7 @@ def hspec_submit_accumulate_task(
                     cpu_tensor.copy_(selected_rows, non_blocking=True)
                     copy_event = torch_npu.npu.Event()
                     copy_event.record(copy_stream)
+                torch.npu.synchronize()
             else:
                 cpu_tensor = selected_rows.cpu()
                 copy_event = None
@@ -1360,8 +1398,10 @@ def hspec_submit_accumulate_task(
     if device.type == "npu":
         import torch_npu  # type: ignore
 
+        torch.npu.synchronize()
         producer_event = torch_npu.npu.Event()
         producer_event.record(torch_npu.npu.current_stream(device))
+        torch.npu.synchronize()
 
     _hspec_accumulate_queue.put(
         _HSpecAsyncAccumulateTask(

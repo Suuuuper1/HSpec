@@ -29,7 +29,7 @@ export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export HSPEC_DEBUG="${HSPEC_DEBUG:-0}"
 export HSPEC_TRACE="${HSPEC_TRACE:-0}"
 export HSPEC_DUMP="${HSPEC_DUMP:-0}"
-export HSPEC_PROFILE="${HSPEC_PROFILE:-1}"
+export HSPEC_PROFILE="${HSPEC_PROFILE:-1}" 
 export HSPEC_DUMP_DIR="${HSPEC_DUMP_DIR:-/workspace/exp/hspec_dump-rollout_1024}"
 
 # Core HSpec knobs.
@@ -46,13 +46,14 @@ export HSPEC_ADVAN_NGRAM="${HSPEC_ADVAN_NGRAM:-1}"
 export HSPEC_ASYNC_HS_ACCUMULATE="${HSPEC_ASYNC_HS_ACCUMULATE:-0}"
 export HSPEC_ASYNC_HS_COPY_STREAM="${HSPEC_ASYNC_HS_COPY_STREAM:-1}"
 export HSPEC_FULL_BATCH_PREFETCH="${HSPEC_FULL_BATCH_PREFETCH:-1}"
+export HSPEC_SYNC_DEBUG="${HSPEC_SYNC_DEBUG:-1}"
 
 # Per-step HSpec breakdown / profiler controls.
 export HSPEC_GEN="${HSPEC_GEN:-0}"
 export HSPEC_GEN_REQ_IDX="${HSPEC_GEN_REQ_IDX:-0}"
 export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
 export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,31,63,91}"
-export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_batch-update_prefill_spec_on}"
+export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_batch-optim_prefetch}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
 export HSPEC_PROFILE_ANALYSE="${HSPEC_PROFILE_ANALYSE:-1}"
@@ -95,7 +96,7 @@ fi
 # Log/output path conventions.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/rl}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/logs}"
-export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-1.5b-64.txt}"
+export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-1.5b-64-2.txt}"
 mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
 
 {
@@ -109,6 +110,7 @@ mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
     echo "use_hspec_decode=${USE_HSPEC_DECODE}"
     echo "hspec_profile=${HSPEC_PROFILE}"
     echo "hspec_dump=${HSPEC_DUMP}"
+    echo "hspec_sync_debug=${HSPEC_SYNC_DEBUG}"
     echo "pca_components=${PCA_COMPONENTS}"
     echo "vllm_spec_batch_threshold=${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"
 } >> "${OUT}"
@@ -151,6 +153,7 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_ACCUMULATE='"'"${HSPEC_ASYNC_HS_ACCUMULATE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_COPY_STREAM='"'"${HSPEC_ASYNC_HS_COPY_STREAM}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_FULL_BATCH_PREFETCH='"'"${HSPEC_FULL_BATCH_PREFETCH}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SYNC_DEBUG='"'"${HSPEC_SYNC_DEBUG}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_SPECULATIVE_BATCH_SIZE_THRE='"'"${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"'"' \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \

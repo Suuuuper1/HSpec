@@ -60,6 +60,7 @@ from vllm_ascend.spec_decode.hspec_utils import (
     hspec_profile_output_dir,
     hspec_record_function,
     hspec_set_profile_context,
+    hspec_sync_debug,
     prompt_id_from_token_ids,
 )
 
@@ -609,11 +610,14 @@ class vLLMRollout(BaseRollout):
         try:
             with self.update_sampling_params(**kwargs):
                 if use_hspec:
+                    hspec_sync_debug("verl_rollout.full_batch_prefetch.before", logger_obj=logger)
                     with hspec_record_function("hspec/rollout/full_batch_prefetch"):
                         _hspec_prefetch_rollout_prompts(
                             self.inference_engine,
                             vllm_inputs,
                         )
+                    hspec_sync_debug("verl_rollout.full_batch_prefetch.after", logger_obj=logger)
+                hspec_sync_debug("verl_rollout.engine_generate.before", logger_obj=logger)
                 with hspec_record_function("hspec/rollout/engine_generate", use_npu_stream=True):
                     outputs = self.inference_engine.generate(
                         prompts=vllm_inputs,
@@ -621,19 +625,25 @@ class vLLMRollout(BaseRollout):
                         lora_request=lora_requests,
                         use_tqdm=True,
                     )
+                hspec_sync_debug("verl_rollout.engine_generate.after", logger_obj=logger)
 
                 hs_store: dict = {}
                 hs_store_index: tuple[dict[str, Any], dict[str, Any]] = ({}, {})
                 if use_hspec:
+                    hspec_sync_debug("verl_rollout.hidden_state_flush.before", logger_obj=logger)
                     with hspec_record_function("hspec/rollout/hidden_state_flush", use_npu_stream=True):
                         hs_store = hspec_flush_and_get_all()
+                    hspec_sync_debug("verl_rollout.hidden_state_flush.after", logger_obj=logger)
+                    hspec_sync_debug("verl_rollout.build_hspec_store_index.before", logger_obj=logger)
                     hs_store_index = _build_hspec_store_index(hs_store)
+                    hspec_sync_debug("verl_rollout.build_hspec_store_index.after", logger_obj=logger)
 
                 response = []
                 rollout_log_probs = []
                 rollout_hidden_states_list: list = []
                 rollout_hspec_token_ids_list: list = []
                 rollout_debug_list: list = []
+                hspec_sync_debug("verl_rollout.output_collect.before", logger_obj=logger)
                 with hspec_record_function("hspec/rollout/output_collect"):
                     for output in outputs:
                         for sample_id in range(len(output.outputs)):
@@ -690,6 +700,9 @@ class vLLMRollout(BaseRollout):
                                             "response_tail": list(response_ids[-preview:]) if response_ids else [],
                                         }
                                     )
+                hspec_sync_debug("verl_rollout.output_collect.after", logger_obj=logger)
+
+                hspec_sync_debug("verl_rollout.pad_concat.before", logger_obj=logger)
 
                 with hspec_record_function("hspec/rollout/pad_concat", use_npu_stream=True):
                     response = pad_2d_list_to_length(
@@ -702,6 +715,7 @@ class vLLMRollout(BaseRollout):
                         rollout_log_probs = rollout_log_probs.to(torch.float32)
 
                     seq = torch.cat([idx, response], dim=-1)
+                    hspec_sync_debug("verl_rollout.pad_concat.after", logger_obj=logger)
         finally:
             if profiler is not None:
                 try:
@@ -714,6 +728,8 @@ class vLLMRollout(BaseRollout):
                     pass
                 profiler.stop()
             hspec_clear_profile_context()
+            
+        hspec_sync_debug("verl_rollout.metadata_pack.before", logger_obj=logger)
 
         with hspec_record_function("hspec/rollout/metadata_pack", use_npu_stream=True):
             response_length = response.size(1)
@@ -763,6 +779,8 @@ class vLLMRollout(BaseRollout):
                 _dbg_arr = np.empty((len(rollout_debug_list),), dtype=object)
                 _dbg_arr[:] = rollout_debug_list
                 non_tensor_batch["hspec_rollout_debug"] = _dbg_arr
+        
+        hspec_sync_debug("verl_rollout.metadata_pack.after", logger_obj=logger)
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

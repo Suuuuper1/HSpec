@@ -1374,7 +1374,11 @@ class RayPPOTrainer:
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                         ray_hspec_tasks = []
                         with marked_timer("update_hspec_tables", timing_raw, color="teal"):
+                            from vllm_ascend.spec_decode.hspec_utils import hspec_sync_debug
+
+                            hspec_sync_debug("ray_trainer.update_hspec_tables.compute_metrics.before")
                             metrics.update(self.hspec_tables.compute_metrics())
+                            hspec_sync_debug("ray_trainer.update_hspec_tables.compute_metrics.after")
                             from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
 
                             prompt_build_data: dict = defaultdict(
@@ -1523,7 +1527,9 @@ class RayPPOTrainer:
                                         dict(prompt_build_data),
                                     )
                             if prompt_build_data:
+                                hspec_sync_debug("ray_trainer.update_hspec_tables.build_tables_async.before")
                                 ray_hspec_tasks = self.hspec_tables.build_tables_async(dict(prompt_build_data))
+                                hspec_sync_debug("ray_trainer.update_hspec_tables.build_tables_async.after")
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -1542,7 +1548,11 @@ class RayPPOTrainer:
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                         if ray_hspec_tasks:
                             with marked_timer("hspec_build_wait", timing_raw, color="teal"):
+                                from vllm_ascend.spec_decode.hspec_utils import hspec_sync_debug
+
+                                hspec_sync_debug("ray_trainer.hspec_build_wait.before")
                                 ray.get(ray_hspec_tasks)
+                                hspec_sync_debug("ray_trainer.hspec_build_wait.after")
 
                 # validate
                 if (

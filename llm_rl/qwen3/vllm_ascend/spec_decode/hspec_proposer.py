@@ -45,6 +45,7 @@ from vllm_ascend.spec_decode.hspec_table import GlobalHSpecTableGroup, get_hspec
 from vllm_ascend.spec_decode.hspec_utils import (
     hspec_profile_context_enabled,
     hspec_record_function,
+    hspec_sync_debug,
     prompt_id_from_token_ids,
 )
 from vllm_ascend.spec_decode.interface import Proposer, SpecDcodeType
@@ -569,15 +570,21 @@ class HSpecProposer(Proposer):
         If a prompt is not ready yet, ``generate_token_ids()`` simply
         returns ``draft=[]`` for that request (graceful degradation).
         """
+        hspec_sync_debug("hspec_proposer.prefetch_for_batch.enter", logger_obj=logger)
         prompt_ids = self._get_prompt_ids_for_batch(req_ids)
         prompt_ids = [pid for pid in prompt_ids if pid]
         if not prompt_ids:
+            hspec_sync_debug("hspec_proposer.prefetch_for_batch.no_prompt_ids", logger_obj=logger)
             return
 
         # Consume any futures that became ready since last call
+        hspec_sync_debug("hspec_proposer.prefetch_for_batch.poll_pending.before", logger_obj=logger)
         self._poll_pending()
+        hspec_sync_debug("hspec_proposer.prefetch_for_batch.poll_pending.after", logger_obj=logger)
         # Fire new async fetches for cache misses
+        hspec_sync_debug("hspec_proposer.prefetch_for_batch.fire_prefetch.before", logger_obj=logger)
         self._fire_prefetch_async(prompt_ids)
+        hspec_sync_debug("hspec_proposer.prefetch_for_batch.fire_prefetch.after", logger_obj=logger)
 
     def prefetch_prompt_token_ids_batch(
         self,
@@ -1100,13 +1107,16 @@ class HSpecProposer(Proposer):
         m_max = max(int(cached.n_entries) for cached in cached_tables)
         hidden_dim = int(cached_tables[0].mean.shape[0])
         # Rebuild on CPU to avoid many tiny NPU slice/copy kernels, then upload
+        hspec_sync_debug("hspec_proposer.build_batched_cache.rebuild_on_cpu.before", logger_obj=logger)
         with (hspec_record_function("hspec/proposal/rebuild_on_cpu")
               if prof_enabled else nullcontext()):
             mean_batch_cpu = np.stack([cached.mean_cpu for cached in cached_tables], axis=0)
             components_t_batch_cpu = np.zeros((num_rows, hidden_dim, k_max), dtype=np.float32)
             keys_batch_cpu = np.zeros((num_rows, m_max, k_max), dtype=np.float32)
             key_lengths_cpu = np.empty((num_rows,), dtype=np.int64)
+        hspec_sync_debug("hspec_proposer.build_batched_cache.rebuild_on_cpu.after", logger_obj=logger)
 
+        hspec_sync_debug("hspec_proposer.build_batched_cache.rebuild_components_keys_mask.before", logger_obj=logger)
         with (hspec_record_function("hspec/proposal/rebuild_components_keys_mask")
               if prof_enabled else nullcontext()):
             total_elems = (num_rows * hidden_dim * k_max) + (num_rows * m_max * k_max)
@@ -1140,7 +1150,9 @@ class HSpecProposer(Proposer):
                     key_lengths_cpu[row] = m_i
 
             invalid_key_mask_cpu = np.arange(m_max, dtype=np.int64)[None, :] >= key_lengths_cpu[:, None]
+        hspec_sync_debug("hspec_proposer.build_batched_cache.rebuild_components_keys_mask.after", logger_obj=logger)
 
+        hspec_sync_debug("hspec_proposer.build_batched_cache.convert_to_npu.before", logger_obj=logger)
         with (hspec_record_function("hspec/proposal/convert_to_npu")
               if prof_enabled else nullcontext()):
             mean_batch = torch.from_numpy(mean_batch_cpu).to(device=device, dtype=dtype, non_blocking=True)
@@ -1151,6 +1163,7 @@ class HSpecProposer(Proposer):
                 device=device, dtype=torch.long, non_blocking=True)
             invalid_key_mask = torch.from_numpy(invalid_key_mask_cpu).to(
                 device=device, dtype=torch.bool, non_blocking=True)
+        hspec_sync_debug("hspec_proposer.build_batched_cache.convert_to_npu.after", logger_obj=logger)
 
         return mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask
 
@@ -1267,13 +1280,16 @@ class HSpecProposer(Proposer):
             gen_enabled = False
         prof_enabled = hspec_profile_context_enabled()
 
+        hspec_sync_debug("hspec_proposer.generate_token_ids.enter", logger_obj=logger)
         # 1. Stable prompt_id + batch anchor hidden states
         req_ids = list(input_batch.req_ids[:batch_size])
         req_states = [self.runner.requests.get(req_id) for req_id in req_ids]
 
         t0_pid = _now_ns() if gen_enabled else 0
+        hspec_sync_debug("hspec_proposer.generate.prompt_id.before", logger_obj=logger)
         with (hspec_record_function("hspec/proposal/prompt_id") if prof_enabled else nullcontext()):
             prompt_ids = self._get_prompt_ids_for_batch(req_ids)
+        hspec_sync_debug("hspec_proposer.generate.prompt_id.after", logger_obj=logger)
         t1_pid = _now_ns() if gen_enabled else 0
 
         decoded_lens = [
@@ -1282,11 +1298,13 @@ class HSpecProposer(Proposer):
         ]
 
         t0_extract = _now_ns() if gen_enabled else 0
+        hspec_sync_debug("hspec_proposer.generate.extract_anchor_hs.before", logger_obj=logger)
         with (hspec_record_function("hspec/proposal/extract_anchor_hs")
               if prof_enabled else nullcontext()):
             anchor_indices = self._compute_anchor_indices(hidden_states,
                                                           valid_sampled_token_ids,
                                                           spec_decode_metadata)
+        hspec_sync_debug("hspec_proposer.generate.extract_anchor_hs.after", logger_obj=logger)
         t1_extract = _now_ns() if gen_enabled else 0
 
         trace_anchor = None
@@ -1357,13 +1375,17 @@ class HSpecProposer(Proposer):
         # Here we poll for any newly-ready futures and fire for prompts
         # that might have arrived after the early prefetch.
         t0_poll = _now_ns() if gen_enabled else 0
+        hspec_sync_debug("hspec_proposer.generate.poll_pending.before", logger_obj=logger)
         with hspec_record_function("hspec/proposal/poll_pending"):
             self._poll_pending()
+        hspec_sync_debug("hspec_proposer.generate.poll_pending.after", logger_obj=logger)
         t1_poll = _now_ns() if gen_enabled else 0
 
         t0_fire = _now_ns() if gen_enabled else 0
+        hspec_sync_debug("hspec_proposer.generate.fire_prefetch_async.before", logger_obj=logger)
         with hspec_record_function("hspec/proposal/fire_prefetch_async"):
             self._fire_prefetch_async(prompt_ids)
+        hspec_sync_debug("hspec_proposer.generate.fire_prefetch_async.after", logger_obj=logger)
         t1_fire = _now_ns() if gen_enabled else 0
 
         # 3. On-device projection + similarity matching
@@ -1374,12 +1396,14 @@ class HSpecProposer(Proposer):
         active_table_rows: List[int] = []
         active_cached_tables: List[_CachedPromptTable] = []
         active_base_positions: List[int] = []
+        hspec_sync_debug("hspec_proposer.generate.get_or_build_batched_table_cache.before", logger_obj=logger)
         batch_table_cache = self._get_or_build_batched_table_cache(
             req_ids,
             prompt_ids,
             dtype=torch.float32,
             device=hidden_states.device,
         )
+        hspec_sync_debug("hspec_proposer.generate.get_or_build_batched_table_cache.after", logger_obj=logger)
         if batch_table_cache is None and gen_enabled and batch_size > 0:
             trace_skip_reason = "prompt_not_cached"
 
@@ -1415,6 +1439,7 @@ class HSpecProposer(Proposer):
         if active_batch_indices and batch_table_cache is not None:
             self._stat_queries += len(active_batch_indices)
             t0_cast = _now_ns() if gen_enabled else 0
+            hspec_sync_debug("hspec_proposer.generate.anchor_gather.before", logger_obj=logger)
             with (hspec_record_function("hspec/proposal/anchor_gather", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
                 gather_idx = torch.tensor(
@@ -1424,7 +1449,9 @@ class HSpecProposer(Proposer):
                 )
                 active_anchor_hs = hidden_states.index_select(0, gather_idx).float()
                 t1_cast = _now_ns() if gen_enabled else 0
+            hspec_sync_debug("hspec_proposer.generate.anchor_gather.after", logger_obj=logger)
 
+            hspec_sync_debug("hspec_proposer.generate.project.before", logger_obj=logger)
             with (hspec_record_function("hspec/proposal/project", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
                 t0_proj = _now_ns() if gen_enabled else 0
@@ -1446,7 +1473,9 @@ class HSpecProposer(Proposer):
                     components_t_batch,
                 ).squeeze(1)
                 t1_proj = _now_ns() if gen_enabled else 0
+            hspec_sync_debug("hspec_proposer.generate.project.after", logger_obj=logger)
 
+            hspec_sync_debug("hspec_proposer.generate.match.before", logger_obj=logger)
             with (hspec_record_function("hspec/proposal/match", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
                 t0_sim = _now_ns() if gen_enabled else 0
@@ -1458,6 +1487,7 @@ class HSpecProposer(Proposer):
                     invalid_key_mask = batch_table_cache.invalid_key_mask.index_select(0, table_rows)
                 best_sims, best_idxs = self._match_projected_batch(z_batch, keys_batch, invalid_key_mask)
                 t1_sim = _now_ns() if gen_enabled else 0
+            hspec_sync_debug("hspec_proposer.generate.match.after", logger_obj=logger)
 
             if gen_enabled:
                 for row, batch_idx in enumerate(active_batch_indices):
@@ -1597,12 +1627,14 @@ class HSpecProposer(Proposer):
 
         # 4. Single device → host sync for the whole batch
         t0_stack = _now_ns() if gen_enabled else 0
+        hspec_sync_debug("hspec_proposer.generate.device_to_host_sync.before", logger_obj=logger)
         with hspec_record_function("hspec/proposal/device_to_host_sync", use_npu_stream=True):
             t1_stack = _now_ns() if gen_enabled else 0
             t0_copy = _now_ns() if gen_enabled else 0
             sims_cpu = best_sims.cpu().numpy()
             idxs_cpu = best_idxs.cpu().numpy()
             t1_copy = _now_ns() if gen_enabled else 0
+        hspec_sync_debug("hspec_proposer.generate.device_to_host_sync.after", logger_obj=logger)
 
         # 5. Draft token retrieval (CPU-only, O(1) per request)
         hit_rows = np.flatnonzero(sims_cpu >= self.similarity_threshold)
@@ -1629,9 +1661,11 @@ class HSpecProposer(Proposer):
 
             # Draft tokens from CPU cache (sub-µs numpy slice)
             prof_this_req = prof_enabled
+            hspec_sync_debug("hspec_proposer.generate.draft_retrieve.before", logger_obj=logger)
             with (hspec_record_function("hspec/proposal/draft_retrieve")
                   if prof_this_req else nullcontext()):
                 draft = cached.get_draft_tokens(matched_entry_idx, effective_wnd)
+            hspec_sync_debug("hspec_proposer.generate.draft_retrieve.after", logger_obj=logger)
             results[i] = draft
             self._stat_hits += 1
             self._stat_total_draft_len += len(draft)

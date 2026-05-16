@@ -59,6 +59,7 @@ from verl.utils.device import (
     get_torch_device,
     set_expandable_segments,
 )
+from vllm_ascend.spec_decode.hspec_utils import hspec_sync_debug
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import (
@@ -893,7 +894,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
+        hspec_sync_debug("fsdp_worker.generate_sequences.enter", logger_obj=logger)
+        hspec_sync_debug("fsdp_worker.generate_sequences.prompts_to_device.before", logger_obj=logger)
         prompts = prompts.to(get_device_id())
+        hspec_sync_debug("fsdp_worker.generate_sequences.prompts_to_device.after", logger_obj=logger)
 
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
@@ -913,13 +917,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             loop.run_until_complete(self.rollout_mode())
+            hspec_sync_debug("fsdp_worker.generate_sequences.rollout_mode.after", logger_obj=logger)
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
+            hspec_sync_debug("fsdp_worker.generate_sequences.rollout_generate.before", logger_obj=logger)
             output = self.rollout.generate_sequences(prompts=prompts)
+            hspec_sync_debug("fsdp_worker.generate_sequences.rollout_generate.after", logger_obj=logger)
 
         if self._is_actor:
+            hspec_sync_debug("fsdp_worker.generate_sequences.trainer_mode.before", logger_obj=logger)
             loop.run_until_complete(self.trainer_mode())
+            hspec_sync_debug("fsdp_worker.generate_sequences.trainer_mode.after", logger_obj=logger)
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         # We calculate the average timing across all ranks
@@ -936,10 +945,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             }
         )
         output.meta_info["timing"] = timing_generate
+        hspec_sync_debug("fsdp_worker.generate_sequences.output_to_cpu.before", logger_obj=logger)
         output = output.to("cpu")
+        hspec_sync_debug("fsdp_worker.generate_sequences.output_to_cpu.after", logger_obj=logger)
 
         # clear kv cache
         get_torch_device().empty_cache()
+        hspec_sync_debug("fsdp_worker.generate_sequences.exit", logger_obj=logger)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
