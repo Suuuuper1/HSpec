@@ -43,7 +43,7 @@ def collate_fn(data_list: list[dict]) -> dict:
 
     Returns:
         Dict where tensor entries are stacked into a torch.Tensor of shape
-        (batch_size, \*dims) and non-tensor entries are converted to
+        (batch_size, *dims) and non-tensor entries are converted to
         np.ndarray of dtype object with shape (batch_size,).
     """
     tensors = defaultdict(list)
@@ -117,7 +117,6 @@ class RLHFDataset(Dataset):
         self.filter_prompts = config.get("filter_prompts", True)
         self.serialize_dataset = False
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
-        self.dataset_fraction = config.get("dataset_fraction", None)
 
         self._download()
         self._read_files_and_tokenize()
@@ -138,14 +137,32 @@ class RLHFDataset(Dataset):
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         print(f"dataset len: {len(self.dataframe)}")
-        if self.dataset_fraction is not None:
-            fraction = float(self.dataset_fraction)
-            if not 0 < fraction <= 1:
-                raise ValueError(f"data.dataset_fraction must be in (0, 1], got {fraction}")
-            sampled_len = max(1, int(len(self.dataframe) * fraction))
-            if sampled_len < len(self.dataframe):
-                self.dataframe = self.dataframe.select(range(sampled_len))
-            print(f"Sampled dataset len: {len(self.dataframe)} (fraction: {fraction})")
+        dataset_fraction = float(self.config.get("dataset_fraction", 1.0))
+        if not 0 < dataset_fraction <= 1:
+            raise ValueError(f"data.dataset_fraction must be in (0, 1], got {dataset_fraction}")
+        if dataset_fraction < 1.0:
+            total = len(self.dataframe)
+            sample_size = max(1, int(total * dataset_fraction))
+            self.dataframe = self.dataframe.select(range(sample_size))
+            print(f"Sampled dataset len: {len(self.dataframe)} (fraction: {dataset_fraction})")
+
+        try:
+            max_samples = int(self.config.get("max_samples", -1))
+        except Exception:
+            max_samples = -1
+        if max_samples is None:
+            max_samples = -1
+        if max_samples > 0:
+            total = len(self.dataframe)
+            if max_samples < total:
+                if bool(self.config.get("shuffle", False)):
+                    seed = self.config.get("seed", None)
+                    rng = np.random.default_rng(seed)
+                    indices = rng.choice(total, size=max_samples, replace=False).tolist()
+                else:
+                    indices = list(range(max_samples))
+                self.dataframe = self.dataframe.select(indices)
+                print(f"selected {len(self.dataframe)} samples (max_samples: {max_samples}) out of previous {total}")
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 
@@ -377,6 +394,7 @@ class RLHFDataset(Dataset):
         if need_tools_kwargs and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
         row_dict["index"] = index
+        row_dict["dataset_item_idx"] = item
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
         return row_dict

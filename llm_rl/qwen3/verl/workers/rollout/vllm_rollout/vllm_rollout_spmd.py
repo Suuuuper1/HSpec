@@ -359,11 +359,22 @@ class vLLMRollout(BaseRollout):
         cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
         # enforce_eager must be False to use cudagraph
         if not config.enforce_eager and cudagraph_capture_sizes:
+            cudagraph_mode = (
+                os.getenv("VERL_VLLM_CUDAGRAPH_MODE")
+                or config.get("cudagraph_mode")
+                or "FULL"
+            )
+            cudagraph_mode = str(cudagraph_mode).upper()
             torch._dynamo.config.log_compilation_metrics = False
             compilation_config["compilation_config"] = {
                 "cudagraph_capture_sizes": cudagraph_capture_sizes,
-                "cudagraph_mode": "PIECEWISE",
+                "cudagraph_mode": cudagraph_mode,
             }
+            logger.warning(
+                "Using vLLM ACL graph capture sizes=%s mode=%s",
+                cudagraph_capture_sizes,
+                cudagraph_mode,
+            )
 
         self.dynamic_eplb = int(os.environ.get("VLLM_ENABLE_EPLB", "0")) == 1
         self.inference_engine = LLM(

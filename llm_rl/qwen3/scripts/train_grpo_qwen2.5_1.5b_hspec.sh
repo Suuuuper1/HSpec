@@ -22,7 +22,7 @@ fi
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 
-# Keep the original HSpec debug/tracing/profile switches.
+# HSpec debug/tracing/profile switches.
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
@@ -59,23 +59,23 @@ export HSPEC_PROFILE_ANALYSE="${HSPEC_PROFILE_ANALYSE:-1}"
 export HSPEC_PROFILE_WITH_STACK="${HSPEC_PROFILE_WITH_STACK:-0}"
 export HSPEC_PROFILE_MEMORY="${HSPEC_PROFILE_MEMORY:-0}"
 
-# Keep rollout strictly sync; current migrated HSpec path assumes sync vLLM rollout.
+# rollout strictly sync; HSpec path assumes sync vLLM rollout.
 export USE_HSPEC_DECODE="${USE_HSPEC_DECODE:-1}"
 export VLLM_SPECULATIVE_BATCH_SIZE_THRE="${VLLM_SPECULATIVE_BATCH_SIZE_THRE:--1}"
 
-# Logging behavior from the original script.
+# Logging behavior.
 export HSPEC_LOG_EVERY_CALLS="${HSPEC_LOG_EVERY_CALLS:-50}"
 export HSPEC_LOG_EVERY_S="${HSPEC_LOG_EVERY_S:-5}"
 export HSPEC_LOG_LEVEL="${HSPEC_LOG_LEVEL:-INFO}"
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 
-# Keep original model / dataset defaults.
+# model / dataset defaults.
 export MODEL_PATH="${MODEL_PATH:-/home/data/Qwen2.5-1.5B-Instruct}"
 export TRAIN_FILE="${TRAIN_FILE:-/home/xy/gsm8k/train.parquet}"
 export TEST_FILE="${TEST_FILE:-/home/xy/gsm8k/test.parquet}"
 
-# Keep original dump-mode behavior for batch sizing.
+# dump-mode behavior for batch sizing.
 if [ "${HSPEC_DUMP}" = "0" ]; then
     export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
     export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"

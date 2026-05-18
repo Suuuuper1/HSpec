@@ -352,6 +352,8 @@ class RayPPOTrainer:
         Creates the train and validation dataloaders.
         """
         # TODO: we have to make sure the batch size is divisible by the dp size
+        from torch.utils.data import Subset
+
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
         if train_dataset is None:
@@ -362,6 +364,18 @@ class RayPPOTrainer:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files, self.config.data, self.tokenizer, self.processor
             )
+
+        train_batch_size = int(self.config.data.get("gen_batch_size", self.config.data.train_batch_size))
+        aligned_train_len = (len(train_dataset) // train_batch_size) * train_batch_size
+        if aligned_train_len <= 0:
+            raise ValueError(
+                f"Train dataset too small after alignment: len={len(train_dataset)}, "
+                f"batch_size={train_batch_size}"
+            )
+        if aligned_train_len < len(train_dataset):
+            print(f"[DataAlign] floor train dataset to batch multiple: {len(train_dataset)} -> {aligned_train_len}")
+            train_dataset = Subset(train_dataset, range(aligned_train_len))
+            train_sampler = None
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         if train_sampler is None:
@@ -372,25 +386,6 @@ class RayPPOTrainer:
             collate_fn = default_collate_fn
 
         num_workers = self.config.data["dataloader_num_workers"]
-        train_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
-        train_multiple = train_batch_size
-        if train_multiple > 0:
-            train_len = len(self.train_dataset)
-            aligned_train_len = train_len - train_len % train_multiple
-            if 0 < aligned_train_len < train_len:
-                if hasattr(self.train_dataset, "dataframe"):
-                    self.train_dataset.dataframe = self.train_dataset.dataframe.select(range(aligned_train_len))
-                    if train_sampler is not None:
-                        train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
-                    print(
-                        f"[DataAlign] floor train dataset to batch multiple: "
-                        f"{train_len} -> {aligned_train_len}"
-                    )
-                else:
-                    print(
-                        f"[DataAlign] skip train dataset flooring for dataset type "
-                        f"{type(self.train_dataset).__name__}"
-                    )
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,

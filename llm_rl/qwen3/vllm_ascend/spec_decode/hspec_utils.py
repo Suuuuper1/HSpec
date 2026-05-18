@@ -58,7 +58,7 @@ def hspec_profile_enabled_for_step(global_step: Optional[int]) -> bool:
         return False
     if global_step is None:
         return False
-    steps = _parse_profile_steps(os.getenv("HSPEC_PROFILE_STEPS", "5,31"))
+    steps = _parse_profile_steps(os.getenv("HSPEC_PROFILE_STEPS", None))
     return int(global_step) in steps
 
 
