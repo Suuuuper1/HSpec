@@ -185,7 +185,6 @@ actor_rollout_ref:
     ignore_eos: false
     enforce_eager: false
     cudagraph_capture_sizes: null
-    cudagraph_mode: null
     free_cache_engine: true
     tensor_model_parallel_size: 2
     data_parallel_size: 1

@@ -43,11 +43,6 @@ enforce_eager: False
 # supported engines: vllm
 cudagraph_capture_sizes: null
 
-# ACL graph mode to use when cudagraph_capture_sizes is provided. Null keeps
-# the high-performance vLLM/vllm-ascend default used by framework2: FULL.
-# Set to PIECEWISE only when debugging graph-capture resource issues.
-cudagraph_mode: null
-
 # Whether to free engine KVCache after generation.
 free_cache_engine: True
 

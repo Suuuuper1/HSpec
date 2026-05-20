@@ -117,7 +117,6 @@ class RolloutConfig(BaseConfig):
     ignore_eos: bool = False
     enforce_eager: bool = True
     cudagraph_capture_sizes: Optional[list] = None
-    cudagraph_mode: Optional[str] = None
     free_cache_engine: bool = True
     data_parallel_size: int = 1
     expert_parallel_size: int = 1

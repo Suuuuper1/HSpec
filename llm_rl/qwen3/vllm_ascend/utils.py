@@ -474,18 +474,18 @@ def update_default_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         update_cudagraph_capture_sizes(vllm_config, new_cudagraph_capture_sizes)
 
 
-def _get_positive_int_env(name: str) -> int | None:
+def _get_positive_int_env(name: str, default: int | None = None) -> int | None:
     value = os.getenv(name)
     if value is None or value == "":
-        return None
+        return default
     try:
         parsed = int(value)
     except ValueError:
         logger.warning("Ignoring invalid %s=%r; expected a positive integer", name, value)
-        return None
+        return default
     if parsed <= 0:
         logger.warning("Ignoring invalid %s=%r; expected a positive integer", name, value)
-        return None
+        return default
     return parsed
 
 
@@ -591,24 +591,33 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     max_num_batch_sizes = max(1, int(max_num_batch_sizes))
     raw_max_num_batch_sizes = max_num_batch_sizes
     env_graph_cap = _get_positive_int_env("VLLM_ASCEND_MAX_ACLGRAPH_SIZES")
-    moe_tp_cap = (
-        _get_positive_int_env("VLLM_ASCEND_MOE_TP_ACLGRAPH_SIZE_CAP")
-        if moe_model and parallel_config.tensor_parallel_size > 1
-        else None
-    )
-    if env_graph_cap is None:
-        env_graph_cap = moe_tp_cap
     if env_graph_cap is not None:
         max_num_batch_sizes = min(max_num_batch_sizes, env_graph_cap)
         if max_num_batch_sizes != raw_max_num_batch_sizes:
             logger.warning(
                 "Capping ACL graph batch-size count from %d to %d via "
-                "%s to avoid Ascend stream exhaustion",
+                "VLLM_ASCEND_MAX_ACLGRAPH_SIZES to avoid Ascend stream exhaustion",
                 raw_max_num_batch_sizes,
                 max_num_batch_sizes,
-                "VLLM_ASCEND_MAX_ACLGRAPH_SIZES"
-                if os.getenv("VLLM_ASCEND_MAX_ACLGRAPH_SIZES")
-                else "VLLM_ASCEND_MOE_TP_ACLGRAPH_SIZE_CAP",
+            )
+    elif moe_model and parallel_config.tensor_parallel_size > 1:
+        # The analytical stream estimate is optimistic for MoE rollout on
+        # Ascend when many PIECEWISE graph variants are captured.  In RL jobs
+        # the same worker process later allocates additional HCCL streams for
+        # real allgather/alltoall work; capturing too close to the hardware
+        # stream limit can make the first generation fail with EI0007
+        # "Failed to allocate resource[stream]".  Keep a conservative default
+        # for MoE+TP, while allowing explicit override for tuned environments.
+        moe_tp_cap = _get_positive_int_env("VLLM_ASCEND_MOE_TP_ACLGRAPH_SIZE_CAP", 7)
+        if moe_tp_cap is not None:
+            max_num_batch_sizes = min(max_num_batch_sizes, moe_tp_cap)
+        if max_num_batch_sizes != raw_max_num_batch_sizes:
+            logger.warning(
+                "Capping ACL graph batch-size count for MoE+TP from %d to %d "
+                "(override with VLLM_ASCEND_MOE_TP_ACLGRAPH_SIZE_CAP or "
+                "VLLM_ASCEND_MAX_ACLGRAPH_SIZES)",
+                raw_max_num_batch_sizes,
+                max_num_batch_sizes,
             )
 
     # If original sizes exceed maximum, sample a representative subset
