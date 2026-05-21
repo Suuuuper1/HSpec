@@ -336,6 +336,7 @@ class RayPPOTrainer:
         self._hspec_dump_tables_written: dict[int, set[str]] = defaultdict(set)
         self._hspec_align_debug = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
         self._hspec_align_debug_max_logs = int(os.getenv("HSPEC_ALIGN_DEBUG_MAX_LOGS", "24"))
+        self._hspec_pending_build_refs: list[tuple[int, ray.ObjectRef]] = []
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -499,6 +500,59 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    @staticmethod
+    def _drop_hspec_non_tensor_fields(batch: DataProto | None) -> None:
+        if batch is None or batch.non_tensor_batch is None:
+            return
+        for key in (
+            "hspec_desc",
+            "rollout_hidden_states",
+            "rollout_hspec_tokens",
+            "hspec_rollout_debug",
+        ):
+            batch.non_tensor_batch.pop(key, None)
+
+    def _wait_hspec_epoch_builds(self, epoch: int, timing_raw: dict | None = None) -> None:
+        pending_refs = getattr(self, "_hspec_pending_build_refs", [])
+        if not pending_refs:
+            return
+
+        epoch_refs = [ref for ref_epoch, ref in pending_refs if ref_epoch == epoch]
+        if epoch_refs:
+            if timing_raw is None:
+                ray.get(epoch_refs)
+            else:
+                with marked_timer("hspec_epoch_build_wait", timing_raw, color="teal"):
+                    ray.get(epoch_refs)
+
+        self._hspec_pending_build_refs = [
+            (ref_epoch, ref)
+            for ref_epoch, ref in pending_refs
+            if ref_epoch != epoch
+        ]
+
+    def _poll_hspec_builds_nonblocking(self, metrics: dict | None = None) -> None:
+        pending_refs = getattr(self, "_hspec_pending_build_refs", [])
+        if not pending_refs:
+            if metrics is not None:
+                metrics["hspec/build_pending_refs"] = 0
+                metrics["hspec/build_ready_refs"] = 0
+            return
+
+        refs = [ref for _, ref in pending_refs]
+        ready_refs, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
+        if ready_refs:
+            ray.get(ready_refs)
+            ready_set = set(ready_refs)
+            self._hspec_pending_build_refs = [
+                (ref_epoch, ref)
+                for ref_epoch, ref in pending_refs
+                if ref not in ready_set
+            ]
+        if metrics is not None:
+            metrics["hspec/build_pending_refs"] = len(self._hspec_pending_build_refs)
+            metrics["hspec/build_ready_refs"] = len(ready_refs)
 
     @staticmethod
     def _hspec_dump_object_array(items):
@@ -1374,7 +1428,9 @@ class RayPPOTrainer:
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                         ray_hspec_tasks = []
                         with marked_timer("update_hspec_tables", timing_raw, color="teal"):
-                            metrics.update(self.hspec_tables.compute_metrics())
+                            self._poll_hspec_builds_nonblocking(metrics)
+                            if not self._hspec_pending_build_refs:
+                                metrics.update(self.hspec_tables.compute_metrics())
                             from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
 
                             prompt_build_data: dict = defaultdict(
@@ -1524,6 +1580,10 @@ class RayPPOTrainer:
                                     )
                             if prompt_build_data:
                                 ray_hspec_tasks = self.hspec_tables.build_tables_async(dict(prompt_build_data))
+                                self._hspec_pending_build_refs.extend(
+                                    (epoch, ref) for ref in ray_hspec_tasks
+                                )
+                            self._drop_hspec_non_tensor_fields(batch)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -1538,11 +1598,6 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-
-                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
-                        if ray_hspec_tasks:
-                            with marked_timer("hspec_build_wait", timing_raw, color="teal"):
-                                ray.get(ray_hspec_tasks)
 
                 # validate
                 if (
@@ -1628,6 +1683,7 @@ class RayPPOTrainer:
 
                 if is_last_step:
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                        self._wait_hspec_epoch_builds(epoch, timing_raw)
                         print(f"HSpec: final swap at epoch={epoch} step={self.global_steps}")
                         self.hspec_tables.swap()
                     pprint(f"Final validation metrics: {last_val_metrics}")
@@ -1641,5 +1697,6 @@ class RayPPOTrainer:
                     self.train_dataset.on_batch_end(batch=batch)
 
             if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                self._wait_hspec_epoch_builds(epoch, timing_raw)
                 print(f"HSpec: swap at epoch={epoch} (promote building -> active)")
                 self.hspec_tables.swap()

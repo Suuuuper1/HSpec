@@ -367,6 +367,12 @@ class NPUWorker(WorkerBase):
         return int(self.model_runner.hspec_prefetch_prompt_ids_batch(
             prompt_ids))
 
+    def hspec_set_collection_enabled(self, enabled: bool) -> bool:
+        if self.model_runner is None or not hasattr(
+                self.model_runner, "hspec_set_collection_enabled"):
+            return False
+        return bool(self.model_runner.hspec_set_collection_enabled(enabled))
+
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()

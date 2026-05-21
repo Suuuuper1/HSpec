@@ -515,6 +515,8 @@ class vLLMRollout(BaseRollout):
         batch_size = idx.size(0)
         global_step = prompts.meta_info.get("global_steps")
         use_hspec = self.config.get("use_hspec_decode", False)
+        is_validate = prompts.meta_info.get("validate", False)
+        collect_hspec = use_hspec and not is_validate
         profile_this_step = hspec_profile_enabled_for_step(global_step)
         profiler = None
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -555,7 +557,6 @@ class vLLMRollout(BaseRollout):
         non_tensor_batch["vllm_inputs"] = _vllm_inputs_arr
 
         do_sample = prompts.meta_info.get("do_sample", True)
-        is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
             kwargs = {
                 "best_of": 1,
@@ -584,6 +585,15 @@ class vLLMRollout(BaseRollout):
                 ] * batch_size
 
         if use_hspec:
+            try:
+                self.inference_engine.llm_engine.collective_rpc(
+                    "hspec_set_collection_enabled",
+                    args=(bool(collect_hspec),),
+                )
+            except Exception:
+                logger.debug("HSpec collection mode update failed", exc_info=True)
+
+        if collect_hspec:
             from vllm_ascend.spec_decode.hspec_utils import (
                 hspec_clear_store,
                 hspec_flush_and_get_all,
@@ -633,7 +643,7 @@ class vLLMRollout(BaseRollout):
 
                 hs_store: dict = {}
                 hs_store_index: tuple[dict[str, Any], dict[str, Any]] = ({}, {})
-                if use_hspec:
+                if collect_hspec:
                     with hspec_record_function("hspec/rollout/hidden_state_flush", use_npu_stream=True):
                         hs_store = hspec_flush_and_get_all()
                     hs_store_index = _build_hspec_store_index(hs_store)
@@ -653,7 +663,7 @@ class vLLMRollout(BaseRollout):
                                 for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                                     curr_log_prob.append(logprob[response_ids[i]].logprob)
                                 rollout_log_probs.append(curr_log_prob)
-                            if use_hspec:
+                            if collect_hspec:
                                 hs_source = "completion"
                                 hs = getattr(output.outputs[sample_id], "hidden_states", None)
                                 hspec_token_ids = getattr(output.outputs[sample_id], "hspec_token_ids", None)
@@ -757,7 +767,7 @@ class vLLMRollout(BaseRollout):
             if self.config.calculate_log_probs:
                 batch["rollout_log_probs"] = rollout_log_probs
 
-            if use_hspec and rollout_hidden_states_list:
+            if collect_hspec and rollout_hidden_states_list:
                 _hs_list = list(rollout_hidden_states_list)
                 _hs_arr = np.empty((len(_hs_list),), dtype=object)
                 _hs_arr[:] = _hs_list
@@ -768,7 +778,7 @@ class vLLMRollout(BaseRollout):
                 _tok_arr[:] = _tok_list
                 non_tensor_batch["rollout_hspec_tokens"] = _tok_arr
 
-            if use_hspec and self._hspec_align_debug and rollout_debug_list:
+            if collect_hspec and self._hspec_align_debug and rollout_debug_list:
                 _dbg_arr = np.empty((len(rollout_debug_list),), dtype=object)
                 _dbg_arr[:] = rollout_debug_list
                 non_tensor_batch["hspec_rollout_debug"] = _dbg_arr

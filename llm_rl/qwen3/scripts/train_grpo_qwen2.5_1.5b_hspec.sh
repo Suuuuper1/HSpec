@@ -29,7 +29,7 @@ export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export HSPEC_DEBUG="${HSPEC_DEBUG:-0}"
 export HSPEC_TRACE="${HSPEC_TRACE:-0}"
 export HSPEC_DUMP="${HSPEC_DUMP:-0}"
-export HSPEC_PROFILE="${HSPEC_PROFILE:-1}"
+export HSPEC_PROFILE="${HSPEC_PROFILE:-0}" 
 export HSPEC_DUMP_DIR="${HSPEC_DUMP_DIR:-/workspace/exp/hspec_dump-rollout_1024}"
 
 # Core HSpec knobs.
@@ -189,7 +189,6 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.hspec_min_match_len=1 \
     actor_rollout_ref.rollout.hspec_n_components="${PCA_COMPONENTS}" \
     actor_rollout_ref.rollout.hspec_max_entries_per_prompt=10000 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=False \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.device=npu \
     trainer.critic_warmup=0 \

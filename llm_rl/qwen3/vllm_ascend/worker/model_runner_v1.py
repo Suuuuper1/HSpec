@@ -519,6 +519,19 @@ class NPUModelRunner(GPUModelRunner):
             logger.debug("HSpec: prompt-token prefetch failed", exc_info=True)
             return 0
 
+    def hspec_set_collection_enabled(self, enabled: bool) -> bool:
+        """Toggle HSpec hidden-state collection without disabling queries."""
+        if not self._hspec_collect:
+            return False
+        try:
+            from vllm_ascend.spec_decode.hspec_utils import hspec_set_collection_enabled
+
+            hspec_set_collection_enabled(bool(enabled))
+            return True
+        except Exception:
+            logger.debug("HSpec: failed to update collection mode", exc_info=True)
+            return False
+
     def hspec_prefetch_prompt_ids_batch(self, prompt_ids: list[str]) -> int:
         """Warm HSpec proposer cache from stable prompt ids."""
         if (not self._hspec_collect or self.drafter is None
