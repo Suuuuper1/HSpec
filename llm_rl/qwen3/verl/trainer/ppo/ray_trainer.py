@@ -337,6 +337,7 @@ class RayPPOTrainer:
         self._hspec_align_debug = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
         self._hspec_align_debug_max_logs = int(os.getenv("HSPEC_ALIGN_DEBUG_MAX_LOGS", "24"))
         self._hspec_pending_build_refs: list[tuple[int, ray.ObjectRef]] = []
+        self._hspec_legacy_dataproto_hs = os.getenv("HSPEC_LEGACY_DATAPROTO_HS", "0") != "0"
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -513,6 +514,12 @@ class RayPPOTrainer:
         ):
             batch.non_tensor_batch.pop(key, None)
 
+    @staticmethod
+    def _read_hspec_desc_arrays(desc):
+        from vllm_ascend.spec_decode.hspec_utils import hspec_read_desc_arrays
+
+        return hspec_read_desc_arrays(desc)
+
     def _wait_hspec_epoch_builds(self, epoch: int, timing_raw: dict | None = None) -> None:
         pending_refs = getattr(self, "_hspec_pending_build_refs", [])
         if not pending_refs:
@@ -636,6 +643,25 @@ class RayPPOTrainer:
                 else:
                     projected_hidden_states_list.append(None)
                     projection_available.append(False)
+
+            if not hidden_states_list and data.get("descs"):
+                for desc in data.get("descs", []):
+                    try:
+                        hs_np, _ = self._read_hspec_desc_arrays(desc)
+                    except Exception:
+                        hs_np = None
+                    if hs_np is None:
+                        hidden_states_list.append(np.empty((0, 0), dtype=np.float16))
+                    else:
+                        hidden_states_list.append(np.ascontiguousarray(np.asarray(hs_np)))
+                    if hs_np is not None and table_present:
+                        hs_f32 = hs_np.astype(np.float32, copy=False)
+                        proj = np.ascontiguousarray((hs_f32 - mean) @ components.T, dtype=np.float32)
+                        projected_hidden_states_list.append(proj)
+                        projection_available.append(True)
+                    else:
+                        projected_hidden_states_list.append(None)
+                        projection_available.append(False)
 
             rollout_path = os.path.join(step_rollout_dir, f"{prompt_id}.npz")
             np.savez_compressed(
@@ -1265,6 +1291,8 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                    gen_batch.meta_info["hspec_epoch"] = epoch
 
                 data_rebalance = self.config.actor_rollout_ref.rollout.data_rebalance if hasattr(
                     self.config.actor_rollout_ref.rollout, 'data_rebalance') else True
@@ -1435,6 +1463,7 @@ class RayPPOTrainer:
 
                             prompt_build_data: dict = defaultdict(
                                 lambda: {
+                                    "descs": [],
                                     "hidden_states": [],
                                     "tokens": [],
                                     "rewards": [],
@@ -1453,8 +1482,9 @@ class RayPPOTrainer:
 
                             for i in range(len(batch)):
                                 batch_item = batch[i]
-                                hs = batch_item.non_tensor_batch.get("rollout_hidden_states")
-                                if hs is None:
+                                desc = batch_item.non_tensor_batch.get("hspec_desc")
+                                hs = None if desc is not None else batch_item.non_tensor_batch.get("rollout_hidden_states")
+                                if desc is None and hs is None:
                                     _hspec_skip += 1
                                     _hspec_none_count += 1
                                     continue
@@ -1463,6 +1493,10 @@ class RayPPOTrainer:
                                 if hspec_tokens is not None:
                                     response = [int(x) for x in list(hspec_tokens)]
                                     response_before_trim = list(response)
+                                elif desc is not None:
+                                    response = batch_item.batch["responses"].cpu().numpy().tolist()
+                                    response_before_trim = list(response)
+                                    response = response[: int(desc.length)]
                                 else:
                                     response = batch_item.batch["responses"].cpu().numpy().tolist()
                                     response_before_trim = list(response)
@@ -1477,11 +1511,17 @@ class RayPPOTrainer:
                                     _hspec_empty_resp_count += 1
                                     continue
 
-                                if (
-                                    hasattr(hs, "shape")
+                                desc_len = int(getattr(desc, "length", -1)) if desc is not None else -1
+                                hs_len = int(hs.shape[0]) if hasattr(hs, "shape") and hs.ndim == 2 else -1
+                                align_failed = (
+                                    desc is not None and desc_len != len(response)
+                                ) or (
+                                    desc is None
+                                    and hasattr(hs, "shape")
                                     and hs.ndim == 2
                                     and hs.shape[0] != len(response)
-                                ):
+                                )
+                                if align_failed:
                                     _hspec_skip += 1
                                     _hspec_align_fail_count += 1
                                     debug_meta = batch_item.non_tensor_batch.get("hspec_rollout_debug")
@@ -1540,7 +1580,7 @@ class RayPPOTrainer:
                                             f"reason={align_reason} prompt_id={prompt_id_dbg} "
                                             f"trainer_trimmed_len={len(response)} "
                                             f"padded_response_len={len(response_before_trim)} "
-                                            f"hs_len={int(hs.shape[0])} "
+                                            f"hs_len={hs_len if desc is None else desc_len} "
                                             f"raw_response_len={raw_response_len} "
                                             f"hspec_token_len={hspec_token_len_debug} "
                                             f"raw_first_pad_idx={raw_first_pad_idx} "
@@ -1554,7 +1594,16 @@ class RayPPOTrainer:
                                 prompt_id = prompt_id_from_token_ids(prompt_token_ids)
                                 reward = batch_item.batch["token_level_scores"].sum().item()
 
-                                prompt_build_data[prompt_id]["hidden_states"].append(hs)
+                                if desc is not None:
+                                    from vllm_ascend.spec_decode.hspec_utils import hspec_desc_with_updates
+                                    if getattr(desc, "prompt_id", prompt_id) != prompt_id:
+                                        _hspec_skip += 1
+                                        _hspec_align_fail_count += 1
+                                        continue
+                                    desc = hspec_desc_with_updates(desc, prompt_id=prompt_id, reward=float(reward))
+                                    prompt_build_data[prompt_id]["descs"].append(desc)
+                                else:
+                                    prompt_build_data[prompt_id]["hidden_states"].append(hs)
                                 prompt_build_data[prompt_id]["tokens"].append(response)
                                 prompt_build_data[prompt_id]["rewards"].append(reward)
                                 if prompt_build_data[prompt_id]["prompt_token_ids"] is None:

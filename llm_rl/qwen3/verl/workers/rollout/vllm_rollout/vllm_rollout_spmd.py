@@ -98,6 +98,7 @@ logging.getLogger("torch._dynamo").setLevel(logging.CRITICAL)
 _PRINTED_VLLM_SPEC_CONFIG = False
 _HSPEC_ALIGN_DEBUG = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
 _HSPEC_ALIGN_DEBUG_PREVIEW = int(os.getenv("HSPEC_ALIGN_DEBUG_PREVIEW", "8"))
+_HSPEC_LEGACY_DATAPROTO_HS = os.getenv("HSPEC_LEGACY_DATAPROTO_HS", "0") != "0"
 
 
 def _get_model_hidden_size(model_runner: Any) -> int | None:
@@ -514,6 +515,7 @@ class vLLMRollout(BaseRollout):
 
         batch_size = idx.size(0)
         global_step = prompts.meta_info.get("global_steps")
+        hspec_epoch = prompts.meta_info.get("hspec_epoch")
         use_hspec = self.config.get("use_hspec_decode", False)
         is_validate = prompts.meta_info.get("validate", False)
         collect_hspec = use_hspec and not is_validate
@@ -593,11 +595,9 @@ class vLLMRollout(BaseRollout):
             except Exception:
                 logger.debug("HSpec collection mode update failed", exc_info=True)
 
+        hspec_legacy_dataproto_hs = _HSPEC_LEGACY_DATAPROTO_HS
         if collect_hspec:
-            from vllm_ascend.spec_decode.hspec_utils import (
-                hspec_clear_store,
-                hspec_flush_and_get_all,
-            )
+            from vllm_ascend.spec_decode.hspec_utils import hspec_clear_store
             hspec_clear_store()
         if profile_this_step:
             profile_dir = os.path.join(
@@ -641,17 +641,11 @@ class vLLMRollout(BaseRollout):
                         use_tqdm=True,
                     )
 
-                hs_store: dict = {}
-                hs_store_index: tuple[dict[str, Any], dict[str, Any]] = ({}, {})
-                if collect_hspec:
-                    with hspec_record_function("hspec/rollout/hidden_state_flush", use_npu_stream=True):
-                        hs_store = hspec_flush_and_get_all()
-                    hs_store_index = _build_hspec_store_index(hs_store)
-
                 response = []
                 rollout_log_probs = []
                 rollout_hidden_states_list: list = []
                 rollout_hspec_token_ids_list: list = []
+                rollout_hspec_desc_list: list = []
                 rollout_debug_list: list = []
                 with hspec_record_function("hspec/rollout/output_collect"):
                     for output in outputs:
@@ -668,23 +662,10 @@ class vLLMRollout(BaseRollout):
                                 hs = getattr(output.outputs[sample_id], "hidden_states", None)
                                 hspec_token_ids = getattr(output.outputs[sample_id], "hspec_token_ids", None)
                                 if hs is None:
-                                    hs_source = "store"
-                                    payload = _lookup_hspec_store_payload(
-                                        hs_store_index,
-                                        output.request_id,
-                                        sample_id,
-                                        len(output.outputs),
-                                    )
-                                    if payload is not None:
-                                        hs = payload.get("hidden_states")
-                                        if hspec_token_ids is None:
-                                            hspec_token_ids = payload.get("token_ids")
-                                    else:
-                                        hs = None
-                                if hs is None:
                                     hs_source = "none"
                                 rollout_hidden_states_list.append(hs)
                                 rollout_hspec_token_ids_list.append(hspec_token_ids)
+                                rollout_hspec_desc_list.append(None)
                                 if self._hspec_align_debug:
                                     raw_pad_idx = -1
                                     try:
@@ -708,7 +689,64 @@ class vLLMRollout(BaseRollout):
                                             "response_head": list(response_ids[:preview]),
                                             "response_tail": list(response_ids[-preview:]) if response_ids else [],
                                         }
+                        )
+
+                hs_store: dict = {}
+                hs_store_index: tuple[dict[str, Any], dict[str, Any]] = ({}, {})
+                if collect_hspec:
+                    with hspec_record_function("hspec/rollout/hidden_state_flush", use_npu_stream=True):
+                        prompt_id_map = {}
+                        for out_idx, output in enumerate(outputs):
+                            prompt_tokens = getattr(output, "prompt_token_ids", None)
+                            if prompt_tokens is None:
+                                try:
+                                    prompt_tokens = vllm_inputs[int(str(output.request_id))].get(
+                                        "prompt_token_ids", []
                                     )
+                                except Exception:
+                                    prompt_tokens = (
+                                        vllm_inputs[out_idx].get("prompt_token_ids", [])
+                                        if out_idx < len(vllm_inputs)
+                                        else []
+                                    )
+                            if prompt_tokens:
+                                prompt_id_map[str(output.request_id)] = prompt_id_from_token_ids(
+                                    list(prompt_tokens)
+                                )
+                        if hspec_legacy_dataproto_hs:
+                            from vllm_ascend.spec_decode.hspec_utils import hspec_flush_and_get_all
+                            hs_store = hspec_flush_and_get_all()
+                        else:
+                            from vllm_ascend.spec_decode.hspec_utils import hspec_flush_and_get_descriptors
+                            hs_store = hspec_flush_and_get_descriptors(
+                                request_id_to_prompt_id=prompt_id_map,
+                                epoch=int(hspec_epoch) if hspec_epoch is not None else None,
+                                global_step=int(global_step) if global_step is not None else None,
+                            )
+                    hs_store_index = _build_hspec_store_index(hs_store)
+
+                    desc_pos = 0
+                    for output in outputs:
+                        for sample_id in range(len(output.outputs)):
+                            if desc_pos >= len(rollout_hidden_states_list):
+                                break
+                            payload = _lookup_hspec_store_payload(
+                                hs_store_index,
+                                output.request_id,
+                                sample_id,
+                                len(output.outputs),
+                            )
+                            if payload is not None:
+                                if hspec_legacy_dataproto_hs:
+                                    if rollout_hidden_states_list[desc_pos] is None:
+                                        rollout_hidden_states_list[desc_pos] = payload.get("hidden_states")
+                                    if rollout_hspec_token_ids_list[desc_pos] is None:
+                                        rollout_hspec_token_ids_list[desc_pos] = payload.get("token_ids")
+                                else:
+                                    rollout_hspec_desc_list[desc_pos] = payload.get("desc")
+                                    if rollout_hspec_token_ids_list[desc_pos] is None:
+                                        rollout_hspec_token_ids_list[desc_pos] = payload.get("token_ids")
+                            desc_pos += 1
 
                 with hspec_record_function("hspec/rollout/pad_concat", use_npu_stream=True):
                     response = pad_2d_list_to_length(
@@ -767,7 +805,13 @@ class vLLMRollout(BaseRollout):
             if self.config.calculate_log_probs:
                 batch["rollout_log_probs"] = rollout_log_probs
 
-            if collect_hspec and rollout_hidden_states_list:
+            if collect_hspec and (not hspec_legacy_dataproto_hs) and rollout_hspec_desc_list:
+                _desc_list = list(rollout_hspec_desc_list)
+                _desc_arr = np.empty((len(_desc_list),), dtype=object)
+                _desc_arr[:] = _desc_list
+                non_tensor_batch["hspec_desc"] = _desc_arr
+
+            if collect_hspec and hspec_legacy_dataproto_hs and rollout_hidden_states_list:
                 _hs_list = list(rollout_hidden_states_list)
                 _hs_arr = np.empty((len(_hs_list),), dtype=object)
                 _hs_arr[:] = _hs_list

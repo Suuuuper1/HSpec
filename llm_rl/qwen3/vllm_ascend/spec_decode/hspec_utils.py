@@ -18,13 +18,18 @@ This module provides helper functions for hidden state collection and processing
 """
 
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
 import atexit
+import json
 import logging
 import hashlib
 import os
 import queue
+import socket
 import struct
+import tempfile
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -36,6 +41,43 @@ except Exception:  # pragma: no cover - fallback for older torch variants
     from torch.autograd.profiler import record_function as _record_function
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class HSpecTrajectoryDesc:
+    """Small control-plane descriptor for one rollout trajectory.
+
+    Hidden states and token ids live in local files; this descriptor is the
+    only object that should travel through DataProto/Ray in the Phase-1 path.
+    """
+
+    epoch: int
+    global_step: int
+    node_id: str
+    worker_rank: int
+    tp_group_id: int
+    shard_id: int
+    request_id: str
+    prompt_id: str
+    hs_path: str
+    hs_offset_rows: int
+    token_path: str
+    token_offset: int
+    length: int
+    hidden_dim: int
+    hs_dtype: str
+    token_dtype: str
+    reward: Optional[float] = None
+
+
+def hspec_desc_with_updates(
+    desc: HSpecTrajectoryDesc,
+    **kwargs,
+) -> HSpecTrajectoryDesc:
+    """Return an updated immutable trajectory descriptor."""
+    if not isinstance(desc, HSpecTrajectoryDesc):
+        desc = HSpecTrajectoryDesc(**dict(desc))
+    return replace(desc, **kwargs)
 
 _hspec_profile_local = threading.local()
 
@@ -883,9 +925,364 @@ _hspec_store_cond = _threading.Condition(_hspec_store_lock)
 _hspec_host_buffers: Dict[str, List[torch.Tensor]] = {}
 # Token-side accumulation buffers: req_id -> list of accepted/generated token ids
 _hspec_token_buffers: Dict[str, List[int]] = {}
+_hspec_desc_buffers: Dict[str, HSpecTrajectoryDesc] = {}
 
 # Whether collection is enabled (set by model_runner at init)
 _hspec_collection_enabled: bool = False
+
+
+def _hspec_legacy_dataproto_hs_enabled() -> bool:
+    return os.getenv("HSPEC_LEGACY_DATAPROTO_HS", "0") != "0"
+
+
+def _hspec_node_id() -> str:
+    return (
+        os.getenv("HSPEC_NODE_ID")
+        or os.getenv("NODE_RANK")
+        or socket.gethostname()
+    )
+
+
+def _hspec_worker_rank() -> int:
+    for name in ("RANK", "LOCAL_RANK", "WORKER_RANK"):
+        value = os.getenv(name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            continue
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return int(os.getpid())
+
+
+def _hspec_num_shards() -> int:
+    try:
+        return max(int(os.getenv("HSPEC_NUM_SHARDS", "5")), 1)
+    except ValueError:
+        return 5
+
+
+def _hspec_tp_group_id(worker_rank: int) -> int:
+    value = os.getenv("HSPEC_TP_GROUP_ID")
+    if value is not None:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    infer_tp = os.getenv("INFER_TP")
+    try:
+        tp = max(int(infer_tp), 1) if infer_tp is not None else 1
+    except ValueError:
+        tp = 1
+    return max(int(worker_rank), 0) // tp
+
+
+def _hspec_current_epoch() -> int:
+    for name in ("HSPEC_EPOCH", "EPOCH"):
+        value = os.getenv(name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            continue
+    return -1
+
+
+def _hspec_current_global_step() -> int:
+    value = os.getenv("HSPEC_GLOBAL_STEP")
+    if value is None:
+        return -1
+    try:
+        return int(value)
+    except ValueError:
+        return -1
+
+
+class _HSpecLocalFileStore:
+    """Append-only local file store for Phase-1 trajectory data."""
+
+    def __init__(self) -> None:
+        root = os.getenv("HSPEC_STORE_DIR")
+        if not root:
+            root = os.path.join(tempfile.gettempdir(), "hspec_store")
+        self.root = os.path.abspath(root)
+        self.node_id = _hspec_node_id()
+        self.worker_rank = _hspec_worker_rank()
+        self.tp_group_id = _hspec_tp_group_id(self.worker_rank)
+        worker_dir = os.path.join(
+            self.root,
+            f"node_{self.node_id}",
+            f"worker_{int(self.worker_rank):05d}",
+        )
+        os.makedirs(worker_dir, exist_ok=True)
+        self.worker_dir = worker_dir
+        self.hs_path = os.path.join(worker_dir, "hs.fp16.bin")
+        self.token_path = os.path.join(worker_dir, "tokens.i32.bin")
+        self.desc_path = os.path.join(worker_dir, "desc.jsonl")
+        open(self.hs_path, "ab").close()
+        open(self.token_path, "ab").close()
+        open(self.desc_path, "a", encoding="utf-8").close()
+        self._complete_dir = os.path.join(worker_dir, "complete")
+        os.makedirs(self._complete_dir, exist_ok=True)
+        self._req_hs_path: Dict[str, str] = {}
+        self._req_token_path: Dict[str, str] = {}
+        self._req_rows: Dict[str, int] = {}
+        self._req_hidden_dim: Dict[str, int] = {}
+        self._req_hs_dtype: Dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _rows_written(path: str, row_bytes: int) -> int:
+        if row_bytes <= 0:
+            return 0
+        return int(os.path.getsize(path) // row_bytes)
+
+    @staticmethod
+    def _items_written(path: str, item_bytes: int) -> int:
+        if item_bytes <= 0:
+            return 0
+        return int(os.path.getsize(path) // item_bytes)
+
+    def append_trajectory(
+        self,
+        request_id: str,
+        prompt_id: str,
+        hidden_states: np.ndarray,
+        token_ids: List[int],
+        epoch: Optional[int] = None,
+        global_step: Optional[int] = None,
+    ) -> Optional[HSpecTrajectoryDesc]:
+        if hidden_states is None or hidden_states.ndim != 2:
+            return None
+        length = int(hidden_states.shape[0])
+        if length <= 0 or length != len(token_ids):
+            return None
+
+        hs_np = np.ascontiguousarray(hidden_states, dtype=np.float16)
+        tok_np = np.ascontiguousarray(np.asarray(token_ids, dtype=np.int32))
+        hidden_dim = int(hs_np.shape[1])
+        hs_offset_rows = self._rows_written(self.hs_path, hidden_dim * np.dtype(np.float16).itemsize)
+        token_offset = self._items_written(self.token_path, np.dtype(np.int32).itemsize)
+
+        with open(self.hs_path, "ab") as f:
+            hs_np.tofile(f)
+        with open(self.token_path, "ab") as f:
+            tok_np.tofile(f)
+
+        shard_id = stable_partition_id(prompt_id, _hspec_num_shards())
+        desc = HSpecTrajectoryDesc(
+            epoch=_hspec_current_epoch() if epoch is None else int(epoch),
+            global_step=(
+                _hspec_current_global_step()
+                if global_step is None
+                else int(global_step)
+            ),
+            node_id=str(self.node_id),
+            worker_rank=int(self.worker_rank),
+            tp_group_id=int(self.tp_group_id),
+            shard_id=int(shard_id),
+            request_id=str(request_id),
+            prompt_id=str(prompt_id),
+            hs_path=self.hs_path,
+            hs_offset_rows=int(hs_offset_rows),
+            token_path=self.token_path,
+            token_offset=int(token_offset),
+            length=length,
+            hidden_dim=hidden_dim,
+            hs_dtype="float16",
+            token_dtype="int32",
+            reward=None,
+        )
+        try:
+            with open(self.desc_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(desc.__dict__, sort_keys=True) + "\n")
+        except Exception:
+            logger.debug("HSpec descriptor journal write failed", exc_info=True)
+        return desc
+
+    @staticmethod
+    def _safe_req_digest(request_id: str) -> str:
+        return hashlib.blake2b(str(request_id).encode("utf-8"), digest_size=8).hexdigest()
+
+    def _new_req_path(self, request_id: str, kind: str, suffix: str) -> str:
+        digest = self._safe_req_digest(request_id)
+        unique = f"{time.time_ns()}_{os.getpid()}_{threading.get_ident()}"
+        return os.path.join(self.worker_dir, f"{kind}_{digest}_{unique}.{suffix}")
+
+    def _complete_path(self, request_id: str, kind: str, source_path: str) -> str:
+        digest = self._safe_req_digest(request_id)
+        base = os.path.basename(source_path)
+        return os.path.join(self._complete_dir, f"{kind}_{digest}_{base}")
+
+    def append_hidden_rows(self, request_id: str, rows: torch.Tensor) -> None:
+        """Append copied CPU hidden rows to this request's local file."""
+        if rows is None or int(rows.numel()) == 0:
+            return
+        req_id = str(request_id)
+        rows_np = np.ascontiguousarray(rows.to(dtype=torch.float16).numpy(), dtype=np.float16)
+        if rows_np.ndim != 2 or rows_np.shape[0] <= 0:
+            return
+        hidden_dim = int(rows_np.shape[1])
+        with self._lock:
+            hs_path = self._req_hs_path.get(req_id)
+            if hs_path is None:
+                hs_path = self._new_req_path(req_id, "hs", "fp16.bin")
+                self._req_hs_path[req_id] = hs_path
+                self._req_rows[req_id] = 0
+                self._req_hidden_dim[req_id] = hidden_dim
+                self._req_hs_dtype[req_id] = "float16"
+                open(hs_path, "wb").close()
+            elif self._req_hidden_dim.get(req_id) != hidden_dim:
+                logger.warning(
+                    "HSpec descriptor store hidden_dim mismatch for req_id=%s: old=%s new=%s",
+                    req_id,
+                    self._req_hidden_dim.get(req_id),
+                    hidden_dim,
+                )
+                return
+
+            with open(hs_path, "ab") as f:
+                rows_np.tofile(f)
+            self._req_rows[req_id] = int(self._req_rows.get(req_id, 0)) + int(rows_np.shape[0])
+
+    def pending_req_ids(self) -> List[str]:
+        with self._lock:
+            return sorted(set(self._req_hs_path.keys()) | set(_hspec_token_buffers.keys()))
+
+    def finalize_request(
+        self,
+        request_id: str,
+        prompt_id: str,
+        token_ids: List[int],
+        epoch: Optional[int] = None,
+        global_step: Optional[int] = None,
+    ) -> Tuple[Optional[HSpecTrajectoryDesc], int]:
+        """Finalize a request and return a descriptor plus hidden row count."""
+        req_id = str(request_id)
+        with self._lock:
+            hs_path = self._req_hs_path.get(req_id)
+            hidden_len = int(self._req_rows.get(req_id, 0))
+            hidden_dim = int(self._req_hidden_dim.get(req_id, 0))
+            hs_dtype = str(self._req_hs_dtype.get(req_id, "float16"))
+        if hs_path is None or hidden_len <= 0:
+            return None, hidden_len
+        if hidden_len != len(token_ids):
+            return None, hidden_len
+
+        token_path = self._new_req_path(req_id, "tok", "i32.bin")
+        tok_np = np.ascontiguousarray(np.asarray(token_ids, dtype=np.int32))
+        with open(token_path, "wb") as f:
+            tok_np.tofile(f)
+        complete_hs_path = self._complete_path(req_id, "hs", hs_path)
+        complete_token_path = self._complete_path(req_id, "tok", token_path)
+        try:
+            os.replace(hs_path, complete_hs_path)
+            hs_path = complete_hs_path
+        except OSError:
+            logger.debug("HSpec finalized hidden-state rename failed", exc_info=True)
+        try:
+            os.replace(token_path, complete_token_path)
+            token_path = complete_token_path
+        except OSError:
+            logger.debug("HSpec finalized token rename failed", exc_info=True)
+
+        shard_id = stable_partition_id(prompt_id, _hspec_num_shards())
+        desc = HSpecTrajectoryDesc(
+            epoch=_hspec_current_epoch() if epoch is None else int(epoch),
+            global_step=(
+                _hspec_current_global_step()
+                if global_step is None
+                else int(global_step)
+            ),
+            node_id=str(self.node_id),
+            worker_rank=int(self.worker_rank),
+            tp_group_id=int(self.tp_group_id),
+            shard_id=int(shard_id),
+            request_id=req_id,
+            prompt_id=str(prompt_id),
+            hs_path=hs_path,
+            hs_offset_rows=0,
+            token_path=token_path,
+            token_offset=0,
+            length=hidden_len,
+            hidden_dim=hidden_dim,
+            hs_dtype=hs_dtype,
+            token_dtype="int32",
+            reward=None,
+        )
+        with self._lock:
+            self._req_hs_path.pop(req_id, None)
+            self._req_rows.pop(req_id, None)
+            self._req_hidden_dim.pop(req_id, None)
+            self._req_hs_dtype.pop(req_id, None)
+        _hspec_desc_buffers[req_id] = desc
+        try:
+            with open(self.desc_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(desc.__dict__, sort_keys=True) + "\n")
+        except Exception:
+            logger.debug("HSpec descriptor journal write failed", exc_info=True)
+        return desc, hidden_len
+
+    def clear_pending(self) -> None:
+        with self._lock:
+            paths = list(self._req_hs_path.values()) + list(self._req_token_path.values())
+            self._req_hs_path.clear()
+            self._req_token_path.clear()
+            self._req_rows.clear()
+            self._req_hidden_dim.clear()
+            self._req_hs_dtype.clear()
+        _hspec_desc_buffers.clear()
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+_hspec_local_file_store: Optional[_HSpecLocalFileStore] = None
+
+
+def _hspec_get_local_file_store() -> _HSpecLocalFileStore:
+    global _hspec_local_file_store
+    if _hspec_local_file_store is None:
+        _hspec_local_file_store = _HSpecLocalFileStore()
+    return _hspec_local_file_store
+
+
+def hspec_read_desc_arrays(desc: HSpecTrajectoryDesc) -> Tuple[np.ndarray, np.ndarray]:
+    """Load a descriptor's hidden states and token ids from local files."""
+    if not isinstance(desc, HSpecTrajectoryDesc):
+        desc = HSpecTrajectoryDesc(**dict(desc))
+    if int(desc.length) <= 0:
+        return (
+            np.empty((0, int(desc.hidden_dim)), dtype=np.float16),
+            np.empty((0,), dtype=np.int32),
+        )
+    hs_dtype = np.dtype(desc.hs_dtype)
+    token_dtype = np.dtype(desc.token_dtype)
+    hs_offset = int(desc.hs_offset_rows) * int(desc.hidden_dim) * hs_dtype.itemsize
+    token_offset = int(desc.token_offset) * token_dtype.itemsize
+    hs_mm = np.memmap(
+        desc.hs_path,
+        dtype=hs_dtype,
+        mode="r",
+        offset=hs_offset,
+        shape=(int(desc.length), int(desc.hidden_dim)),
+    )
+    tok_mm = np.memmap(
+        desc.token_path,
+        dtype=token_dtype,
+        mode="r",
+        offset=token_offset,
+        shape=(int(desc.length),),
+    )
+    return np.asarray(hs_mm), np.asarray(tok_mm)
 
 
 class _HSpecAsyncCopyTask:
@@ -893,6 +1290,7 @@ class _HSpecAsyncCopyTask:
     __slots__ = (
         "req_slices",
         "cpu_tensor",
+        "pool_token",
         "event",
         "device_tensor_ref",
     )
@@ -901,11 +1299,13 @@ class _HSpecAsyncCopyTask:
         self,
         req_slices: List[Tuple[str, int, int]],
         cpu_tensor: torch.Tensor,
+        pool_token: Optional[Tuple[Tuple[str, int, int], torch.Tensor]],
         event: Any,
         device_tensor_ref: Optional[torch.Tensor],
     ) -> None:
         self.req_slices = req_slices
         self.cpu_tensor = cpu_tensor
+        self.pool_token = pool_token
         self.event = event
         # Keep the source device tensor alive until the async copy completes.
         self.device_tensor_ref = device_tensor_ref
@@ -946,6 +1346,100 @@ _hspec_accumulate_thread: Optional[_threading.Thread] = None
 _hspec_async_transfer_streams: Dict[str, Any] = {}
 _hspec_async_pending_total: int = 0
 _hspec_async_pending_by_req: Dict[str, int] = {}
+
+
+class _HSpecPinnedPool:
+    """Small best-effort pinned host buffer pool for HSpec D2H copies."""
+
+    def __init__(self) -> None:
+        self.max_bytes = int(os.getenv("HSPEC_PINNED_POOL_BYTES", str(512 * 1024 * 1024)))
+        self.max_slots = int(os.getenv("HSPEC_PINNED_POOL_MAX_SLOTS", "32"))
+        self.min_bucket_rows = max(int(os.getenv("HSPEC_PINNED_POOL_MIN_ROWS", "64")), 1)
+        self._lock = threading.Lock()
+        self._free: Dict[Tuple[str, int, int], List[torch.Tensor]] = {}
+        self._cached_bytes = 0
+        self._cached_slots = 0
+
+    def _bucket_rows(self, rows: int) -> int:
+        bucket = self.min_bucket_rows
+        while bucket < rows:
+            bucket <<= 1
+        return bucket
+
+    @staticmethod
+    def _tensor_nbytes(tensor: torch.Tensor) -> int:
+        return int(tensor.numel() * tensor.element_size())
+
+    def checkout(
+        self,
+        shape: Tuple[int, int],
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[Tuple[str, int, int], torch.Tensor]]]:
+        rows, hidden_dim = int(shape[0]), int(shape[1])
+        bucket_rows = self._bucket_rows(rows)
+        key = (str(dtype), hidden_dim, bucket_rows)
+        with self._lock:
+            free_list = self._free.get(key)
+            if free_list:
+                base = free_list.pop()
+                self._cached_bytes -= self._tensor_nbytes(base)
+                self._cached_slots -= 1
+                return base[:rows], (key, base)
+        try:
+            base = torch.empty(
+                (bucket_rows, hidden_dim),
+                dtype=dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            return base[:rows], (key, base)
+        except Exception:
+            logger.debug("HSpec pinned pool allocation failed; using direct CPU tensor", exc_info=True)
+            return torch.empty(shape, dtype=dtype, device="cpu"), None
+
+    def release(self, token: Optional[Tuple[Tuple[str, int, int], torch.Tensor]]) -> None:
+        if token is None:
+            return
+        key, base = token
+        nbytes = self._tensor_nbytes(base)
+        with self._lock:
+            if (
+                self.max_bytes >= 0
+                and self._cached_bytes + nbytes <= self.max_bytes
+                and self._cached_slots < self.max_slots
+            ):
+                self._free.setdefault(key, []).append(base)
+                self._cached_bytes += nbytes
+                self._cached_slots += 1
+
+
+_hspec_pinned_pool: Optional[_HSpecPinnedPool] = None
+
+
+def _hspec_get_pinned_pool() -> _HSpecPinnedPool:
+    global _hspec_pinned_pool
+    if _hspec_pinned_pool is None:
+        _hspec_pinned_pool = _HSpecPinnedPool()
+    return _hspec_pinned_pool
+
+
+def _hspec_make_cpu_copy_buffer(
+    selected_rows: torch.Tensor,
+) -> Tuple[torch.Tensor, Optional[Tuple[Tuple[str, int, int], torch.Tensor]]]:
+    if selected_rows.ndim == 2 and os.getenv("HSPEC_DISABLE_PINNED_POOL", "0") == "0":
+        return _hspec_get_pinned_pool().checkout(
+            (int(selected_rows.shape[0]), int(selected_rows.shape[1])),
+            selected_rows.dtype,
+        )
+    return (
+        torch.empty(
+            selected_rows.shape,
+            dtype=selected_rows.dtype,
+            device="cpu",
+            pin_memory=True,
+        ),
+        None,
+    )
 
 
 def _hspec_use_legacy_async_accumulate() -> bool:
@@ -1094,14 +1588,25 @@ def _hspec_copy_worker() -> None:
             if task.event is not None:
                 task.event.synchronize()
 
-            with _hspec_store_cond:
+            if _hspec_legacy_dataproto_hs_enabled():
+                with _hspec_store_cond:
+                    for req_id, start, end in task.req_slices:
+                        rows = task.cpu_tensor[start:end]
+                        if req_id not in _hspec_host_buffers:
+                            _hspec_host_buffers[req_id] = []
+                        _hspec_host_buffers[req_id].append(rows)
+            else:
+                store = _hspec_get_local_file_store()
                 for req_id, start, end in task.req_slices:
-                    if req_id not in _hspec_host_buffers:
-                        _hspec_host_buffers[req_id] = []
-                    _hspec_host_buffers[req_id].append(task.cpu_tensor[start:end])
+                    store.append_hidden_rows(req_id, task.cpu_tensor[start:end])
+            _hspec_get_pinned_pool().release(task.pool_token)
             _hspec_finish_pending([req_id for req_id, _, _ in task.req_slices])
         except Exception:
             logger.exception("HSpec async copy worker failed")
+            try:
+                _hspec_get_pinned_pool().release(task.pool_token)
+            except Exception:
+                pass
             _hspec_finish_pending([req_id for req_id, _, _ in task.req_slices])
 
 
@@ -1132,12 +1637,7 @@ def _hspec_accumulate_worker() -> None:
             with torch.npu.stream(transfer_stream) if device.type == "npu" else nullcontext():
                 selected_rows = task.sample_hidden_states.index_select(0, gather_indices).detach()
                 if device.type == "npu":
-                    cpu_tensor = torch.empty(
-                        selected_rows.shape,
-                        dtype=selected_rows.dtype,
-                        device="cpu",
-                        pin_memory=True,
-                    )
+                    cpu_tensor, pool_token = _hspec_make_cpu_copy_buffer(selected_rows)
                     cpu_tensor.copy_(selected_rows, non_blocking=True)
                     import torch_npu  # type: ignore
                     copy_event = torch_npu.npu.Event()
@@ -1145,11 +1645,13 @@ def _hspec_accumulate_worker() -> None:
                 else:
                     cpu_tensor = selected_rows.cpu()
                     copy_event = None
+                    pool_token = None
 
             _hspec_copy_queue.put(
                 _HSpecAsyncCopyTask(
                     req_slices=req_slices,
                     cpu_tensor=cpu_tensor,
+                    pool_token=pool_token,
                     event=copy_event,
                     device_tensor_ref=selected_rows if copy_event is not None else None,
                 )
@@ -1255,6 +1757,15 @@ def hspec_append_step_hs(req_id: str, hidden_state: torch.Tensor):
     if not _hspec_collection_enabled:
         return
     req_id = str(req_id)
+    if not _hspec_legacy_dataproto_hs_enabled():
+        try:
+            _hspec_get_local_file_store().append_hidden_rows(
+                req_id,
+                hidden_state.detach().reshape(1, -1).cpu(),
+            )
+        except Exception:
+            logger.exception("HSpec descriptor append_step_hs failed")
+        return
     with _hspec_store_lock:
         if req_id not in _hspec_host_buffers:
             _hspec_host_buffers[req_id] = []
@@ -1330,23 +1841,20 @@ def hspec_submit_accumulate_task(
                 else:
                     copy_stream = current_stream
                 with torch.npu.stream(copy_stream):
-                    cpu_tensor = torch.empty(
-                        selected_rows.shape,
-                        dtype=selected_rows.dtype,
-                        device="cpu",
-                        pin_memory=True,
-                    )
+                    cpu_tensor, pool_token = _hspec_make_cpu_copy_buffer(selected_rows)
                     cpu_tensor.copy_(selected_rows, non_blocking=True)
                     copy_event = torch_npu.npu.Event()
                     copy_event.record(copy_stream)
             else:
                 cpu_tensor = selected_rows.cpu()
                 copy_event = None
+                pool_token = None
 
             _hspec_copy_queue.put(
                 _HSpecAsyncCopyTask(
                     req_slices=req_slices,
                     cpu_tensor=cpu_tensor,
+                    pool_token=pool_token,
                     event=copy_event,
                     device_tensor_ref=selected_rows if copy_event is not None else None,
                 )
@@ -1427,6 +1935,50 @@ def hspec_flush_and_get_all() -> Dict[str, Dict[str, Any]]:
         return result
 
 
+def hspec_flush_and_get_descriptors(
+    request_id_to_prompt_id: Optional[Dict[str, str]] = None,
+    epoch: Optional[int] = None,
+    global_step: Optional[int] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Flush pending copies and return small descriptor payloads.
+
+    This Phase-1 API replaces the DataProto hidden-state ndarray path. It
+    never returns hidden-state matrices; it only finalizes local files and
+    emits descriptors plus aligned token ids for trainer-side checks.
+    """
+    _hspec_wait_pending_all()
+    request_id_to_prompt_id = {
+        str(k): str(v) for k, v in (request_id_to_prompt_id or {}).items()
+    }
+    with _hspec_store_lock:
+        result: Dict[str, Dict[str, Any]] = {}
+        store = _hspec_get_local_file_store()
+        all_req_ids = set(store.pending_req_ids()) | set(_hspec_token_buffers.keys())
+        for req_id in all_req_ids:
+            token_ids = list(_hspec_token_buffers.get(req_id, []))
+            prompt_id = request_id_to_prompt_id.get(str(req_id), "")
+            desc = None
+            hs_len = 0
+            if prompt_id and token_ids:
+                desc, hs_len = store.finalize_request(
+                    request_id=str(req_id),
+                    prompt_id=prompt_id,
+                    token_ids=token_ids,
+                    epoch=epoch,
+                    global_step=global_step,
+                )
+            else:
+                with store._lock:
+                    hs_len = int(store._req_rows.get(str(req_id), 0))
+            result[str(req_id)] = {
+                "desc": desc,
+                "token_ids": token_ids,
+                "hidden_len": int(hs_len if desc is None else desc.length),
+            }
+        _hspec_token_buffers.clear()
+        return result
+
+
 def hspec_pop_request(req_id: str) -> Optional[Dict[str, Any]]:
     """Pop hidden states for a *single* request.
 
@@ -1439,6 +1991,17 @@ def hspec_pop_request(req_id: str) -> Optional[Dict[str, Any]]:
     """
     req_id = str(req_id)
     _hspec_wait_pending_for_req(req_id)
+    if not _hspec_legacy_dataproto_hs_enabled():
+        with _hspec_store_lock:
+            desc = _hspec_desc_buffers.pop(req_id, None)
+            token_ids = list(_hspec_token_buffers.pop(req_id, []))
+            if desc is None and not token_ids:
+                return None
+            return {
+                "hidden_states": None,
+                "token_ids": token_ids,
+                "desc": desc,
+            }
     with _hspec_store_lock:
         has_hs = req_id in _hspec_host_buffers
         has_tok = req_id in _hspec_token_buffers
@@ -1464,6 +2027,9 @@ def hspec_clear_store():
             tensors.clear()
         _hspec_host_buffers.clear()
         _hspec_token_buffers.clear()
+        _hspec_desc_buffers.clear()
+        if not _hspec_legacy_dataproto_hs_enabled():
+            _hspec_get_local_file_store().clear_pending()
 
 
 class HSpecConfig:
