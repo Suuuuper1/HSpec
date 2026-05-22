@@ -16,7 +16,6 @@ HSpec: Hidden State based Speculative Decoding query table.
 """
 
 import logging
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import msgpack
@@ -25,11 +24,9 @@ import ray
 import zmq
 
 from vllm_ascend.spec_decode.hspec_utils import (
-    HSpecTrajectoryDesc,
     PromptPCAParams,
     fit_pca_multi_sequence,
     fit_pca_single_sequence,
-    hspec_read_desc_arrays,
     stable_partition_id,
 )
 
@@ -194,10 +191,7 @@ class PromptTableData:
 
 # Partitioned Ray actor
 
-try:
-    _num_groups: int = max(int(os.getenv("HSPEC_NUM_SHARDS", "5")), 1)
-except ValueError:
-    _num_groups = 5
+_num_groups: int = 5
 
 
 @ray.remote(num_cpus=1)
@@ -337,100 +331,11 @@ class HSpecTableGroup:
             }}``
         """
         for prompt_id, data in prompt_data_dict.items():
-            if data.get("descs"):
-                self.build_prompt_table_from_descs(
-                    prompt_id,
-                    data.get("descs", []),
-                    data.get("rewards"),
-                    data.get("tokens"),
-                )
-            else:
-                self.build_prompt_table(
-                    prompt_id,
-                    data["hidden_states"],
-                    data["tokens"],
-                    data["rewards"],
-                )
-
-    def build_prompt_table_from_descs(
-        self,
-        prompt_id: str,
-        descs: List[HSpecTrajectoryDesc],
-        rewards: Optional[List[float]] = None,
-        token_seq_list: Optional[List[Any]] = None,
-    ):
-        """Build a prompt table from Phase-1 local-file descriptors."""
-        hidden_states_list: List[np.ndarray] = []
-        token_arrays: List[np.ndarray] = []
-        reward_list: List[float] = []
-
-        for idx, desc in enumerate(descs):
-            if desc is None:
-                self._discard_count += 1
-                continue
-            if not isinstance(desc, HSpecTrajectoryDesc):
-                try:
-                    desc = HSpecTrajectoryDesc(**dict(desc))
-                except Exception:
-                    self._discard_count += 1
-                    continue
-            if str(desc.prompt_id) != str(prompt_id):
-                logger.warning(
-                    "HSpec descriptor prompt mismatch: key=%s desc=%s, discarding",
-                    prompt_id,
-                    desc.prompt_id,
-                )
-                self._discard_count += 1
-                continue
-            try:
-                hs, stored_tokens = hspec_read_desc_arrays(desc)
-            except Exception as exc:
-                logger.warning("HSpec descriptor read failed for %s: %s", prompt_id, exc)
-                self._discard_count += 1
-                continue
-            if hs.ndim != 2 or hs.shape[0] != int(desc.length):
-                logger.warning(
-                    "HSpec descriptor hidden-state mismatch for %s: desc_len=%d hs_shape=%s",
-                    prompt_id,
-                    int(desc.length),
-                    getattr(hs, "shape", None),
-                )
-                self._discard_count += 1
-                continue
-            if token_seq_list is not None and idx < len(token_seq_list):
-                trainer_tokens = np.asarray(token_seq_list[idx], dtype=np.int32)
-                if len(trainer_tokens) != int(desc.length):
-                    logger.warning(
-                        "HSpec descriptor token mismatch for %s: desc_len=%d trainer_tokens=%d",
-                        prompt_id,
-                        int(desc.length),
-                        len(trainer_tokens),
-                    )
-                    self._discard_count += 1
-                    continue
-                if not np.array_equal(trainer_tokens, stored_tokens):
-                    logger.warning(
-                        "HSpec descriptor token content mismatch for %s, discarding",
-                        prompt_id,
-                    )
-                    self._discard_count += 1
-                    continue
-            tokens = stored_tokens
-            hidden_states_list.append(hs)
-            token_arrays.append(tokens)
-            if rewards is not None and idx < len(rewards):
-                reward_list.append(float(rewards[idx]))
-            elif desc.reward is not None:
-                reward_list.append(float(desc.reward))
-            else:
-                reward_list.append(0.0)
-
-        if hidden_states_list:
             self.build_prompt_table(
                 prompt_id,
-                hidden_states_list,
-                token_arrays,
-                reward_list,
+                data["hidden_states"],
+                data["tokens"],
+                data["rewards"],
             )
 
     # Query
@@ -928,13 +833,19 @@ class GlobalHSpecTableGroup:
             return None
 
     # Build  (async, non-blocking)
-    def build_tables_async(self, prompt_data: Dict[str, Any]) -> List[ray.ObjectRef]:
+    def build_tables_async(self, prompt_data: Dict[str, Dict]) -> List[ray.ObjectRef]:
         """Send rollout data to partition actors for async PCA fitting + build.
 
-        Phase 1 accepts descriptor payloads:
-        ``{prompt_id: {'descs': List[HSpecTrajectoryDesc], 'rewards': [...]}}``.
-        The legacy ndarray payload remains supported behind
-        ``HSPEC_LEGACY_DATAPROTO_HS=1``.
+        This is the main Step 1 entry point called by the trainer.
+        PCA fitting + table construction runs inside Ray actors and does
+        **not** block the caller.
+
+        Args:
+            prompt_data: ``{prompt_id: {
+                'hidden_states': List[ndarray (L_i, D)],
+                'tokens':        List[List[int]],
+                'rewards':       List[float],
+            }}``
 
         Returns:
             Ray ObjectRefs (futures).  Call ``ray.get(refs)`` only when you

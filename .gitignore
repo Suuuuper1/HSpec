@@ -11,3 +11,5 @@ llm_rl/qwen3/file_list.md
 tensorboard_log/
 /llm_rl/qwen3/.cursorindexingignore
 another_new_version/
+llm_rl/qwen3/HSpec_system-optim-doc.md
+llm_rl/qwen3/HSpec_system-optim-tips.md
