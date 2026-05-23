@@ -38,6 +38,11 @@ except Exception:  # pragma: no cover - fallback for older torch variants
 logger = logging.getLogger(__name__)
 
 _hspec_profile_local = threading.local()
+_hspec_runtime_metric_lock = threading.Lock()
+_hspec_runtime_metrics: Dict[str, int] = {
+    "pinned_pool_miss": 0,
+    "pinned_pageable_fallback": 0,
+}
 
 
 def _parse_profile_steps(value: str) -> set[int]:
@@ -88,6 +93,20 @@ def hspec_profile_method() -> str:
 
 def hspec_profile_domain() -> str:
     return os.getenv("HSPEC_PROFILE_DOMAIN", "hspec")
+
+
+def _hspec_metric_add(name: str, value: int = 1) -> None:
+    with _hspec_runtime_metric_lock:
+        _hspec_runtime_metrics[name] = _hspec_runtime_metrics.get(name, 0) + int(value)
+
+
+def hspec_collect_runtime_metrics(reset: bool = True) -> Dict[str, int]:
+    with _hspec_runtime_metric_lock:
+        metrics = dict(_hspec_runtime_metrics)
+        if reset:
+            for key in list(_hspec_runtime_metrics.keys()):
+                _hspec_runtime_metrics[key] = 0
+    return metrics
 
 
 def hspec_profile_context_enabled() -> bool:
@@ -1019,8 +1038,11 @@ class _HSpecPinnedPool:
                 except Exception:
                     logger.debug("HSpec pinned pool allocation failed; using pageable CPU buffer",
                                  exc_info=True)
+                    _hspec_metric_add("pinned_pool_miss")
+                    _hspec_metric_add("pinned_pageable_fallback")
 
         # Budget exhausted or pin allocation failed: do not block decode.
+        _hspec_metric_add("pinned_pool_miss")
         return torch.empty(tuple(shape), dtype=dtype, device="cpu"), None
 
     def release(self, handle: Optional[Tuple[Tuple[str, int, int], torch.Tensor]]) -> None:
@@ -1044,6 +1066,7 @@ def _hspec_checkout_cpu_buffer(
     try:
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True), None
     except Exception:
+        _hspec_metric_add("pinned_pageable_fallback")
         return torch.empty(tuple(shape), dtype=dtype, device="cpu"), None
 
 
@@ -1378,14 +1401,19 @@ def hspec_append_step_hs(req_id: str, hidden_state: torch.Tensor):
         hspec_legacy_dataproto_hs_enabled,
     )
 
+    if not hspec_legacy_dataproto_hs_enabled():
+        logger.warning(
+            "hspec_append_step_hs() is disabled in descriptor mode; "
+            "use hspec_submit_accumulate_task() to avoid per-token host sync."
+        )
+        return
+
     rows = hidden_state.unsqueeze(0).cpu()
     if hspec_legacy_dataproto_hs_enabled():
         with _hspec_store_lock:
             if req_id not in _hspec_host_buffers:
                 _hspec_host_buffers[req_id] = []
             _hspec_host_buffers[req_id].append(rows)
-    else:
-        get_hspec_local_collector().append_hidden_rows(req_id, rows)
 
 
 def hspec_submit_accumulate_task(

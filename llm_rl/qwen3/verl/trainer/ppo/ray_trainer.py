@@ -28,6 +28,7 @@ from pprint import pprint
 from typing import Optional
 
 import numpy as np
+import psutil
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
@@ -1289,6 +1290,9 @@ class RayPPOTrainer:
                         
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        hspec_rollout_metrics = gen_batch_output.meta_info.pop("hspec_metrics", None)
+                        if isinstance(hspec_rollout_metrics, dict):
+                            metrics.update(hspec_rollout_metrics)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1728,6 +1732,7 @@ class RayPPOTrainer:
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                metrics["hspec/driver_rss_gb"] = psutil.Process().memory_info().rss / (1024**3)
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one

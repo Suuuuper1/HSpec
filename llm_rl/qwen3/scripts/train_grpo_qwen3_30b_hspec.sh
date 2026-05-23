@@ -22,11 +22,10 @@ fi
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 
-# HSpec system data-plane switches. Phase 1 defaults to descriptor transport;
-# set HSPEC_LEGACY_DATAPROTO_HS=1 only for A/B validation of the old path.
+# HSpec system data-plane switches. 
 export HSPEC_LEGACY_DATAPROTO_HS="${HSPEC_LEGACY_DATAPROTO_HS:-0}"
-export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-/tmp/hspec_store}"
-export HSPEC_NUM_SHARDS="${HSPEC_NUM_SHARDS:-5}"
+export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_store}"
+export HSPEC_TABLE_STORE_DIR="${HSPEC_TABLE_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_table_store}"
 
 # capture graph
 # export VERL_VLLM_CUDAGRAPH_MODE="${VERL_VLLM_CUDAGRAPH_MODE:-FULL}"
@@ -91,6 +90,10 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.9}"
 INFER_TP="${INFER_TP:-4}"
+export HSPEC_INFER_TP="${HSPEC_INFER_TP:-${INFER_TP}}"
+export HSPEC_NUM_SHARDS="${HSPEC_NUM_SHARDS:-${HSPEC_INFER_TP}}"
+export NODE_RANK="${NODE_RANK:-0}"
+export HSPEC_TP_GROUP_ID="${HSPEC_TP_GROUP_ID:-}"
 
 # dump-mode behavior for batch sizes and rollout count.
 if [ "${HSPEC_DUMP}" = "0" ]; then
@@ -237,7 +240,11 @@ env \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DUMP_DIR='"'"${HSPEC_DUMP_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LEGACY_DATAPROTO_HS='"'"${HSPEC_LEGACY_DATAPROTO_HS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DIR='"'"${HSPEC_STORE_DIR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TABLE_STORE_DIR='"'"${HSPEC_TABLE_STORE_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUM_SHARDS='"'"${HSPEC_NUM_SHARDS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_INFER_TP='"'"${HSPEC_INFER_TP}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.NODE_RANK='"'"${NODE_RANK}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TP_GROUP_ID='"'"${HSPEC_TP_GROUP_ID}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN='"'"${HSPEC_GEN}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_REQ_IDX='"'"${HSPEC_GEN_REQ_IDX}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_MAX_CALLS='"'"${HSPEC_GEN_MAX_CALLS}"'"' \

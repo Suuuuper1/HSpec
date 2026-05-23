@@ -67,6 +67,11 @@ def run_ppo(config) -> None:
 
     if config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
         from vllm_ascend.spec_decode.hspec_table import init_hspec_tables
+        if int(config.trainer.nnodes) > 1 and os.getenv("HSPEC_ALLOW_MULTI_NODE", "0") == "0":
+            raise RuntimeError(
+                "HSpec Phase 1 descriptor build is currently only supported in single-node mode "
+                "unless HSPEC_ALLOW_MULTI_NODE=1 and node-local build affinity is configured."
+            )
 
         similarity_threshold = config.actor_rollout_ref.rollout.get(
             "hspec_similarity_threshold", 0.9

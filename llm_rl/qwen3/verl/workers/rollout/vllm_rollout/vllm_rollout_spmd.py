@@ -518,7 +518,8 @@ class vLLMRollout(BaseRollout):
         hspec_epoch = prompts.meta_info.get("hspec_epoch", -1)
         use_hspec = self.config.get("use_hspec_decode", False)
         is_validate = prompts.meta_info.get("validate", False)
-        collect_hspec = use_hspec and not is_validate
+        do_sample = prompts.meta_info.get("do_sample", True)
+        collect_hspec = use_hspec and not is_validate and bool(do_sample)
         profile_this_step = hspec_profile_enabled_for_step(global_step)
         profiler = None
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -558,7 +559,6 @@ class vLLMRollout(BaseRollout):
         _vllm_inputs_arr[:] = _vllm_inputs_list
         non_tensor_batch["vllm_inputs"] = _vllm_inputs_arr
 
-        do_sample = prompts.meta_info.get("do_sample", True)
         if not do_sample:
             kwargs = {
                 "best_of": 1,
@@ -858,7 +858,25 @@ class vLLMRollout(BaseRollout):
                 _dbg_arr[:] = rollout_debug_list
                 non_tensor_batch["hspec_rollout_debug"] = _dbg_arr
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        meta_info = {}
+        if use_hspec:
+            try:
+                from vllm_ascend.spec_decode.hspec_store import collect_hspec_store_metrics
+                from vllm_ascend.spec_decode.hspec_utils import hspec_collect_runtime_metrics
+
+                store_metrics = collect_hspec_store_metrics(reset=True)
+                runtime_metrics = hspec_collect_runtime_metrics(reset=True)
+                meta_info["hspec_metrics"] = {
+                    "hspec/raw_store_bytes": float(store_metrics.get("raw_store_bytes", 0)),
+                    "hspec/desc_count": float(store_metrics.get("desc_count", 0)),
+                    "hspec/collect_dropped": float(store_metrics.get("collect_dropped", 0)),
+                    "hspec/pinned_pool_miss": float(runtime_metrics.get("pinned_pool_miss", 0)),
+                    "hspec/pinned_pageable_fallback": float(runtime_metrics.get("pinned_pageable_fallback", 0)),
+                }
+            except Exception:
+                logger.debug("Failed to collect HSpec rollout metrics", exc_info=True)
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.

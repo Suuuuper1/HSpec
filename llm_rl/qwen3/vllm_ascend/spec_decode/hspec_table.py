@@ -16,18 +16,30 @@ HSpec: Hidden State based Speculative Decoding query table.
 """
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import msgpack
 import numpy as np
 import ray
 import zmq
+from threadpoolctl import threadpool_limits
 
 from vllm_ascend.spec_decode.hspec_utils import (
     PromptPCAParams,
     fit_pca_multi_sequence,
     fit_pca_single_sequence,
     stable_partition_id,
+)
+from vllm_ascend.spec_decode.hspec_store import (
+    HSpecTrajectoryDesc,
+    coerce_hspec_desc,
+    collect_hspec_store_metrics,
+    delete_hspec_trajectory,
+    estimate_hspec_trajectory_bytes,
+    get_hspec_num_shards,
+    get_hspec_table_store_root,
+    load_hspec_trajectory,
 )
 
 logger = logging.getLogger(__name__)
@@ -191,7 +203,11 @@ class PromptTableData:
 
 # Partitioned Ray actor
 
-_num_groups: int = 5
+def _resolve_num_groups() -> int:
+    return get_hspec_num_shards()
+
+
+_num_groups: int = _resolve_num_groups()
 
 
 @ray.remote(num_cpus=1)
@@ -204,6 +220,7 @@ class HSpecTableGroup:
         similarity_threshold: float = 0.9,
         max_entries_per_prompt: int = 10_000,
         n_components: int = 64,
+        shard_id: int = 0,
     ):
         # Double-buffered tables
         #   _active  : read-only during decode (online query)
@@ -217,6 +234,22 @@ class HSpecTableGroup:
         self.max_entries = max_entries_per_prompt
         self.n_components = n_components
         self.port = port
+        self.shard_id = int(shard_id)
+        self.table_store_root = os.path.join(
+            get_hspec_table_store_root(),
+            f"shard_{self.shard_id:03d}",
+        )
+        os.makedirs(self.table_store_root, exist_ok=True)
+        self._build_queue_max_descs = max(
+            int(os.getenv("HSPEC_BUILD_QUEUE_MAX_DESCS", "0")),
+            0,
+        )
+        self._build_queue_max_bytes = max(
+            int(os.getenv("HSPEC_BUILD_QUEUE_MAX_BYTES", "0")),
+            0,
+        )
+        self._build_pending_descs = 0
+        self._build_pending_bytes = 0
 
         # Metrics (track queries on active tables)
         self._query_count = 0
@@ -248,6 +281,78 @@ class HSpecTableGroup:
 
         # ZMQ state
         self.running = False
+
+    def _can_accept_descriptor_batch(self, descs: List[HSpecTrajectoryDesc]) -> bool:
+        pending_descs = self._build_pending_descs + len(descs)
+        pending_bytes = self._build_pending_bytes + sum(estimate_hspec_trajectory_bytes(desc) for desc in descs)
+        if self._build_queue_max_descs > 0 and pending_descs > self._build_queue_max_descs:
+            return False
+        if self._build_queue_max_bytes > 0 and pending_bytes > self._build_queue_max_bytes:
+            return False
+        return True
+
+    def _mark_descriptor_batch_pending(self, descs: List[HSpecTrajectoryDesc]) -> None:
+        self._build_pending_descs += len(descs)
+        self._build_pending_bytes += sum(estimate_hspec_trajectory_bytes(desc) for desc in descs)
+
+    def _mark_descriptor_batch_finished(self, descs: List[HSpecTrajectoryDesc]) -> None:
+        self._build_pending_descs = max(self._build_pending_descs - len(descs), 0)
+        self._build_pending_bytes = max(
+            self._build_pending_bytes - sum(estimate_hspec_trajectory_bytes(desc) for desc in descs),
+            0,
+        )
+
+    def _load_prompt_build_inputs_from_descs(
+        self,
+        prompt_id: str,
+        descs: List[HSpecTrajectoryDesc],
+    ) -> tuple[List[np.ndarray], List[np.ndarray], List[float]]:
+        hidden_states_list: List[np.ndarray] = []
+        token_seq_list: List[np.ndarray] = []
+        rewards: List[float] = []
+
+        for desc in descs:
+            if desc is None:
+                self._discard_count += 1
+                continue
+            if int(desc.shard_id) != self.shard_id:
+                logger.warning(
+                    "HSpec descriptor shard mismatch: prompt_id=%s desc.shard_id=%s actor.shard_id=%s",
+                    prompt_id,
+                    desc.shard_id,
+                    self.shard_id,
+                )
+                self._discard_count += 1
+                continue
+            try:
+                hs, tokens = load_hspec_trajectory(desc)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load HSpec trajectory for prompt_id=%s request_id=%s: %s",
+                    prompt_id,
+                    desc.request_id,
+                    exc,
+                )
+                self._discard_count += 1
+                continue
+            if hs is None or tokens is None:
+                self._discard_count += 1
+                continue
+            hidden_states_list.append(np.asarray(hs, dtype=np.float32))
+            token_seq_list.append(np.asarray(tokens, dtype=np.int32))
+            rewards.append(float(desc.reward or 0.0))
+
+        return hidden_states_list, token_seq_list, rewards
+
+    def _cleanup_trajectory_descs(self, descs: List[HSpecTrajectoryDesc]) -> None:
+        cleanup = os.getenv("HSPEC_DELETE_TRAJECTORY_AFTER_BUILD", "1") != "0"
+        if not cleanup:
+            return
+        for desc in descs:
+            try:
+                delete_hspec_trajectory(desc)
+            except Exception:
+                logger.debug("Failed to clean HSpec trajectory %s", desc, exc_info=True)
 
     # Build
 
@@ -330,13 +435,45 @@ class HSpecTableGroup:
                 'rewards':       List[float],
             }}``
         """
-        for prompt_id, data in prompt_data_dict.items():
-            self.build_prompt_table(
-                prompt_id,
-                data["hidden_states"],
-                data["tokens"],
-                data["rewards"],
-            )
+        blas_threads = max(int(os.getenv("HSPEC_BUILD_BLAS_THREADS", "1")), 1)
+        with threadpool_limits(limits=blas_threads):
+            for prompt_id, data in prompt_data_dict.items():
+                if isinstance(data, list):
+                    descs = [coerce_hspec_desc(item) for item in data if item is not None]
+                    if not descs:
+                        continue
+                    if not self._can_accept_descriptor_batch(descs):
+                        logger.warning(
+                            "HSpec build queue budget exceeded on shard=%s, dropping %s descriptors for prompt_id=%s",
+                            self.shard_id,
+                            len(descs),
+                            prompt_id,
+                        )
+                        self._discard_count += len(descs)
+                        continue
+                    self._mark_descriptor_batch_pending(descs)
+                    try:
+                        hidden_states_list, token_seq_list, rewards = self._load_prompt_build_inputs_from_descs(
+                            prompt_id,
+                            descs,
+                        )
+                        self.build_prompt_table(
+                            prompt_id,
+                            hidden_states_list,
+                            token_seq_list,
+                            rewards,
+                        )
+                    finally:
+                        self._cleanup_trajectory_descs(descs)
+                        self._mark_descriptor_batch_finished(descs)
+                    continue
+
+                self.build_prompt_table(
+                    prompt_id,
+                    data["hidden_states"],
+                    data["tokens"],
+                    data["rewards"],
+                )
 
     # Query
 
@@ -727,10 +864,11 @@ class GlobalHSpecTableGroup:
         self.similarity_threshold = similarity_threshold
         self.max_entries = max_entries_per_prompt
         self.n_components = n_components
+        self.num_groups = _resolve_num_groups()
 
         # Discover existing Ray actors
         self.groups: List[ray.actor.ActorHandle] = []
-        for i in range(_num_groups):
+        for i in range(self.num_groups):
             try:
                 self.groups.append(ray.get_actor(f"hspec_table_{i}"))
             except ValueError:
@@ -747,7 +885,7 @@ class GlobalHSpecTableGroup:
         return len(self.groups)
 
     def _get_partition_id(self, prompt_id: str) -> int:
-        return stable_partition_id(prompt_id, _num_groups)
+        return stable_partition_id(prompt_id, self.num_groups)
 
     def _get_partition(self, prompt_id: str) -> ray.actor.ActorHandle:
         return self.groups[self._get_partition_id(prompt_id)]
@@ -853,7 +991,7 @@ class GlobalHSpecTableGroup:
             the next rollout that will query the tables).
         """
         # Group by partition
-        partition_payloads: Dict[int, Dict[str, Dict]] = {i: {} for i in range(_num_groups)}
+        partition_payloads: Dict[int, Dict[str, Any]] = {i: {} for i in range(self.num_groups)}
         for prompt_id, data in prompt_data.items():
             pid = self._get_partition_id(prompt_id)
             partition_payloads[pid][prompt_id] = data
@@ -877,7 +1015,7 @@ class GlobalHSpecTableGroup:
         """Batch query via Ray actors (blocking – collects results)."""
         parts: Dict[int, Dict[str, list]] = {
             i: {"pids": [], "hss": [], "als": [], "pos": []}
-            for i in range(_num_groups)
+            for i in range(self.num_groups)
         }
         for idx, (pid, hs, al) in enumerate(zip(prompt_id_list, hidden_state_list, accept_length_list)):
             part = self._get_partition_id(pid)
@@ -915,7 +1053,7 @@ class GlobalHSpecTableGroup:
 
         parts: Dict[int, Dict[str, list]] = {
             i: {"pids": [], "hss": [], "als": [], "pos": []}
-            for i in range(_num_groups)
+            for i in range(self.num_groups)
         }
         for idx, (pid, hs, al) in enumerate(zip(prompt_id_list, hidden_state_list, accept_length_list)):
             part = self._get_partition_id(pid)
@@ -1126,6 +1264,11 @@ class GlobalHSpecTableGroup:
                 entry_accept_len_sum / entry_verify_count if entry_verify_count > 0 else 0.0),
         }
 
+        store_metrics = collect_hspec_store_metrics(reset=True)
+        result["hspec/raw_store_bytes"] = float(store_metrics.get("raw_store_bytes", 0))
+        result["hspec/desc_count"] = float(store_metrics.get("desc_count", 0))
+        result["hspec/collect_dropped"] = float(store_metrics.get("collect_dropped", 0))
+
         abs_deltas = set()
         for key in agg:
             if key.startswith("entry_abs_delta_verify_"):
@@ -1194,6 +1337,8 @@ def init_hspec_tables(
 ):
     """Create and register HSpec Ray actors.  Call once at training start."""
     global _hspec_table_handles
+    global _num_groups
+    _num_groups = _resolve_num_groups()
     _hspec_table_handles = []
 
     for i in range(_num_groups):
@@ -1202,6 +1347,7 @@ def init_hspec_tables(
             similarity_threshold=similarity_threshold,
             max_entries_per_prompt=max_entries_per_prompt,
             n_components=n_components,
+            shard_id=i,
         )
         _hspec_table_handles.append(handle)
 
@@ -1222,6 +1368,11 @@ def get_hspec_tables(
 
     If actors do not exist yet they are created automatically.
     """
+    global _num_groups
+    expected_groups = _resolve_num_groups()
+    if _num_groups != expected_groups:
+        _num_groups = expected_groups
+
     # Ensure actors exist
     needs_init = False
     for i in range(_num_groups):

@@ -22,11 +22,14 @@ fi
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 
-# HSpec system data-plane switches. 
+# HSpec system data-plane switches.
 export HSPEC_LEGACY_DATAPROTO_HS="${HSPEC_LEGACY_DATAPROTO_HS:-0}"
-export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-/tmp/hspec_store}"
-export HSPEC_NUM_SHARDS="${HSPEC_NUM_SHARDS:-5}"
-
+export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_store}"
+export HSPEC_TABLE_STORE_DIR="${HSPEC_TABLE_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_table_store}"
+export HSPEC_INFER_TP="${HSPEC_INFER_TP:-2}"
+export HSPEC_NUM_SHARDS="${HSPEC_NUM_SHARDS:-${HSPEC_INFER_TP}}"
+export NODE_RANK="${NODE_RANK:-0}"
+export HSPEC_TP_GROUP_ID="${HSPEC_TP_GROUP_ID:-}"
 
 # HSpec debug/tracing/profile switches.
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
@@ -35,7 +38,7 @@ export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export HSPEC_DEBUG="${HSPEC_DEBUG:-0}"
 export HSPEC_TRACE="${HSPEC_TRACE:-0}"
 export HSPEC_DUMP="${HSPEC_DUMP:-0}"
-export HSPEC_PROFILE="${HSPEC_PROFILE:-0}" 
+export HSPEC_PROFILE="${HSPEC_PROFILE:-0}"
 export HSPEC_DUMP_DIR="${HSPEC_DUMP_DIR:-/workspace/exp/hspec_dump-rollout_1024}"
 
 # Core HSpec knobs.
@@ -129,12 +132,16 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DEBUG_MAX_SAMPLES='"4"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DEBUG_MAX_VALUES='"8"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_LEVEL='"'"${VLLM_LOGGING_LEVEL}"'"' \
-    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LEGACY_DATAPROTO_HS='"'"${HSPEC_LEGACY_DATAPROTO_HS}"'"' \
-    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DIR='"'"${HSPEC_STORE_DIR}"'"' \
-    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUM_SHARDS='"'"$
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TRACE='"'"${HSPEC_TRACE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DUMP='"'"${HSPEC_DUMP}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DUMP_DIR='"'"${HSPEC_DUMP_DIR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LEGACY_DATAPROTO_HS='"'"${HSPEC_LEGACY_DATAPROTO_HS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DIR='"'"${HSPEC_STORE_DIR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TABLE_STORE_DIR='"'"${HSPEC_TABLE_STORE_DIR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUM_SHARDS='"'"${HSPEC_NUM_SHARDS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_INFER_TP='"'"${HSPEC_INFER_TP}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.NODE_RANK='"'"${NODE_RANK}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TP_GROUP_ID='"'"${HSPEC_TP_GROUP_ID}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN='"'"${HSPEC_GEN}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_REQ_IDX='"'"${HSPEC_GEN_REQ_IDX}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_MAX_CALLS='"'"${HSPEC_GEN_MAX_CALLS}"'"' \
