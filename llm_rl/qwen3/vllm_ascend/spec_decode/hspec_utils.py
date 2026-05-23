@@ -895,6 +895,7 @@ class _HSpecAsyncCopyTask:
         "cpu_tensor",
         "event",
         "device_tensor_ref",
+        "pool_handle",
     )
 
     def __init__(
@@ -903,12 +904,14 @@ class _HSpecAsyncCopyTask:
         cpu_tensor: torch.Tensor,
         event: Any,
         device_tensor_ref: Optional[torch.Tensor],
+        pool_handle: Any = None,
     ) -> None:
         self.req_slices = req_slices
         self.cpu_tensor = cpu_tensor
         self.event = event
         # Keep the source device tensor alive until the async copy completes.
         self.device_tensor_ref = device_tensor_ref
+        self.pool_handle = pool_handle
 
 
 class _HSpecAsyncAccumulateTask:
@@ -946,6 +949,102 @@ _hspec_accumulate_thread: Optional[_threading.Thread] = None
 _hspec_async_transfer_streams: Dict[str, Any] = {}
 _hspec_async_pending_total: int = 0
 _hspec_async_pending_by_req: Dict[str, int] = {}
+
+
+class _HSpecPinnedPool:
+    """Small fixed-size pinned host buffer pool for async D2H copies."""
+
+    def __init__(self) -> None:
+        self._lock = _threading.Lock()
+        self._free: Dict[Tuple[str, int, int], List[torch.Tensor]] = {}
+        self._reserved_bytes = 0
+        self._reserved_slots = 0
+        self._max_bytes = int(
+            os.getenv("HSPEC_PINNED_POOL_BYTES", str(512 * 1024 * 1024)))
+        self._max_slots = int(os.getenv("HSPEC_PINNED_POOL_MAX_SLOTS", "64"))
+        buckets = os.getenv("HSPEC_PINNED_POOL_BUCKET_ROWS", "64,128,256,512,1024")
+        parsed = []
+        for item in buckets.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                value = int(item)
+                if value > 0:
+                    parsed.append(value)
+            except ValueError:
+                logger.warning("Ignoring invalid HSPEC_PINNED_POOL_BUCKET_ROWS item: %s", item)
+        self._bucket_rows = sorted(set(parsed)) or [64, 128, 256, 512, 1024]
+
+    def _bucket_for_rows(self, rows: int) -> int:
+        for bucket in self._bucket_rows:
+            if rows <= bucket:
+                return bucket
+        # Keep large copies bounded to one exact-size allocation; they are not
+        # rounded to avoid reserving a huge rarely reusable slot.
+        return int(rows)
+
+    def checkout(
+        self,
+        shape: torch.Size | Tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[Tuple[str, int, int], torch.Tensor]]]:
+        rows = int(shape[0])
+        hidden_dim = int(shape[1]) if len(shape) > 1 else 1
+        bucket_rows = self._bucket_for_rows(rows)
+        key = (str(dtype), hidden_dim, bucket_rows)
+
+        with self._lock:
+            free_list = self._free.get(key)
+            if free_list:
+                base = free_list.pop()
+                return base[:rows, :hidden_dim], (key, base)
+
+            bytes_needed = bucket_rows * hidden_dim * torch.empty((), dtype=dtype).element_size()
+            can_reserve = (
+                self._reserved_bytes + bytes_needed <= self._max_bytes
+                and self._reserved_slots < self._max_slots
+            )
+            if can_reserve:
+                try:
+                    base = torch.empty(
+                        (bucket_rows, hidden_dim),
+                        dtype=dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    self._reserved_bytes += bytes_needed
+                    self._reserved_slots += 1
+                    return base[:rows, :hidden_dim], (key, base)
+                except Exception:
+                    logger.debug("HSpec pinned pool allocation failed; using pageable CPU buffer",
+                                 exc_info=True)
+
+        # Budget exhausted or pin allocation failed: do not block decode.
+        return torch.empty(tuple(shape), dtype=dtype, device="cpu"), None
+
+    def release(self, handle: Optional[Tuple[Tuple[str, int, int], torch.Tensor]]) -> None:
+        if handle is None:
+            return
+        key, base = handle
+        with self._lock:
+            self._free.setdefault(key, []).append(base)
+
+
+_hspec_pinned_pool = _HSpecPinnedPool()
+
+
+def _hspec_checkout_cpu_buffer(
+    shape: torch.Size | Tuple[int, ...],
+    dtype: torch.dtype,
+    allow_pool: bool,
+) -> Tuple[torch.Tensor, Optional[Tuple[Tuple[str, int, int], torch.Tensor]]]:
+    if allow_pool:
+        return _hspec_pinned_pool.checkout(shape, dtype)
+    try:
+        return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True), None
+    except Exception:
+        return torch.empty(tuple(shape), dtype=dtype, device="cpu"), None
 
 
 def _hspec_use_legacy_async_accumulate() -> bool:
@@ -1094,15 +1193,30 @@ def _hspec_copy_worker() -> None:
             if task.event is not None:
                 task.event.synchronize()
 
-            with _hspec_store_cond:
+            from vllm_ascend.spec_decode.hspec_store import (
+                get_hspec_local_collector,
+                hspec_legacy_dataproto_hs_enabled,
+            )
+
+            legacy_dataproto_hs = hspec_legacy_dataproto_hs_enabled()
+            collector = get_hspec_local_collector()
+            if legacy_dataproto_hs:
+                with _hspec_store_cond:
+                    for req_id, start, end in task.req_slices:
+                        rows = task.cpu_tensor[start:end]
+                        if req_id not in _hspec_host_buffers:
+                            _hspec_host_buffers[req_id] = []
+                        _hspec_host_buffers[req_id].append(rows)
+            else:
                 for req_id, start, end in task.req_slices:
-                    if req_id not in _hspec_host_buffers:
-                        _hspec_host_buffers[req_id] = []
-                    _hspec_host_buffers[req_id].append(task.cpu_tensor[start:end])
+                    rows = task.cpu_tensor[start:end]
+                    collector.append_hidden_rows(req_id, rows)
             _hspec_finish_pending([req_id for req_id, _, _ in task.req_slices])
         except Exception:
             logger.exception("HSpec async copy worker failed")
             _hspec_finish_pending([req_id for req_id, _, _ in task.req_slices])
+        finally:
+            _hspec_pinned_pool.release(task.pool_handle)
 
 
 def _hspec_accumulate_worker() -> None:
@@ -1126,17 +1240,20 @@ def _hspec_accumulate_worker() -> None:
                 _hspec_finish_pending(list(task.req_ids))
                 continue
 
+            from vllm_ascend.spec_decode.hspec_store import hspec_legacy_dataproto_hs_enabled
+
+            allow_pool = not hspec_legacy_dataproto_hs_enabled()
             device = task.sample_hidden_states.device
             gather_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
             transfer_stream = _hspec_get_transfer_stream(device)
+            pool_handle = None
             with torch.npu.stream(transfer_stream) if device.type == "npu" else nullcontext():
                 selected_rows = task.sample_hidden_states.index_select(0, gather_indices).detach()
                 if device.type == "npu":
-                    cpu_tensor = torch.empty(
+                    cpu_tensor, pool_handle = _hspec_checkout_cpu_buffer(
                         selected_rows.shape,
                         dtype=selected_rows.dtype,
-                        device="cpu",
-                        pin_memory=True,
+                        allow_pool=allow_pool,
                     )
                     cpu_tensor.copy_(selected_rows, non_blocking=True)
                     import torch_npu  # type: ignore
@@ -1152,6 +1269,7 @@ def _hspec_accumulate_worker() -> None:
                     cpu_tensor=cpu_tensor,
                     event=copy_event,
                     device_tensor_ref=selected_rows if copy_event is not None else None,
+                    pool_handle=pool_handle,
                 )
             )
         except Exception:
@@ -1255,10 +1373,19 @@ def hspec_append_step_hs(req_id: str, hidden_state: torch.Tensor):
     if not _hspec_collection_enabled:
         return
     req_id = str(req_id)
-    with _hspec_store_lock:
-        if req_id not in _hspec_host_buffers:
-            _hspec_host_buffers[req_id] = []
-        _hspec_host_buffers[req_id].append(hidden_state.unsqueeze(0).cpu())
+    from vllm_ascend.spec_decode.hspec_store import (
+        get_hspec_local_collector,
+        hspec_legacy_dataproto_hs_enabled,
+    )
+
+    rows = hidden_state.unsqueeze(0).cpu()
+    if hspec_legacy_dataproto_hs_enabled():
+        with _hspec_store_lock:
+            if req_id not in _hspec_host_buffers:
+                _hspec_host_buffers[req_id] = []
+            _hspec_host_buffers[req_id].append(rows)
+    else:
+        get_hspec_local_collector().append_hidden_rows(req_id, rows)
 
 
 def hspec_submit_accumulate_task(
@@ -1313,6 +1440,9 @@ def hspec_submit_accumulate_task(
     device = sample_hidden_states.device
     if not legacy_async:
         try:
+            from vllm_ascend.spec_decode.hspec_store import hspec_legacy_dataproto_hs_enabled
+
+            allow_pool = not hspec_legacy_dataproto_hs_enabled()
             contiguous_slice = _hspec_contiguous_index_slice(flat_indices)
             if contiguous_slice is not None:
                 start, length = contiguous_slice
@@ -1329,12 +1459,12 @@ def hspec_submit_accumulate_task(
                     copy_stream.wait_stream(current_stream)
                 else:
                     copy_stream = current_stream
+                pool_handle = None
                 with torch.npu.stream(copy_stream):
-                    cpu_tensor = torch.empty(
+                    cpu_tensor, pool_handle = _hspec_checkout_cpu_buffer(
                         selected_rows.shape,
                         dtype=selected_rows.dtype,
-                        device="cpu",
-                        pin_memory=True,
+                        allow_pool=allow_pool,
                     )
                     cpu_tensor.copy_(selected_rows, non_blocking=True)
                     copy_event = torch_npu.npu.Event()
@@ -1342,6 +1472,7 @@ def hspec_submit_accumulate_task(
             else:
                 cpu_tensor = selected_rows.cpu()
                 copy_event = None
+                pool_handle = None
 
             _hspec_copy_queue.put(
                 _HSpecAsyncCopyTask(
@@ -1349,6 +1480,7 @@ def hspec_submit_accumulate_task(
                     cpu_tensor=cpu_tensor,
                     event=copy_event,
                     device_tensor_ref=selected_rows if copy_event is not None else None,
+                    pool_handle=pool_handle,
                 )
             )
         except Exception:
@@ -1387,10 +1519,34 @@ def hspec_extend_step_tokens(req_id: str, token_ids: List[int]) -> None:
     if not token_ids:
         return
     req_id = str(req_id)
-    with _hspec_store_lock:
-        if req_id not in _hspec_token_buffers:
-            _hspec_token_buffers[req_id] = []
-        _hspec_token_buffers[req_id].extend(int(t) for t in token_ids)
+    from vllm_ascend.spec_decode.hspec_store import (
+        get_hspec_local_collector,
+        hspec_legacy_dataproto_hs_enabled,
+    )
+
+    if hspec_legacy_dataproto_hs_enabled():
+        with _hspec_store_lock:
+            if req_id not in _hspec_token_buffers:
+                _hspec_token_buffers[req_id] = []
+            _hspec_token_buffers[req_id].extend(int(t) for t in token_ids)
+    else:
+        get_hspec_local_collector().extend_tokens(req_id, token_ids)
+
+
+def hspec_flush_and_get_descriptors(
+    request_id_to_prompt_id: Optional[Dict[str, str]] = None,
+    epoch: int = -1,
+    global_step: int = -1,
+) -> Dict[str, Any]:
+    """Flush in-flight copies and return small trajectory descriptors only."""
+    _hspec_wait_pending_all()
+    from vllm_ascend.spec_decode.hspec_store import get_hspec_local_collector
+
+    return get_hspec_local_collector().flush_descriptors(
+        request_id_to_prompt_id=request_id_to_prompt_id,
+        epoch=epoch,
+        global_step=global_step,
+    )
 
 
 def hspec_flush_and_get_all() -> Dict[str, Dict[str, Any]]:
@@ -1464,6 +1620,12 @@ def hspec_clear_store():
             tensors.clear()
         _hspec_host_buffers.clear()
         _hspec_token_buffers.clear()
+    try:
+        from vllm_ascend.spec_decode.hspec_store import get_hspec_local_collector
+
+        get_hspec_local_collector().clear_batch()
+    except Exception:
+        logger.debug("HSpec descriptor collector clear failed", exc_info=True)
 
 
 class HSpecConfig:

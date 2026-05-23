@@ -1265,6 +1265,7 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                gen_batch.meta_info["hspec_epoch"] = epoch
 
                 data_rebalance = self.config.actor_rollout_ref.rollout.data_rebalance if hasattr(
                     self.config.actor_rollout_ref.rollout, 'data_rebalance') else True
@@ -1431,16 +1432,31 @@ class RayPPOTrainer:
                             self._poll_hspec_builds_nonblocking(metrics)
                             if not self._hspec_pending_build_refs:
                                 metrics.update(self.hspec_tables.compute_metrics())
-                            from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
-
-                            prompt_build_data: dict = defaultdict(
-                                lambda: {
-                                    "hidden_states": [],
-                                    "tokens": [],
-                                    "rewards": [],
-                                    "prompt_token_ids": None,
-                                }
+                            from vllm_ascend.spec_decode.hspec_store import (
+                                coerce_hspec_desc,
+                                hspec_legacy_dataproto_hs_enabled,
                             )
+                            from vllm_ascend.spec_decode.hspec_utils import (
+                                prompt_id_from_token_ids,
+                                stable_partition_id,
+                            )
+
+                            try:
+                                hspec_num_shards = max(int(os.getenv("HSPEC_NUM_SHARDS", "5")), 1)
+                            except ValueError:
+                                hspec_num_shards = 5
+                            legacy_hspec_dataproto_hs = hspec_legacy_dataproto_hs_enabled()
+                            if legacy_hspec_dataproto_hs:
+                                prompt_build_data: dict = defaultdict(
+                                    lambda: {
+                                        "hidden_states": [],
+                                        "tokens": [],
+                                        "rewards": [],
+                                        "prompt_token_ids": None,
+                                    }
+                                )
+                            else:
+                                prompt_build_data: dict = defaultdict(list)
                             _hspec_skip = 0
                             _hspec_none_count = 0
                             _hspec_empty_resp_count = 0
@@ -1453,41 +1469,77 @@ class RayPPOTrainer:
 
                             for i in range(len(batch)):
                                 batch_item = batch[i]
-                                hs = batch_item.non_tensor_batch.get("rollout_hidden_states")
-                                if hs is None:
-                                    _hspec_skip += 1
-                                    _hspec_none_count += 1
-                                    continue
+                                hs = None
+                                desc_obj = None
+                                desc_len = None
+                                hspec_desc = batch_item.non_tensor_batch.get("hspec_desc")
+                                if legacy_hspec_dataproto_hs:
+                                    hs = batch_item.non_tensor_batch.get("rollout_hidden_states")
+                                    if hs is None:
+                                        _hspec_skip += 1
+                                        _hspec_none_count += 1
+                                        continue
+                                else:
+                                    if hspec_desc is None:
+                                        _hspec_skip += 1
+                                        _hspec_none_count += 1
+                                        continue
+                                    try:
+                                        desc_obj = coerce_hspec_desc(hspec_desc)
+                                        desc_len = int(desc_obj.length)
+                                    except Exception:
+                                        _hspec_skip += 1
+                                        _hspec_align_fail_count += 1
+                                        _hspec_align_fail_unknown += 1
+                                        continue
 
-                                hspec_tokens = batch_item.non_tensor_batch.get("rollout_hspec_tokens")
-                                if hspec_tokens is not None:
-                                    response = [int(x) for x in list(hspec_tokens)]
+                                if not legacy_hspec_dataproto_hs:
+                                    # Descriptor/token file is the source of truth
+                                    # for table-building alignment. Do not infer
+                                    # length from padded responses because
+                                    # pad_token_id may equal eos_token_id.
+                                    response = [0] * desc_len
                                     response_before_trim = list(response)
                                 else:
-                                    response = batch_item.batch["responses"].cpu().numpy().tolist()
-                                    response_before_trim = list(response)
-                                    try:
-                                        pad_idx = response.index(self.tokenizer.pad_token_id)
-                                        response = response[:pad_idx]
-                                    except ValueError:
-                                        pass
+                                    hspec_tokens = batch_item.non_tensor_batch.get("rollout_hspec_tokens")
+                                    if hspec_tokens is not None:
+                                        response = [int(x) for x in list(hspec_tokens)]
+                                        response_before_trim = list(response)
+                                    else:
+                                        response = batch_item.batch["responses"].cpu().numpy().tolist()
+                                        response_before_trim = list(response)
+                                        try:
+                                            pad_idx = response.index(self.tokenizer.pad_token_id)
+                                            response = response[:pad_idx]
+                                        except ValueError:
+                                            pass
 
                                 if len(response) == 0:
                                     _hspec_skip += 1
                                     _hspec_empty_resp_count += 1
                                     continue
 
-                                if (
-                                    hasattr(hs, "shape")
-                                    and hs.ndim == 2
-                                    and hs.shape[0] != len(response)
-                                ):
+                                if legacy_hspec_dataproto_hs:
+                                    align_mismatch = (
+                                        hasattr(hs, "shape")
+                                        and hs.ndim == 2
+                                        and hs.shape[0] != len(response)
+                                    )
+                                else:
+                                    # Descriptor mode has already made
+                                    # response length equal to desc.length.
+                                    # The builder validates the mmap-backed
+                                    # hidden rows and token file again before
+                                    # admitting the trajectory.
+                                    align_mismatch = False
+                                if align_mismatch:
                                     _hspec_skip += 1
                                     _hspec_align_fail_count += 1
                                     debug_meta = batch_item.non_tensor_batch.get("hspec_rollout_debug")
                                     raw_response_len = None
                                     raw_first_pad_idx = None
                                     hs_len_debug = None
+                                    hspec_token_len_debug = None
                                     hs_source = None
                                     response_head = None
                                     response_tail = None
@@ -1499,8 +1551,6 @@ class RayPPOTrainer:
                                         hs_source = debug_meta.get("hs_source")
                                         response_head = debug_meta.get("response_head")
                                         response_tail = debug_meta.get("response_tail")
-                                    else:
-                                        hspec_token_len_debug = None
                                     trainer_len_mismatch = (
                                         raw_response_len is not None and int(raw_response_len) != len(response)
                                     )
@@ -1511,6 +1561,8 @@ class RayPPOTrainer:
                                         and int(hs_len_debug) >= 0
                                         and int(hs_len_debug) != int(hspec_token_len_debug)
                                     )
+                                    if not legacy_hspec_dataproto_hs and desc_len is not None:
+                                        upstream_hs_mismatch = int(desc_len) != len(response)
                                     if trainer_len_mismatch and upstream_hs_mismatch:
                                         _hspec_align_fail_both += 1
                                         align_reason = "both"
@@ -1540,7 +1592,7 @@ class RayPPOTrainer:
                                             f"reason={align_reason} prompt_id={prompt_id_dbg} "
                                             f"trainer_trimmed_len={len(response)} "
                                             f"padded_response_len={len(response_before_trim)} "
-                                            f"hs_len={int(hs.shape[0])} "
+                                            f"hs_len={int(hs.shape[0]) if hasattr(hs, 'shape') else desc_len} "
                                             f"raw_response_len={raw_response_len} "
                                             f"hspec_token_len={hspec_token_len_debug} "
                                             f"raw_first_pad_idx={raw_first_pad_idx} "
@@ -1554,11 +1606,22 @@ class RayPPOTrainer:
                                 prompt_id = prompt_id_from_token_ids(prompt_token_ids)
                                 reward = batch_item.batch["token_level_scores"].sum().item()
 
-                                prompt_build_data[prompt_id]["hidden_states"].append(hs)
-                                prompt_build_data[prompt_id]["tokens"].append(response)
-                                prompt_build_data[prompt_id]["rewards"].append(reward)
-                                if prompt_build_data[prompt_id]["prompt_token_ids"] is None:
-                                    prompt_build_data[prompt_id]["prompt_token_ids"] = list(prompt_token_ids)
+                                if legacy_hspec_dataproto_hs:
+                                    prompt_build_data[prompt_id]["hidden_states"].append(hs)
+                                    prompt_build_data[prompt_id]["tokens"].append(response)
+                                    prompt_build_data[prompt_id]["rewards"].append(reward)
+                                    if prompt_build_data[prompt_id]["prompt_token_ids"] is None:
+                                        prompt_build_data[prompt_id]["prompt_token_ids"] = list(prompt_token_ids)
+                                else:
+                                    desc_obj = desc_obj.with_updates(
+                                        prompt_id=prompt_id,
+                                        shard_id=stable_partition_id(
+                                            prompt_id,
+                                            hspec_num_shards,
+                                        ),
+                                        reward=float(reward),
+                                    )
+                                    prompt_build_data[prompt_id].append(desc_obj)
 
                             if _hspec_skip > 0:
                                 print(
@@ -1572,7 +1635,11 @@ class RayPPOTrainer:
                                     f"align_fail_unknown={_hspec_align_fail_unknown})"
                                 )
 
-                            if prompt_build_data and self._hspec_dump_enabled:
+                            if (
+                                prompt_build_data
+                                and self._hspec_dump_enabled
+                                and legacy_hspec_dataproto_hs
+                            ):
                                 with marked_timer("hspec_dump", timing_raw, color="teal"):
                                     self._dump_hspec_rollouts_and_tables(
                                         epoch,

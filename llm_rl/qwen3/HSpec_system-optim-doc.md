@@ -112,7 +112,7 @@ class HSpecTrajectoryDesc:
 - `reward` 在 rollout worker 阶段未知，trainer 计算 reward 后填入或附加到 build request。
 - descriptor 可以进入 `DataProto.non_tensor_batch`，因为它是小对象；hidden state 不可以进入。
 
-### 2.3 分布式部署与节点亲和（相对 tips 的必补澄清）
+### 2.3 分布式部署与节点亲和
 
 tips 要求「本机 mmap + 本机 build shard」，但当前框架存在三类进程，**若不做节点亲和，descriptor 中的绝对路径会失效**：
 
@@ -200,7 +200,7 @@ class HSpecTrajectoryDesc:
 
 **错误模式（必须禁止）**：延续现 `init_hspec_tables()` 在集群任意节点创建 5 个 `HSpecTableGroup`，并由 **driver** 把整包 `hidden_states_list` `remote()` 进去——这与 mmap 设计矛盾。
 
-#### 2.3.4 共享文件系统（可选）
+#### 2.3.4 共享文件系统（当前环境为单机+16卡，共享文件系统暂时不必要）
 
 若多机但共用 NFS/Lustre：
 
@@ -541,7 +541,7 @@ HSPEC_BUILD_MAX_PENDING_EPOCHS
 
 当前 `HSpecTableGroup` 同时承担构建、存储、query、metrics、ZMQ server。重构目标是拆为 **本机数据面组件 + 轻量 Coordinator**，而不是把「Ray actor」继续当作 HS/表的载体。
 
-### 6.0 职责拆分与现码映射（相对 tips 的核心澄清）
+### 6.0 职责拆分与现码映射
 
 | 组件 | 现码 | 重构后 | 禁止事项 |
 | --- | --- | --- | --- |
@@ -891,7 +891,7 @@ for key in ("hspec_desc", "rollout_hidden_states", "rollout_hspec_tokens", "hspe
 
 目标：不改变大架构，先减少训练 step 内阻塞和无效数据生命周期。
 
-改动：
+改动（主要对应前面§7.1, §7.4, §3.5。部分覆盖，依赖后续阶段彻底消除大对象）：
 
 - 删除或配置化 [ray.get(ray_hspec_tasks)](verl/trainer/ppo/ray_trainer.py:1544)，改成 epoch barrier。
 - 在 HSpec build 提交后从 `batch.non_tensor_batch` 删除 `rollout_hidden_states`。
@@ -906,7 +906,7 @@ for key in ("hspec_desc", "rollout_hidden_states", "rollout_hspec_tokens", "hspe
 
 目标：hidden states 不再进入 Ray object store。
 
-改动：
+改动（主要对应§2.2, §3.1-3.4, §6.1, §6.2, §7.2, §7.4）：
 
 - 新增 collector mmap writer 和 `hspec_flush_and_get_descriptors()`。
 - `vllm_rollout_spmd.py` 改为返回 `hspec_desc`（object ndarray of `HSpecTrajectoryDesc`）。
@@ -924,7 +924,7 @@ for key in ("hspec_desc", "rollout_hidden_states", "rollout_hspec_tokens", "hspe
 
 目标：消除 `np.concatenate + full SVD` 的内存峰值，table 不再常驻 Ray actor heap。
 
-改动：
+改动（主要对应§4.1-4.6, §6.3）：
 
 - 新增 `hspec_builder.py` 和 `hspec_table_store.py`。
 - `fit_pca_multi_sequence()` 保留为 debug reference，新建 tiled covariance/randomized PCA。
@@ -935,7 +935,7 @@ for key in ("hspec_desc", "rollout_hidden_states", "rollout_hspec_tokens", "hspe
 
 目标：在线 prefetch 不通过 Ray 传大 arrays。
 
-改动：
+改动（主要对应§6.4, §6.5）：
 
 - `HSpecProposer._poll_pending()` 消费 descriptor。
 - `_build_cached_table_from_descriptor()` mmap 读取 table，转为 worker-local CPU/NPU cache。
@@ -945,7 +945,7 @@ for key in ("hspec_desc", "rollout_hidden_states", "rollout_hspec_tokens", "hspe
 
 目标：让 HSpec 在长 rollout 和 30B/MoE 训练中可控。
 
-改动：
+改动（主要对应§5.3, §6.6）：
 
 - collector、build queue、table store 三类预算和 backpressure。
 - table prompt 级淘汰策略：LRU、entry count、reward、recent hit rate。
@@ -995,40 +995,3 @@ for key in ("hspec_desc", "rollout_hidden_states", "rollout_hspec_tokens", "hspe
 - active table 是 mmap store，swap 是元数据原子切换。
 - proposer 热路径仍保持当前优势：worker-local cache、NPU batch projection/match、一次 host sync、CPU O(1) draft slice。
 - 当 HSpec build 落后或资源不足时，系统降级为少量 prompt miss，而不是拖慢整步训练或压垮 Ray/CPU 内存。
-
-## 11. 方案完备性评估（相对高层次目标）
-
-高层次目标：**高性能、低耗时、低内存开销，在较低 CPU 占用、较少挤占 NPU 的前提下，尽可能提高训练速度与吞吐。**
-
-### 11.1 目标达成度矩阵
-
-| 维度 | 重构后预期 | 仍存在的风险 / 非“完美”点 | 缓解 |
-| --- | --- | --- | --- |
-| **训练 step 墙钟** | Phase 0 即可去掉 step 内 `hspec_build_wait`；Phase 1+ build 与 update/下一 gen 重叠 | epoch 末 barrier 仍可能等待最慢 prompt；长 rollout 尾部 straggler | `HSPEC_SWAP_PARTIAL_ON_TIMEOUT`、randomized PCA、按 prompt 超时丢弃 |
-| **Ray / 内存** | Object store HS 归零；driver RSS 与 step token 数解耦 | Phase 0 未做 descriptor 时仍可能 Plasma 压力 | 强制 Phase 0 pop + Phase 1 门禁 |
-| **CPU** | build 限线程 + shard 对齐 TP；采集无 per-step cat 大数组 | 多 shard 并发仍可能占满部分 core；与 ref/logprob 争用 | `HSPEC_BUILD_THREADS_PER_SHARD`、`HSPEC_BUILD_MAX_INFLIGHT` |
-| **NPU** | 热路径仅 proposer GEMM；build 默认 CPU | 误开 `HSPEC_BUILD_USE_NPU=1` 或与 decode 叠加大 GEMM | 默认关闭；scheduler 检查 engine 状态 |
-| **吞吐（tokens/s）** | 依赖 HSpec 命中率 × accept_length；系统层减少 stall | **算法层** PCA/randomized 近似可能略降 match rate | `HSPEC_PCA_METHOD=covariance` 对照；A/B match rate |
-| **多机** | 文档 §2.3 已定义 per-node 表 | **非共享盘时各节点表独立**，全局 prompt 命中语义变化 | 明确 `table_scope`；或 NFS 统一 table_store |
-| **工程复杂度** | 四层清晰 | 迁移 Phase 多、需维护 legacy 开关 | Phase 0→3 严格门禁与指标 |
-
-### 11.2 结论：是否“完美优秀”
-
-**结论：方案在系统架构层面优秀且与 tips 一致，但不宜称为“完美”；在按本文档 §2.3 / §6.0–6.6 落地前，仍存在可预见的缺口。**
-
-**优秀之处**：
-
-1. 正确识别并切断 **GB 级数据走 Ray/DataProto** 这一根本矛盾，与 VERL 现码 (`pickle` `DataProto`、`ray_trainer` 聚合) 精准对齐。
-2. **热路径 / 冷路径分离**明确：proposer NPU 稳态不变，mmap + 流式 PCA 只影响冷路径。
-3. 内存峰值从 **O(ND) 多副本** 变为 **可配置** `O(tile·D + D²)` 或 `O(D·r)`，适合 30B 长 response。
-4. Phase 0 可独立交付价值，降低迁移风险。
-
-**尚未覆盖或需实现时证明的缺口**：
-
-1. **多机全局表**：per-node table 与「全局 prompt 共享一张表」语义不等价；多机生产需共享存储或接受命中率折损。
-2. **Build 与 rollout 的精确同步**：worker 本地 queue 模式下，epoch barrier 如何等待 **所有节点** 的 shard（需 coordinator 跨节点 `build_done` 聚合）。
-3. **bf16 存盘与对齐**：NPU `sample_hidden_states` 常为 bf16，mmap 用 `uint16_raw` 时的数值与 PCA 稳定性需实验验证。
-4. **DataProto.repeat/union**：`hspec_desc` 在 `rollout.n>1` 时经 `batch.repeat(..., interleave=True)`（`ray_trainer.py`）后，需在 `protocol.py` 验证 object ndarray 按样本切片仍与每条轨迹一一对应，避免 descriptor 重复或丢失。
-5. **效果–性能联合最优**：randomized PCA 与 partial swap 是系统友好型近似，**不保证** RL 收敛指标最优；需 offline A/B。
-
-**总体评价**：满足「**高性能、低内存、少挤占 NPU、训练吞吐导向**」的 **必要条件**；达到「**完美**」还需：多机表语义决策、Phase 0–3 指标门禁达标、以及线上 match rate / step time 的联合验证。建议以 **Phase 0 + Phase 1（nnodes=1）** 为发布基线，再推进 mmap table 与 proposer descriptor prefetch。

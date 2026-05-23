@@ -22,6 +22,12 @@ fi
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 
+# HSpec system data-plane switches. Phase 1 defaults to descriptor transport;
+# set HSPEC_LEGACY_DATAPROTO_HS=1 only for A/B validation of the old path.
+export HSPEC_LEGACY_DATAPROTO_HS="${HSPEC_LEGACY_DATAPROTO_HS:-0}"
+export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-/tmp/hspec_store}"
+export HSPEC_NUM_SHARDS="${HSPEC_NUM_SHARDS:-5}"
+
 # capture graph
 # export VERL_VLLM_CUDAGRAPH_MODE="${VERL_VLLM_CUDAGRAPH_MODE:-FULL}"
 
@@ -32,7 +38,7 @@ export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export HSPEC_DEBUG="${HSPEC_DEBUG:-0}"
 export HSPEC_TRACE="${HSPEC_TRACE:-0}"
 export HSPEC_DUMP="${HSPEC_DUMP:-0}"
-export HSPEC_PROFILE="${HSPEC_PROFILE:-0}"
+export HSPEC_PROFILE="${HSPEC_PROFILE:-1}"
 export HSPEC_DUMP_DIR="${HSPEC_DUMP_DIR:-/workspace/exp/hspec_dump-rollout_1024}"
 
 # Core HSpec knobs.
@@ -229,6 +235,9 @@ env \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TRACE='"'"${HSPEC_TRACE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DUMP='"'"${HSPEC_DUMP}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DUMP_DIR='"'"${HSPEC_DUMP_DIR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LEGACY_DATAPROTO_HS='"'"${HSPEC_LEGACY_DATAPROTO_HS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DIR='"'"${HSPEC_STORE_DIR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUM_SHARDS='"'"${HSPEC_NUM_SHARDS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN='"'"${HSPEC_GEN}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_REQ_IDX='"'"${HSPEC_GEN_REQ_IDX}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_MAX_CALLS='"'"${HSPEC_GEN_MAX_CALLS}"'"' \
