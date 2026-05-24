@@ -205,9 +205,9 @@ def coerce_hspec_desc(obj: Any) -> HSpecTrajectoryDesc:
 class HSpecLocalCollector:
     """Process-local writer for HSpec rollout trajectories.
 
-    Hidden states are written as fp16 rows. Tokens are written as int32. Files
-    are per-request, which keeps each descriptor expressible as one contiguous
-    segment even when decode steps interleave requests.
+    Hidden states are written as fp16 rows. Tokens are written as int32.
+    Storage is per-worker append-only segment per batch, while each request
+    keeps a contiguous row/token slice via offsets in the descriptor.
     """
 
     def __init__(self) -> None:
@@ -227,11 +227,19 @@ class HSpecLocalCollector:
                 "Set HSPEC_STORE_DIR to a large local NVMe or controlled shared path.",
                 self.store_root,
             )
+        self._segment_dir = self._batch_dir()
+        self._segment_hs_path = str(self._segment_dir / "hs.fp16.bin")
+        self._segment_token_path = str(self._segment_dir / "tokens.i32.bin")
+        self._segment_hs_fh = None
+        self._segment_token_fh = None
+        self._segment_hs_rows = 0
+        self._segment_token_len = 0
 
     def _batch_dir(self) -> Path:
         path = (
             self.store_root
             / f"node_{self.node_id}"
+            / f"tp_{self.tp_group_id:03d}"
             / f"worker_{self.worker_rank:05d}"
             / f"pid_{os.getpid()}"
             / f"batch_{self._batch_counter:08d}"
@@ -321,33 +329,22 @@ class HSpecLocalCollector:
         if state is not None:
             return state
 
-        req_key = self._safe_request_key(req_id)
-        base = self._batch_dir() / req_key
         state = {
             "request_id": req_id,
-            "hs_path": str(base.with_suffix(".hs.fp16.bin")),
-            "token_path": str(base.with_suffix(".tokens.i32.bin")),
-            "hs_fh": None,
-            "token_fh": None,
+            "hs_path": self._segment_hs_path,
+            "token_path": self._segment_token_path,
             "hidden_dim": 0,
             "hs_rows": 0,
             "token_len": 0,
+            "hs_offset_rows": int(self._segment_hs_rows),
+            "token_offset": int(self._segment_token_len),
         }
         self._req_states[req_id] = state
         return state
 
     @staticmethod
     def _close_state_files(state: Dict[str, Any]) -> None:
-        for key in ("hs_fh", "token_fh"):
-            fh = state.get(key)
-            if fh is None:
-                continue
-            try:
-                fh.close()
-            except Exception:
-                logger.debug("Failed to close HSpec collector file handle", exc_info=True)
-            finally:
-                state[key] = None
+        return
 
     def clear_batch(self) -> None:
         """Forget in-flight request state without deleting flushed files."""
@@ -355,7 +352,24 @@ class HSpecLocalCollector:
             for state in self._req_states.values():
                 self._close_state_files(state)
             self._req_states.clear()
+            if self._segment_hs_fh is not None:
+                try:
+                    self._segment_hs_fh.close()
+                except Exception:
+                    logger.debug("Failed to close HSpec hidden-state segment file", exc_info=True)
+            if self._segment_token_fh is not None:
+                try:
+                    self._segment_token_fh.close()
+                except Exception:
+                    logger.debug("Failed to close HSpec token segment file", exc_info=True)
+            self._segment_hs_fh = None
+            self._segment_token_fh = None
             self._batch_counter += 1
+            self._segment_dir = self._batch_dir()
+            self._segment_hs_path = str(self._segment_dir / "hs.fp16.bin")
+            self._segment_token_path = str(self._segment_dir / "tokens.i32.bin")
+            self._segment_hs_rows = 0
+            self._segment_token_len = 0
 
     def append_hidden_rows(self, req_id: str, rows: torch.Tensor) -> None:
         if rows is None or rows.numel() == 0:
@@ -376,10 +390,11 @@ class HSpecLocalCollector:
                     f"HSpec hidden dim mismatch for {req_id}: "
                     f"{state['hidden_dim']} vs {hidden_dim}"
                 )
-            if state.get("hs_fh") is None:
-                state["hs_fh"] = open(state["hs_path"], "ab")
-            state["hs_fh"].write(rows_np.tobytes(order="C"))
+            if self._segment_hs_fh is None:
+                self._segment_hs_fh = open(self._segment_hs_path, "ab")
+            self._segment_hs_fh.write(rows_np.tobytes(order="C"))
             state["hs_rows"] += int(rows_np.shape[0])
+            self._segment_hs_rows += int(rows_np.shape[0])
             _metric_add("raw_store_bytes", int(rows_np.nbytes))
 
     def extend_tokens(self, req_id: str, token_ids: Iterable[int]) -> None:
@@ -390,10 +405,11 @@ class HSpecLocalCollector:
 
         with self._lock:
             state = self._state_for_req(str(req_id))
-            if state.get("token_fh") is None:
-                state["token_fh"] = open(state["token_path"], "ab")
-            state["token_fh"].write(token_np.tobytes(order="C"))
+            if self._segment_token_fh is None:
+                self._segment_token_fh = open(self._segment_token_path, "ab")
+            self._segment_token_fh.write(token_np.tobytes(order="C"))
             state["token_len"] += int(token_np.shape[0])
+            self._segment_token_len += int(token_np.shape[0])
             _metric_add("raw_store_bytes", int(token_np.nbytes))
 
     def flush_descriptors(
@@ -440,9 +456,9 @@ class HSpecLocalCollector:
                 request_id=str(req_id),
                 prompt_id=prompt_id,
                 hs_path=str(state["hs_path"]),
-                hs_offset_rows=0,
+                hs_offset_rows=int(state["hs_offset_rows"]),
                 token_path=str(state["token_path"]),
-                token_offset=0,
+                token_offset=int(state["token_offset"]),
                 length=hs_rows,
                 hidden_dim=hidden_dim,
                 hs_dtype="float16",

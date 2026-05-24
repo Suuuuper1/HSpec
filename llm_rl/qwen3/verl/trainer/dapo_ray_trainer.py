@@ -151,6 +151,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                             gen_batch_output.reorder(interleave_indices)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        from verl.trainer.ppo.ray_trainer import _extract_and_sum_hspec_rollout_metrics
+                        metrics.update(_extract_and_sum_hspec_rollout_metrics(gen_batch_output.meta_info))
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, "red"):
@@ -159,6 +161,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             if data_rebalance:
                                 gen_baseline_output.reorder(interleave_indices)
+                            metrics.update(_extract_and_sum_hspec_rollout_metrics(gen_baseline_output.meta_info))
                             new_batch = new_batch.union(gen_baseline_output)
                             reward_baseline_tensor = self.reward_fn(new_batch)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)

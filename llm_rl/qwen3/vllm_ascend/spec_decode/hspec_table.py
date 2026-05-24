@@ -15,6 +15,7 @@
 HSpec: Hidden State based Speculative Decoding query table.
 """
 
+import json
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,6 +44,10 @@ from vllm_ascend.spec_decode.hspec_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_actor_name(shard_id: int) -> str:
+    return f"hspec_build_shard_{int(shard_id)}"
 
 
 # Per-prompt table data  (continuous-array, reference-value storage)
@@ -212,7 +217,7 @@ _num_groups: int = _resolve_num_groups()
 
 @ray.remote(num_cpus=1)
 class HSpecTableGroup:
-    """Ray actor managing HSpec tables for one partition of prompts."""
+    """Ray actor managing HSpec build/query state for one shard."""
 
     def __init__(
         self,
@@ -240,6 +245,7 @@ class HSpecTableGroup:
             f"shard_{self.shard_id:03d}",
         )
         os.makedirs(self.table_store_root, exist_ok=True)
+        self._active_version_path = os.path.join(self.table_store_root, "active_version.json")
         self._build_queue_max_descs = max(
             int(os.getenv("HSPEC_BUILD_QUEUE_MAX_DESCS", "0")),
             0,
@@ -315,13 +321,7 @@ class HSpecTableGroup:
             if desc is None:
                 self._discard_count += 1
                 continue
-            if int(desc.shard_id) != self.shard_id:
-                logger.warning(
-                    "HSpec descriptor shard mismatch: prompt_id=%s desc.shard_id=%s actor.shard_id=%s",
-                    prompt_id,
-                    desc.shard_id,
-                    self.shard_id,
-                )
+            if not self._validate_descriptor_topology(prompt_id, desc):
                 self._discard_count += 1
                 continue
             try:
@@ -353,6 +353,53 @@ class HSpecTableGroup:
                 delete_hspec_trajectory(desc)
             except Exception:
                 logger.debug("Failed to clean HSpec trajectory %s", desc, exc_info=True)
+
+    def _validate_descriptor_topology(
+        self,
+        prompt_id: str,
+        desc: HSpecTrajectoryDesc,
+    ) -> bool:
+        if os.getenv("HSPEC_ALLOW_MULTI_NODE", "0") == "0":
+            actor_node = os.getenv("NODE_RANK", "")
+            if actor_node and str(desc.node_id) != str(actor_node):
+                logger.warning(
+                    "HSpec descriptor node mismatch in single-node mode: prompt_id=%s desc.node_id=%s actor.node_id=%s",
+                    prompt_id,
+                    desc.node_id,
+                    actor_node,
+                )
+                return False
+        if int(desc.shard_id) != self.shard_id:
+            logger.warning(
+                "HSpec descriptor shard mismatch: prompt_id=%s desc.shard_id=%s actor.shard_id=%s",
+                prompt_id,
+                desc.shard_id,
+                self.shard_id,
+            )
+            return False
+        expected_shard = stable_partition_id(prompt_id, _resolve_num_groups())
+        if int(desc.shard_id) != int(expected_shard):
+            logger.warning(
+                "HSpec descriptor stable shard mismatch: prompt_id=%s desc.shard_id=%s expected=%s",
+                prompt_id,
+                desc.shard_id,
+                expected_shard,
+            )
+            return False
+        return True
+
+    def _write_active_version_manifest(self) -> None:
+        payload = {
+            "active_version": int(self._active_version),
+            "shard_id": int(self.shard_id),
+            "num_prompts": int(len(self._active)),
+            "total_entries": int(self.total_entries()),
+        }
+        try:
+            with open(self._active_version_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.debug("Failed to write HSpec active version manifest", exc_info=True)
 
     # Build
 
@@ -556,6 +603,7 @@ class HSpecTableGroup:
         self._active.clear()
         self._building.clear()
         self._reset_metrics()
+        self._write_active_version_manifest()
 
     def exist(self, prompt_id: str) -> bool:
         return prompt_id in self._active
@@ -870,9 +918,12 @@ class GlobalHSpecTableGroup:
         self.groups: List[ray.actor.ActorHandle] = []
         for i in range(self.num_groups):
             try:
-                self.groups.append(ray.get_actor(f"hspec_table_{i}"))
+                self.groups.append(ray.get_actor(_build_actor_name(i)))
             except ValueError:
-                logger.warning("HSpec actor hspec_table_%d not found", i)
+                try:
+                    self.groups.append(ray.get_actor(f"hspec_table_{i}"))
+                except ValueError:
+                    logger.warning("HSpec build shard actor %s not found", _build_actor_name(i))
 
         # ZMQ connections (lazy-initialised on first query)
         self._zmq_ctx: Optional[zmq.Context] = None
@@ -1342,7 +1393,7 @@ def init_hspec_tables(
     _hspec_table_handles = []
 
     for i in range(_num_groups):
-        handle = HSpecTableGroup.options(name=f"hspec_table_{i}").remote(
+        handle = HSpecTableGroup.options(name=_build_actor_name(i)).remote(
             port=6555 + i,
             similarity_threshold=similarity_threshold,
             max_entries_per_prompt=max_entries_per_prompt,
@@ -1353,10 +1404,10 @@ def init_hspec_tables(
 
     for i in range(_num_groups):
         try:
-            ray.get_actor(f"hspec_table_{i}")
-            logger.info("HSpec Actor %d registered successfully.", i)
+            ray.get_actor(_build_actor_name(i))
+            logger.info("HSpec build shard actor %d registered successfully.", i)
         except ValueError:
-            logger.error("HSpec Actor %d failed to register!", i)
+            logger.error("HSpec build shard actor %d failed to register!", i)
 
 
 def get_hspec_tables(
@@ -1377,10 +1428,13 @@ def get_hspec_tables(
     needs_init = False
     for i in range(_num_groups):
         try:
-            ray.get_actor(f"hspec_table_{i}")
+            ray.get_actor(_build_actor_name(i))
         except ValueError:
-            needs_init = True
-            break
+            try:
+                ray.get_actor(f"hspec_table_{i}")
+            except ValueError:
+                needs_init = True
+                break
 
     if needs_init:
         init_hspec_tables(similarity_threshold, max_entries_per_prompt, n_components)

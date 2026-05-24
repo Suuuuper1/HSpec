@@ -63,6 +63,49 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
+def _maybe_get_ray_object_store_used_mb() -> float:
+    try:
+        import ray._private.internal_api as internal_api
+
+        summary = internal_api.memory_summary(stats_only=True)
+        for line in str(summary).splitlines():
+            if "Plasma memory usage" in line or "Object Store memory usage" in line:
+                numbers = [token for token in line.replace(",", " ").split() if token.replace(".", "", 1).isdigit()]
+                if numbers:
+                    return float(numbers[0])
+    except Exception:
+        pass
+    return -1.0
+
+
+def _extract_and_sum_hspec_rollout_metrics(meta_info: dict | None) -> dict[str, float]:
+    if not isinstance(meta_info, dict):
+        return {}
+    metrics_obj = meta_info.get("metrics")
+    if not isinstance(metrics_obj, dict):
+        return {}
+
+    hspec_keys = (
+        "hspec/raw_store_bytes",
+        "hspec/desc_count",
+        "hspec/collect_dropped",
+        "hspec/pinned_pool_miss",
+        "hspec/pinned_pageable_fallback",
+    )
+    result: dict[str, float] = {}
+    for key in hspec_keys:
+        value = metrics_obj.pop(key, None)
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            result[key] = float(sum(value))
+        else:
+            result[key] = float(value)
+    if not metrics_obj:
+        meta_info.pop("metrics", None)
+    return result
+
+
 @dataclass
 class ResourcePoolManager:
     """
@@ -785,6 +828,7 @@ class RayPPOTrainer:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            _extract_and_sum_hspec_rollout_metrics(test_output_gen_batch_padded.meta_info)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -1290,9 +1334,7 @@ class RayPPOTrainer:
                         
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-                        hspec_rollout_metrics = gen_batch_output.meta_info.pop("hspec_metrics", None)
-                        if isinstance(hspec_rollout_metrics, dict):
-                            metrics.update(hspec_rollout_metrics)
+                        metrics.update(_extract_and_sum_hspec_rollout_metrics(gen_batch_output.meta_info))
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1308,6 +1350,7 @@ class RayPPOTrainer:
                             
                             if data_rebalance:
                                 gen_baseline_output.reorder(interleave_indices)
+                            metrics.update(_extract_and_sum_hspec_rollout_metrics(gen_baseline_output.meta_info))
 
                             batch = batch.union(gen_baseline_output)
                             reward_baseline_tensor = self.reward_fn(batch)
@@ -1733,6 +1776,7 @@ class RayPPOTrainer:
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 metrics["hspec/driver_rss_gb"] = psutil.Process().memory_info().rss / (1024**3)
+                metrics["hspec/ray_object_store_used_mb"] = _maybe_get_ray_object_store_used_mb()
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one

@@ -866,7 +866,7 @@ class vLLMRollout(BaseRollout):
 
                 store_metrics = collect_hspec_store_metrics(reset=True)
                 runtime_metrics = hspec_collect_runtime_metrics(reset=True)
-                meta_info["hspec_metrics"] = {
+                meta_info["metrics"] = {
                     "hspec/raw_store_bytes": float(store_metrics.get("raw_store_bytes", 0)),
                     "hspec/desc_count": float(store_metrics.get("desc_count", 0)),
                     "hspec/collect_dropped": float(store_metrics.get("collect_dropped", 0)),
