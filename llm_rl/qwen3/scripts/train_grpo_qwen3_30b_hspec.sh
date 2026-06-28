@@ -22,10 +22,15 @@ fi
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 
-# HSpec system data-plane switches. 
+# HSpec system data-plane switches.
 export HSPEC_LEGACY_DATAPROTO_HS="${HSPEC_LEGACY_DATAPROTO_HS:-0}"
+export HSPEC_STRICT_DESCRIPTOR_MODE="${HSPEC_STRICT_DESCRIPTOR_MODE:-1}"
+export HSPEC_STORE_DTYPE="${HSPEC_STORE_DTYPE:-float16}"
 export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_store}"
 export HSPEC_TABLE_STORE_DIR="${HSPEC_TABLE_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_table_store}"
+export HSPEC_SINGLE_NODE_ONLY="${HSPEC_SINGLE_NODE_ONLY:-1}"
+export HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS="${HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS:-1}"
+export HSPEC_STEP0_RUNTIME_ASSERTS="${HSPEC_STEP0_RUNTIME_ASSERTS:-0}"
 
 # capture graph
 # export VERL_VLLM_CUDAGRAPH_MODE="${VERL_VLLM_CUDAGRAPH_MODE:-FULL}"
@@ -133,6 +138,17 @@ mkdir -p "${LOG_DIR}" "${ROLL_LEN_ROOT}" "${TB_ROOT}" "${ROLLOUT_LENGTH_DIR}" "$
     echo "rollout_length_dir=${ROLLOUT_LENGTH_DIR}"
     echo "tensorboard_dir=${TENSORBOARD_DIR}"
     echo "use_hspec_decode=${USE_HSPEC_DECODE}"
+    echo "hspec_legacy_dataproto_hs=${HSPEC_LEGACY_DATAPROTO_HS}"
+    echo "hspec_strict_descriptor_mode=${HSPEC_STRICT_DESCRIPTOR_MODE}"
+    echo "hspec_store_dtype=${HSPEC_STORE_DTYPE}"
+    echo "hspec_store_dir=${HSPEC_STORE_DIR}"
+    echo "hspec_table_store_dir=${HSPEC_TABLE_STORE_DIR}"
+    echo "hspec_infer_tp=${HSPEC_INFER_TP}"
+    echo "hspec_num_shards=${HSPEC_NUM_SHARDS}"
+    echo "node_rank=${NODE_RANK}"
+    echo "hspec_single_node_only=${HSPEC_SINGLE_NODE_ONLY}"
+    echo "hspec_require_explicit_num_shards=${HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS}"
+    echo "hspec_step0_runtime_asserts=${HSPEC_STEP0_RUNTIME_ASSERTS}"
     echo "hspec_profile=${HSPEC_PROFILE}"
     echo "hspec_dump=${HSPEC_DUMP}"
     echo "pca_components=${PCA_COMPONENTS}"
@@ -239,11 +255,16 @@ env \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DUMP='"'"${HSPEC_DUMP}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DUMP_DIR='"'"${HSPEC_DUMP_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LEGACY_DATAPROTO_HS='"'"${HSPEC_LEGACY_DATAPROTO_HS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STRICT_DESCRIPTOR_MODE='"'"${HSPEC_STRICT_DESCRIPTOR_MODE}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DTYPE='"'"${HSPEC_STORE_DTYPE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DIR='"'"${HSPEC_STORE_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TABLE_STORE_DIR='"'"${HSPEC_TABLE_STORE_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUM_SHARDS='"'"${HSPEC_NUM_SHARDS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_INFER_TP='"'"${HSPEC_INFER_TP}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.NODE_RANK='"'"${NODE_RANK}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SINGLE_NODE_ONLY='"'"${HSPEC_SINGLE_NODE_ONLY}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS='"'"${HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STEP0_RUNTIME_ASSERTS='"'"${HSPEC_STEP0_RUNTIME_ASSERTS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TP_GROUP_ID='"'"${HSPEC_TP_GROUP_ID}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN='"'"${HSPEC_GEN}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_REQ_IDX='"'"${HSPEC_GEN_REQ_IDX}"'"' \

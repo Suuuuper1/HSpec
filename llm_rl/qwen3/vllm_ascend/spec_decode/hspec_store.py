@@ -41,6 +41,10 @@ _store_metrics: Dict[str, int] = {
     "raw_store_bytes": 0,
     "desc_count": 0,
     "collect_dropped": 0,
+    "strict_descriptor_violation": 0,
+    "legacy_payload_count": 0,
+    "descriptor_payload_count": 0,
+    "validation_collect_skip": 0,
 }
 
 
@@ -55,6 +59,25 @@ def _stable_partition_id(key: str, num_partitions: int) -> int:
 def hspec_legacy_dataproto_hs_enabled() -> bool:
     """Whether to keep the old DataProto ndarray transport path."""
     return os.getenv("HSPEC_LEGACY_DATAPROTO_HS", "0") != "0"
+
+
+def hspec_default_descriptor_mode_enabled() -> bool:
+    """Whether the default descriptor transport path is active."""
+    return not hspec_legacy_dataproto_hs_enabled()
+
+
+def hspec_step0_runtime_asserts_enabled() -> bool:
+    """Enable cheap Step-0 key-level invariants outside decode hot paths."""
+    return os.getenv("HSPEC_STEP0_RUNTIME_ASSERTS", "0") != "0"
+
+
+def hspec_record_store_metric(name: str, value: int = 1) -> None:
+    """Record a lightweight HSpec store/runtime metric.
+
+    Step 0 metrics are process-local counters only. They intentionally avoid
+    filesystem scans, object-store queries, or ndarray size traversal.
+    """
+    _metric_add(str(name), int(value))
 
 
 def get_hspec_node_id() -> str:

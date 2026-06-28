@@ -846,17 +846,67 @@ class vLLMRollout(BaseRollout):
                 _tok_arr = np.empty((len(_tok_list),), dtype=object)
                 _tok_arr[:] = _tok_list
                 non_tensor_batch["rollout_hspec_tokens"] = _tok_arr
+                try:
+                    from vllm_ascend.spec_decode.hspec_store import hspec_record_store_metric
+
+                    hspec_record_store_metric("legacy_payload_count", len(_hs_list))
+                except Exception:
+                    logger.debug("Failed to record HSpec legacy payload metric", exc_info=True)
 
             if collect_hspec and not legacy_hspec_dataproto_hs and rollout_hspec_desc_list:
                 _desc_list = list(rollout_hspec_desc_list)
                 _desc_arr = np.empty((len(_desc_list),), dtype=object)
                 _desc_arr[:] = _desc_list
                 non_tensor_batch["hspec_desc"] = _desc_arr
+                try:
+                    from vllm_ascend.spec_decode.hspec_store import hspec_record_store_metric
+
+                    hspec_record_store_metric("descriptor_payload_count", len(_desc_list))
+                except Exception:
+                    logger.debug("Failed to record HSpec descriptor payload metric", exc_info=True)
 
             if collect_hspec and self._hspec_align_debug and rollout_debug_list:
                 _dbg_arr = np.empty((len(rollout_debug_list),), dtype=object)
                 _dbg_arr[:] = rollout_debug_list
                 non_tensor_batch["hspec_rollout_debug"] = _dbg_arr
+
+            if use_hspec and not collect_hspec:
+                try:
+                    from vllm_ascend.spec_decode.hspec_store import hspec_record_store_metric
+
+                    hspec_record_store_metric("validation_collect_skip", batch_size)
+                except Exception:
+                    logger.debug("Failed to record HSpec collect-skip metric", exc_info=True)
+
+            try:
+                from vllm_ascend.spec_decode.hspec_store import (
+                    hspec_record_store_metric,
+                    hspec_step0_runtime_asserts_enabled,
+                )
+
+                if hspec_step0_runtime_asserts_enabled():
+                    if not legacy_hspec_dataproto_hs:
+                        forbidden = ("rollout_hidden_states", "rollout_hspec_tokens")
+                        present = [key for key in forbidden if key in non_tensor_batch]
+                        if present:
+                            hspec_record_store_metric("strict_descriptor_violation", len(present))
+                            raise RuntimeError(
+                                "HSpec Step0 invariant failed: default descriptor path "
+                                f"emitted legacy payload keys {present}"
+                            )
+                    if use_hspec and not collect_hspec:
+                        forbidden = ("hspec_desc", "rollout_hidden_states", "rollout_hspec_tokens")
+                        present = [key for key in forbidden if key in non_tensor_batch]
+                        if present:
+                            hspec_record_store_metric("strict_descriptor_violation", len(present))
+                            raise RuntimeError(
+                                "HSpec Step0 invariant failed: collection-disabled rollout "
+                                f"emitted HSpec payload keys {present}"
+                            )
+            except RuntimeError:
+                raise
+            except Exception:
+                logger.debug("Failed to run HSpec Step0 runtime assertions", exc_info=True)
 
         meta_info = {}
         if use_hspec:
@@ -870,6 +920,13 @@ class vLLMRollout(BaseRollout):
                     "hspec/raw_store_bytes": float(store_metrics.get("raw_store_bytes", 0)),
                     "hspec/desc_count": float(store_metrics.get("desc_count", 0)),
                     "hspec/collect_dropped": float(store_metrics.get("collect_dropped", 0)),
+                    "hspec/strict_descriptor_violation": float(
+                        store_metrics.get("strict_descriptor_violation", 0)),
+                    "hspec/legacy_payload_count": float(store_metrics.get("legacy_payload_count", 0)),
+                    "hspec/descriptor_payload_count": float(
+                        store_metrics.get("descriptor_payload_count", 0)),
+                    "hspec/validation_collect_skip": float(
+                        store_metrics.get("validation_collect_skip", 0)),
                     "hspec/pinned_pool_miss": float(runtime_metrics.get("pinned_pool_miss", 0)),
                     "hspec/pinned_pageable_fallback": float(runtime_metrics.get("pinned_pageable_fallback", 0)),
                 }

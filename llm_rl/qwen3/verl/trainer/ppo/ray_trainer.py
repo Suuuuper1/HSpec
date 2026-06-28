@@ -1481,7 +1481,9 @@ class RayPPOTrainer:
                                 metrics.update(self.hspec_tables.compute_metrics())
                             from vllm_ascend.spec_decode.hspec_store import (
                                 coerce_hspec_desc,
+                                hspec_record_store_metric,
                                 hspec_legacy_dataproto_hs_enabled,
+                                hspec_step0_runtime_asserts_enabled,
                             )
                             from vllm_ascend.spec_decode.hspec_utils import (
                                 prompt_id_from_token_ids,
@@ -1493,6 +1495,16 @@ class RayPPOTrainer:
                             except ValueError:
                                 hspec_num_shards = 5
                             legacy_hspec_dataproto_hs = hspec_legacy_dataproto_hs_enabled()
+                            step0_runtime_asserts = hspec_step0_runtime_asserts_enabled()
+                            if step0_runtime_asserts and not legacy_hspec_dataproto_hs:
+                                forbidden = ("rollout_hidden_states", "rollout_hspec_tokens")
+                                present = [key for key in forbidden if key in batch.non_tensor_batch]
+                                if present:
+                                    hspec_record_store_metric("strict_descriptor_violation", len(present))
+                                    raise RuntimeError(
+                                        "HSpec Step0 invariant failed: trainer received legacy "
+                                        f"payload keys in descriptor mode: {present}"
+                                    )
                             if legacy_hspec_dataproto_hs:
                                 prompt_build_data: dict = defaultdict(
                                     lambda: {
@@ -1698,6 +1710,26 @@ class RayPPOTrainer:
                                     (epoch, ref) for ref in ray_hspec_tasks
                                 )
                             self._drop_hspec_non_tensor_fields(batch)
+                            if step0_runtime_asserts:
+                                forbidden_after_drop = (
+                                    "hspec_desc",
+                                    "rollout_hidden_states",
+                                    "rollout_hspec_tokens",
+                                    "hspec_rollout_debug",
+                                )
+                                present = [
+                                    key for key in forbidden_after_drop
+                                    if key in batch.non_tensor_batch
+                                ]
+                                if present:
+                                    hspec_record_store_metric(
+                                        "strict_descriptor_violation",
+                                        len(present),
+                                    )
+                                    raise RuntimeError(
+                                        "HSpec Step0 invariant failed: HSpec non-tensor "
+                                        f"fields survived cleanup before actor update: {present}"
+                                    )
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
