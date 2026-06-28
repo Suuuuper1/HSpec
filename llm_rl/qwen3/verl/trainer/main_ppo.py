@@ -67,11 +67,45 @@ def run_ppo(config) -> None:
 
     if config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
         from vllm_ascend.spec_decode.hspec_table import init_hspec_tables
-        if int(config.trainer.nnodes) > 1 and os.getenv("HSPEC_ALLOW_MULTI_NODE", "0") == "0":
+        from vllm_ascend.spec_decode.hspec_store import (
+            assert_hspec_num_shards_configured_for_production,
+            get_hspec_build_actor_num_cpus,
+            get_hspec_num_shards,
+            get_hspec_node_id,
+            get_hspec_store_dtype,
+            hspec_legacy_dataproto_hs_enabled,
+            hspec_strict_descriptor_mode_enabled,
+        )
+
+        unsafe_multi_node = os.getenv("HSPEC_EXPERIMENTAL_ALLOW_MULTI_NODE_UNSAFE", "0") != "0"
+        if int(config.trainer.nnodes) != 1 and not unsafe_multi_node:
             raise RuntimeError(
-                "HSpec Phase 1 descriptor build is currently only supported in single-node mode "
-                "unless HSPEC_ALLOW_MULTI_NODE=1 and node-local build affinity is configured."
+                "HSpec Phase 1 descriptor path supports single-node only. "
+                "Descriptor raw-store paths are node-local; multi-node requires node-local "
+                "build affinity, which is not implemented in Phase 1. For experiments only, "
+                "set HSPEC_EXPERIMENTAL_ALLOW_MULTI_NODE_UNSAFE=1."
             )
+        if unsafe_multi_node:
+            print(
+                "WARNING: HSPEC_EXPERIMENTAL_ALLOW_MULTI_NODE_UNSAFE=1 is set. "
+                "HSpec Phase 1 descriptor build does not guarantee node-local raw-store access."
+            )
+
+        assert_hspec_num_shards_configured_for_production()
+        hspec_store_dtype = get_hspec_store_dtype()
+        hspec_num_shards = get_hspec_num_shards()
+        hspec_build_actor_cpus = get_hspec_build_actor_num_cpus()
+        print(
+            "HSpec Phase1 config: "
+            f"store_dtype={hspec_store_dtype}, "
+            f"strict_descriptor_mode={hspec_strict_descriptor_mode_enabled()}, "
+            f"single_node_only={os.getenv('HSPEC_SINGLE_NODE_ONLY', '1') != '0'}, "
+            f"nnodes={int(config.trainer.nnodes)}, "
+            f"num_shards={hspec_num_shards}, "
+            f"build_actor_num_cpus={hspec_build_actor_cpus}, "
+            f"node_rank={get_hspec_node_id()}, "
+            f"legacy_dataproto_hs={hspec_legacy_dataproto_hs_enabled()}"
+        )
 
         similarity_threshold = config.actor_rollout_ref.rollout.get(
             "hspec_similarity_threshold", 0.9

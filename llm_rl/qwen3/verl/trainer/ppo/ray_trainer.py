@@ -1481,6 +1481,7 @@ class RayPPOTrainer:
                                 metrics.update(self.hspec_tables.compute_metrics())
                             from vllm_ascend.spec_decode.hspec_store import (
                                 coerce_hspec_desc,
+                                get_hspec_num_shards,
                                 hspec_record_store_metric,
                                 hspec_legacy_dataproto_hs_enabled,
                                 hspec_step0_runtime_asserts_enabled,
@@ -1490,10 +1491,7 @@ class RayPPOTrainer:
                                 stable_partition_id,
                             )
 
-                            try:
-                                hspec_num_shards = max(int(os.getenv("HSPEC_NUM_SHARDS", "5")), 1)
-                            except ValueError:
-                                hspec_num_shards = 5
+                            hspec_num_shards = get_hspec_num_shards()
                             legacy_hspec_dataproto_hs = hspec_legacy_dataproto_hs_enabled()
                             step0_runtime_asserts = hspec_step0_runtime_asserts_enabled()
                             if step0_runtime_asserts and not legacy_hspec_dataproto_hs:

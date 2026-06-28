@@ -45,6 +45,10 @@ _store_metrics: Dict[str, int] = {
     "legacy_payload_count": 0,
     "descriptor_payload_count": 0,
     "validation_collect_skip": 0,
+    "store_fp16_rows": 0,
+    "source_dtype_fp16_rows": 0,
+    "source_dtype_bf16_rows": 0,
+    "source_dtype_other_rows": 0,
 }
 
 
@@ -66,6 +70,19 @@ def hspec_default_descriptor_mode_enabled() -> bool:
     return not hspec_legacy_dataproto_hs_enabled()
 
 
+def hspec_strict_descriptor_mode_enabled() -> bool:
+    """Whether descriptor mode should reject legacy payloads by default.
+
+    This is a configuration helper for Step 5's hard API boundary. Step 1 only
+    centralizes the policy so rollout/trainer/table code do not invent their
+    own interpretation of the env knobs.
+    """
+    return (
+        os.getenv("HSPEC_STRICT_DESCRIPTOR_MODE", "1") != "0"
+        and not hspec_legacy_dataproto_hs_enabled()
+    )
+
+
 def hspec_step0_runtime_asserts_enabled() -> bool:
     """Enable cheap Step-0 key-level invariants outside decode hot paths."""
     return os.getenv("HSPEC_STEP0_RUNTIME_ASSERTS", "0") != "0"
@@ -78,6 +95,53 @@ def hspec_record_store_metric(name: str, value: int = 1) -> None:
     filesystem scans, object-store queries, or ndarray size traversal.
     """
     _metric_add(str(name), int(value))
+
+
+def get_hspec_store_dtype() -> str:
+    """Return HSpec raw-store on-disk dtype.
+
+    Phase 1 stores hidden rows as float16 by default to minimize local IO and
+    page-cache pressure. This dtype describes bytes on disk, not the model's
+    original hidden-state dtype.
+    """
+    value = os.getenv("HSPEC_STORE_DTYPE", "float16").strip().lower()
+    aliases = {
+        "fp16": "float16",
+        "float16": "float16",
+    }
+    if value in aliases:
+        return aliases[value]
+    raise ValueError(
+        f"Unsupported HSPEC_STORE_DTYPE={value!r}. "
+        "HSpec Phase 1 currently supports only 'float16' on disk."
+    )
+
+
+def hspec_require_explicit_num_shards_enabled() -> bool:
+    return os.getenv("HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS", "1") != "0"
+
+
+def assert_hspec_num_shards_configured_for_production() -> None:
+    """Require explicit shard count only on the HSpec production init path."""
+    if hspec_require_explicit_num_shards_enabled() and not os.getenv("HSPEC_NUM_SHARDS"):
+        raise RuntimeError(
+            "HSPEC_NUM_SHARDS must be set when HSpec decode is enabled. "
+            "Set HSPEC_NUM_SHARDS to match rollout TP/build shard policy, "
+            "for example HSPEC_NUM_SHARDS=${HSPEC_INFER_TP}."
+        )
+
+
+def get_hspec_build_actor_num_cpus() -> float:
+    value = os.getenv("HSPEC_BUILD_ACTOR_NUM_CPUS", "1")
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning("Ignoring invalid HSPEC_BUILD_ACTOR_NUM_CPUS=%s; using 1", value)
+        return 1.0
+    if parsed <= 0:
+        logger.warning("HSPEC_BUILD_ACTOR_NUM_CPUS=%s must be > 0; using 1", value)
+        return 1.0
+    return parsed
 
 
 def get_hspec_node_id() -> str:
@@ -113,6 +177,9 @@ def get_hspec_num_shards() -> int:
             return max(int(infer_tp), 1)
         except ValueError:
             logger.warning("Ignoring invalid HSPEC_INFER_TP=%s", infer_tp)
+    logger.warning(
+        "HSPEC_NUM_SHARDS is not set; falling back to 5 outside strict HSpec production init."
+    )
     return 5
 
 
@@ -357,6 +424,7 @@ class HSpecLocalCollector:
             "hs_path": self._segment_hs_path,
             "token_path": self._segment_token_path,
             "hidden_dim": 0,
+            "hs_dtype": "",
             "hs_rows": 0,
             "token_len": 0,
             "hs_offset_rows": int(self._segment_hs_rows),
@@ -400,9 +468,15 @@ class HSpecLocalCollector:
         if rows.ndim != 2:
             raise ValueError(f"HSpec hidden rows must be 2-D, got {tuple(rows.shape)}")
 
-        rows_cpu = rows.detach().to(device="cpu", dtype=torch.float16).contiguous()
+        store_dtype = get_hspec_store_dtype()
+        if store_dtype == "float16":
+            rows_cpu = rows.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            hs_dtype = "float16"
+        else:
+            raise AssertionError(f"Unsupported HSpec store dtype after validation: {store_dtype}")
         rows_np = rows_cpu.numpy()
         hidden_dim = int(rows_np.shape[1])
+        rows_count = int(rows_np.shape[0])
 
         with self._lock:
             state = self._state_for_req(str(req_id))
@@ -413,12 +487,27 @@ class HSpecLocalCollector:
                     f"HSpec hidden dim mismatch for {req_id}: "
                     f"{state['hidden_dim']} vs {hidden_dim}"
                 )
+            if not state.get("hs_dtype"):
+                state["hs_dtype"] = hs_dtype
+            elif str(state["hs_dtype"]) != hs_dtype:
+                raise ValueError(
+                    f"HSpec hidden dtype mismatch for {req_id}: "
+                    f"{state['hs_dtype']} vs {hs_dtype}"
+                )
             if self._segment_hs_fh is None:
                 self._segment_hs_fh = open(self._segment_hs_path, "ab")
             self._segment_hs_fh.write(rows_np.tobytes(order="C"))
-            state["hs_rows"] += int(rows_np.shape[0])
-            self._segment_hs_rows += int(rows_np.shape[0])
+            state["hs_rows"] += rows_count
+            self._segment_hs_rows += rows_count
             _metric_add("raw_store_bytes", int(rows_np.nbytes))
+            _metric_add("store_fp16_rows", rows_count)
+            source_dtype = str(getattr(rows, "dtype", ""))
+            if "bfloat16" in source_dtype:
+                _metric_add("source_dtype_bf16_rows", rows_count)
+            elif "float16" in source_dtype:
+                _metric_add("source_dtype_fp16_rows", rows_count)
+            else:
+                _metric_add("source_dtype_other_rows", rows_count)
 
     def extend_tokens(self, req_id: str, token_ids: Iterable[int]) -> None:
         token_list = [int(t) for t in token_ids]
@@ -454,6 +543,7 @@ class HSpecLocalCollector:
             hs_rows = int(state.get("hs_rows", 0))
             token_len = int(state.get("token_len", 0))
             hidden_dim = int(state.get("hidden_dim", 0))
+            hs_dtype = str(state.get("hs_dtype") or get_hspec_store_dtype())
             if hs_rows <= 0 or token_len <= 0:
                 _metric_add("collect_dropped", 1)
                 continue
@@ -484,7 +574,7 @@ class HSpecLocalCollector:
                 token_offset=int(state["token_offset"]),
                 length=hs_rows,
                 hidden_dim=hidden_dim,
-                hs_dtype="float16",
+                hs_dtype=hs_dtype,
                 token_dtype="int32",
                 reward=None,
             )

@@ -11,6 +11,7 @@ export HSPEC_STORE_DTYPE="${HSPEC_STORE_DTYPE:-float16}"
 export HSPEC_SINGLE_NODE_ONLY="${HSPEC_SINGLE_NODE_ONLY:-1}"
 export HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS="${HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS:-1}"
 export HSPEC_STEP0_RUNTIME_ASSERTS="${HSPEC_STEP0_RUNTIME_ASSERTS:-0}"
+export HSPEC_BUILD_ACTOR_NUM_CPUS="${HSPEC_BUILD_ACTOR_NUM_CPUS:-1}"
 export HSPEC_DUMP="${HSPEC_DUMP:-1}"
 export HSPEC_DUMP_DIR="${HSPEC_DUMP_DIR:-${PROJECT_ROOT}/outputs/hspec_acceptance_dump}"
 
@@ -23,6 +24,7 @@ echo "hspec_store_dtype=${HSPEC_STORE_DTYPE}"
 echo "hspec_single_node_only=${HSPEC_SINGLE_NODE_ONLY}"
 echo "hspec_require_explicit_num_shards=${HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS}"
 echo "hspec_step0_runtime_asserts=${HSPEC_STEP0_RUNTIME_ASSERTS}"
+echo "hspec_build_actor_num_cpus=${HSPEC_BUILD_ACTOR_NUM_CPUS}"
 echo "requirement=run at least 2 epochs and verify epoch1 tables are used in epoch2"
 
 bash "${SCRIPT_DIR}/train_grpo_qwen2.5_1.5b_hspec-short.sh" \

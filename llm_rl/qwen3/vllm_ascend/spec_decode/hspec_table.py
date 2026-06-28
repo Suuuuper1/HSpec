@@ -38,6 +38,7 @@ from vllm_ascend.spec_decode.hspec_store import (
     collect_hspec_store_metrics,
     delete_hspec_trajectory,
     estimate_hspec_trajectory_bytes,
+    get_hspec_build_actor_num_cpus,
     get_hspec_num_shards,
     get_hspec_table_store_root,
     load_hspec_trajectory,
@@ -359,9 +360,9 @@ class HSpecTableGroup:
         prompt_id: str,
         desc: HSpecTrajectoryDesc,
     ) -> bool:
-        if os.getenv("HSPEC_ALLOW_MULTI_NODE", "0") == "0":
-            actor_node = os.getenv("NODE_RANK", "")
-            if actor_node and str(desc.node_id) != str(actor_node):
+        if os.getenv("HSPEC_SINGLE_NODE_ONLY", "1") != "0":
+            actor_node = os.getenv("NODE_RANK", "0")
+            if str(desc.node_id) != str(actor_node):
                 logger.warning(
                     "HSpec descriptor node mismatch in single-node mode: prompt_id=%s desc.node_id=%s actor.node_id=%s",
                     prompt_id,
@@ -1022,19 +1023,22 @@ class GlobalHSpecTableGroup:
             return None
 
     # Build  (async, non-blocking)
-    def build_tables_async(self, prompt_data: Dict[str, Dict]) -> List[ray.ObjectRef]:
-        """Send rollout data to partition actors for async PCA fitting + build.
+    def build_tables_async(
+        self,
+        prompt_data: Dict[str, List[HSpecTrajectoryDesc] | Dict[str, Any]],
+    ) -> List[ray.ObjectRef]:
+        """Send descriptor-first rollout data to partition actors.
 
-        This is the main Step 1 entry point called by the trainer.
-        PCA fitting + table construction runs inside Ray actors and does
-        **not** block the caller.
+        Phase 1 default payload is ``{prompt_id:
+        List[HSpecTrajectoryDesc]}``.  Legacy dict payloads containing
+        ``hidden_states`` are kept only for explicit
+        ``HSPEC_LEGACY_DATAPROTO_HS=1`` A/B runs; Step 5 will harden this API
+        boundary. PCA fitting + table construction runs inside Ray actors and
+        does **not** block the caller.
 
         Args:
-            prompt_data: ``{prompt_id: {
-                'hidden_states': List[ndarray (L_i, D)],
-                'tokens':        List[List[int]],
-                'rewards':       List[float],
-            }}``
+            prompt_data: Descriptor-first prompt payload, with legacy dict
+                payloads accepted only for the old A/B path.
 
         Returns:
             Ray ObjectRefs (futures).  Call ``ray.get(refs)`` only when you
@@ -1045,6 +1049,26 @@ class GlobalHSpecTableGroup:
         partition_payloads: Dict[int, Dict[str, Any]] = {i: {} for i in range(self.num_groups)}
         for prompt_id, data in prompt_data.items():
             pid = self._get_partition_id(prompt_id)
+            if isinstance(data, list):
+                for desc in data:
+                    if desc is None:
+                        continue
+                    try:
+                        desc_obj = coerce_hspec_desc(desc)
+                        if int(desc_obj.shard_id) != int(pid):
+                            logger.warning(
+                                "HSpec descriptor shard hint mismatch during routing: "
+                                "prompt_id=%s desc.shard_id=%s expected=%s; routing by prompt_id",
+                                prompt_id,
+                                desc_obj.shard_id,
+                                pid,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Failed to inspect HSpec descriptor shard hint for prompt_id=%s",
+                            prompt_id,
+                            exc_info=True,
+                        )
             partition_payloads[pid][prompt_id] = data
 
         futures: List[ray.ObjectRef] = []
@@ -1392,8 +1416,13 @@ def init_hspec_tables(
     _num_groups = _resolve_num_groups()
     _hspec_table_handles = []
 
+    num_cpus = get_hspec_build_actor_num_cpus()
     for i in range(_num_groups):
-        handle = HSpecTableGroup.options(name=_build_actor_name(i)).remote(
+        handle = HSpecTableGroup.options(
+            name=_build_actor_name(i),
+            num_cpus=num_cpus,
+            num_gpus=0,
+        ).remote(
             port=6555 + i,
             similarity_threshold=similarity_threshold,
             max_entries_per_prompt=max_entries_per_prompt,

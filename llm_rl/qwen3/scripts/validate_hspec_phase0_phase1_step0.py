@@ -31,6 +31,10 @@ def _read(rel_path: str) -> str:
     return (PROJECT_ROOT / rel_path).read_text(encoding="utf-8")
 
 
+def _exists(rel_path: str) -> bool:
+    return (PROJECT_ROOT / rel_path).is_file()
+
+
 def _set_result(report: dict[str, Any], name: str, ok: bool, detail: str = "") -> None:
     report["checks"][name] = bool(ok)
     if not ok and detail:
@@ -53,6 +57,7 @@ def run_static_checks() -> dict[str, Any]:
 
     rollout = _read("verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py")
     trainer = _read("verl/trainer/ppo/ray_trainer.py")
+    main_ppo = _read("verl/trainer/main_ppo.py")
     table = _read("vllm_ascend/spec_decode/hspec_table.py")
     store = _read("vllm_ascend/spec_decode/hspec_store.py")
 
@@ -181,20 +186,134 @@ def run_static_checks() -> dict[str, Any]:
             f"missing Step0 metric placeholder {metric}.",
         )
 
+    _set_result(
+        report,
+        "store_step1_helpers_present",
+        "def get_hspec_store_dtype" in store
+        and "def hspec_strict_descriptor_mode_enabled" in store
+        and "def hspec_require_explicit_num_shards_enabled" in store
+        and "def assert_hspec_num_shards_configured_for_production" in store
+        and "def get_hspec_build_actor_num_cpus" in store,
+        "Step1 centralized HSpec configuration helpers are missing.",
+    )
+    _set_result(
+        report,
+        "store_dtype_helper_float16_only",
+        "HSPEC_STORE_DTYPE" in store
+        and '"fp16": "float16"' in store
+        and '"float16": "float16"' in store
+        and "Unsupported HSPEC_STORE_DTYPE" in store,
+        "HSPEC_STORE_DTYPE must default to/validate float16 on-disk storage.",
+    )
+    append_pos = store.find("def append_hidden_rows")
+    flush_pos = store.find("def flush_descriptors")
+    append_body = store[append_pos:flush_pos] if append_pos >= 0 and flush_pos > append_pos else ""
+    flush_body = store[flush_pos:] if flush_pos >= 0 else ""
+    _set_result(
+        report,
+        "store_append_uses_dtype_helper",
+        "store_dtype = get_hspec_store_dtype()" in append_body
+        and "dtype=torch.float16" in append_body
+        and 'state["hs_dtype"] = hs_dtype' in append_body
+        and "HSpec hidden dtype mismatch" in append_body,
+        "append_hidden_rows must use the on-disk dtype helper and persist per-request hs_dtype.",
+    )
+    _set_result(
+        report,
+        "store_flush_uses_state_hs_dtype",
+        'state.get("hs_dtype") or get_hspec_store_dtype()' in flush_body
+        and "hs_dtype=hs_dtype" in flush_body,
+        "flush_descriptors must use request-state hs_dtype instead of hardcoding float16.",
+    )
+    for metric in (
+        "store_fp16_rows",
+        "source_dtype_fp16_rows",
+        "source_dtype_bf16_rows",
+        "source_dtype_other_rows",
+    ):
+        _set_result(
+            report,
+            f"store_metric_{metric}",
+            f'"{metric}"' in store,
+            f"missing Step1 dtype metric placeholder {metric}.",
+        )
+    _set_result(
+        report,
+        "store_num_shards_fallback_warns",
+        "HSPEC_NUM_SHARDS is not set; falling back to 5 outside strict HSpec production init" in store,
+        "get_hspec_num_shards fallback must be explicit and warned outside production init.",
+    )
+
+    _set_result(
+        report,
+        "main_ppo_hspec_init_uses_step1_helpers",
+        "assert_hspec_num_shards_configured_for_production()" in main_ppo
+        and "get_hspec_store_dtype()" in main_ppo
+        and "get_hspec_num_shards()" in main_ppo
+        and "get_hspec_build_actor_num_cpus()" in main_ppo
+        and "hspec_strict_descriptor_mode_enabled()" in main_ppo,
+        "main_ppo HSpec init must use centralized Step1 helpers.",
+    )
+    _set_result(
+        report,
+        "main_ppo_single_node_hard_gate",
+        "HSPEC_EXPERIMENTAL_ALLOW_MULTI_NODE_UNSAFE" in main_ppo
+        and "HSpec Phase 1 descriptor path supports single-node only" in main_ppo
+        and "HSPEC_ALLOW_MULTI_NODE" not in main_ppo,
+        "main_ppo must hard-gate multi-node HSpec and not honor the old HSPEC_ALLOW_MULTI_NODE bypass.",
+    )
+    _set_result(
+        report,
+        "main_ppo_phase1_config_log",
+        "HSpec Phase1 config:" in main_ppo
+        and "store_dtype=" in main_ppo
+        and "strict_descriptor_mode=" in main_ppo
+        and "single_node_only=" in main_ppo
+        and "num_shards=" in main_ppo
+        and "build_actor_num_cpus=" in main_ppo,
+        "HSpec init must print the Step1 config boundary once at startup.",
+    )
+    _set_result(
+        report,
+        "table_actor_resource_options_explicit",
+        "get_hspec_build_actor_num_cpus" in table
+        and "num_cpus = get_hspec_build_actor_num_cpus()" in table
+        and "num_cpus=num_cpus" in table
+        and "num_gpus=0" in table,
+        "init_hspec_tables must set build actor CPU budget explicitly and avoid GPU/NPU resources.",
+    )
+    _set_result(
+        report,
+        "table_single_node_only_topology",
+        "HSPEC_SINGLE_NODE_ONLY" in table
+        and "HSPEC_ALLOW_MULTI_NODE" not in table,
+        "descriptor topology validation must use HSPEC_SINGLE_NODE_ONLY, not the old multi-node bypass.",
+    )
+    _set_result(
+        report,
+        "table_build_async_descriptor_first_doc",
+        "Dict[str, List[HSpecTrajectoryDesc] | Dict[str, Any]]" in table
+        and "descriptor-first" in table
+        and "HSPEC_LEGACY_DATAPROTO_HS=1" in table,
+        "build_tables_async must document the descriptor-first Phase1 payload boundary.",
+    )
+    _set_result(
+        report,
+        "trainer_uses_hspec_num_shards_helper",
+        "get_hspec_num_shards" in trainer
+        and "hspec_num_shards = get_hspec_num_shards()" in trainer
+        and 'os.getenv("HSPEC_NUM_SHARDS", "5")' not in trainer,
+        "trainer must use get_hspec_num_shards() and must not keep a local fallback=5.",
+    )
+
     _set_warning(
         report,
         "legacy_build_dict_payload_still_open",
         'data["hidden_states"]' in table,
         "Expected in Step 0; Step 5 should harden strict descriptor API.",
     )
-    _set_warning(
-        report,
-        "trainer_local_hspec_num_shards_fallback_5",
-        'os.getenv("HSPEC_NUM_SHARDS", "5")' in trainer,
-        "Expected until Step 1/7 unifies shard helper use.",
-    )
 
-    scripts = [
+    script_candidates = [
         "scripts/train.sh",
         "scripts/train_grpo_hspec.sh",
         "scripts/train_grpo_qwen2.5_1.5b_hspec.sh",
@@ -213,6 +332,7 @@ def run_static_checks() -> dict[str, Any]:
         "HSPEC_SINGLE_NODE_ONLY",
         "HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS",
         "HSPEC_STEP0_RUNTIME_ASSERTS",
+        "HSPEC_BUILD_ACTOR_NUM_CPUS",
     ]
     required_runtime_env = [
         "HSPEC_STRICT_DESCRIPTOR_MODE",
@@ -220,8 +340,17 @@ def run_static_checks() -> dict[str, Any]:
         "HSPEC_SINGLE_NODE_ONLY",
         "HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS",
         "HSPEC_STEP0_RUNTIME_ASSERTS",
+        "HSPEC_BUILD_ACTOR_NUM_CPUS",
     ]
-    for rel_path in scripts:
+    for rel_path in script_candidates:
+        if not _exists(rel_path):
+            _set_warning(
+                report,
+                f"{Path(rel_path).name}:script_not_present",
+                True,
+                f"{rel_path} is not present in this checkout; skipping script env checks for it.",
+            )
+            continue
         text = _read(rel_path)
         for env_name in required_exports:
             _set_result(
@@ -243,6 +372,13 @@ def run_static_checks() -> dict[str, Any]:
             'HSPEC_LEGACY_DATAPROTO_HS="${HSPEC_LEGACY_DATAPROTO_HS:-0}"' in text,
             f"{rel_path} must default HSPEC_LEGACY_DATAPROTO_HS to 0.",
         )
+        _set_result(
+            report,
+            f"{Path(rel_path).name}:HSPEC_BUILD_ACTOR_NUM_CPUS_logged",
+            "hspec_build_actor_num_cpus=${HSPEC_BUILD_ACTOR_NUM_CPUS}" in text
+            or "HSPEC_BUILD_ACTOR_NUM_CPUS=${HSPEC_BUILD_ACTOR_NUM_CPUS}" in text,
+            f"{rel_path} must print HSPEC_BUILD_ACTOR_NUM_CPUS in startup logs.",
+        )
 
     acceptance = _read("scripts/run_hspec_phase1_acceptance.sh")
     for env_name in (
@@ -252,6 +388,7 @@ def run_static_checks() -> dict[str, Any]:
         "HSPEC_SINGLE_NODE_ONLY",
         "HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS",
         "HSPEC_STEP0_RUNTIME_ASSERTS",
+        "HSPEC_BUILD_ACTOR_NUM_CPUS",
     ):
         _set_result(
             report,
@@ -259,6 +396,37 @@ def run_static_checks() -> dict[str, Any]:
             f"export {env_name}=" in acceptance,
             f"acceptance wrapper must export {env_name}.",
         )
+    _set_result(
+        report,
+        "run_hspec_phase1_acceptance.sh:HSPEC_BUILD_ACTOR_NUM_CPUS_logged",
+        "hspec_build_actor_num_cpus=${HSPEC_BUILD_ACTOR_NUM_CPUS}" in acceptance
+        or "HSPEC_BUILD_ACTOR_NUM_CPUS=${HSPEC_BUILD_ACTOR_NUM_CPUS}" in acceptance,
+        "acceptance wrapper must print HSPEC_BUILD_ACTOR_NUM_CPUS.",
+    )
+
+    baseline = _read("scripts/run_hspec_step0_baseline.sh")
+    for env_name in (
+        "HSPEC_LEGACY_DATAPROTO_HS",
+        "HSPEC_STRICT_DESCRIPTOR_MODE",
+        "HSPEC_STORE_DTYPE",
+        "HSPEC_SINGLE_NODE_ONLY",
+        "HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS",
+        "HSPEC_STEP0_RUNTIME_ASSERTS",
+        "HSPEC_BUILD_ACTOR_NUM_CPUS",
+    ):
+        _set_result(
+            report,
+            f"run_hspec_step0_baseline.sh:{env_name}_exported",
+            f"export {env_name}=" in baseline,
+            f"baseline wrapper must export {env_name}.",
+        )
+    _set_result(
+        report,
+        "run_hspec_step0_baseline.sh:HSPEC_BUILD_ACTOR_NUM_CPUS_logged",
+        "hspec_build_actor_num_cpus=${HSPEC_BUILD_ACTOR_NUM_CPUS}" in baseline
+        or "HSPEC_BUILD_ACTOR_NUM_CPUS=${HSPEC_BUILD_ACTOR_NUM_CPUS}" in baseline,
+        "baseline wrapper must print HSPEC_BUILD_ACTOR_NUM_CPUS.",
+    )
 
     report["ok"] = all(report["checks"].values())
     return report
@@ -507,7 +675,10 @@ def run_extract_baseline(log_file: Path, output_json: Path | None) -> dict[str, 
         "HSPEC_TABLE_STORE_DIR",
         "HSPEC_STRICT_DESCRIPTOR_MODE",
         "HSPEC_STORE_DTYPE",
+        "HSPEC_SINGLE_NODE_ONLY",
+        "HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS",
         "HSPEC_STEP0_RUNTIME_ASSERTS",
+        "HSPEC_BUILD_ACTOR_NUM_CPUS",
     ]
     env: dict[str, str | None] = {}
     for name in env_names:
@@ -530,6 +701,14 @@ def run_extract_baseline(log_file: Path, output_json: Path | None) -> dict[str, 
             [r"hspec[/_]collect_dropped['\"]?\s*[:=]\s*([0-9.]+)"], text),
         "hspec_raw_store_bytes_total": _extract_last_float(
             [r"hspec[/_]raw_store_bytes['\"]?\s*[:=]\s*([0-9.]+)"], text),
+        "hspec_store_fp16_rows_total": _extract_last_float(
+            [r"hspec[/_]store_fp16_rows['\"]?\s*[:=]\s*([0-9.]+)"], text),
+        "hspec_source_dtype_fp16_rows_total": _extract_last_float(
+            [r"hspec[/_]source_dtype_fp16_rows['\"]?\s*[:=]\s*([0-9.]+)"], text),
+        "hspec_source_dtype_bf16_rows_total": _extract_last_float(
+            [r"hspec[/_]source_dtype_bf16_rows['\"]?\s*[:=]\s*([0-9.]+)"], text),
+        "hspec_source_dtype_other_rows_total": _extract_last_float(
+            [r"hspec[/_]source_dtype_other_rows['\"]?\s*[:=]\s*([0-9.]+)"], text),
         "hspec_pinned_pageable_fallback_total": _extract_last_float(
             [r"hspec[/_]pinned_pageable_fallback['\"]?\s*[:=]\s*([0-9.]+)"], text),
         "hspec_build_pending_refs_last": _extract_last_float(
