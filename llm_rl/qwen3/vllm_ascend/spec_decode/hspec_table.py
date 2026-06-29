@@ -36,15 +36,16 @@ from vllm_ascend.spec_decode.hspec_store import (
     HSpecTrajectoryDesc,
     coerce_hspec_desc,
     collect_hspec_store_metrics,
-    delete_hspec_trajectory,
     estimate_hspec_trajectory_bytes,
     get_hspec_build_actor_num_cpus,
     get_hspec_num_shards,
     get_hspec_table_store_root,
+    hspec_record_store_metric,
     load_hspec_trajectory,
 )
 
 logger = logging.getLogger(__name__)
+_unsafe_descriptor_cleanup_warned = False
 
 
 def _build_actor_name(shard_id: int) -> str:
@@ -346,14 +347,17 @@ class HSpecTableGroup:
         return hidden_states_list, token_seq_list, rewards
 
     def _cleanup_trajectory_descs(self, descs: List[HSpecTrajectoryDesc]) -> None:
-        cleanup = os.getenv("HSPEC_DELETE_TRAJECTORY_AFTER_BUILD", "1") != "0"
-        if not cleanup:
+        cleanup = os.getenv("HSPEC_DELETE_TRAJECTORY_AFTER_BUILD", "0") != "0"
+        if not cleanup or not descs:
             return
-        for desc in descs:
-            try:
-                delete_hspec_trajectory(desc)
-            except Exception:
-                logger.debug("Failed to clean HSpec trajectory %s", desc, exc_info=True)
+        hspec_record_store_metric("unsafe_descriptor_cleanup_suppressed", len(descs))
+        global _unsafe_descriptor_cleanup_warned
+        if not _unsafe_descriptor_cleanup_warned:
+            logger.warning(
+                "HSPEC_DELETE_TRAJECTORY_AFTER_BUILD is disabled for shared HSpec "
+                "segment store; raw files are cleaned only by segment/epoch GC."
+            )
+            _unsafe_descriptor_cleanup_warned = True
 
     def _validate_descriptor_topology(
         self,
@@ -1343,6 +1347,14 @@ class GlobalHSpecTableGroup:
         result["hspec/raw_store_bytes"] = float(store_metrics.get("raw_store_bytes", 0))
         result["hspec/desc_count"] = float(store_metrics.get("desc_count", 0))
         result["hspec/collect_dropped"] = float(store_metrics.get("collect_dropped", 0))
+        result["hspec/segment_sealed"] = float(store_metrics.get("segment_sealed", 0))
+        result["hspec/segment_rotated"] = float(store_metrics.get("segment_rotated", 0))
+        result["hspec/segment_manifest_write_error"] = float(
+            store_metrics.get("segment_manifest_write_error", 0))
+        result["hspec/raw_store_budget_gc_skipped"] = float(
+            store_metrics.get("raw_store_budget_gc_skipped", 0))
+        result["hspec/unsafe_descriptor_cleanup_suppressed"] = float(
+            store_metrics.get("unsafe_descriptor_cleanup_suppressed", 0))
 
         abs_deltas = set()
         for key in agg:

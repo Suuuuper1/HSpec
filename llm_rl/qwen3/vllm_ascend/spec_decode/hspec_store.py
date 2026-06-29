@@ -26,15 +26,23 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import socket
 import tempfile
 import threading
+import time
 from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+_SEGMENT_MANIFEST_NAME = "segment.json"
+_DESC_MANIFEST_NAME = "desc.jsonl"
+_SEGMENT_SAFE_DELETE_STATES = frozenset({"gc_deletable", "aborted", "epoch_build_done"})
+_SEGMENT_CONFIRMED_DELETE_STATES = _SEGMENT_SAFE_DELETE_STATES | frozenset({"sealed", "submitted_to_build"})
+_unsafe_delete_trajectory_warned = False
 
 _store_metrics_lock = threading.Lock()
 _store_metrics: Dict[str, int] = {
@@ -45,10 +53,31 @@ _store_metrics: Dict[str, int] = {
     "legacy_payload_count": 0,
     "descriptor_payload_count": 0,
     "validation_collect_skip": 0,
+    "collect_dropped_empty": 0,
+    "collect_dropped_invalid_dim": 0,
+    "collect_dropped_missing_offset": 0,
+    "collect_dropped_align_mismatch": 0,
     "store_fp16_rows": 0,
     "source_dtype_fp16_rows": 0,
     "source_dtype_bf16_rows": 0,
     "source_dtype_other_rows": 0,
+    "segment_sealed": 0,
+    "segment_sealed_empty": 0,
+    "segment_rotated": 0,
+    "segment_manifest_write_error": 0,
+    "segment_fsync_count": 0,
+    "segment_close_error": 0,
+    "segment_aborted": 0,
+    "raw_store_budget_bytes": 0,
+    "raw_store_budget_files": 0,
+    "raw_store_budget_over_bytes": 0,
+    "raw_store_budget_over_files": 0,
+    "raw_store_budget_gc_skipped": 0,
+    "raw_store_budget_gc_deleted": 0,
+    "unsafe_descriptor_cleanup_suppressed": 0,
+    "segment_delete_count": 0,
+    "segment_delete_bytes": 0,
+    "segment_delete_error": 0,
 }
 
 
@@ -246,9 +275,43 @@ def get_hspec_store_retain_batches() -> int:
         return 128
 
 
+def hspec_segment_fsync_on_seal_enabled() -> bool:
+    return os.getenv("HSPEC_SEGMENT_FSYNC_ON_SEAL", "0") != "0"
+
+
+def hspec_raw_store_budget_delete_enabled() -> bool:
+    """Whether budget enforcement may delete manifest-marked raw segments.
+
+    Epoch-level GC is the normal production cleanup path. Budget deletion is
+    intentionally opt-in and only touches gc_deletable/aborted segments.
+    """
+    return os.getenv("HSPEC_RAW_STORE_BUDGET_DELETE", "0") != "0"
+
+
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            logger.debug("Failed to remove temporary HSpec manifest %s", tmp, exc_info=True)
+
+
 def _metric_add(name: str, value: int) -> None:
     with _store_metrics_lock:
         _store_metrics[name] = _store_metrics.get(name, 0) + int(value)
+
+
+def _record_collect_drop(reason: str, count: int = 1) -> None:
+    _metric_add("collect_dropped", count)
+    _metric_add(f"collect_dropped_{reason}", count)
 
 
 def collect_hspec_store_metrics(reset: bool = True) -> Dict[str, int]:
@@ -290,6 +353,55 @@ def coerce_hspec_desc(obj: Any) -> HSpecTrajectoryDesc:
     if isinstance(obj, dict):
         return HSpecTrajectoryDesc(**obj)
     raise TypeError(f"Expected HSpecTrajectoryDesc or dict, got {type(obj)!r}")
+
+
+@dataclass(frozen=True)
+class HSpecSegmentKey:
+    node_id: str
+    worker_rank: int
+    tp_group_id: int
+    segment_dir: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def hspec_segment_key_from_desc(
+    desc_obj: HSpecTrajectoryDesc | Dict[str, Any],
+) -> HSpecSegmentKey:
+    desc = coerce_hspec_desc(desc_obj)
+    hs_dir = Path(desc.hs_path).resolve().parent
+    token_dir = Path(desc.token_path).resolve().parent
+    if hs_dir != token_dir:
+        raise ValueError(
+            f"HSpec descriptor spans different segment dirs: hs={hs_dir} token={token_dir}"
+        )
+    return HSpecSegmentKey(
+        node_id=str(desc.node_id),
+        worker_rank=int(desc.worker_rank),
+        tp_group_id=int(desc.tp_group_id),
+        segment_dir=str(hs_dir),
+    )
+
+
+def read_hspec_segment_manifest(segment_dir: str | Path) -> Dict[str, Any]:
+    manifest_path = Path(segment_dir).resolve() / _SEGMENT_MANIFEST_NAME
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def update_hspec_segment_manifest_status(
+    segment_dir: str | Path,
+    status: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    segment_path = Path(segment_dir).resolve()
+    manifest = read_hspec_segment_manifest(segment_path)
+    manifest["status"] = str(status)
+    manifest["status_time_ns"] = time.time_ns()
+    if extra:
+        manifest.update(extra)
+    _write_json_atomic(segment_path / _SEGMENT_MANIFEST_NAME, manifest)
 
 
 class HSpecLocalCollector:
@@ -343,6 +455,18 @@ class HSpecLocalCollector:
         except Exception:
             return 0
 
+    @staticmethod
+    def _segment_dir_bytes(segment_dir: Path) -> int:
+        total = 0
+        for file_path in segment_dir.rglob("*"):
+            if not file_path.is_file():
+                continue
+            try:
+                total += int(file_path.stat().st_size)
+            except FileNotFoundError:
+                continue
+        return total
+
     def _enforce_store_budget(self) -> None:
         max_bytes = get_hspec_raw_store_max_bytes()
         max_files = get_hspec_raw_store_max_files()
@@ -358,55 +482,54 @@ class HSpecLocalCollector:
             logger.debug("Failed to list HSpec batch directories for GC", exc_info=True)
             return
 
-        retain = get_hspec_store_retain_batches()
-        protected = set(batch_dirs[-retain:])
-
-        def current_bytes() -> int:
-            total = 0
-            for batch_dir in batch_dirs:
-                if not batch_dir.exists():
-                    continue
-                for file_path in batch_dir.rglob("*"):
-                    if file_path.is_file():
-                        try:
-                            total += file_path.stat().st_size
-                        except FileNotFoundError:
-                            continue
-            return total
-
-        total_bytes = current_bytes()
-        total_files = self._count_existing_files()
+        total_bytes = 0
+        deletable_dirs: list[Path] = []
         for batch_dir in batch_dirs:
-            if batch_dir in protected:
+            if not batch_dir.exists():
                 continue
+            total_bytes += self._segment_dir_bytes(batch_dir)
+            manifest_path = batch_dir / _SEGMENT_MANIFEST_NAME
+            if not manifest_path.exists():
+                continue
+            try:
+                manifest = read_hspec_segment_manifest(batch_dir)
+            except Exception:
+                continue
+            if str(manifest.get("status", "")) in {"gc_deletable", "aborted"}:
+                deletable_dirs.append(batch_dir)
+
+        total_files = self._count_existing_files()
+        _metric_add("raw_store_budget_bytes", total_bytes)
+        _metric_add("raw_store_budget_files", total_files)
+
+        over_bytes = max(total_bytes - max_bytes, 0) if max_bytes > 0 else 0
+        over_files = max(total_files - max_files, 0) if max_files > 0 else 0
+        if over_bytes <= 0 and over_files <= 0:
+            return
+
+        _metric_add("raw_store_budget_over_bytes", over_bytes)
+        _metric_add("raw_store_budget_over_files", over_files)
+        if not hspec_raw_store_budget_delete_enabled():
+            _metric_add("raw_store_budget_gc_skipped", 1)
+            logger.warning(
+                "HSpec raw store budget exceeded but budget deletion is disabled: "
+                "bytes=%d max_bytes=%d files=%d max_files=%d",
+                total_bytes,
+                max_bytes,
+                total_files,
+                max_files,
+            )
+            return
+
+        for batch_dir in deletable_dirs:
             if (max_bytes <= 0 or total_bytes <= max_bytes) and (max_files <= 0 or total_files <= max_files):
                 break
-            removed_bytes = 0
-            removed_files = 0
-            for file_path in sorted(batch_dir.rglob("*"), reverse=True):
-                if not file_path.exists():
-                    continue
-                if file_path.is_file():
-                    try:
-                        removed_bytes += file_path.stat().st_size
-                    except FileNotFoundError:
-                        pass
-                    try:
-                        file_path.unlink()
-                        removed_files += 1
-                    except FileNotFoundError:
-                        pass
-                elif file_path.is_dir():
-                    try:
-                        file_path.rmdir()
-                    except OSError:
-                        pass
-            try:
-                batch_dir.rmdir()
-            except OSError:
-                pass
-            total_bytes = max(total_bytes - removed_bytes, 0)
-            total_files = max(total_files - removed_files, 0)
+            before_bytes = self._segment_dir_bytes(batch_dir)
+            before_files = sum(1 for p in batch_dir.rglob("*") if p.is_file())
+            if delete_hspec_segment(batch_dir, caller_confirmed_safe=False):
+                _metric_add("raw_store_budget_gc_deleted", 1)
+                total_bytes = max(total_bytes - before_bytes, 0)
+                total_files = max(total_files - before_files, 0)
 
     @staticmethod
     def _safe_request_key(req_id: str) -> str:
@@ -427,8 +550,8 @@ class HSpecLocalCollector:
             "hs_dtype": "",
             "hs_rows": 0,
             "token_len": 0,
-            "hs_offset_rows": int(self._segment_hs_rows),
-            "token_offset": int(self._segment_token_len),
+            "hs_offset_rows": None,
+            "token_offset": None,
         }
         self._req_states[req_id] = state
         return state
@@ -437,30 +560,100 @@ class HSpecLocalCollector:
     def _close_state_files(state: Dict[str, Any]) -> None:
         return
 
+    def _segment_has_work_locked(self) -> bool:
+        return (
+            bool(self._req_states)
+            or int(self._segment_hs_rows) > 0
+            or int(self._segment_token_len) > 0
+            or self._segment_hs_fh is not None
+            or self._segment_token_fh is not None
+        )
+
+    def _flush_and_close_segment_files_locked(self) -> None:
+        for fh in (self._segment_hs_fh, self._segment_token_fh):
+            if fh is None:
+                continue
+            try:
+                fh.flush()
+                if hspec_segment_fsync_on_seal_enabled():
+                    os.fsync(fh.fileno())
+                    _metric_add("segment_fsync_count", 1)
+            finally:
+                try:
+                    fh.close()
+                except Exception:
+                    _metric_add("segment_close_error", 1)
+                    logger.debug("Failed to close HSpec segment file", exc_info=True)
+        self._segment_hs_fh = None
+        self._segment_token_fh = None
+
+    def _write_segment_manifest_locked(
+        self,
+        *,
+        status: str,
+        desc_count: int,
+        epoch: int,
+        global_step: int,
+        dropped_count: int = 0,
+    ) -> None:
+        payload = {
+            "schema_version": 1,
+            "status": str(status),
+            "node_id": self.node_id,
+            "worker_rank": int(self.worker_rank),
+            "tp_group_id": int(self.tp_group_id),
+            "pid": int(os.getpid()),
+            "batch_id": int(self._batch_counter),
+            "segment_dir": str(self._segment_dir),
+            "hs_path": str(self._segment_hs_path),
+            "token_path": str(self._segment_token_path),
+            "hs_rows": int(self._segment_hs_rows),
+            "token_len": int(self._segment_token_len),
+            "desc_count": int(desc_count),
+            "dropped_count": int(dropped_count),
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "store_dtype": get_hspec_store_dtype(),
+            "token_dtype": "int32",
+            "sealed_time_ns": time.time_ns(),
+            "fsync_on_seal": hspec_segment_fsync_on_seal_enabled(),
+        }
+        try:
+            _write_json_atomic(self._segment_dir / _SEGMENT_MANIFEST_NAME, payload)
+        except Exception:
+            _metric_add("segment_manifest_write_error", 1)
+            raise
+
+    def _rotate_to_next_segment_locked(self) -> None:
+        self._batch_counter += 1
+        self._segment_dir = self._batch_dir()
+        self._segment_hs_path = str(self._segment_dir / "hs.fp16.bin")
+        self._segment_token_path = str(self._segment_dir / "tokens.i32.bin")
+        self._segment_hs_fh = None
+        self._segment_token_fh = None
+        self._segment_hs_rows = 0
+        self._segment_token_len = 0
+        _metric_add("segment_rotated", 1)
+
     def clear_batch(self) -> None:
         """Forget in-flight request state without deleting flushed files."""
         with self._lock:
             for state in self._req_states.values():
                 self._close_state_files(state)
+            has_work = self._segment_has_work_locked()
             self._req_states.clear()
-            if self._segment_hs_fh is not None:
-                try:
-                    self._segment_hs_fh.close()
-                except Exception:
-                    logger.debug("Failed to close HSpec hidden-state segment file", exc_info=True)
-            if self._segment_token_fh is not None:
-                try:
-                    self._segment_token_fh.close()
-                except Exception:
-                    logger.debug("Failed to close HSpec token segment file", exc_info=True)
-            self._segment_hs_fh = None
-            self._segment_token_fh = None
-            self._batch_counter += 1
-            self._segment_dir = self._batch_dir()
-            self._segment_hs_path = str(self._segment_dir / "hs.fp16.bin")
-            self._segment_token_path = str(self._segment_dir / "tokens.i32.bin")
-            self._segment_hs_rows = 0
-            self._segment_token_len = 0
+            if not has_work:
+                return
+            self._flush_and_close_segment_files_locked()
+            self._write_segment_manifest_locked(
+                status="gc_deletable",
+                desc_count=0,
+                epoch=-1,
+                global_step=-1,
+                dropped_count=0,
+            )
+            _metric_add("segment_aborted", 1)
+            self._rotate_to_next_segment_locked()
 
     def append_hidden_rows(self, req_id: str, rows: torch.Tensor) -> None:
         if rows is None or rows.numel() == 0:
@@ -494,6 +687,8 @@ class HSpecLocalCollector:
                     f"HSpec hidden dtype mismatch for {req_id}: "
                     f"{state['hs_dtype']} vs {hs_dtype}"
                 )
+            if state["hs_offset_rows"] is None:
+                state["hs_offset_rows"] = int(self._segment_hs_rows)
             if self._segment_hs_fh is None:
                 self._segment_hs_fh = open(self._segment_hs_path, "ab")
             self._segment_hs_fh.write(rows_np.tobytes(order="C"))
@@ -517,6 +712,8 @@ class HSpecLocalCollector:
 
         with self._lock:
             state = self._state_for_req(str(req_id))
+            if state["token_offset"] is None:
+                state["token_offset"] = int(self._segment_token_len)
             if self._segment_token_fh is None:
                 self._segment_token_fh = open(self._segment_token_path, "ab")
             self._segment_token_fh.write(token_np.tobytes(order="C"))
@@ -534,52 +731,92 @@ class HSpecLocalCollector:
         descs: Dict[str, HSpecTrajectoryDesc] = {}
 
         with self._lock:
+            if not self._segment_has_work_locked():
+                return {}
             states = self._req_states
             self._req_states = {}
-            self._batch_counter += 1
 
-        for req_id, state in states.items():
-            self._close_state_files(state)
-            hs_rows = int(state.get("hs_rows", 0))
-            token_len = int(state.get("token_len", 0))
-            hidden_dim = int(state.get("hidden_dim", 0))
-            hs_dtype = str(state.get("hs_dtype") or get_hspec_store_dtype())
-            if hs_rows <= 0 or token_len <= 0:
-                _metric_add("collect_dropped", 1)
-                continue
-            if hs_rows != token_len:
-                logger.warning(
-                    "HSpec descriptor alignment mismatch: req_id=%s hs_rows=%d token_len=%d; dropping",
-                    req_id,
-                    hs_rows,
-                    token_len,
+            dropped_count = 0
+            for req_id, state in states.items():
+                self._close_state_files(state)
+                hs_rows = int(state.get("hs_rows", 0))
+                token_len = int(state.get("token_len", 0))
+                hidden_dim = int(state.get("hidden_dim", 0))
+                hs_dtype = str(state.get("hs_dtype") or get_hspec_store_dtype())
+                hs_offset_rows = state.get("hs_offset_rows")
+                token_offset = state.get("token_offset")
+                if hs_rows <= 0 or token_len <= 0:
+                    _record_collect_drop("empty")
+                    dropped_count += 1
+                    continue
+                if hidden_dim <= 0:
+                    logger.warning(
+                        "HSpec descriptor invalid hidden dim: req_id=%s hidden_dim=%d; dropping",
+                        req_id,
+                        hidden_dim,
+                    )
+                    _record_collect_drop("invalid_dim")
+                    dropped_count += 1
+                    continue
+                if hs_offset_rows is None or token_offset is None:
+                    logger.warning(
+                        "HSpec descriptor missing offset: req_id=%s hs_offset_rows=%s token_offset=%s; dropping",
+                        req_id,
+                        hs_offset_rows,
+                        token_offset,
+                    )
+                    _record_collect_drop("missing_offset")
+                    dropped_count += 1
+                    continue
+                if hs_rows != token_len:
+                    logger.warning(
+                        "HSpec descriptor alignment mismatch: req_id=%s hs_rows=%d token_len=%d; dropping",
+                        req_id,
+                        hs_rows,
+                        token_len,
+                    )
+                    _record_collect_drop("align_mismatch")
+                    dropped_count += 1
+                    continue
+
+                prompt_id = str(request_id_to_prompt_id.get(req_id, ""))
+                shard_id = _stable_partition_id(prompt_id or req_id, get_hspec_num_shards())
+                desc = HSpecTrajectoryDesc(
+                    epoch=int(epoch),
+                    global_step=int(global_step),
+                    node_id=self.node_id,
+                    worker_rank=int(self.worker_rank),
+                    tp_group_id=int(self.tp_group_id),
+                    shard_id=int(shard_id),
+                    request_id=str(req_id),
+                    prompt_id=prompt_id,
+                    hs_path=str(state["hs_path"]),
+                    hs_offset_rows=int(hs_offset_rows),
+                    token_path=str(state["token_path"]),
+                    token_offset=int(token_offset),
+                    length=hs_rows,
+                    hidden_dim=hidden_dim,
+                    hs_dtype=hs_dtype,
+                    token_dtype="int32",
+                    reward=None,
                 )
-                _metric_add("collect_dropped", 1)
-                continue
+                descs[req_id] = desc
+                self._append_manifest(desc)
 
-            prompt_id = str(request_id_to_prompt_id.get(req_id, ""))
-            shard_id = _stable_partition_id(prompt_id or req_id, get_hspec_num_shards())
-            desc = HSpecTrajectoryDesc(
+            self._flush_and_close_segment_files_locked()
+            segment_status = "sealed" if descs else "gc_deletable"
+            self._write_segment_manifest_locked(
+                status=segment_status,
+                desc_count=len(descs),
                 epoch=int(epoch),
                 global_step=int(global_step),
-                node_id=self.node_id,
-                worker_rank=int(self.worker_rank),
-                tp_group_id=int(self.tp_group_id),
-                shard_id=int(shard_id),
-                request_id=str(req_id),
-                prompt_id=prompt_id,
-                hs_path=str(state["hs_path"]),
-                hs_offset_rows=int(state["hs_offset_rows"]),
-                token_path=str(state["token_path"]),
-                token_offset=int(state["token_offset"]),
-                length=hs_rows,
-                hidden_dim=hidden_dim,
-                hs_dtype=hs_dtype,
-                token_dtype="int32",
-                reward=None,
+                dropped_count=dropped_count,
             )
-            descs[req_id] = desc
-            self._append_manifest(desc)
+            if descs:
+                _metric_add("segment_sealed", 1)
+            else:
+                _metric_add("segment_sealed_empty", 1)
+            self._rotate_to_next_segment_locked()
 
         _metric_add("desc_count", len(descs))
         self._enforce_store_budget()
@@ -587,7 +824,7 @@ class HSpecLocalCollector:
 
     def _append_manifest(self, desc: HSpecTrajectoryDesc) -> None:
         try:
-            manifest_path = Path(desc.hs_path).with_name("desc.jsonl")
+            manifest_path = Path(desc.hs_path).with_name(_DESC_MANIFEST_NAME)
             with open(manifest_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(asdict(desc), ensure_ascii=False) + "\n")
         except Exception:
@@ -617,6 +854,10 @@ def load_hspec_trajectory(
         raise ValueError(f"HSpec descriptor has non-positive length: {desc.length}")
     if desc.hidden_dim <= 0:
         raise ValueError(f"HSpec descriptor has invalid hidden_dim: {desc.hidden_dim}")
+    if int(desc.hs_offset_rows) < 0:
+        raise ValueError(f"HSpec descriptor has negative hs_offset_rows: {desc.hs_offset_rows}")
+    if int(desc.token_offset) < 0:
+        raise ValueError(f"HSpec descriptor has negative token_offset: {desc.token_offset}")
 
     hs_dtype = np.dtype(desc.hs_dtype)
     token_dtype = np.dtype(desc.token_dtype)
@@ -668,9 +909,78 @@ def estimate_hspec_trajectory_bytes(
     return hs_bytes + token_bytes
 
 
+def _cleanup_empty_segment_parents(seg: Path, root: Path) -> None:
+    parent = seg.parent
+    while parent != root and parent != parent.parent:
+        if not parent.name.startswith(("pid_", "worker_", "tp_", "node_")):
+            break
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def delete_hspec_segment(
+    segment: HSpecSegmentKey | str | Path,
+    *,
+    caller_confirmed_safe: bool = False,
+) -> bool:
+    """Delete a sealed HSpec segment directory after lifecycle checks.
+
+    The caller must only pass ``caller_confirmed_safe=True`` after all build
+    refs that may read the segment have completed successfully.
+    """
+    try:
+        if isinstance(segment, HSpecSegmentKey):
+            seg = Path(segment.segment_dir).resolve()
+        else:
+            seg = Path(segment).resolve()
+        root = Path(get_hspec_store_root()).resolve()
+        if seg == root or root not in seg.parents:
+            raise ValueError(f"refuse to delete outside HSPEC_STORE_DIR: {seg}")
+        if not seg.name.startswith("batch_"):
+            raise ValueError(f"refuse to delete non-segment directory: {seg}")
+        if not seg.exists():
+            return False
+        manifest = read_hspec_segment_manifest(seg)
+        status = str(manifest.get("status", ""))
+        allowed = _SEGMENT_CONFIRMED_DELETE_STATES if caller_confirmed_safe else _SEGMENT_SAFE_DELETE_STATES
+        if status not in allowed:
+            raise ValueError(f"refuse to delete segment with status={status!r}: {seg}")
+
+        bytes_deleted = HSpecLocalCollector._segment_dir_bytes(seg)
+        shutil.rmtree(seg)
+        _metric_add("segment_delete_count", 1)
+        _metric_add("segment_delete_bytes", bytes_deleted)
+        _cleanup_empty_segment_parents(seg, root)
+        return True
+    except Exception:
+        _metric_add("segment_delete_error", 1)
+        logger.debug("Failed to delete HSpec segment %s", segment, exc_info=True)
+        raise
+
+
 def delete_hspec_trajectory(
     desc_obj: HSpecTrajectoryDesc | Dict[str, Any],
-) -> None:
+) -> bool:
+    """Unsafe legacy per-descriptor delete helper.
+
+    Descriptor-mode HSpec stores many descriptors in one shared batch segment.
+    Deleting ``desc.hs_path`` or ``desc.token_path`` can break other pending
+    descriptors. Use ``delete_hspec_segment`` after epoch-level build success.
+    """
+    global _unsafe_delete_trajectory_warned
+    if os.getenv("HSPEC_UNSAFE_DELETE_TRAJECTORY_FILES", "0") == "0":
+        _metric_add("unsafe_descriptor_cleanup_suppressed", 1)
+        if not _unsafe_delete_trajectory_warned:
+            logger.warning(
+                "Ignoring unsafe delete_hspec_trajectory(); use delete_hspec_segment() "
+                "after epoch-level HSpec GC."
+            )
+            _unsafe_delete_trajectory_warned = True
+        return False
+
     desc = coerce_hspec_desc(desc_obj)
     for path_str in (desc.hs_path, desc.token_path):
         try:
@@ -686,3 +996,5 @@ def delete_hspec_trajectory(
                 parent = parent.parent
         except Exception:
             logger.debug("Failed to delete HSpec trajectory file %s", path_str, exc_info=True)
+            return False
+    return True

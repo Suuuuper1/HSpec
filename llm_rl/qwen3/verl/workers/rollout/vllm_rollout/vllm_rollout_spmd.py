@@ -920,6 +920,14 @@ class vLLMRollout(BaseRollout):
                     "hspec/raw_store_bytes": float(store_metrics.get("raw_store_bytes", 0)),
                     "hspec/desc_count": float(store_metrics.get("desc_count", 0)),
                     "hspec/collect_dropped": float(store_metrics.get("collect_dropped", 0)),
+                    "hspec/collect_dropped_empty": float(
+                        store_metrics.get("collect_dropped_empty", 0)),
+                    "hspec/collect_dropped_invalid_dim": float(
+                        store_metrics.get("collect_dropped_invalid_dim", 0)),
+                    "hspec/collect_dropped_missing_offset": float(
+                        store_metrics.get("collect_dropped_missing_offset", 0)),
+                    "hspec/collect_dropped_align_mismatch": float(
+                        store_metrics.get("collect_dropped_align_mismatch", 0)),
                     "hspec/strict_descriptor_violation": float(
                         store_metrics.get("strict_descriptor_violation", 0)),
                     "hspec/legacy_payload_count": float(store_metrics.get("legacy_payload_count", 0)),
@@ -927,6 +935,14 @@ class vLLMRollout(BaseRollout):
                         store_metrics.get("descriptor_payload_count", 0)),
                     "hspec/validation_collect_skip": float(
                         store_metrics.get("validation_collect_skip", 0)),
+                    "hspec/segment_sealed": float(store_metrics.get("segment_sealed", 0)),
+                    "hspec/segment_rotated": float(store_metrics.get("segment_rotated", 0)),
+                    "hspec/segment_manifest_write_error": float(
+                        store_metrics.get("segment_manifest_write_error", 0)),
+                    "hspec/raw_store_budget_gc_skipped": float(
+                        store_metrics.get("raw_store_budget_gc_skipped", 0)),
+                    "hspec/unsafe_descriptor_cleanup_suppressed": float(
+                        store_metrics.get("unsafe_descriptor_cleanup_suppressed", 0)),
                     "hspec/pinned_pool_miss": float(runtime_metrics.get("pinned_pool_miss", 0)),
                     "hspec/pinned_pageable_fallback": float(runtime_metrics.get("pinned_pageable_fallback", 0)),
                 }
