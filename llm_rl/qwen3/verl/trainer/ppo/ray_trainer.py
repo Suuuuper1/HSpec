@@ -107,6 +107,18 @@ def _extract_and_sum_hspec_rollout_metrics(meta_info: dict | None) -> dict[str, 
 
 
 @dataclass
+class HSpecPendingBuild:
+    epoch: int
+    ref: ray.ObjectRef
+    shard_id: int
+    segments: frozenset[object] = field(default_factory=frozenset)
+    prompt_ids: tuple[str, ...] = field(default_factory=tuple)
+    legacy: bool = False
+    done: bool = False
+    result_metrics: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class ResourcePoolManager:
     """
     Define a resource pool specification. Resource pool will be initialized first.
@@ -380,7 +392,8 @@ class RayPPOTrainer:
         self._hspec_dump_tables_written: dict[int, set[str]] = defaultdict(set)
         self._hspec_align_debug = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
         self._hspec_align_debug_max_logs = int(os.getenv("HSPEC_ALIGN_DEBUG_MAX_LOGS", "24"))
-        self._hspec_pending_build_refs: list[tuple[int, ray.ObjectRef]] = []
+        # HSpec build records retain segment keys until epoch-level GC.
+        self._hspec_pending_build_refs: list[HSpecPendingBuild] = []
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -557,46 +570,156 @@ class RayPPOTrainer:
         ):
             batch.non_tensor_batch.pop(key, None)
 
+    def _hspec_has_inflight_builds(self) -> bool:
+        return any(
+            not record.done
+            for record in getattr(self, "_hspec_pending_build_refs", [])
+        )
+
+    @staticmethod
+    def _coerce_hspec_result_metrics(result: object) -> dict[str, float]:
+        if not isinstance(result, dict):
+            return {}
+        coerced: dict[str, float] = {}
+        for key, value in result.items():
+            if isinstance(value, (int, float)):
+                coerced[str(key)] = float(value)
+        return coerced
+
+    @staticmethod
+    def _merge_hspec_build_result_metrics(metrics: dict | None, result: object) -> None:
+        if metrics is None or not isinstance(result, dict):
+            return
+        additive_keys = (
+            "prompt_count",
+            "desc_count",
+            "legacy_payload_count",
+            "build_count_delta",
+            "discard_count_delta",
+            "build_total_ms",
+        )
+        for key in additive_keys:
+            value = result.get(key)
+            if isinstance(value, (int, float)):
+                metric_key = f"hspec/build_result_{key}"
+                metrics[metric_key] = metrics.get(metric_key, 0.0) + float(value)
+        rss = result.get("build_actor_rss_mb")
+        if isinstance(rss, (int, float)) and float(rss) >= 0:
+            metrics["hspec/build_actor_rss_mb_max"] = max(
+                float(metrics.get("hspec/build_actor_rss_mb_max", 0.0)),
+                float(rss),
+            )
+
+    @staticmethod
+    def _hspec_pending_segment_count(records: list[HSpecPendingBuild]) -> int:
+        return len({segment for record in records for segment in record.segments})
+
     def _wait_hspec_epoch_builds(self, epoch: int, timing_raw: dict | None = None) -> None:
-        pending_refs = getattr(self, "_hspec_pending_build_refs", [])
-        if not pending_refs:
+        records: list[HSpecPendingBuild] = getattr(self, "_hspec_pending_build_refs", [])
+        if not records:
             return
 
-        epoch_refs = [ref for ref_epoch, ref in pending_refs if ref_epoch == epoch]
-        if epoch_refs:
+        epoch_records = [record for record in records if record.epoch == epoch]
+        if not epoch_records:
+            return
+
+        def _wait_not_done() -> None:
+            for record in epoch_records:
+                if record.done:
+                    continue
+                result = ray.get(record.ref)
+                record.done = True
+                record.result_metrics = self._coerce_hspec_result_metrics(result)
+
+        if timing_raw is None:
+            _wait_not_done()
+        else:
+            with marked_timer("hspec_epoch_build_wait", timing_raw, color="teal"):
+                _wait_not_done()
+
+        segments = {
+            segment
+            for record in epoch_records
+            for segment in record.segments
+        }
+        from vllm_ascend.spec_decode.hspec_store import (
+            delete_hspec_segment,
+            hspec_raw_store_gc_after_epoch_enabled,
+            hspec_record_store_metric,
+            update_hspec_segment_manifest_status,
+        )
+
+        if segments and hspec_raw_store_gc_after_epoch_enabled():
+            deleted = 0
+
+            def _gc_segments() -> None:
+                nonlocal deleted
+                for segment in sorted(segments, key=lambda item: str(getattr(item, "segment_dir", item))):
+                    try:
+                        if hasattr(segment, "segment_dir"):
+                            update_hspec_segment_manifest_status(
+                                segment.segment_dir,
+                                "epoch_build_done",
+                                extra={"epoch": int(epoch), "gc_reason": "epoch_build_success"},
+                            )
+                        if delete_hspec_segment(
+                            segment,
+                            caller_confirmed_safe=True,
+                        ):
+                            deleted += 1
+                    except Exception:
+                        hspec_record_store_metric("raw_store_epoch_gc_error", 1)
+                        raise
+
             if timing_raw is None:
-                ray.get(epoch_refs)
+                _gc_segments()
             else:
-                with marked_timer("hspec_epoch_build_wait", timing_raw, color="teal"):
-                    ray.get(epoch_refs)
+                with marked_timer("hspec_epoch_raw_store_gc", timing_raw, color="teal"):
+                    _gc_segments()
+            hspec_record_store_metric("raw_store_epoch_gc_segments", len(segments))
+            hspec_record_store_metric("raw_store_epoch_gc_deleted", deleted)
+        elif segments:
+            hspec_record_store_metric("raw_store_epoch_gc_skipped", len(segments))
 
         self._hspec_pending_build_refs = [
-            (ref_epoch, ref)
-            for ref_epoch, ref in pending_refs
-            if ref_epoch != epoch
+            record
+            for record in records
+            if record.epoch != epoch
         ]
 
     def _poll_hspec_builds_nonblocking(self, metrics: dict | None = None) -> None:
-        pending_refs = getattr(self, "_hspec_pending_build_refs", [])
-        if not pending_refs:
+        records: list[HSpecPendingBuild] = getattr(self, "_hspec_pending_build_refs", [])
+        if not records:
             if metrics is not None:
                 metrics["hspec/build_pending_refs"] = 0
                 metrics["hspec/build_ready_refs"] = 0
+                metrics["hspec/build_done_refs"] = 0
+                metrics["hspec/build_pending_records"] = 0
+                metrics["hspec/build_pending_segments"] = 0
             return
 
-        refs = [ref for _, ref in pending_refs]
-        ready_refs, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
-        if ready_refs:
-            ray.get(ready_refs)
-            ready_set = set(ready_refs)
-            self._hspec_pending_build_refs = [
-                (ref_epoch, ref)
-                for ref_epoch, ref in pending_refs
-                if ref not in ready_set
-            ]
+        active_records = [record for record in records if not record.done]
+        ready_refs = []
+        if active_records:
+            ref_to_record = {record.ref: record for record in active_records}
+            ready_refs, _ = ray.wait(
+                list(ref_to_record.keys()),
+                num_returns=len(ref_to_record),
+                timeout=0,
+            )
+            for ref in ready_refs:
+                record = ref_to_record[ref]
+                result = ray.get(ref)
+                record.done = True
+                record.result_metrics = self._coerce_hspec_result_metrics(result)
+                self._merge_hspec_build_result_metrics(metrics, result)
+
         if metrics is not None:
-            metrics["hspec/build_pending_refs"] = len(self._hspec_pending_build_refs)
+            metrics["hspec/build_pending_refs"] = sum(not record.done for record in records)
             metrics["hspec/build_ready_refs"] = len(ready_refs)
+            metrics["hspec/build_done_refs"] = sum(record.done for record in records)
+            metrics["hspec/build_pending_records"] = len(records)
+            metrics["hspec/build_pending_segments"] = self._hspec_pending_segment_count(records)
 
     @staticmethod
     def _hspec_dump_object_array(items):
@@ -1474,16 +1597,16 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
-                        ray_hspec_tasks = []
                         with marked_timer("update_hspec_tables", timing_raw, color="teal"):
                             self._poll_hspec_builds_nonblocking(metrics)
-                            if not self._hspec_pending_build_refs:
+                            if not self._hspec_has_inflight_builds():
                                 metrics.update(self.hspec_tables.compute_metrics())
                             from vllm_ascend.spec_decode.hspec_store import (
                                 coerce_hspec_desc,
                                 get_hspec_num_shards,
-                                hspec_record_store_metric,
                                 hspec_legacy_dataproto_hs_enabled,
+                                hspec_record_store_metric,
+                                hspec_strict_descriptor_mode_enabled,
                                 hspec_step0_runtime_asserts_enabled,
                             )
                             from vllm_ascend.spec_decode.hspec_utils import (
@@ -1493,14 +1616,15 @@ class RayPPOTrainer:
 
                             hspec_num_shards = get_hspec_num_shards()
                             legacy_hspec_dataproto_hs = hspec_legacy_dataproto_hs_enabled()
+                            strict_descriptor_mode = hspec_strict_descriptor_mode_enabled()
                             step0_runtime_asserts = hspec_step0_runtime_asserts_enabled()
-                            if step0_runtime_asserts and not legacy_hspec_dataproto_hs:
+                            if strict_descriptor_mode:
                                 forbidden = ("rollout_hidden_states", "rollout_hspec_tokens")
                                 present = [key for key in forbidden if key in batch.non_tensor_batch]
                                 if present:
                                     hspec_record_store_metric("strict_descriptor_violation", len(present))
                                     raise RuntimeError(
-                                        "HSpec Step0 invariant failed: trainer received legacy "
+                                        "HSpec strict descriptor mode forbids legacy trainer "
                                         f"payload keys in descriptor mode: {present}"
                                     )
                             if legacy_hspec_dataproto_hs:
@@ -1703,9 +1827,26 @@ class RayPPOTrainer:
                                         dict(prompt_build_data),
                                     )
                             if prompt_build_data:
-                                ray_hspec_tasks = self.hspec_tables.build_tables_async(dict(prompt_build_data))
+                                if legacy_hspec_dataproto_hs:
+                                    ray_hspec_tasks = self.hspec_tables.build_tables_async_legacy(
+                                        dict(prompt_build_data)
+                                    )
+                                else:
+                                    ray_hspec_tasks = self.hspec_tables.build_tables_async(dict(prompt_build_data))
                                 self._hspec_pending_build_refs.extend(
-                                    (epoch, ref) for ref in ray_hspec_tasks
+                                    HSpecPendingBuild(
+                                        epoch=epoch,
+                                        ref=submission.ref,
+                                        shard_id=int(submission.shard_id),
+                                        segments=submission.segments,
+                                        prompt_ids=submission.prompt_ids,
+                                        legacy=bool(getattr(submission, "legacy", False)),
+                                    )
+                                    for submission in ray_hspec_tasks
+                                )
+                                metrics["hspec/build_submitted_refs"] = len(ray_hspec_tasks)
+                                metrics["hspec/build_submitted_segments"] = len(
+                                    {segment for submission in ray_hspec_tasks for segment in submission.segments}
                                 )
                             self._drop_hspec_non_tensor_fields(batch)
                             if step0_runtime_asserts:

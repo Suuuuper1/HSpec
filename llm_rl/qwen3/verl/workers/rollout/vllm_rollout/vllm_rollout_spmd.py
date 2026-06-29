@@ -881,9 +881,19 @@ class vLLMRollout(BaseRollout):
             try:
                 from vllm_ascend.spec_decode.hspec_store import (
                     hspec_record_store_metric,
+                    hspec_strict_descriptor_mode_enabled,
                     hspec_step0_runtime_asserts_enabled,
                 )
 
+                if hspec_strict_descriptor_mode_enabled():
+                    forbidden = ("rollout_hidden_states", "rollout_hspec_tokens")
+                    present = [key for key in forbidden if key in non_tensor_batch]
+                    if present:
+                        hspec_record_store_metric("strict_descriptor_violation", len(present))
+                        raise RuntimeError(
+                            "HSpec strict descriptor mode forbids legacy rollout "
+                            f"payload keys: {present}"
+                        )
                 if hspec_step0_runtime_asserts_enabled():
                     if not legacy_hspec_dataproto_hs:
                         forbidden = ("rollout_hidden_states", "rollout_hspec_tokens")

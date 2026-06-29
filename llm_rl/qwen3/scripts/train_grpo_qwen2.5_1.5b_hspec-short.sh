@@ -35,6 +35,8 @@ export HSPEC_SINGLE_NODE_ONLY="${HSPEC_SINGLE_NODE_ONLY:-1}"
 export HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS="${HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS:-1}"
 export HSPEC_STEP0_RUNTIME_ASSERTS="${HSPEC_STEP0_RUNTIME_ASSERTS:-0}"
 export HSPEC_BUILD_ACTOR_NUM_CPUS="${HSPEC_BUILD_ACTOR_NUM_CPUS:-1}"
+export HSPEC_DELETE_TRAJECTORY_AFTER_BUILD="${HSPEC_DELETE_TRAJECTORY_AFTER_BUILD:-0}"
+export HSPEC_RAW_STORE_GC_AFTER_EPOCH="${HSPEC_RAW_STORE_GC_AFTER_EPOCH:-1}"
 export HSPEC_TP_GROUP_ID="${HSPEC_TP_GROUP_ID:-}"
 
 # HSpec debug/tracing/profile switches.
@@ -134,6 +136,8 @@ mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
     echo "hspec_require_explicit_num_shards=${HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS}"
     echo "hspec_step0_runtime_asserts=${HSPEC_STEP0_RUNTIME_ASSERTS}"
     echo "hspec_build_actor_num_cpus=${HSPEC_BUILD_ACTOR_NUM_CPUS}"
+    echo "hspec_delete_trajectory_after_build=${HSPEC_DELETE_TRAJECTORY_AFTER_BUILD}"
+    echo "hspec_raw_store_gc_after_epoch=${HSPEC_RAW_STORE_GC_AFTER_EPOCH}"
     echo "hspec_profile=${HSPEC_PROFILE}"
     echo "hspec_dump=${HSPEC_DUMP}"
     echo "pca_components=${PCA_COMPONENTS}"
@@ -165,6 +169,8 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS='"'"${HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STEP0_RUNTIME_ASSERTS='"'"${HSPEC_STEP0_RUNTIME_ASSERTS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_BUILD_ACTOR_NUM_CPUS='"'"${HSPEC_BUILD_ACTOR_NUM_CPUS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DELETE_TRAJECTORY_AFTER_BUILD='"'"${HSPEC_DELETE_TRAJECTORY_AFTER_BUILD}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RAW_STORE_GC_AFTER_EPOCH='"'"${HSPEC_RAW_STORE_GC_AFTER_EPOCH}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TP_GROUP_ID='"'"${HSPEC_TP_GROUP_ID}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN='"'"${HSPEC_GEN}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_REQ_IDX='"'"${HSPEC_GEN_REQ_IDX}"'"' \

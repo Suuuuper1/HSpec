@@ -78,6 +78,12 @@ _store_metrics: Dict[str, int] = {
     "segment_delete_count": 0,
     "segment_delete_bytes": 0,
     "segment_delete_error": 0,
+    "raw_store_epoch_gc_segments": 0,
+    "raw_store_epoch_gc_deleted": 0,
+    "raw_store_epoch_gc_skipped": 0,
+    "raw_store_epoch_gc_error": 0,
+    "build_submission_count": 0,
+    "build_submission_segments": 0,
 }
 
 
@@ -115,6 +121,11 @@ def hspec_strict_descriptor_mode_enabled() -> bool:
 def hspec_step0_runtime_asserts_enabled() -> bool:
     """Enable cheap Step-0 key-level invariants outside decode hot paths."""
     return os.getenv("HSPEC_STEP0_RUNTIME_ASSERTS", "0") != "0"
+
+
+def hspec_raw_store_gc_after_epoch_enabled() -> bool:
+    """Whether trainer epoch barriers should delete successfully built raw segments."""
+    return os.getenv("HSPEC_RAW_STORE_GC_AFTER_EPOCH", "1") != "0"
 
 
 def hspec_record_store_metric(name: str, value: int = 1) -> None:

@@ -18,6 +18,8 @@ HSpec: Hidden State based Speculative Decoding query table.
 import json
 import logging
 import os
+import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import msgpack
@@ -33,6 +35,7 @@ from vllm_ascend.spec_decode.hspec_utils import (
     stable_partition_id,
 )
 from vllm_ascend.spec_decode.hspec_store import (
+    HSpecSegmentKey,
     HSpecTrajectoryDesc,
     coerce_hspec_desc,
     collect_hspec_store_metrics,
@@ -40,16 +43,56 @@ from vllm_ascend.spec_decode.hspec_store import (
     get_hspec_build_actor_num_cpus,
     get_hspec_num_shards,
     get_hspec_table_store_root,
+    hspec_legacy_dataproto_hs_enabled,
     hspec_record_store_metric,
+    hspec_segment_key_from_desc,
+    hspec_strict_descriptor_mode_enabled,
     load_hspec_trajectory,
 )
 
 logger = logging.getLogger(__name__)
 _unsafe_descriptor_cleanup_warned = False
+_LEGACY_HSPEC_PAYLOAD_KEYS = frozenset({"hidden_states", "tokens", "rewards", "prompt_token_ids"})
+
+
+@dataclass(frozen=True)
+class HSpecBuildSubmission:
+    ref: ray.ObjectRef
+    shard_id: int
+    segments: frozenset[HSpecSegmentKey]
+    prompt_ids: tuple[str, ...]
+    legacy: bool = False
 
 
 def _build_actor_name(shard_id: int) -> str:
     return f"hspec_build_shard_{int(shard_id)}"
+
+
+def _looks_like_legacy_hspec_payload(data: Any) -> bool:
+    return isinstance(data, dict) and bool(_LEGACY_HSPEC_PAYLOAD_KEYS.intersection(data.keys()))
+
+
+def _raise_legacy_payload_forbidden(prompt_id: str, data: Any) -> None:
+    if _looks_like_legacy_hspec_payload(data):
+        hspec_record_store_metric("strict_descriptor_violation", 1)
+        raise ValueError(
+            "Legacy HSpec ndarray payload is forbidden in descriptor build API "
+            "when HSPEC_LEGACY_DATAPROTO_HS=0. "
+            f"prompt_id={prompt_id!r}; use build_tables_batch_legacy() only for explicit A/B."
+        )
+    raise TypeError(
+        "HSpec descriptor build API expects a list of HSpecTrajectoryDesc "
+        f"for prompt_id={prompt_id!r}, got {type(data)!r}"
+    )
+
+
+def _maybe_process_rss_mb() -> float:
+    try:
+        import psutil
+
+        return float(psutil.Process().memory_info().rss / (1024 * 1024))
+    except Exception:
+        return -1.0
 
 
 # Per-prompt table data  (continuous-array, reference-value storage)
@@ -477,55 +520,125 @@ class HSpecTableGroup:
         self._building[prompt_id] = table
         self._build_count += 1
 
-    def build_tables_batch(self, prompt_data_dict: Dict[str, Dict]):
-        """Build tables for a *batch* of prompts (one remote call per partition).
+    def _build_result_metrics(
+        self,
+        *,
+        t0: float,
+        prompt_count: int,
+        desc_count: int,
+        legacy_payload_count: int,
+        build_count_before: int,
+        discard_count_before: int,
+    ) -> Dict[str, float]:
+        return {
+            "shard_id": float(self.shard_id),
+            "prompt_count": float(prompt_count),
+            "desc_count": float(desc_count),
+            "legacy_payload_count": float(legacy_payload_count),
+            "build_count_delta": float(self._build_count - build_count_before),
+            "discard_count_delta": float(self._discard_count - discard_count_before),
+            "build_total_ms": float((time.perf_counter() - t0) * 1000.0),
+            "build_actor_rss_mb": _maybe_process_rss_mb(),
+        }
 
-        Args:
-            prompt_data_dict: ``{prompt_id: {
-                'hidden_states': List[ndarray (L_i, D)],
-                'tokens':        List[List[int]],
-                'rewards':       List[float],
-            }}``
+    def build_tables_batch(
+        self,
+        prompt_data_dict: Dict[str, List[HSpecTrajectoryDesc | Dict[str, Any]]],
+    ) -> Dict[str, float]:
+        """Build descriptor-only prompt payloads for one partition.
+
+        Payload shape is ``{prompt_id: [HSpecTrajectoryDesc | dict, ...]}``.
+        Legacy ndarray dict payloads must use ``build_tables_batch_legacy``.
         """
+        t0 = time.perf_counter()
+        prompt_count = 0
+        desc_count = 0
+        build_count_before = self._build_count
+        discard_count_before = self._discard_count
         blas_threads = max(int(os.getenv("HSPEC_BUILD_BLAS_THREADS", "1")), 1)
         with threadpool_limits(limits=blas_threads):
             for prompt_id, data in prompt_data_dict.items():
-                if isinstance(data, list):
-                    descs = [coerce_hspec_desc(item) for item in data if item is not None]
-                    if not descs:
-                        continue
-                    if not self._can_accept_descriptor_batch(descs):
-                        logger.warning(
-                            "HSpec build queue budget exceeded on shard=%s, dropping %s descriptors for prompt_id=%s",
-                            self.shard_id,
-                            len(descs),
-                            prompt_id,
-                        )
-                        self._discard_count += len(descs)
-                        continue
-                    self._mark_descriptor_batch_pending(descs)
-                    try:
-                        hidden_states_list, token_seq_list, rewards = self._load_prompt_build_inputs_from_descs(
-                            prompt_id,
-                            descs,
-                        )
-                        self.build_prompt_table(
-                            prompt_id,
-                            hidden_states_list,
-                            token_seq_list,
-                            rewards,
-                        )
-                    finally:
-                        self._cleanup_trajectory_descs(descs)
-                        self._mark_descriptor_batch_finished(descs)
+                if not isinstance(data, list):
+                    if hspec_strict_descriptor_mode_enabled() or _looks_like_legacy_hspec_payload(data):
+                        _raise_legacy_payload_forbidden(prompt_id, data)
+                    _raise_legacy_payload_forbidden(prompt_id, data)
+                descs = [coerce_hspec_desc(item) for item in data if item is not None]
+                if not descs:
                     continue
+                prompt_count += 1
+                desc_count += len(descs)
+                hspec_record_store_metric("descriptor_payload_count", len(descs))
+                if not self._can_accept_descriptor_batch(descs):
+                    logger.warning(
+                        "HSpec build queue budget exceeded on shard=%s, dropping %s descriptors for prompt_id=%s",
+                        self.shard_id,
+                        len(descs),
+                        prompt_id,
+                    )
+                    self._discard_count += len(descs)
+                    continue
+                self._mark_descriptor_batch_pending(descs)
+                try:
+                    hidden_states_list, token_seq_list, rewards = self._load_prompt_build_inputs_from_descs(
+                        prompt_id,
+                        descs,
+                    )
+                    self.build_prompt_table(
+                        prompt_id,
+                        hidden_states_list,
+                        token_seq_list,
+                        rewards,
+                    )
+                finally:
+                    self._cleanup_trajectory_descs(descs)
+                    self._mark_descriptor_batch_finished(descs)
 
+        return self._build_result_metrics(
+            t0=t0,
+            prompt_count=prompt_count,
+            desc_count=desc_count,
+            legacy_payload_count=0,
+            build_count_before=build_count_before,
+            discard_count_before=discard_count_before,
+        )
+
+    def build_tables_batch_legacy(self, prompt_data_dict: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+        """Build old ndarray payloads for explicit HSPEC_LEGACY_DATAPROTO_HS=1 A/B only."""
+        if not hspec_legacy_dataproto_hs_enabled():
+            hspec_record_store_metric("strict_descriptor_violation", 1)
+            raise RuntimeError("build_tables_batch_legacy() requires HSPEC_LEGACY_DATAPROTO_HS=1")
+
+        t0 = time.perf_counter()
+        prompt_count = 0
+        legacy_payload_count = 0
+        build_count_before = self._build_count
+        discard_count_before = self._discard_count
+        blas_threads = max(int(os.getenv("HSPEC_BUILD_BLAS_THREADS", "1")), 1)
+        with threadpool_limits(limits=blas_threads):
+            for prompt_id, data in prompt_data_dict.items():
+                if not _looks_like_legacy_hspec_payload(data):
+                    raise TypeError(
+                        "Legacy HSpec build API expects dict payload with "
+                        f"hidden_states/tokens/rewards for prompt_id={prompt_id!r}"
+                    )
+                prompt_count += 1
+                hidden_states = data["hidden_states"]
+                legacy_payload_count += len(hidden_states) if hasattr(hidden_states, "__len__") else 1
                 self.build_prompt_table(
                     prompt_id,
-                    data["hidden_states"],
+                    hidden_states,
                     data["tokens"],
                     data["rewards"],
                 )
+        hspec_record_store_metric("legacy_payload_count", legacy_payload_count)
+        return self._build_result_metrics(
+            t0=t0,
+            prompt_count=prompt_count,
+            desc_count=0,
+            legacy_payload_count=legacy_payload_count,
+            build_count_before=build_count_before,
+            discard_count_before=discard_count_before,
+        )
 
     # Query
 
@@ -1029,57 +1142,112 @@ class GlobalHSpecTableGroup:
     # Build  (async, non-blocking)
     def build_tables_async(
         self,
-        prompt_data: Dict[str, List[HSpecTrajectoryDesc] | Dict[str, Any]],
-    ) -> List[ray.ObjectRef]:
-        """Send descriptor-first rollout data to partition actors.
+        prompt_data: Dict[str, List[HSpecTrajectoryDesc | Dict[str, Any]]],
+    ) -> List[HSpecBuildSubmission]:
+        """Submit descriptor-only rollout data to partition actors.
 
-        Phase 1 default payload is ``{prompt_id:
-        List[HSpecTrajectoryDesc]}``.  Legacy dict payloads containing
-        ``hidden_states`` are kept only for explicit
-        ``HSPEC_LEGACY_DATAPROTO_HS=1`` A/B runs; Step 5 will harden this API
-        boundary. PCA fitting + table construction runs inside Ray actors and
-        does **not** block the caller.
-
-        Args:
-            prompt_data: Descriptor-first prompt payload, with legacy dict
-                payloads accepted only for the old A/B path.
-
-        Returns:
-            Ray ObjectRefs (futures).  Call ``ray.get(refs)`` only when you
-            need to guarantee building is complete (e.g. before starting
-            the next rollout that will query the tables).
+        Phase 1 default payload is ``{prompt_id: List[HSpecTrajectoryDesc]}``.
+        Legacy ndarray dict payloads must use ``build_tables_async_legacy``.
+        PCA fitting + table construction runs inside Ray actors and does not
+        block the caller. The returned submission records retain the raw
+        segment keys required for epoch-level GC.
         """
-        # Group by partition
         partition_payloads: Dict[int, Dict[str, Any]] = {i: {} for i in range(self.num_groups)}
+        partition_segments: Dict[int, set[HSpecSegmentKey]] = {i: set() for i in range(self.num_groups)}
+        partition_prompt_ids: Dict[int, List[str]] = {i: [] for i in range(self.num_groups)}
         for prompt_id, data in prompt_data.items():
-            pid = self._get_partition_id(prompt_id)
-            if isinstance(data, list):
-                for desc in data:
-                    if desc is None:
-                        continue
-                    try:
-                        desc_obj = coerce_hspec_desc(desc)
-                        if int(desc_obj.shard_id) != int(pid):
-                            logger.warning(
-                                "HSpec descriptor shard hint mismatch during routing: "
-                                "prompt_id=%s desc.shard_id=%s expected=%s; routing by prompt_id",
-                                prompt_id,
-                                desc_obj.shard_id,
-                                pid,
-                            )
-                    except Exception:
-                        logger.debug(
-                            "Failed to inspect HSpec descriptor shard hint for prompt_id=%s",
-                            prompt_id,
-                            exc_info=True,
-                        )
-            partition_payloads[pid][prompt_id] = data
+            if not isinstance(data, list):
+                if hspec_strict_descriptor_mode_enabled() or _looks_like_legacy_hspec_payload(data):
+                    _raise_legacy_payload_forbidden(prompt_id, data)
+                _raise_legacy_payload_forbidden(prompt_id, data)
 
-        futures: List[ray.ObjectRef] = []
+            pid = self._get_partition_id(prompt_id)
+            descs: List[HSpecTrajectoryDesc] = []
+            for desc in data:
+                if desc is None:
+                    continue
+                desc_obj = coerce_hspec_desc(desc)
+                descs.append(desc_obj)
+                try:
+                    partition_segments[pid].add(hspec_segment_key_from_desc(desc_obj))
+                    if int(desc_obj.shard_id) != int(pid):
+                        logger.warning(
+                            "HSpec descriptor shard hint mismatch during routing: "
+                            "prompt_id=%s desc.shard_id=%s expected=%s; routing by prompt_id",
+                            prompt_id,
+                            desc_obj.shard_id,
+                            pid,
+                        )
+                except Exception:
+                    logger.debug(
+                        "Failed to inspect HSpec descriptor segment/shard hint for prompt_id=%s",
+                        prompt_id,
+                        exc_info=True,
+                    )
+                    raise
+            if not descs:
+                continue
+            partition_payloads[pid][prompt_id] = descs
+            partition_prompt_ids[pid].append(prompt_id)
+
+        submissions: List[HSpecBuildSubmission] = []
         for pid, payload in partition_payloads.items():
             if payload and pid < len(self.groups):
-                futures.append(self.groups[pid].build_tables_batch.remote(payload))
-        return futures
+                ref = self.groups[pid].build_tables_batch.remote(payload)
+                submissions.append(
+                    HSpecBuildSubmission(
+                        ref=ref,
+                        shard_id=pid,
+                        segments=frozenset(partition_segments[pid]),
+                        prompt_ids=tuple(partition_prompt_ids[pid]),
+                        legacy=False,
+                    )
+                )
+        if submissions:
+            hspec_record_store_metric("build_submission_count", len(submissions))
+            hspec_record_store_metric(
+                "build_submission_segments",
+                len({segment for item in submissions for segment in item.segments}),
+            )
+        return submissions
+
+    def build_tables_async_legacy(
+        self,
+        prompt_data: Dict[str, Dict[str, Any]],
+    ) -> List[HSpecBuildSubmission]:
+        """Submit old ndarray payloads for explicit HSPEC_LEGACY_DATAPROTO_HS=1 A/B only."""
+        if not hspec_legacy_dataproto_hs_enabled():
+            hspec_record_store_metric("strict_descriptor_violation", 1)
+            raise RuntimeError("build_tables_async_legacy() requires HSPEC_LEGACY_DATAPROTO_HS=1")
+
+        partition_payloads: Dict[int, Dict[str, Any]] = {i: {} for i in range(self.num_groups)}
+        partition_prompt_ids: Dict[int, List[str]] = {i: [] for i in range(self.num_groups)}
+        for prompt_id, data in prompt_data.items():
+            if not _looks_like_legacy_hspec_payload(data):
+                raise TypeError(
+                    "Legacy HSpec build API expects dict payload with "
+                    f"hidden_states/tokens/rewards for prompt_id={prompt_id!r}"
+                )
+            pid = self._get_partition_id(prompt_id)
+            partition_payloads[pid][prompt_id] = data
+            partition_prompt_ids[pid].append(prompt_id)
+
+        submissions: List[HSpecBuildSubmission] = []
+        for pid, payload in partition_payloads.items():
+            if payload and pid < len(self.groups):
+                ref = self.groups[pid].build_tables_batch_legacy.remote(payload)
+                submissions.append(
+                    HSpecBuildSubmission(
+                        ref=ref,
+                        shard_id=pid,
+                        segments=frozenset(),
+                        prompt_ids=tuple(partition_prompt_ids[pid]),
+                        legacy=True,
+                    )
+                )
+        if submissions:
+            hspec_record_store_metric("build_submission_count", len(submissions))
+        return submissions
 
     def query(self, prompt_id: str, hidden_state: np.ndarray, accept_length: int = 1):
         actor = self._get_partition(prompt_id)
@@ -1355,6 +1523,18 @@ class GlobalHSpecTableGroup:
             store_metrics.get("raw_store_budget_gc_skipped", 0))
         result["hspec/unsafe_descriptor_cleanup_suppressed"] = float(
             store_metrics.get("unsafe_descriptor_cleanup_suppressed", 0))
+        result["hspec/segment_delete_count"] = float(store_metrics.get("segment_delete_count", 0))
+        result["hspec/segment_delete_bytes"] = float(store_metrics.get("segment_delete_bytes", 0))
+        result["hspec/raw_store_epoch_gc_segments"] = float(
+            store_metrics.get("raw_store_epoch_gc_segments", 0))
+        result["hspec/raw_store_epoch_gc_deleted"] = float(
+            store_metrics.get("raw_store_epoch_gc_deleted", 0))
+        result["hspec/raw_store_epoch_gc_skipped"] = float(
+            store_metrics.get("raw_store_epoch_gc_skipped", 0))
+        result["hspec/raw_store_epoch_gc_error"] = float(
+            store_metrics.get("raw_store_epoch_gc_error", 0))
+        result["hspec/build_submission_count"] = float(store_metrics.get("build_submission_count", 0))
+        result["hspec/build_submission_segments"] = float(store_metrics.get("build_submission_segments", 0))
 
         abs_deltas = set()
         for key in agg:
