@@ -10,6 +10,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 CUSTOM_OPP_PATH="${PROJECT_ROOT}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend"
 CUSTOM_OP_API_LIB="${CUSTOM_OPP_PATH}/op_api/lib"
+RUN_NAME="${RUN_NAME:-qwen25_15b_hspec}"
+HSPEC_RUN_NAME="${HSPEC_RUN_NAME:-${RUN_NAME}}"
 
 if [ -d "${CUSTOM_OPP_PATH}" ]; then
     export ASCEND_CUSTOM_OPP_PATH="${CUSTOM_OPP_PATH}:${ASCEND_CUSTOM_OPP_PATH:-}"
@@ -26,8 +28,8 @@ export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 export HSPEC_LEGACY_DATAPROTO_HS="${HSPEC_LEGACY_DATAPROTO_HS:-0}"
 export HSPEC_STRICT_DESCRIPTOR_MODE="${HSPEC_STRICT_DESCRIPTOR_MODE:-1}"
 export HSPEC_STORE_DTYPE="${HSPEC_STORE_DTYPE:-float16}"
-export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_store}"
-export HSPEC_TABLE_STORE_DIR="${HSPEC_TABLE_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_table_store}"
+export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_store/${HSPEC_RUN_NAME}}"
+export HSPEC_TABLE_STORE_DIR="${HSPEC_TABLE_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_table_store/${HSPEC_RUN_NAME}}"
 export HSPEC_INFER_TP="${HSPEC_INFER_TP:-2}"
 export HSPEC_NUM_SHARDS="${HSPEC_NUM_SHARDS:-${HSPEC_INFER_TP}}"
 export NODE_RANK="${NODE_RANK:-0}"
@@ -37,9 +39,14 @@ export HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS="${HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS:-1
 export HSPEC_STEP0_RUNTIME_ASSERTS="${HSPEC_STEP0_RUNTIME_ASSERTS:-0}"
 export HSPEC_BUILD_ACTOR_NUM_CPUS="${HSPEC_BUILD_ACTOR_NUM_CPUS:-1}"
 export HSPEC_BUILD_BLAS_THREADS="${HSPEC_BUILD_BLAS_THREADS:-1}"
-export HSPEC_BUILD_ACTOR_NAME_PREFIX="${HSPEC_BUILD_ACTOR_NAME_PREFIX:-hspec_build_shard}"
+export HSPEC_BUILD_ACTOR_NAME_PREFIX="${HSPEC_BUILD_ACTOR_NAME_PREFIX:-hspec_build_${HSPEC_RUN_NAME}}"
 export HSPEC_DELETE_TRAJECTORY_AFTER_BUILD="${HSPEC_DELETE_TRAJECTORY_AFTER_BUILD:-0}"
 export HSPEC_RAW_STORE_GC_AFTER_EPOCH="${HSPEC_RAW_STORE_GC_AFTER_EPOCH:-1}"
+export HSPEC_SEGMENT_FSYNC_ON_SEAL="${HSPEC_SEGMENT_FSYNC_ON_SEAL:-0}"
+export HSPEC_RAW_STORE_MAX_BYTES="${HSPEC_RAW_STORE_MAX_BYTES:-0}"
+export HSPEC_RAW_STORE_MAX_FILES="${HSPEC_RAW_STORE_MAX_FILES:-0}"
+export HSPEC_STORE_RETAIN_BATCHES="${HSPEC_STORE_RETAIN_BATCHES:-128}"
+export HSPEC_RAW_STORE_BUDGET_DELETE="${HSPEC_RAW_STORE_BUDGET_DELETE:-0}"
 export HSPEC_TP_GROUP_ID="${HSPEC_TP_GROUP_ID:-}"
 export HSPEC_PINNED_POOL_BYTES="${HSPEC_PINNED_POOL_BYTES:-268435456}"
 export HSPEC_PINNED_POOL_MAX_SLOTS="${HSPEC_PINNED_POOL_MAX_SLOTS:-64}"
@@ -132,6 +139,8 @@ mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
     echo
     echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') hspec single run ====="
     echo "project_root=${PROJECT_ROOT}"
+    echo "run_name=${RUN_NAME}"
+    echo "hspec_run_name=${HSPEC_RUN_NAME}"
     echo "model_path=${MODEL_PATH}"
     echo "train_file=${TRAIN_FILE}"
     echo "test_file=${TEST_FILE}"
@@ -154,6 +163,11 @@ mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
     echo "hspec_build_actor_name_prefix=${HSPEC_BUILD_ACTOR_NAME_PREFIX}"
     echo "hspec_delete_trajectory_after_build=${HSPEC_DELETE_TRAJECTORY_AFTER_BUILD}"
     echo "hspec_raw_store_gc_after_epoch=${HSPEC_RAW_STORE_GC_AFTER_EPOCH}"
+    echo "hspec_segment_fsync_on_seal=${HSPEC_SEGMENT_FSYNC_ON_SEAL}"
+    echo "hspec_raw_store_max_bytes=${HSPEC_RAW_STORE_MAX_BYTES}"
+    echo "hspec_raw_store_max_files=${HSPEC_RAW_STORE_MAX_FILES}"
+    echo "hspec_store_retain_batches=${HSPEC_STORE_RETAIN_BATCHES}"
+    echo "hspec_raw_store_budget_delete=${HSPEC_RAW_STORE_BUDGET_DELETE}"
     echo "hspec_pinned_pool_bytes=${HSPEC_PINNED_POOL_BYTES}"
     echo "hspec_pinned_pool_max_slots=${HSPEC_PINNED_POOL_MAX_SLOTS}"
     echo "hspec_pinned_pool_bucket_rows=${HSPEC_PINNED_POOL_BUCKET_ROWS}"
@@ -166,6 +180,8 @@ mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
     echo "hspec_build_max_rss_mb=${HSPEC_BUILD_MAX_RSS_MB}"
     echo "hspec_profile=${HSPEC_PROFILE}"
     echo "hspec_dump=${HSPEC_DUMP}"
+    echo "hspec_async_hs_accumulate=${HSPEC_ASYNC_HS_ACCUMULATE}"
+    echo "hspec_async_hs_copy_stream=${HSPEC_ASYNC_HS_COPY_STREAM}"
     echo "pca_components=${PCA_COMPONENTS}"
     echo "vllm_spec_batch_threshold=${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"
 } >> "${OUT}"
@@ -200,6 +216,11 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_BUILD_ACTOR_NAME_PREFIX='"'"${HSPEC_BUILD_ACTOR_NAME_PREFIX}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DELETE_TRAJECTORY_AFTER_BUILD='"'"${HSPEC_DELETE_TRAJECTORY_AFTER_BUILD}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RAW_STORE_GC_AFTER_EPOCH='"'"${HSPEC_RAW_STORE_GC_AFTER_EPOCH}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SEGMENT_FSYNC_ON_SEAL='"'"${HSPEC_SEGMENT_FSYNC_ON_SEAL}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RAW_STORE_MAX_BYTES='"'"${HSPEC_RAW_STORE_MAX_BYTES}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RAW_STORE_MAX_FILES='"'"${HSPEC_RAW_STORE_MAX_FILES}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_RETAIN_BATCHES='"'"${HSPEC_STORE_RETAIN_BATCHES}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RAW_STORE_BUDGET_DELETE='"'"${HSPEC_RAW_STORE_BUDGET_DELETE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TP_GROUP_ID='"'"${HSPEC_TP_GROUP_ID}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_BYTES='"'"${HSPEC_PINNED_POOL_BYTES}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_MAX_SLOTS='"'"${HSPEC_PINNED_POOL_MAX_SLOTS}"'"' \

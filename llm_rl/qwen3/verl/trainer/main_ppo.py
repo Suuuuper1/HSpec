@@ -78,8 +78,16 @@ def run_ppo(config) -> None:
             get_hspec_build_max_rss_mb,
             get_hspec_num_shards,
             get_hspec_node_id,
+            get_hspec_raw_store_max_bytes,
+            get_hspec_raw_store_max_files,
+            get_hspec_store_retain_batches,
             get_hspec_store_dtype,
+            get_hspec_store_root,
+            get_hspec_table_store_root,
             hspec_legacy_dataproto_hs_enabled,
+            hspec_raw_store_budget_delete_enabled,
+            hspec_raw_store_gc_after_epoch_enabled,
+            hspec_segment_fsync_on_seal_enabled,
             hspec_single_node_only_enabled,
             hspec_strict_descriptor_mode_enabled,
             hspec_topology_strict_enabled,
@@ -114,31 +122,6 @@ def run_ppo(config) -> None:
         hspec_build_max_prompt_descs = get_hspec_build_max_prompt_descs()
         hspec_build_max_rss_mb = get_hspec_build_max_rss_mb()
         total_build_actor_cpus = float(hspec_num_shards) * float(hspec_build_actor_cpus)
-        if not hspec_single_node_only:
-            print(
-                "WARNING: HSPEC_SINGLE_NODE_ONLY=0 disables descriptor node checks, "
-                "but Phase 1 still does not implement multi-node local-file build routing."
-            )
-        print(
-            "HSpec Phase1 config: "
-            f"store_dtype={hspec_store_dtype}, "
-            f"strict_descriptor_mode={hspec_strict_descriptor_mode_enabled()}, "
-            f"single_node_only={hspec_single_node_only}, "
-            f"topology_strict={hspec_topology_strict}, "
-            f"nnodes={int(config.trainer.nnodes)}, "
-            f"num_shards={hspec_num_shards}, "
-            f"build_actor_num_cpus={hspec_build_actor_cpus}, "
-            f"build_blas_threads={hspec_build_blas_threads}, "
-            f"build_actor_name_prefix={hspec_build_actor_prefix}, "
-            f"build_max_prompt_rows={hspec_build_max_prompt_rows}, "
-            f"build_max_prompt_raw_bytes={hspec_build_max_prompt_raw_bytes}, "
-            f"build_max_prompt_descs={hspec_build_max_prompt_descs}, "
-            f"build_max_rss_mb={hspec_build_max_rss_mb}, "
-            f"total_build_actor_cpus={total_build_actor_cpus}, "
-            f"node_rank={get_hspec_node_id()}, "
-            f"legacy_dataproto_hs={hspec_legacy_dataproto_hs_enabled()}"
-        )
-
         similarity_threshold = config.actor_rollout_ref.rollout.get(
             "hspec_similarity_threshold", 0.9
         )
@@ -147,6 +130,52 @@ def run_ppo(config) -> None:
         )
         hspec_max_entries = config.actor_rollout_ref.rollout.get(
             "hspec_max_entries_per_prompt", 10000
+        )
+        if not hspec_single_node_only:
+            print(
+                "WARNING: HSPEC_SINGLE_NODE_ONLY=0 disables descriptor node checks, "
+                "but Phase 1 still does not implement multi-node local-file build routing."
+            )
+        print(
+            "HSpec Phase1 config: "
+            f"store_dtype={hspec_store_dtype}, "
+            f"store_dir={get_hspec_store_root()}, "
+            f"table_store_dir={get_hspec_table_store_root()}, "
+            f"strict_descriptor_mode={hspec_strict_descriptor_mode_enabled()}, "
+            f"single_node_only={hspec_single_node_only}, "
+            f"topology_strict={hspec_topology_strict}, "
+            f"nnodes={int(config.trainer.nnodes)}, "
+            f"n_gpus_per_node={int(config.trainer.n_gpus_per_node)}, "
+            f"num_shards={hspec_num_shards}, "
+            f"build_actor_num_cpus={hspec_build_actor_cpus}, "
+            f"build_blas_threads={hspec_build_blas_threads}, "
+            f"build_actor_name_prefix={hspec_build_actor_prefix}, "
+            f"raw_store_gc_after_epoch={hspec_raw_store_gc_after_epoch_enabled()}, "
+            f"segment_fsync_on_seal={hspec_segment_fsync_on_seal_enabled()}, "
+            f"raw_store_budget_delete={hspec_raw_store_budget_delete_enabled()}, "
+            f"raw_store_max_bytes={get_hspec_raw_store_max_bytes()}, "
+            f"raw_store_max_files={get_hspec_raw_store_max_files()}, "
+            f"store_retain_batches={get_hspec_store_retain_batches()}, "
+            f"pinned_pool_bytes={os.getenv('HSPEC_PINNED_POOL_BYTES', str(256 * 1024 * 1024))}, "
+            f"pinned_pool_max_slots={os.getenv('HSPEC_PINNED_POOL_MAX_SLOTS', '64')}, "
+            f"pinned_pool_bucket_rows={os.getenv('HSPEC_PINNED_POOL_BUCKET_ROWS', '64,128,256,512,1024,2048,4096')}, "
+            f"copy_max_pending_tasks={os.getenv('HSPEC_COPY_MAX_PENDING_TASKS', '64')}, "
+            f"copy_max_pending_rows={os.getenv('HSPEC_COPY_MAX_PENDING_ROWS', '0')}, "
+            f"drop_on_backpressure={os.getenv('HSPEC_DROP_ON_BACKPRESSURE', '1')}, "
+            f"build_max_prompt_rows={hspec_build_max_prompt_rows}, "
+            f"build_max_prompt_raw_bytes={hspec_build_max_prompt_raw_bytes}, "
+            f"build_max_prompt_descs={hspec_build_max_prompt_descs}, "
+            f"build_max_rss_mb={hspec_build_max_rss_mb}, "
+            f"total_build_actor_cpus={total_build_actor_cpus}, "
+            f"node_rank={get_hspec_node_id()}, "
+            f"hspec_similarity_threshold={similarity_threshold}, "
+            f"hspec_n_components={hspec_n_components}, "
+            f"hspec_max_entries_per_prompt={hspec_max_entries}, "
+            f"rollout_tp={config.actor_rollout_ref.rollout.get('tensor_model_parallel_size')}, "
+            f"rollout_n={config.actor_rollout_ref.rollout.get('n')}, "
+            f"rollout_max_num_seqs={config.actor_rollout_ref.rollout.get('max_num_seqs')}, "
+            f"max_response_length={config.data.get('max_response_length')}, "
+            f"legacy_dataproto_hs={hspec_legacy_dataproto_hs_enabled()}"
         )
         init_hspec_tables(
             similarity_threshold=similarity_threshold,
