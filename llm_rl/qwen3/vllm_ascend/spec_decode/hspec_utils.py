@@ -25,6 +25,7 @@ import os
 import queue
 import struct
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -42,6 +43,33 @@ _hspec_runtime_metric_lock = threading.Lock()
 _hspec_runtime_metrics: Dict[str, int] = {
     "pinned_pool_miss": 0,
     "pinned_pageable_fallback": 0,
+    "pinned_reserved_bytes": 0,
+    "pinned_reserved_slots": 0,
+    "pinned_checkout_count": 0,
+    "pinned_reuse_count": 0,
+    "pinned_alloc_count": 0,
+    "pinned_miss_budget_bytes": 0,
+    "pinned_miss_budget_slots": 0,
+    "pinned_miss_alloc_error": 0,
+    "pinned_miss_shape_too_large": 0,
+    "copy_pending_tasks": 0,
+    "copy_pending_tasks_max": 0,
+    "copy_pending_rows": 0,
+    "copy_pending_rows_max": 0,
+    "copy_submitted_tasks": 0,
+    "copy_submitted_rows": 0,
+    "copy_finished_tasks": 0,
+    "copy_finished_rows": 0,
+    "copy_backpressure_drop": 0,
+    "copy_backpressure_drop_rows": 0,
+    "copy_backpressure_drop_reqs": 0,
+    "copy_worker_error": 0,
+    "copy_submit_error": 0,
+    "copy_worker_pair_write_error": 0,
+    "copy_token_hidden_len_mismatch": 0,
+    "flush_wait_ms_total": 0,
+    "flush_wait_ms_max": 0,
+    "flush_wait_count": 0,
 }
 
 
@@ -100,12 +128,33 @@ def _hspec_metric_add(name: str, value: int = 1) -> None:
         _hspec_runtime_metrics[name] = _hspec_runtime_metrics.get(name, 0) + int(value)
 
 
-def hspec_collect_runtime_metrics(reset: bool = True) -> Dict[str, int]:
+def _hspec_metric_set(name: str, value: int) -> None:
     with _hspec_runtime_metric_lock:
+        _hspec_runtime_metrics[name] = int(value)
+
+
+def _hspec_metric_max(name: str, value: int) -> None:
+    with _hspec_runtime_metric_lock:
+        _hspec_runtime_metrics[name] = max(
+            int(_hspec_runtime_metrics.get(name, 0)),
+            int(value),
+        )
+
+
+def hspec_collect_runtime_metrics(reset: bool = True) -> Dict[str, int]:
+    pool_snapshot: Dict[str, int] = {}
+    pool = globals().get("_hspec_pinned_pool")
+    if pool is not None and hasattr(pool, "snapshot"):
+        try:
+            pool_snapshot = pool.snapshot()
+        except Exception:
+            pool_snapshot = {}
+    with _hspec_runtime_metric_lock:
+        _hspec_runtime_metrics.update(pool_snapshot)
         metrics = dict(_hspec_runtime_metrics)
         if reset:
             for key in list(_hspec_runtime_metrics.keys()):
-                _hspec_runtime_metrics[key] = 0
+                _hspec_runtime_metrics[key] = int(pool_snapshot.get(key, 0))
     return metrics
 
 
@@ -911,32 +960,43 @@ class _HSpecAsyncCopyTask:
 
     __slots__ = (
         "req_slices",
+        "token_slices",
         "cpu_tensor",
         "event",
         "device_tensor_ref",
         "pool_handle",
+        "num_rows",
     )
 
     def __init__(
         self,
         req_slices: List[Tuple[str, int, int]],
+        token_slices: Optional[Dict[str, List[int]]],
         cpu_tensor: torch.Tensor,
         event: Any,
         device_tensor_ref: Optional[torch.Tensor],
         pool_handle: Any = None,
+        num_rows: int = 0,
     ) -> None:
         self.req_slices = req_slices
+        self.token_slices = token_slices
         self.cpu_tensor = cpu_tensor
         self.event = event
         # Keep the source device tensor alive until the async copy completes.
         self.device_tensor_ref = device_tensor_ref
         self.pool_handle = pool_handle
+        self.num_rows = int(num_rows)
 
 
 class _HSpecAsyncAccumulateTask:
 
     __slots__ = (
         "req_ids",
+        "req_slices",
+        "flat_indices",
+        "pending_req_ids",
+        "token_slices",
+        "num_rows",
         "sample_hidden_states",
         "valid_sampled_token_ids",
         "spec_decode_metadata",
@@ -947,6 +1007,11 @@ class _HSpecAsyncAccumulateTask:
     def __init__(
         self,
         req_ids: Tuple[str, ...],
+        req_slices: List[Tuple[str, int, int]],
+        flat_indices: List[int],
+        pending_req_ids: List[str],
+        token_slices: Optional[Dict[str, List[int]]],
+        num_rows: int,
         sample_hidden_states: torch.Tensor,
         valid_sampled_token_ids: List[List[int]],
         spec_decode_metadata: Any,
@@ -954,6 +1019,11 @@ class _HSpecAsyncAccumulateTask:
         producer_event: Any,
     ) -> None:
         self.req_ids = req_ids
+        self.req_slices = req_slices
+        self.flat_indices = flat_indices
+        self.pending_req_ids = pending_req_ids
+        self.token_slices = token_slices
+        self.num_rows = int(num_rows)
         self.sample_hidden_states = sample_hidden_states
         self.valid_sampled_token_ids = valid_sampled_token_ids
         self.spec_decode_metadata = spec_decode_metadata
@@ -967,6 +1037,8 @@ _hspec_accumulate_queue: "queue.SimpleQueue[_HSpecAsyncAccumulateTask | None]" =
 _hspec_accumulate_thread: Optional[_threading.Thread] = None
 _hspec_async_transfer_streams: Dict[str, Any] = {}
 _hspec_async_pending_total: int = 0
+_hspec_async_pending_tasks: int = 0
+_hspec_async_pending_rows: int = 0
 _hspec_async_pending_by_req: Dict[str, int] = {}
 
 
@@ -979,9 +1051,12 @@ class _HSpecPinnedPool:
         self._reserved_bytes = 0
         self._reserved_slots = 0
         self._max_bytes = int(
-            os.getenv("HSPEC_PINNED_POOL_BYTES", str(512 * 1024 * 1024)))
+            os.getenv("HSPEC_PINNED_POOL_BYTES", str(256 * 1024 * 1024)))
         self._max_slots = int(os.getenv("HSPEC_PINNED_POOL_MAX_SLOTS", "64"))
-        buckets = os.getenv("HSPEC_PINNED_POOL_BUCKET_ROWS", "64,128,256,512,1024")
+        buckets = os.getenv(
+            "HSPEC_PINNED_POOL_BUCKET_ROWS",
+            "64,128,256,512,1024,2048,4096",
+        )
         parsed = []
         for item in buckets.split(","):
             item = item.strip()
@@ -993,7 +1068,7 @@ class _HSpecPinnedPool:
                     parsed.append(value)
             except ValueError:
                 logger.warning("Ignoring invalid HSPEC_PINNED_POOL_BUCKET_ROWS item: %s", item)
-        self._bucket_rows = sorted(set(parsed)) or [64, 128, 256, 512, 1024]
+        self._bucket_rows = sorted(set(parsed)) or [64, 128, 256, 512, 1024, 2048, 4096]
 
     def _bucket_for_rows(self, rows: int) -> int:
         for bucket in self._bucket_rows:
@@ -1012,18 +1087,24 @@ class _HSpecPinnedPool:
         hidden_dim = int(shape[1]) if len(shape) > 1 else 1
         bucket_rows = self._bucket_for_rows(rows)
         key = (str(dtype), hidden_dim, bucket_rows)
+        _hspec_metric_add("pinned_checkout_count")
 
         with self._lock:
             free_list = self._free.get(key)
             if free_list:
                 base = free_list.pop()
+                _hspec_metric_add("pinned_reuse_count")
                 return base[:rows, :hidden_dim], (key, base)
 
             bytes_needed = bucket_rows * hidden_dim * torch.empty((), dtype=dtype).element_size()
-            can_reserve = (
-                self._reserved_bytes + bytes_needed <= self._max_bytes
-                and self._reserved_slots < self._max_slots
+            if self._max_bytes > 0 and bytes_needed > self._max_bytes:
+                _hspec_metric_add("pinned_miss_shape_too_large")
+            over_bytes = (
+                self._max_bytes > 0
+                and self._reserved_bytes + bytes_needed > self._max_bytes
             )
+            over_slots = self._max_slots > 0 and self._reserved_slots >= self._max_slots
+            can_reserve = not over_bytes and not over_slots
             if can_reserve:
                 try:
                     base = torch.empty(
@@ -1034,15 +1115,26 @@ class _HSpecPinnedPool:
                     )
                     self._reserved_bytes += bytes_needed
                     self._reserved_slots += 1
+                    _hspec_metric_add("pinned_alloc_count")
+                    _hspec_metric_set("pinned_reserved_bytes", self._reserved_bytes)
+                    _hspec_metric_set("pinned_reserved_slots", self._reserved_slots)
                     return base[:rows, :hidden_dim], (key, base)
                 except Exception:
                     logger.debug("HSpec pinned pool allocation failed; using pageable CPU buffer",
                                  exc_info=True)
                     _hspec_metric_add("pinned_pool_miss")
                     _hspec_metric_add("pinned_pageable_fallback")
+                    _hspec_metric_add("pinned_miss_alloc_error")
+                    return torch.empty(tuple(shape), dtype=dtype, device="cpu"), None
+            else:
+                if over_bytes:
+                    _hspec_metric_add("pinned_miss_budget_bytes")
+                if over_slots:
+                    _hspec_metric_add("pinned_miss_budget_slots")
 
         # Budget exhausted or pin allocation failed: do not block decode.
         _hspec_metric_add("pinned_pool_miss")
+        _hspec_metric_add("pinned_pageable_fallback")
         return torch.empty(tuple(shape), dtype=dtype, device="cpu"), None
 
     def release(self, handle: Optional[Tuple[Tuple[str, int, int], torch.Tensor]]) -> None:
@@ -1051,6 +1143,13 @@ class _HSpecPinnedPool:
         key, base = handle
         with self._lock:
             self._free.setdefault(key, []).append(base)
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "pinned_reserved_bytes": int(self._reserved_bytes),
+                "pinned_reserved_slots": int(self._reserved_slots),
+            }
 
 
 _hspec_pinned_pool = _HSpecPinnedPool()
@@ -1083,6 +1182,58 @@ def _hspec_use_async_copy_stream() -> bool:
     while hiding most D2H latency behind the next decode wave.
     """
     return os.getenv("HSPEC_ASYNC_HS_COPY_STREAM", "1") != "0"
+
+
+def _get_hspec_copy_max_pending_tasks() -> int:
+    try:
+        return max(int(os.getenv("HSPEC_COPY_MAX_PENDING_TASKS", "0")), 0)
+    except ValueError:
+        logger.warning("Ignoring invalid HSPEC_COPY_MAX_PENDING_TASKS")
+        return 0
+
+
+def _get_hspec_copy_max_pending_rows() -> int:
+    try:
+        return max(int(os.getenv("HSPEC_COPY_MAX_PENDING_ROWS", "0")), 0)
+    except ValueError:
+        logger.warning("Ignoring invalid HSPEC_COPY_MAX_PENDING_ROWS")
+        return 0
+
+
+def _hspec_drop_on_backpressure_enabled() -> bool:
+    return os.getenv("HSPEC_DROP_ON_BACKPRESSURE", "1") != "0"
+
+
+def hspec_should_collect_step(
+    estimated_rows: int = 0,
+    estimated_reqs: int = 0,
+) -> bool:
+    if not _hspec_collection_enabled:
+        return False
+
+    max_tasks = _get_hspec_copy_max_pending_tasks()
+    max_rows = _get_hspec_copy_max_pending_rows()
+    if max_tasks <= 0 and max_rows <= 0:
+        return True
+
+    rows = max(int(estimated_rows), 0)
+    reqs = max(int(estimated_reqs), 0)
+    with _hspec_store_cond:
+        would_exceed_tasks = (
+            max_tasks > 0 and _hspec_async_pending_tasks >= max_tasks
+        )
+        would_exceed_rows = (
+            max_rows > 0 and _hspec_async_pending_rows + rows > max_rows
+        )
+
+    if not (would_exceed_tasks or would_exceed_rows):
+        return True
+    if _hspec_drop_on_backpressure_enabled():
+        _hspec_metric_add("copy_backpressure_drop")
+        _hspec_metric_add("copy_backpressure_drop_rows", rows)
+        _hspec_metric_add("copy_backpressure_drop_reqs", reqs)
+        return False
+    return True
 
 
 def _hspec_metadata_to_list(metadata: Any, cache_attr: str,
@@ -1190,8 +1341,74 @@ def _hspec_contiguous_index_slice(
     return start, len(indices)
 
 
-def _hspec_finish_pending(req_ids: List[str]) -> None:
+def _hspec_compute_token_slices(
+    req_ids: List[str],
+    valid_sampled_token_ids: List[List[int]],
+    req_slices: List[Tuple[str, int, int]],
+) -> Optional[Dict[str, List[int]]]:
+    req_to_tokens: Dict[str, List[int]] = {}
+    n = min(len(req_ids), len(valid_sampled_token_ids))
+    for i in range(n):
+        req_to_tokens[str(req_ids[i])] = [
+            int(x) for x in valid_sampled_token_ids[i]
+        ]
+
+    token_slices: Dict[str, List[int]] = {}
+    for req_id, start, end in req_slices:
+        expected = int(end) - int(start)
+        if expected <= 0:
+            continue
+        tokens = req_to_tokens.get(str(req_id), [])
+        if len(tokens) < expected:
+            _hspec_metric_add("copy_token_hidden_len_mismatch")
+            return None
+        token_slices[str(req_id)] = tokens[:expected]
+    return token_slices
+
+
+def _hspec_validate_token_slices(
+    req_slices: List[Tuple[str, int, int]],
+    token_slices: Optional[Dict[str, List[int]]],
+) -> bool:
+    if token_slices is None:
+        return True
+    for req_id, start, end in req_slices:
+        expected = int(end) - int(start)
+        actual = len(token_slices.get(str(req_id), []))
+        if actual != expected:
+            _hspec_metric_add("copy_token_hidden_len_mismatch")
+            return False
+    return True
+
+
+def _hspec_reserve_pending(req_ids: List[str], rows: int) -> None:
     global _hspec_async_pending_total
+    global _hspec_async_pending_tasks
+    global _hspec_async_pending_rows
+
+    rows = max(int(rows), 0)
+    with _hspec_store_cond:
+        for req_id in req_ids:
+            _hspec_async_pending_by_req[req_id] = (
+                _hspec_async_pending_by_req.get(req_id, 0) + 1
+            )
+        _hspec_async_pending_total += len(req_ids)
+        _hspec_async_pending_tasks += 1
+        _hspec_async_pending_rows += rows
+        _hspec_metric_set("copy_pending_tasks", _hspec_async_pending_tasks)
+        _hspec_metric_set("copy_pending_rows", _hspec_async_pending_rows)
+        _hspec_metric_max("copy_pending_tasks_max", _hspec_async_pending_tasks)
+        _hspec_metric_max("copy_pending_rows_max", _hspec_async_pending_rows)
+
+
+def _hspec_finish_pending(
+    req_ids: List[str],
+    rows: int = 0,
+    task_count: int = 1,
+) -> None:
+    global _hspec_async_pending_total
+    global _hspec_async_pending_tasks
+    global _hspec_async_pending_rows
 
     with _hspec_store_cond:
         for req_id in req_ids:
@@ -1202,16 +1419,25 @@ def _hspec_finish_pending(req_ids: List[str]) -> None:
                 _hspec_async_pending_by_req.pop(req_id, None)
         _hspec_async_pending_total = max(
             _hspec_async_pending_total - len(req_ids), 0)
+        _hspec_async_pending_tasks = max(
+            _hspec_async_pending_tasks - int(task_count), 0)
+        _hspec_async_pending_rows = max(
+            _hspec_async_pending_rows - max(int(rows), 0), 0)
+        _hspec_metric_set("copy_pending_tasks", _hspec_async_pending_tasks)
+        _hspec_metric_set("copy_pending_rows", _hspec_async_pending_rows)
+        if task_count > 0:
+            _hspec_metric_add("copy_finished_tasks", int(task_count))
+        if rows > 0:
+            _hspec_metric_add("copy_finished_rows", int(rows))
         _hspec_store_cond.notify_all()
 
 
 def _hspec_copy_worker() -> None:
-    global _hspec_async_pending_total
-
     while True:
         task = _hspec_copy_queue.get()
         if task is None:
             return
+        task_req_ids = [req_id for req_id, _, _ in task.req_slices]
         try:
             if task.event is not None:
                 task.event.synchronize()
@@ -1233,12 +1459,35 @@ def _hspec_copy_worker() -> None:
             else:
                 for req_id, start, end in task.req_slices:
                     rows = task.cpu_tensor[start:end]
-                    collector.append_hidden_rows(req_id, rows)
-            _hspec_finish_pending([req_id for req_id, _, _ in task.req_slices])
+                    tokens = (
+                        task.token_slices.get(str(req_id), [])
+                        if task.token_slices is not None else []
+                    )
+                    expected = int(end) - int(start)
+                    if len(tokens) != expected:
+                        _hspec_metric_add("copy_token_hidden_len_mismatch")
+                        continue
+                    try:
+                        if hasattr(collector, "append_hidden_and_tokens"):
+                            collector.append_hidden_and_tokens(req_id, rows, tokens)
+                        else:
+                            collector.append_hidden_rows(req_id, rows)
+                            collector.extend_tokens(req_id, tokens)
+                    except Exception:
+                        _hspec_metric_add("copy_worker_pair_write_error")
+                        logger.exception(
+                            "HSpec async copy worker failed to write pair for req_id=%s",
+                            req_id,
+                        )
         except Exception:
             logger.exception("HSpec async copy worker failed")
-            _hspec_finish_pending([req_id for req_id, _, _ in task.req_slices])
+            _hspec_metric_add("copy_worker_error")
         finally:
+            _hspec_finish_pending(
+                task_req_ids,
+                rows=int(getattr(task, "num_rows", 0)),
+                task_count=1,
+            )
             _hspec_pinned_pool.release(task.pool_handle)
 
 
@@ -1251,16 +1500,10 @@ def _hspec_accumulate_worker() -> None:
             if task.producer_event is not None:
                 task.producer_event.synchronize()
 
-            req_ids = list(task.req_ids)
-            valid_sampled_token_ids = task.valid_sampled_token_ids
-            req_slices, flat_indices, pending_req_ids = _hspec_compute_req_slices(
-                req_ids,
-                valid_sampled_token_ids,
-                task.spec_decode_metadata,
-                task.accepted_prefix_lengths,
-            )
+            req_slices = task.req_slices
+            flat_indices = task.flat_indices
+            pending_req_ids = task.pending_req_ids
             if not pending_req_ids:
-                _hspec_finish_pending(list(task.req_ids))
                 continue
 
             from vllm_ascend.spec_decode.hspec_store import hspec_legacy_dataproto_hs_enabled
@@ -1289,15 +1532,22 @@ def _hspec_accumulate_worker() -> None:
             _hspec_copy_queue.put(
                 _HSpecAsyncCopyTask(
                     req_slices=req_slices,
+                    token_slices=task.token_slices,
                     cpu_tensor=cpu_tensor,
                     event=copy_event,
                     device_tensor_ref=selected_rows if copy_event is not None else None,
                     pool_handle=pool_handle,
+                    num_rows=task.num_rows,
                 )
             )
         except Exception:
             logger.exception("HSpec async accumulate worker failed")
-            _hspec_finish_pending(list(task.req_ids))
+            _hspec_metric_add("copy_submit_error")
+            _hspec_finish_pending(
+                list(task.pending_req_ids),
+                rows=int(getattr(task, "num_rows", 0)),
+                task_count=1,
+            )
 
 
 def _hspec_ensure_async_worker(start_accumulate_worker: bool = False) -> None:
@@ -1422,7 +1672,7 @@ def hspec_submit_accumulate_task(
     valid_sampled_token_ids: List[List[int]],
     spec_decode_metadata: Any = None,
     accepted_prefix_lengths: Optional[List[int]] = None,
-) -> None:
+) -> bool:
     """Submit HSpec hidden-state accumulation work.
 
     The normal path computes the CPU-side row mapping on the caller, enqueues
@@ -1430,43 +1680,49 @@ def hspec_submit_accumulate_task(
     asynchronously.  The legacy full background-NPU path is kept only behind
     ``HSPEC_ASYNC_HS_ACCUMULATE=1`` for debugging/experiments.
     """
-    global _hspec_async_pending_total
-
     if not _hspec_collection_enabled:
-        return
+        return False
     if sample_hidden_states is None or not req_ids:
-        return
+        return False
 
-    pending_req_ids: List[str] = []
-    for req_id, sampled_ids in zip(req_ids, valid_sampled_token_ids):
-        if sampled_ids:
-            pending_req_ids.append(str(req_id))
+    str_req_ids = [str(req_id) for req_id in req_ids]
+    normalized_token_ids = [
+        [int(x) for x in sampled_ids] for sampled_ids in valid_sampled_token_ids
+    ]
+    normalized_accepts = (
+        [int(x) for x in accepted_prefix_lengths]
+        if accepted_prefix_lengths is not None else None
+    )
+
+    req_slices, flat_indices, pending_req_ids = _hspec_compute_req_slices(
+        str_req_ids,
+        normalized_token_ids,
+        spec_decode_metadata,
+        normalized_accepts,
+    )
     if not pending_req_ids:
-        return
+        return False
+
+    token_slices = _hspec_compute_token_slices(
+        str_req_ids,
+        normalized_token_ids,
+        req_slices,
+    )
+    if token_slices is None:
+        return False
+    if not _hspec_validate_token_slices(req_slices, token_slices):
+        return False
+
+    num_rows = len(flat_indices)
+    if not hspec_should_collect_step(num_rows, len(pending_req_ids)):
+        return False
 
     legacy_async = _hspec_use_legacy_async_accumulate()
     _hspec_ensure_async_worker(start_accumulate_worker=legacy_async)
-
-    req_slices: List[Tuple[str, int, int]] = []
-    flat_indices: List[int] = []
-    if not legacy_async:
-        req_slices, flat_indices, pending_req_ids = _hspec_compute_req_slices(
-            [str(req_id) for req_id in req_ids],
-            [[int(x) for x in sampled_ids] for sampled_ids in valid_sampled_token_ids],
-            spec_decode_metadata,
-            [int(x) for x in accepted_prefix_lengths]
-            if accepted_prefix_lengths is not None else None,
-        )
-        if not pending_req_ids:
-            return
-
-    with _hspec_store_cond:
-        for req_id in pending_req_ids:
-            _hspec_async_pending_by_req[req_id] = _hspec_async_pending_by_req.get(req_id, 0) + 1
-        _hspec_async_pending_total += len(pending_req_ids)
-
+    _hspec_reserve_pending(pending_req_ids, num_rows)
     device = sample_hidden_states.device
     if not legacy_async:
+        pool_handle = None
         try:
             from vllm_ascend.spec_decode.hspec_store import hspec_legacy_dataproto_hs_enabled
 
@@ -1487,7 +1743,6 @@ def hspec_submit_accumulate_task(
                     copy_stream.wait_stream(current_stream)
                 else:
                     copy_stream = current_stream
-                pool_handle = None
                 with torch.npu.stream(copy_stream):
                     cpu_tensor, pool_handle = _hspec_checkout_cpu_buffer(
                         selected_rows.shape,
@@ -1505,16 +1760,23 @@ def hspec_submit_accumulate_task(
             _hspec_copy_queue.put(
                 _HSpecAsyncCopyTask(
                     req_slices=req_slices,
+                    token_slices=token_slices,
                     cpu_tensor=cpu_tensor,
                     event=copy_event,
                     device_tensor_ref=selected_rows if copy_event is not None else None,
                     pool_handle=pool_handle,
+                    num_rows=num_rows,
                 )
             )
+            _hspec_metric_add("copy_submitted_tasks")
+            _hspec_metric_add("copy_submitted_rows", num_rows)
+            return True
         except Exception:
             logger.exception("HSpec main-thread async copy submit failed")
-            _hspec_finish_pending(pending_req_ids)
-        return
+            _hspec_metric_add("copy_submit_error")
+            _hspec_pinned_pool.release(pool_handle)
+            _hspec_finish_pending(pending_req_ids, rows=num_rows, task_count=1)
+            return False
 
     producer_event = None
     if device.type == "npu":
@@ -1525,19 +1787,22 @@ def hspec_submit_accumulate_task(
 
     _hspec_accumulate_queue.put(
         _HSpecAsyncAccumulateTask(
-            req_ids=tuple(str(req_id) for req_id in req_ids),
+            req_ids=tuple(str_req_ids),
+            req_slices=req_slices,
+            flat_indices=flat_indices,
+            pending_req_ids=pending_req_ids,
+            token_slices=token_slices,
+            num_rows=num_rows,
             sample_hidden_states=sample_hidden_states,
-            valid_sampled_token_ids=[
-                [int(x) for x in sampled_ids] for sampled_ids in valid_sampled_token_ids
-            ],
+            valid_sampled_token_ids=normalized_token_ids,
             spec_decode_metadata=spec_decode_metadata,
-            accepted_prefix_lengths=(
-                [int(x) for x in accepted_prefix_lengths]
-                if accepted_prefix_lengths is not None else None
-            ),
+            accepted_prefix_lengths=normalized_accepts,
             producer_event=producer_event,
         )
     )
+    _hspec_metric_add("copy_submitted_tasks")
+    _hspec_metric_add("copy_submitted_rows", num_rows)
+    return True
 
 
 def hspec_extend_step_tokens(req_id: str, token_ids: List[int]) -> None:
@@ -1567,7 +1832,12 @@ def hspec_flush_and_get_descriptors(
     global_step: int = -1,
 ) -> Dict[str, Any]:
     """Flush in-flight copies and return small trajectory descriptors only."""
+    start_ns = time.perf_counter_ns()
     _hspec_wait_pending_all()
+    wait_ms = int((time.perf_counter_ns() - start_ns) / 1_000_000)
+    _hspec_metric_add("flush_wait_count")
+    _hspec_metric_add("flush_wait_ms_total", wait_ms)
+    _hspec_metric_max("flush_wait_ms_max", wait_ms)
     from vllm_ascend.spec_decode.hspec_store import get_hspec_local_collector
 
     return get_hspec_local_collector().flush_descriptors(

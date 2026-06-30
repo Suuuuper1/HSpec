@@ -955,6 +955,52 @@ class vLLMRollout(BaseRollout):
                         store_metrics.get("unsafe_descriptor_cleanup_suppressed", 0)),
                     "hspec/pinned_pool_miss": float(runtime_metrics.get("pinned_pool_miss", 0)),
                     "hspec/pinned_pageable_fallback": float(runtime_metrics.get("pinned_pageable_fallback", 0)),
+                    "hspec/pinned_reserved_bytes": float(
+                        runtime_metrics.get("pinned_reserved_bytes", 0)),
+                    "hspec/pinned_reserved_slots": float(
+                        runtime_metrics.get("pinned_reserved_slots", 0)),
+                    "hspec/pinned_checkout_count": float(
+                        runtime_metrics.get("pinned_checkout_count", 0)),
+                    "hspec/pinned_reuse_count": float(
+                        runtime_metrics.get("pinned_reuse_count", 0)),
+                    "hspec/pinned_alloc_count": float(
+                        runtime_metrics.get("pinned_alloc_count", 0)),
+                    "hspec/pinned_miss_budget_bytes": float(
+                        runtime_metrics.get("pinned_miss_budget_bytes", 0)),
+                    "hspec/pinned_miss_budget_slots": float(
+                        runtime_metrics.get("pinned_miss_budget_slots", 0)),
+                    "hspec/pinned_miss_alloc_error": float(
+                        runtime_metrics.get("pinned_miss_alloc_error", 0)),
+                    "hspec/pinned_miss_shape_too_large": float(
+                        runtime_metrics.get("pinned_miss_shape_too_large", 0)),
+                    "hspec/copy_pending_tasks_max": float(
+                        runtime_metrics.get("copy_pending_tasks_max", 0)),
+                    "hspec/copy_pending_rows_max": float(
+                        runtime_metrics.get("copy_pending_rows_max", 0)),
+                    "hspec/copy_submitted_tasks": float(
+                        runtime_metrics.get("copy_submitted_tasks", 0)),
+                    "hspec/copy_submitted_rows": float(
+                        runtime_metrics.get("copy_submitted_rows", 0)),
+                    "hspec/copy_backpressure_drop": float(
+                        runtime_metrics.get("copy_backpressure_drop", 0)),
+                    "hspec/copy_backpressure_drop_rows": float(
+                        runtime_metrics.get("copy_backpressure_drop_rows", 0)),
+                    "hspec/copy_backpressure_drop_reqs": float(
+                        runtime_metrics.get("copy_backpressure_drop_reqs", 0)),
+                    "hspec/copy_worker_error": float(
+                        runtime_metrics.get("copy_worker_error", 0)),
+                    "hspec/copy_submit_error": float(
+                        runtime_metrics.get("copy_submit_error", 0)),
+                    "hspec/copy_worker_pair_write_error": float(
+                        runtime_metrics.get("copy_worker_pair_write_error", 0)),
+                    "hspec/copy_token_hidden_len_mismatch": float(
+                        runtime_metrics.get("copy_token_hidden_len_mismatch", 0)),
+                    "hspec/flush_wait_ms_total": float(
+                        runtime_metrics.get("flush_wait_ms_total", 0)),
+                    "hspec/flush_wait_ms_max": float(
+                        runtime_metrics.get("flush_wait_ms_max", 0)),
+                    "hspec/flush_wait_count": float(
+                        runtime_metrics.get("flush_wait_count", 0)),
                 }
             except Exception:
                 logger.debug("Failed to collect HSpec rollout metrics", exc_info=True)

@@ -41,6 +41,12 @@ export HSPEC_BUILD_ACTOR_NAME_PREFIX="${HSPEC_BUILD_ACTOR_NAME_PREFIX:-hspec_bui
 export HSPEC_DELETE_TRAJECTORY_AFTER_BUILD="${HSPEC_DELETE_TRAJECTORY_AFTER_BUILD:-0}"
 export HSPEC_RAW_STORE_GC_AFTER_EPOCH="${HSPEC_RAW_STORE_GC_AFTER_EPOCH:-1}"
 export HSPEC_TP_GROUP_ID="${HSPEC_TP_GROUP_ID:-}"
+export HSPEC_PINNED_POOL_BYTES="${HSPEC_PINNED_POOL_BYTES:-268435456}"
+export HSPEC_PINNED_POOL_MAX_SLOTS="${HSPEC_PINNED_POOL_MAX_SLOTS:-64}"
+export HSPEC_PINNED_POOL_BUCKET_ROWS="${HSPEC_PINNED_POOL_BUCKET_ROWS:-64,128,256,512,1024,2048,4096}"
+export HSPEC_COPY_MAX_PENDING_TASKS="${HSPEC_COPY_MAX_PENDING_TASKS:-64}"
+export HSPEC_COPY_MAX_PENDING_ROWS="${HSPEC_COPY_MAX_PENDING_ROWS:-0}"
+export HSPEC_DROP_ON_BACKPRESSURE="${HSPEC_DROP_ON_BACKPRESSURE:-1}"
 
 # HSpec debug/tracing/profile switches.
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
@@ -144,6 +150,12 @@ mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
     echo "hspec_build_actor_name_prefix=${HSPEC_BUILD_ACTOR_NAME_PREFIX}"
     echo "hspec_delete_trajectory_after_build=${HSPEC_DELETE_TRAJECTORY_AFTER_BUILD}"
     echo "hspec_raw_store_gc_after_epoch=${HSPEC_RAW_STORE_GC_AFTER_EPOCH}"
+    echo "hspec_pinned_pool_bytes=${HSPEC_PINNED_POOL_BYTES}"
+    echo "hspec_pinned_pool_max_slots=${HSPEC_PINNED_POOL_MAX_SLOTS}"
+    echo "hspec_pinned_pool_bucket_rows=${HSPEC_PINNED_POOL_BUCKET_ROWS}"
+    echo "hspec_copy_max_pending_tasks=${HSPEC_COPY_MAX_PENDING_TASKS}"
+    echo "hspec_copy_max_pending_rows=${HSPEC_COPY_MAX_PENDING_ROWS}"
+    echo "hspec_drop_on_backpressure=${HSPEC_DROP_ON_BACKPRESSURE}"
     echo "hspec_profile=${HSPEC_PROFILE}"
     echo "hspec_dump=${HSPEC_DUMP}"
     echo "pca_components=${PCA_COMPONENTS}"
@@ -181,6 +193,12 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DELETE_TRAJECTORY_AFTER_BUILD='"'"${HSPEC_DELETE_TRAJECTORY_AFTER_BUILD}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RAW_STORE_GC_AFTER_EPOCH='"'"${HSPEC_RAW_STORE_GC_AFTER_EPOCH}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TP_GROUP_ID='"'"${HSPEC_TP_GROUP_ID}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_BYTES='"'"${HSPEC_PINNED_POOL_BYTES}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_MAX_SLOTS='"'"${HSPEC_PINNED_POOL_MAX_SLOTS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_BUCKET_ROWS='"'"${HSPEC_PINNED_POOL_BUCKET_ROWS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_COPY_MAX_PENDING_TASKS='"'"${HSPEC_COPY_MAX_PENDING_TASKS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_COPY_MAX_PENDING_ROWS='"'"${HSPEC_COPY_MAX_PENDING_ROWS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DROP_ON_BACKPRESSURE='"'"${HSPEC_DROP_ON_BACKPRESSURE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN='"'"${HSPEC_GEN}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_REQ_IDX='"'"${HSPEC_GEN_REQ_IDX}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_MAX_CALLS='"'"${HSPEC_GEN_MAX_CALLS}"'"' \

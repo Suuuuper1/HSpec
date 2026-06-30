@@ -605,10 +605,10 @@ class NPUModelRunner(GPUModelRunner):
         valid_sampled_token_ids: list[list[int]],
         spec_decode_metadata: Optional[SpecDecodeMetadata],
         accepted_prefix_lengths: Optional[list[int]] = None,
-    ) -> None:
+    ) -> bool:
         from vllm_ascend.spec_decode.hspec_utils import hspec_submit_accumulate_task
 
-        hspec_submit_accumulate_task(
+        return hspec_submit_accumulate_task(
             req_ids=list(self.input_batch.req_ids),
             sample_hidden_states=sample_hidden_states,
             valid_sampled_token_ids=valid_sampled_token_ids,
@@ -2358,15 +2358,20 @@ class NPUModelRunner(GPUModelRunner):
         # between the first-stage worker and the last-stage worker.
         if self._hspec_collect and not self.use_async_scheduling:
             try:
-                from vllm_ascend.spec_decode.hspec_utils import hspec_extend_step_tokens
+                from vllm_ascend.spec_decode.hspec_store import (
+                    hspec_legacy_dataproto_hs_enabled,
+                )
 
-                n = min(num_sampled_tokens, len(valid_sampled_token_ids))
-                for req_idx in range(n):
-                    sampled_ids = valid_sampled_token_ids[req_idx]
-                    if not sampled_ids:
-                        continue
-                    req_id = self.input_batch.req_ids[req_idx]
-                    hspec_extend_step_tokens(req_id, sampled_ids)
+                if hspec_legacy_dataproto_hs_enabled():
+                    from vllm_ascend.spec_decode.hspec_utils import hspec_extend_step_tokens
+
+                    n = min(num_sampled_tokens, len(valid_sampled_token_ids))
+                    for req_idx in range(n):
+                        sampled_ids = valid_sampled_token_ids[req_idx]
+                        if not sampled_ids:
+                            continue
+                        req_id = self.input_batch.req_ids[req_idx]
+                        hspec_extend_step_tokens(req_id, sampled_ids)
             except Exception:
                 pass
 

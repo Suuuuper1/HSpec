@@ -85,15 +85,41 @@ def _extract_and_sum_hspec_rollout_metrics(meta_info: dict | None) -> dict[str, 
     if not isinstance(metrics_obj, dict):
         return {}
 
-    hspec_keys = (
+    sum_keys = (
         "hspec/raw_store_bytes",
         "hspec/desc_count",
         "hspec/collect_dropped",
+        "hspec/collect_dropped_align_mismatch",
         "hspec/pinned_pool_miss",
         "hspec/pinned_pageable_fallback",
+        "hspec/pinned_reserved_bytes",
+        "hspec/pinned_reserved_slots",
+        "hspec/pinned_checkout_count",
+        "hspec/pinned_reuse_count",
+        "hspec/pinned_alloc_count",
+        "hspec/pinned_miss_budget_bytes",
+        "hspec/pinned_miss_budget_slots",
+        "hspec/pinned_miss_alloc_error",
+        "hspec/pinned_miss_shape_too_large",
+        "hspec/copy_submitted_tasks",
+        "hspec/copy_submitted_rows",
+        "hspec/copy_backpressure_drop",
+        "hspec/copy_backpressure_drop_rows",
+        "hspec/copy_backpressure_drop_reqs",
+        "hspec/copy_worker_error",
+        "hspec/copy_submit_error",
+        "hspec/copy_worker_pair_write_error",
+        "hspec/copy_token_hidden_len_mismatch",
+        "hspec/flush_wait_ms_total",
+        "hspec/flush_wait_count",
+    )
+    max_keys = (
+        "hspec/copy_pending_tasks_max",
+        "hspec/copy_pending_rows_max",
+        "hspec/flush_wait_ms_max",
     )
     result: dict[str, float] = {}
-    for key in hspec_keys:
+    for key in sum_keys:
         value = metrics_obj.pop(key, None)
         if value is None:
             continue
@@ -101,6 +127,27 @@ def _extract_and_sum_hspec_rollout_metrics(meta_info: dict | None) -> dict[str, 
             result[key] = float(sum(value))
         else:
             result[key] = float(value)
+    for key in max_keys:
+        value = metrics_obj.pop(key, None)
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            result[key] = float(max(value)) if value else 0.0
+        else:
+            result[key] = float(value)
+    checkout_count = result.get("hspec/pinned_checkout_count", 0.0)
+    if checkout_count > 0:
+        result["hspec/pinned_pageable_fallback_ratio"] = (
+            result.get("hspec/pinned_pageable_fallback", 0.0) / checkout_count
+        )
+        result["hspec/pinned_pool_miss_ratio"] = (
+            result.get("hspec/pinned_pool_miss", 0.0) / checkout_count
+        )
+    flush_wait_count = result.get("hspec/flush_wait_count", 0.0)
+    if flush_wait_count > 0:
+        result["hspec/flush_wait_ms_avg"] = (
+            result.get("hspec/flush_wait_ms_total", 0.0) / flush_wait_count
+        )
     if not metrics_obj:
         meta_info.pop("metrics", None)
     return result

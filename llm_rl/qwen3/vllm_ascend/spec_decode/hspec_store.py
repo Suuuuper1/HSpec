@@ -717,41 +717,17 @@ class HSpecLocalCollector:
         else:
             raise AssertionError(f"Unsupported HSpec store dtype after validation: {store_dtype}")
         rows_np = rows_cpu.numpy()
-        hidden_dim = int(rows_np.shape[1])
-        rows_count = int(rows_np.shape[0])
+        source_dtype = str(getattr(rows, "dtype", ""))
 
         with self._lock:
             state = self._state_for_req(str(req_id))
-            if state["hidden_dim"] == 0:
-                state["hidden_dim"] = hidden_dim
-            elif int(state["hidden_dim"]) != hidden_dim:
-                raise ValueError(
-                    f"HSpec hidden dim mismatch for {req_id}: "
-                    f"{state['hidden_dim']} vs {hidden_dim}"
-                )
-            if not state.get("hs_dtype"):
-                state["hs_dtype"] = hs_dtype
-            elif str(state["hs_dtype"]) != hs_dtype:
-                raise ValueError(
-                    f"HSpec hidden dtype mismatch for {req_id}: "
-                    f"{state['hs_dtype']} vs {hs_dtype}"
-                )
-            if state["hs_offset_rows"] is None:
-                state["hs_offset_rows"] = int(self._segment_hs_rows)
-            if self._segment_hs_fh is None:
-                self._segment_hs_fh = open(self._segment_hs_path, "ab")
-            self._segment_hs_fh.write(rows_np.tobytes(order="C"))
-            state["hs_rows"] += rows_count
-            self._segment_hs_rows += rows_count
-            _metric_add("raw_store_bytes", int(rows_np.nbytes))
-            _metric_add("store_fp16_rows", rows_count)
-            source_dtype = str(getattr(rows, "dtype", ""))
-            if "bfloat16" in source_dtype:
-                _metric_add("source_dtype_bf16_rows", rows_count)
-            elif "float16" in source_dtype:
-                _metric_add("source_dtype_fp16_rows", rows_count)
-            else:
-                _metric_add("source_dtype_other_rows", rows_count)
+            self._append_hidden_rows_locked(
+                str(req_id),
+                state,
+                rows_np,
+                hs_dtype,
+                source_dtype,
+            )
 
     def extend_tokens(self, req_id: str, token_ids: Iterable[int]) -> None:
         token_list = [int(t) for t in token_ids]
@@ -761,14 +737,102 @@ class HSpecLocalCollector:
 
         with self._lock:
             state = self._state_for_req(str(req_id))
-            if state["token_offset"] is None:
-                state["token_offset"] = int(self._segment_token_len)
-            if self._segment_token_fh is None:
-                self._segment_token_fh = open(self._segment_token_path, "ab")
-            self._segment_token_fh.write(token_np.tobytes(order="C"))
-            state["token_len"] += int(token_np.shape[0])
-            self._segment_token_len += int(token_np.shape[0])
-            _metric_add("raw_store_bytes", int(token_np.nbytes))
+            self._extend_tokens_locked(state, token_np)
+
+    def append_hidden_and_tokens(
+        self,
+        req_id: str,
+        rows: torch.Tensor,
+        token_ids: Iterable[int],
+    ) -> None:
+        token_list = [int(t) for t in token_ids]
+        if (rows is None or rows.numel() == 0) and not token_list:
+            return
+        if rows is None or rows.numel() == 0:
+            raise ValueError("HSpec token payload cannot be written without hidden rows")
+        if rows.ndim != 2:
+            raise ValueError(f"HSpec hidden rows must be 2-D, got {tuple(rows.shape)}")
+
+        store_dtype = get_hspec_store_dtype()
+        if store_dtype == "float16":
+            rows_cpu = rows.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            hs_dtype = "float16"
+        else:
+            raise AssertionError(f"Unsupported HSpec store dtype after validation: {store_dtype}")
+        rows_np = rows_cpu.numpy()
+        rows_count = int(rows_np.shape[0])
+        if rows_count != len(token_list):
+            raise ValueError(
+                f"HSpec token/hidden length mismatch for {req_id}: "
+                f"hidden_rows={rows_count} token_len={len(token_list)}"
+            )
+        token_np = np.ascontiguousarray(token_list, dtype=np.int32)
+        source_dtype = str(getattr(rows, "dtype", ""))
+
+        with self._lock:
+            state = self._state_for_req(str(req_id))
+            self._append_hidden_rows_locked(
+                str(req_id),
+                state,
+                rows_np,
+                hs_dtype,
+                source_dtype,
+            )
+            self._extend_tokens_locked(state, token_np)
+
+    def _append_hidden_rows_locked(
+        self,
+        req_id: str,
+        state: Dict[str, Any],
+        rows_np: np.ndarray,
+        hs_dtype: str,
+        source_dtype: str,
+    ) -> None:
+        hidden_dim = int(rows_np.shape[1])
+        rows_count = int(rows_np.shape[0])
+        if state["hidden_dim"] == 0:
+            state["hidden_dim"] = hidden_dim
+        elif int(state["hidden_dim"]) != hidden_dim:
+            raise ValueError(
+                f"HSpec hidden dim mismatch for {req_id}: "
+                f"{state['hidden_dim']} vs {hidden_dim}"
+            )
+        if not state.get("hs_dtype"):
+            state["hs_dtype"] = hs_dtype
+        elif str(state["hs_dtype"]) != hs_dtype:
+            raise ValueError(
+                f"HSpec hidden dtype mismatch for {req_id}: "
+                f"{state['hs_dtype']} vs {hs_dtype}"
+            )
+        if state["hs_offset_rows"] is None:
+            state["hs_offset_rows"] = int(self._segment_hs_rows)
+        if self._segment_hs_fh is None:
+            self._segment_hs_fh = open(self._segment_hs_path, "ab")
+        self._segment_hs_fh.write(rows_np.tobytes(order="C"))
+        state["hs_rows"] += rows_count
+        self._segment_hs_rows += rows_count
+        _metric_add("raw_store_bytes", int(rows_np.nbytes))
+        _metric_add("store_fp16_rows", rows_count)
+        if "bfloat16" in source_dtype:
+            _metric_add("source_dtype_bf16_rows", rows_count)
+        elif "float16" in source_dtype:
+            _metric_add("source_dtype_fp16_rows", rows_count)
+        else:
+            _metric_add("source_dtype_other_rows", rows_count)
+
+    def _extend_tokens_locked(
+        self,
+        state: Dict[str, Any],
+        token_np: np.ndarray,
+    ) -> None:
+        if state["token_offset"] is None:
+            state["token_offset"] = int(self._segment_token_len)
+        if self._segment_token_fh is None:
+            self._segment_token_fh = open(self._segment_token_path, "ab")
+        self._segment_token_fh.write(token_np.tobytes(order="C"))
+        state["token_len"] += int(token_np.shape[0])
+        self._segment_token_len += int(token_np.shape[0])
+        _metric_add("raw_store_bytes", int(token_np.nbytes))
 
     def flush_descriptors(
         self,
