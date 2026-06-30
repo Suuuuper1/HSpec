@@ -18,6 +18,7 @@ HSpec: Hidden State based Speculative Decoding query table.
 import json
 import logging
 import os
+import socket
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,13 +41,19 @@ from vllm_ascend.spec_decode.hspec_store import (
     coerce_hspec_desc,
     collect_hspec_store_metrics,
     estimate_hspec_trajectory_bytes,
+    get_hspec_build_actor_name_prefix,
     get_hspec_build_actor_num_cpus,
+    get_hspec_build_blas_threads,
+    get_hspec_node_id,
     get_hspec_num_shards,
+    get_hspec_store_root,
     get_hspec_table_store_root,
     hspec_legacy_dataproto_hs_enabled,
     hspec_record_store_metric,
     hspec_segment_key_from_desc,
+    hspec_single_node_only_enabled,
     hspec_strict_descriptor_mode_enabled,
+    hspec_topology_strict_enabled,
     load_hspec_trajectory,
 )
 
@@ -64,8 +71,203 @@ class HSpecBuildSubmission:
     legacy: bool = False
 
 
+@dataclass(frozen=True)
+class HSpecBuildActorTopology:
+    actor_name: str
+    shard_id: int
+    num_groups: int
+    logical_node_id: str
+    hostname: str
+    pid: int
+    ray_node_id: str
+    table_store_root: str
+    table_store_base_root: str
+    hspec_store_root: str
+    similarity_threshold: float
+    max_entries_per_prompt: int
+    n_components: int
+    build_actor_num_cpus: float
+    build_blas_threads: int
+
+
 def _build_actor_name(shard_id: int) -> str:
-    return f"hspec_build_shard_{int(shard_id)}"
+    prefix = get_hspec_build_actor_name_prefix()
+    return f"{prefix}_{int(shard_id)}"
+
+
+def _actor_topology_error(
+    message: str,
+    *,
+    topologies: List[Dict[str, Any]],
+    expected_num_groups: int,
+    expected_node_id: str,
+) -> RuntimeError:
+    summary = [
+        {
+            "actor_name": item.get("actor_name"),
+            "shard_id": item.get("shard_id"),
+            "num_groups": item.get("num_groups"),
+            "logical_node_id": item.get("logical_node_id"),
+            "ray_node_id": item.get("ray_node_id"),
+            "table_store_root": item.get("table_store_root"),
+            "table_store_base_root": item.get("table_store_base_root"),
+            "build_actor_num_cpus": item.get("build_actor_num_cpus"),
+            "build_blas_threads": item.get("build_blas_threads"),
+            "similarity_threshold": item.get("similarity_threshold"),
+            "max_entries_per_prompt": item.get("max_entries_per_prompt"),
+            "n_components": item.get("n_components"),
+        }
+        for item in topologies
+    ]
+    return RuntimeError(
+        "HSpec build actor topology mismatch: "
+        f"{message}; expected_num_groups={expected_num_groups}, "
+        f"expected_node_id={expected_node_id!r}, "
+        f"actor_name_prefix={get_hspec_build_actor_name_prefix()!r}, "
+        f"topologies={summary}. "
+        "This usually means stale Ray named actors or inconsistent HSPEC_NUM_SHARDS. "
+        "Restart Ray or set a unique HSPEC_BUILD_ACTOR_NAME_PREFIX."
+    )
+
+
+def _validate_actor_topologies(
+    topologies: List[Dict[str, Any]],
+    *,
+    expected_num_groups: int,
+    expected_node_id: str,
+    expected_similarity_threshold: Optional[float] = None,
+    expected_max_entries_per_prompt: Optional[int] = None,
+    expected_n_components: Optional[int] = None,
+) -> None:
+    if len(topologies) != expected_num_groups:
+        hspec_record_store_metric("topology_actor_init_error", 1)
+        raise _actor_topology_error(
+            f"actor_count={len(topologies)}",
+            topologies=topologies,
+            expected_num_groups=expected_num_groups,
+            expected_node_id=expected_node_id,
+        )
+
+    shard_ids: List[int] = []
+    for item in topologies:
+        try:
+            shard_ids.append(int(item.get("shard_id")))
+        except Exception as exc:
+            hspec_record_store_metric("topology_actor_shard_mismatch", 1)
+            raise _actor_topology_error(
+                f"invalid shard_id in topology: {exc}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            ) from exc
+
+    expected_shards = list(range(expected_num_groups))
+    if sorted(shard_ids) != expected_shards:
+        hspec_record_store_metric("topology_actor_shard_mismatch", 1)
+        raise _actor_topology_error(
+            f"shard_ids={sorted(shard_ids)} expected={expected_shards}",
+            topologies=topologies,
+            expected_num_groups=expected_num_groups,
+            expected_node_id=expected_node_id,
+        )
+
+    for item in topologies:
+        shard_id = int(item["shard_id"])
+        if int(item.get("num_groups", -1)) != expected_num_groups:
+            hspec_record_store_metric("topology_actor_num_groups_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports num_groups={item.get('num_groups')}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if str(item.get("actor_name")) != _build_actor_name(shard_id):
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports actor_name={item.get('actor_name')!r}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if hspec_single_node_only_enabled() and str(item.get("logical_node_id")) != str(expected_node_id):
+            hspec_record_store_metric("topology_actor_node_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports node_id={item.get('logical_node_id')!r}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if int(item.get("build_blas_threads", 0)) < 1:
+            hspec_record_store_metric("topology_actor_init_error", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports invalid build_blas_threads={item.get('build_blas_threads')}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if str(item.get("hspec_store_root")) != str(get_hspec_store_root()):
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports hspec_store_root={item.get('hspec_store_root')!r}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if str(item.get("table_store_base_root")) != str(get_hspec_table_store_root()):
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports table_store_base_root={item.get('table_store_base_root')!r}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if expected_n_components is not None and int(item.get("n_components", -1)) != int(expected_n_components):
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports n_components={item.get('n_components')}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if (
+            expected_max_entries_per_prompt is not None
+            and int(item.get("max_entries_per_prompt", -1)) != int(expected_max_entries_per_prompt)
+        ):
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports max_entries_per_prompt={item.get('max_entries_per_prompt')}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if expected_similarity_threshold is not None:
+            try:
+                actor_threshold = float(item.get("similarity_threshold"))
+            except Exception as exc:
+                hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+                raise _actor_topology_error(
+                    f"actor shard={shard_id} reports invalid similarity_threshold={item.get('similarity_threshold')}",
+                    topologies=topologies,
+                    expected_num_groups=expected_num_groups,
+                    expected_node_id=expected_node_id,
+                ) from exc
+            if abs(actor_threshold - float(expected_similarity_threshold)) > 1e-12:
+                hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+                raise _actor_topology_error(
+                    f"actor shard={shard_id} reports similarity_threshold={actor_threshold}",
+                    topologies=topologies,
+                    expected_num_groups=expected_num_groups,
+                    expected_node_id=expected_node_id,
+                )
+
+
+def _get_actor_topologies(handles: List[ray.actor.ActorHandle]) -> List[Dict[str, Any]]:
+    try:
+        return [dict(item) for item in ray.get([handle.get_topology.remote() for handle in handles])]
+    except Exception:
+        hspec_record_store_metric("topology_actor_init_error", 1)
+        logger.exception("Failed to fetch HSpec build actor topology")
+        raise
 
 
 def _looks_like_legacy_hspec_payload(data: Any) -> bool:
@@ -285,6 +487,15 @@ class HSpecTableGroup:
         self.n_components = n_components
         self.port = port
         self.shard_id = int(shard_id)
+        self.num_groups = _resolve_num_groups()
+        self.logical_node_id = get_hspec_node_id()
+        self.build_actor_num_cpus = get_hspec_build_actor_num_cpus()
+        self.build_blas_threads = get_hspec_build_blas_threads()
+        self.actor_name = _build_actor_name(self.shard_id)
+        try:
+            self.ray_node_id = str(ray.get_runtime_context().get_node_id())
+        except Exception:
+            self.ray_node_id = ""
         self.table_store_root = os.path.join(
             get_hspec_table_store_root(),
             f"shard_{self.shard_id:03d}",
@@ -332,6 +543,25 @@ class HSpecTableGroup:
 
         # ZMQ state
         self.running = False
+
+    def get_topology(self) -> Dict[str, Any]:
+        return {
+            "actor_name": str(self.actor_name),
+            "shard_id": int(self.shard_id),
+            "num_groups": int(self.num_groups),
+            "logical_node_id": str(self.logical_node_id),
+            "hostname": socket.gethostname(),
+            "pid": int(os.getpid()),
+            "ray_node_id": str(self.ray_node_id),
+            "table_store_root": str(self.table_store_root),
+            "table_store_base_root": str(get_hspec_table_store_root()),
+            "hspec_store_root": str(get_hspec_store_root()),
+            "similarity_threshold": float(self.similarity_threshold),
+            "max_entries_per_prompt": int(self.max_entries),
+            "n_components": int(self.n_components),
+            "build_actor_num_cpus": float(self.build_actor_num_cpus),
+            "build_blas_threads": int(self.build_blas_threads),
+        }
 
     def _can_accept_descriptor_batch(self, descs: List[HSpecTrajectoryDesc]) -> bool:
         pending_descs = self._build_pending_descs + len(descs)
@@ -407,30 +637,60 @@ class HSpecTableGroup:
         prompt_id: str,
         desc: HSpecTrajectoryDesc,
     ) -> bool:
-        if os.getenv("HSPEC_SINGLE_NODE_ONLY", "1") != "0":
-            actor_node = os.getenv("NODE_RANK", "0")
+        expected_shard = stable_partition_id(prompt_id, self.num_groups)
+        if desc.prompt_id and str(desc.prompt_id) != str(prompt_id):
+            hspec_record_store_metric("descriptor_prompt_mismatch", 1)
+            hspec_record_store_metric("descriptor_topology_violation", 1)
+            logger.warning(
+                "HSpec descriptor prompt mismatch on actor: prompt_id=%s desc.prompt_id=%s "
+                "request_id=%s shard=%s expected_shard=%s",
+                prompt_id,
+                desc.prompt_id,
+                desc.request_id,
+                self.shard_id,
+                expected_shard,
+            )
+            return False
+        if hspec_single_node_only_enabled():
+            actor_node = self.logical_node_id
             if str(desc.node_id) != str(actor_node):
+                hspec_record_store_metric("descriptor_node_mismatch", 1)
+                hspec_record_store_metric("descriptor_topology_violation", 1)
                 logger.warning(
-                    "HSpec descriptor node mismatch in single-node mode: prompt_id=%s desc.node_id=%s actor.node_id=%s",
+                    "HSpec descriptor node mismatch in single-node mode: prompt_id=%s "
+                    "request_id=%s desc.node_id=%s actor.node_id=%s desc.shard_id=%s actor.shard_id=%s expected=%s",
                     prompt_id,
+                    desc.request_id,
                     desc.node_id,
                     actor_node,
+                    desc.shard_id,
+                    self.shard_id,
+                    expected_shard,
                 )
                 return False
         if int(desc.shard_id) != self.shard_id:
+            hspec_record_store_metric("descriptor_shard_mismatch", 1)
+            hspec_record_store_metric("descriptor_topology_violation", 1)
             logger.warning(
-                "HSpec descriptor shard mismatch: prompt_id=%s desc.shard_id=%s actor.shard_id=%s",
+                "HSpec descriptor shard mismatch: prompt_id=%s request_id=%s "
+                "desc.shard_id=%s actor.shard_id=%s expected=%s",
                 prompt_id,
+                desc.request_id,
                 desc.shard_id,
                 self.shard_id,
+                expected_shard,
             )
             return False
-        expected_shard = stable_partition_id(prompt_id, _resolve_num_groups())
         if int(desc.shard_id) != int(expected_shard):
+            hspec_record_store_metric("descriptor_shard_mismatch", 1)
+            hspec_record_store_metric("descriptor_topology_violation", 1)
             logger.warning(
-                "HSpec descriptor stable shard mismatch: prompt_id=%s desc.shard_id=%s expected=%s",
+                "HSpec descriptor stable shard mismatch: prompt_id=%s request_id=%s "
+                "desc.shard_id=%s actor.shard_id=%s expected=%s",
                 prompt_id,
+                desc.request_id,
                 desc.shard_id,
+                self.shard_id,
                 expected_shard,
             )
             return False
@@ -555,8 +815,7 @@ class HSpecTableGroup:
         desc_count = 0
         build_count_before = self._build_count
         discard_count_before = self._discard_count
-        blas_threads = max(int(os.getenv("HSPEC_BUILD_BLAS_THREADS", "1")), 1)
-        with threadpool_limits(limits=blas_threads):
+        with threadpool_limits(limits=self.build_blas_threads):
             for prompt_id, data in prompt_data_dict.items():
                 if not isinstance(data, list):
                     if hspec_strict_descriptor_mode_enabled() or _looks_like_legacy_hspec_payload(data):
@@ -613,8 +872,7 @@ class HSpecTableGroup:
         legacy_payload_count = 0
         build_count_before = self._build_count
         discard_count_before = self._discard_count
-        blas_threads = max(int(os.getenv("HSPEC_BUILD_BLAS_THREADS", "1")), 1)
-        with threadpool_limits(limits=blas_threads):
+        with threadpool_limits(limits=self.build_blas_threads):
             for prompt_id, data in prompt_data_dict.items():
                 if not _looks_like_legacy_hspec_payload(data):
                     raise TypeError(
@@ -1031,6 +1289,9 @@ class GlobalHSpecTableGroup:
         self.max_entries = max_entries_per_prompt
         self.n_components = n_components
         self.num_groups = _resolve_num_groups()
+        self.logical_node_id = get_hspec_node_id()
+        self.single_node_only = hspec_single_node_only_enabled()
+        self.topology_strict = hspec_topology_strict_enabled()
 
         # Discover existing Ray actors
         self.groups: List[ray.actor.ActorHandle] = []
@@ -1038,17 +1299,35 @@ class GlobalHSpecTableGroup:
             try:
                 self.groups.append(ray.get_actor(_build_actor_name(i)))
             except ValueError:
-                try:
-                    self.groups.append(ray.get_actor(f"hspec_table_{i}"))
-                except ValueError:
-                    logger.warning("HSpec build shard actor %s not found", _build_actor_name(i))
+                logger.warning("HSpec build shard actor %s not found", _build_actor_name(i))
+
+        if len(self.groups) != self.num_groups:
+            raise RuntimeError(
+                "HSpec build actors are incomplete: "
+                f"found={len(self.groups)} expected={self.num_groups}. "
+                "Call init_hspec_tables() before constructing GlobalHSpecTableGroup, "
+                "or check HSPEC_BUILD_ACTOR_NAME_PREFIX/HSPEC_NUM_SHARDS."
+            )
+        self.actor_topologies = _get_actor_topologies(self.groups)
+        _validate_actor_topologies(
+            self.actor_topologies,
+            expected_num_groups=self.num_groups,
+            expected_node_id=self.logical_node_id,
+            expected_similarity_threshold=self.similarity_threshold,
+            expected_max_entries_per_prompt=self.max_entries,
+            expected_n_components=self.n_components,
+        )
 
         # ZMQ connections (lazy-initialised on first query)
         self._zmq_ctx: Optional[zmq.Context] = None
         self._zmq_sockets: Dict[int, zmq.Socket] = {}
 
-        if self.groups:
-            logger.info("HSpec: GlobalHSpecTableGroup connected to %d actors", len(self.groups))
+        logger.info(
+            "HSpec: GlobalHSpecTableGroup connected to %d actors, node_id=%s, topology_strict=%s",
+            len(self.groups),
+            self.logical_node_id,
+            self.topology_strict,
+        )
 
     def __len__(self):
         return len(self.groups)
@@ -1058,6 +1337,74 @@ class GlobalHSpecTableGroup:
 
     def _get_partition(self, prompt_id: str) -> ray.actor.ActorHandle:
         return self.groups[self._get_partition_id(prompt_id)]
+
+    def _topology_violation(self, metric_name: str, message: str) -> None:
+        hspec_record_store_metric(metric_name, 1)
+        hspec_record_store_metric("descriptor_topology_violation", 1)
+        raise RuntimeError(message)
+
+    def _validate_and_normalize_descriptor_for_routing(
+        self,
+        prompt_id: str,
+        desc: HSpecTrajectoryDesc,
+        expected_pid: int,
+    ) -> HSpecTrajectoryDesc:
+        recomputed_pid = stable_partition_id(prompt_id, self.num_groups)
+        if int(expected_pid) != int(recomputed_pid):
+            raise RuntimeError(
+                "HSpec routing partition mismatch inside GlobalHSpecTableGroup: "
+                f"prompt_id={prompt_id!r}, expected_pid={expected_pid}, recomputed={recomputed_pid}, "
+                f"num_groups={self.num_groups}"
+            )
+        if expected_pid >= len(self.actor_topologies):
+            raise RuntimeError(
+                "HSpec routing points to missing build actor: "
+                f"prompt_id={prompt_id!r}, expected_pid={expected_pid}, "
+                f"actor_count={len(self.actor_topologies)}, num_groups={self.num_groups}"
+            )
+        actor_topology = self.actor_topologies[expected_pid]
+        if int(actor_topology.get("shard_id", -1)) != int(expected_pid):
+            raise RuntimeError(
+                "HSpec cached actor topology is inconsistent: "
+                f"prompt_id={prompt_id!r}, expected_pid={expected_pid}, topology={actor_topology}"
+            )
+        if desc.prompt_id and str(desc.prompt_id) != str(prompt_id):
+            self._topology_violation(
+                "descriptor_prompt_mismatch",
+                "HSpec descriptor prompt mismatch before build routing: "
+                f"prompt_id={prompt_id!r}, desc.prompt_id={desc.prompt_id!r}, "
+                f"request_id={desc.request_id!r}, desc.node_id={desc.node_id!r}, "
+                f"desc.shard_id={desc.shard_id}, expected_pid={expected_pid}, "
+                f"num_groups={self.num_groups}, logical_node_id={self.logical_node_id!r}, "
+                f"topology_strict={self.topology_strict}",
+            )
+        if self.single_node_only and str(desc.node_id) != str(self.logical_node_id):
+            self._topology_violation(
+                "descriptor_node_mismatch",
+                "HSpec descriptor node mismatch in single-node mode before build routing: "
+                f"prompt_id={prompt_id!r}, request_id={desc.request_id!r}, "
+                f"desc.node_id={desc.node_id!r}, driver.node_id={self.logical_node_id!r}, "
+                f"desc.shard_id={desc.shard_id}, expected_pid={expected_pid}, "
+                f"num_groups={self.num_groups}, topology_strict={self.topology_strict}. "
+                "Descriptor raw-store files are local; Phase 1 does not support cross-node build.",
+            )
+        if int(desc.shard_id) != int(expected_pid):
+            hspec_record_store_metric("descriptor_shard_mismatch", 1)
+            hspec_record_store_metric("descriptor_topology_violation", 1)
+            message = (
+                "HSpec descriptor shard mismatch before build routing: "
+                f"prompt_id={prompt_id!r}, request_id={desc.request_id!r}, "
+                f"desc.node_id={desc.node_id!r}, desc.shard_id={desc.shard_id}, "
+                f"expected_pid={expected_pid}, num_groups={self.num_groups}, "
+                f"logical_node_id={self.logical_node_id!r}, topology_strict={self.topology_strict}. "
+                "This indicates HSPEC_NUM_SHARDS drift or stale descriptor."
+            )
+            if self.topology_strict:
+                raise RuntimeError(message)
+            logger.warning("%s Normalizing descriptor shard because HSPEC_TOPOLOGY_STRICT=0.", message)
+            hspec_record_store_metric("descriptor_shard_normalized", 1)
+            desc = desc.with_updates(shard_id=int(expected_pid))
+        return desc
 
     # Online metrics reporting (worker-local fast path)
 
@@ -1167,17 +1514,14 @@ class GlobalHSpecTableGroup:
                 if desc is None:
                     continue
                 desc_obj = coerce_hspec_desc(desc)
+                desc_obj = self._validate_and_normalize_descriptor_for_routing(
+                    prompt_id,
+                    desc_obj,
+                    pid,
+                )
                 descs.append(desc_obj)
                 try:
                     partition_segments[pid].add(hspec_segment_key_from_desc(desc_obj))
-                    if int(desc_obj.shard_id) != int(pid):
-                        logger.warning(
-                            "HSpec descriptor shard hint mismatch during routing: "
-                            "prompt_id=%s desc.shard_id=%s expected=%s; routing by prompt_id",
-                            prompt_id,
-                            desc_obj.shard_id,
-                            pid,
-                        )
                 except Exception:
                     logger.debug(
                         "Failed to inspect HSpec descriptor segment/shard hint for prompt_id=%s",
@@ -1192,17 +1536,23 @@ class GlobalHSpecTableGroup:
 
         submissions: List[HSpecBuildSubmission] = []
         for pid, payload in partition_payloads.items():
-            if payload and pid < len(self.groups):
-                ref = self.groups[pid].build_tables_batch.remote(payload)
-                submissions.append(
-                    HSpecBuildSubmission(
-                        ref=ref,
-                        shard_id=pid,
-                        segments=frozenset(partition_segments[pid]),
-                        prompt_ids=tuple(partition_prompt_ids[pid]),
-                        legacy=False,
-                    )
+            if not payload:
+                continue
+            if pid >= len(self.groups):
+                raise RuntimeError(
+                    "HSpec build routing points to missing actor: "
+                    f"pid={pid}, actor_count={len(self.groups)}, num_groups={self.num_groups}"
                 )
+            ref = self.groups[pid].build_tables_batch.remote(payload)
+            submissions.append(
+                HSpecBuildSubmission(
+                    ref=ref,
+                    shard_id=pid,
+                    segments=frozenset(partition_segments[pid]),
+                    prompt_ids=tuple(partition_prompt_ids[pid]),
+                    legacy=False,
+                )
+            )
         if submissions:
             hspec_record_store_metric("build_submission_count", len(submissions))
             hspec_record_store_metric(
@@ -1234,17 +1584,23 @@ class GlobalHSpecTableGroup:
 
         submissions: List[HSpecBuildSubmission] = []
         for pid, payload in partition_payloads.items():
-            if payload and pid < len(self.groups):
-                ref = self.groups[pid].build_tables_batch_legacy.remote(payload)
-                submissions.append(
-                    HSpecBuildSubmission(
-                        ref=ref,
-                        shard_id=pid,
-                        segments=frozenset(),
-                        prompt_ids=tuple(partition_prompt_ids[pid]),
-                        legacy=True,
-                    )
+            if not payload:
+                continue
+            if pid >= len(self.groups):
+                raise RuntimeError(
+                    "HSpec legacy build routing points to missing actor: "
+                    f"pid={pid}, actor_count={len(self.groups)}, num_groups={self.num_groups}"
                 )
+            ref = self.groups[pid].build_tables_batch_legacy.remote(payload)
+            submissions.append(
+                HSpecBuildSubmission(
+                    ref=ref,
+                    shard_id=pid,
+                    segments=frozenset(),
+                    prompt_ids=tuple(partition_prompt_ids[pid]),
+                    legacy=True,
+                )
+            )
         if submissions:
             hspec_record_store_metric("build_submission_count", len(submissions))
         return submissions
@@ -1535,6 +1891,27 @@ class GlobalHSpecTableGroup:
             store_metrics.get("raw_store_epoch_gc_error", 0))
         result["hspec/build_submission_count"] = float(store_metrics.get("build_submission_count", 0))
         result["hspec/build_submission_segments"] = float(store_metrics.get("build_submission_segments", 0))
+        result["hspec/topology_actor_count"] = float(len(self.actor_topologies))
+        result["hspec/topology_actor_init_error"] = float(
+            store_metrics.get("topology_actor_init_error", 0))
+        result["hspec/topology_actor_reuse_mismatch"] = float(
+            store_metrics.get("topology_actor_reuse_mismatch", 0))
+        result["hspec/topology_actor_node_mismatch"] = float(
+            store_metrics.get("topology_actor_node_mismatch", 0))
+        result["hspec/topology_actor_shard_mismatch"] = float(
+            store_metrics.get("topology_actor_shard_mismatch", 0))
+        result["hspec/topology_actor_num_groups_mismatch"] = float(
+            store_metrics.get("topology_actor_num_groups_mismatch", 0))
+        result["hspec/descriptor_topology_violation"] = float(
+            store_metrics.get("descriptor_topology_violation", 0))
+        result["hspec/descriptor_node_mismatch"] = float(
+            store_metrics.get("descriptor_node_mismatch", 0))
+        result["hspec/descriptor_shard_mismatch"] = float(
+            store_metrics.get("descriptor_shard_mismatch", 0))
+        result["hspec/descriptor_prompt_mismatch"] = float(
+            store_metrics.get("descriptor_prompt_mismatch", 0))
+        result["hspec/descriptor_shard_normalized"] = float(
+            store_metrics.get("descriptor_shard_normalized", 0))
 
         abs_deltas = set()
         for key in agg:
@@ -1609,6 +1986,47 @@ def init_hspec_tables(
     _hspec_table_handles = []
 
     num_cpus = get_hspec_build_actor_num_cpus()
+    total_actor_cpus = float(_num_groups) * float(num_cpus)
+    host_cpus = os.cpu_count() or 0
+    if host_cpus and total_actor_cpus > max(host_cpus - 2, 1):
+        logger.warning(
+            "HSpec build actor CPU reservation may oversubscribe host CPUs: "
+            "num_groups=%s actor_num_cpus=%s total_actor_cpus=%s host_cpus=%s",
+            _num_groups,
+            num_cpus,
+            total_actor_cpus,
+            host_cpus,
+        )
+
+    existing_handles: List[ray.actor.ActorHandle] = []
+    missing_existing = False
+    for i in range(_num_groups):
+        try:
+            existing_handles.append(ray.get_actor(_build_actor_name(i)))
+        except ValueError:
+            missing_existing = True
+            break
+    if existing_handles and not missing_existing:
+        topologies = _get_actor_topologies(existing_handles)
+        _validate_actor_topologies(
+            topologies,
+            expected_num_groups=_num_groups,
+            expected_node_id=get_hspec_node_id(),
+            expected_similarity_threshold=similarity_threshold,
+            expected_max_entries_per_prompt=max_entries_per_prompt,
+            expected_n_components=n_components,
+        )
+        _hspec_table_handles = existing_handles
+        logger.info("HSpec: reusing %d validated build shard actors.", len(existing_handles))
+        return
+    if existing_handles and missing_existing:
+        hspec_record_store_metric("topology_actor_init_error", 1)
+        raise RuntimeError(
+            "HSpec found a partial set of existing build shard actors: "
+            f"found={len(existing_handles)} expected={_num_groups}. "
+            "Restart Ray or set a unique HSPEC_BUILD_ACTOR_NAME_PREFIX."
+        )
+
     for i in range(_num_groups):
         handle = HSpecTableGroup.options(
             name=_build_actor_name(i),
@@ -1623,12 +2041,26 @@ def init_hspec_tables(
         )
         _hspec_table_handles.append(handle)
 
-    for i in range(_num_groups):
-        try:
-            ray.get_actor(_build_actor_name(i))
-            logger.info("HSpec build shard actor %d registered successfully.", i)
-        except ValueError:
-            logger.error("HSpec build shard actor %d failed to register!", i)
+    topologies = _get_actor_topologies(_hspec_table_handles)
+    _validate_actor_topologies(
+        topologies,
+        expected_num_groups=_num_groups,
+        expected_node_id=get_hspec_node_id(),
+        expected_similarity_threshold=similarity_threshold,
+        expected_max_entries_per_prompt=max_entries_per_prompt,
+        expected_n_components=n_components,
+    )
+    hspec_record_store_metric("topology_actor_count", len(topologies))
+    for item in topologies:
+        logger.info(
+            "HSpec build shard actor %d registered successfully: node_id=%s ray_node_id=%s "
+            "build_actor_num_cpus=%s build_blas_threads=%s",
+            int(item["shard_id"]),
+            item.get("logical_node_id"),
+            item.get("ray_node_id"),
+            item.get("build_actor_num_cpus"),
+            item.get("build_blas_threads"),
+        )
 
 
 def get_hspec_tables(
@@ -1645,20 +2077,28 @@ def get_hspec_tables(
     if _num_groups != expected_groups:
         _num_groups = expected_groups
 
-    # Ensure actors exist
+    # Ensure actors exist and match the current topology.
     needs_init = False
+    existing_handles: List[ray.actor.ActorHandle] = []
     for i in range(_num_groups):
         try:
-            ray.get_actor(_build_actor_name(i))
+            existing_handles.append(ray.get_actor(_build_actor_name(i)))
         except ValueError:
-            try:
-                ray.get_actor(f"hspec_table_{i}")
-            except ValueError:
-                needs_init = True
-                break
+            needs_init = True
+            break
 
     if needs_init:
         init_hspec_tables(similarity_threshold, max_entries_per_prompt, n_components)
+    else:
+        topologies = _get_actor_topologies(existing_handles)
+        _validate_actor_topologies(
+            topologies,
+            expected_num_groups=_num_groups,
+            expected_node_id=get_hspec_node_id(),
+            expected_similarity_threshold=similarity_threshold,
+            expected_max_entries_per_prompt=max_entries_per_prompt,
+            expected_n_components=n_components,
+        )
 
     return GlobalHSpecTableGroup(
         similarity_threshold=similarity_threshold,

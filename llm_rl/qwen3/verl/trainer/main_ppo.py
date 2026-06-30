@@ -69,12 +69,16 @@ def run_ppo(config) -> None:
         from vllm_ascend.spec_decode.hspec_table import init_hspec_tables
         from vllm_ascend.spec_decode.hspec_store import (
             assert_hspec_num_shards_configured_for_production,
+            get_hspec_build_actor_name_prefix,
             get_hspec_build_actor_num_cpus,
+            get_hspec_build_blas_threads,
             get_hspec_num_shards,
             get_hspec_node_id,
             get_hspec_store_dtype,
             hspec_legacy_dataproto_hs_enabled,
+            hspec_single_node_only_enabled,
             hspec_strict_descriptor_mode_enabled,
+            hspec_topology_strict_enabled,
         )
 
         unsafe_multi_node = os.getenv("HSPEC_EXPERIMENTAL_ALLOW_MULTI_NODE_UNSAFE", "0") != "0"
@@ -88,21 +92,37 @@ def run_ppo(config) -> None:
         if unsafe_multi_node:
             print(
                 "WARNING: HSPEC_EXPERIMENTAL_ALLOW_MULTI_NODE_UNSAFE=1 is set. "
-                "HSpec Phase 1 descriptor build does not guarantee node-local raw-store access."
+                "This only bypasses the startup guard. HSpec Phase 1 still does not "
+                "provide node-local build actor routing and must not be used for "
+                "production measurements."
             )
 
         assert_hspec_num_shards_configured_for_production()
         hspec_store_dtype = get_hspec_store_dtype()
         hspec_num_shards = get_hspec_num_shards()
         hspec_build_actor_cpus = get_hspec_build_actor_num_cpus()
+        hspec_build_blas_threads = get_hspec_build_blas_threads()
+        hspec_single_node_only = hspec_single_node_only_enabled()
+        hspec_topology_strict = hspec_topology_strict_enabled()
+        hspec_build_actor_prefix = get_hspec_build_actor_name_prefix()
+        total_build_actor_cpus = float(hspec_num_shards) * float(hspec_build_actor_cpus)
+        if not hspec_single_node_only:
+            print(
+                "WARNING: HSPEC_SINGLE_NODE_ONLY=0 disables descriptor node checks, "
+                "but Phase 1 still does not implement multi-node local-file build routing."
+            )
         print(
             "HSpec Phase1 config: "
             f"store_dtype={hspec_store_dtype}, "
             f"strict_descriptor_mode={hspec_strict_descriptor_mode_enabled()}, "
-            f"single_node_only={os.getenv('HSPEC_SINGLE_NODE_ONLY', '1') != '0'}, "
+            f"single_node_only={hspec_single_node_only}, "
+            f"topology_strict={hspec_topology_strict}, "
             f"nnodes={int(config.trainer.nnodes)}, "
             f"num_shards={hspec_num_shards}, "
             f"build_actor_num_cpus={hspec_build_actor_cpus}, "
+            f"build_blas_threads={hspec_build_blas_threads}, "
+            f"build_actor_name_prefix={hspec_build_actor_prefix}, "
+            f"total_build_actor_cpus={total_build_actor_cpus}, "
             f"node_rank={get_hspec_node_id()}, "
             f"legacy_dataproto_hs={hspec_legacy_dataproto_hs_enabled()}"
         )

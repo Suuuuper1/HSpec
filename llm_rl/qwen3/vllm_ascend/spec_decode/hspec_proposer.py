@@ -430,9 +430,14 @@ class HSpecProposer(Proposer):
         self.max_draft_tokens: int = spec_config.num_speculative_tokens
         self.similarity_threshold: float = getattr(spec_config, "hspec_similarity_threshold", 0.9)
         self.min_match_len: int = getattr(spec_config, "hspec_min_match_len", 1)
+        self.n_components: int = getattr(spec_config, "hspec_n_components", 64)
+        self.max_entries_per_prompt: int = getattr(spec_config, "hspec_max_entries_per_prompt", 10_000)
 
         self.hspec_tables: GlobalHSpecTableGroup = get_hspec_tables(
-            similarity_threshold=self.similarity_threshold)
+            similarity_threshold=self.similarity_threshold,
+            n_components=self.n_components,
+            max_entries_per_prompt=self.max_entries_per_prompt,
+        )
 
         self._cache: OrderedDict[str, _CachedPromptTable] = OrderedDict()
         self._not_in_table: Set[str] = set()

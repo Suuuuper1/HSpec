@@ -84,6 +84,17 @@ _store_metrics: Dict[str, int] = {
     "raw_store_epoch_gc_error": 0,
     "build_submission_count": 0,
     "build_submission_segments": 0,
+    "topology_actor_count": 0,
+    "topology_actor_init_error": 0,
+    "topology_actor_reuse_mismatch": 0,
+    "topology_actor_shard_mismatch": 0,
+    "topology_actor_num_groups_mismatch": 0,
+    "topology_actor_node_mismatch": 0,
+    "descriptor_topology_violation": 0,
+    "descriptor_node_mismatch": 0,
+    "descriptor_shard_mismatch": 0,
+    "descriptor_prompt_mismatch": 0,
+    "descriptor_shard_normalized": 0,
 }
 
 
@@ -126,6 +137,16 @@ def hspec_step0_runtime_asserts_enabled() -> bool:
 def hspec_raw_store_gc_after_epoch_enabled() -> bool:
     """Whether trainer epoch barriers should delete successfully built raw segments."""
     return os.getenv("HSPEC_RAW_STORE_GC_AFTER_EPOCH", "1") != "0"
+
+
+def hspec_single_node_only_enabled() -> bool:
+    """Whether descriptor raw-store paths must remain on one logical node."""
+    return os.getenv("HSPEC_SINGLE_NODE_ONLY", "1") != "0"
+
+
+def hspec_topology_strict_enabled() -> bool:
+    """Whether descriptor topology/routing drift should fail fast."""
+    return os.getenv("HSPEC_TOPOLOGY_STRICT", "1") != "0"
 
 
 def hspec_record_store_metric(name: str, value: int = 1) -> None:
@@ -182,6 +203,23 @@ def get_hspec_build_actor_num_cpus() -> float:
         logger.warning("HSPEC_BUILD_ACTOR_NUM_CPUS=%s must be > 0; using 1", value)
         return 1.0
     return parsed
+
+
+def get_hspec_build_blas_threads() -> int:
+    value = os.getenv("HSPEC_BUILD_BLAS_THREADS", "1")
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid HSPEC_BUILD_BLAS_THREADS=%s; using 1", value)
+        return 1
+    if parsed <= 0:
+        logger.warning("HSPEC_BUILD_BLAS_THREADS=%s must be > 0; using 1", value)
+        return 1
+    return parsed
+
+
+def get_hspec_build_actor_name_prefix() -> str:
+    return os.getenv("HSPEC_BUILD_ACTOR_NAME_PREFIX", "hspec_build_shard").strip() or "hspec_build_shard"
 
 
 def get_hspec_node_id() -> str:
