@@ -218,6 +218,44 @@ def get_hspec_build_blas_threads() -> int:
     return parsed
 
 
+def _parse_nonnegative_int_env(name: str, default: int = 0) -> int:
+    value = os.getenv(name, str(default))
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%s; using %s", name, value, default)
+        return max(int(default), 0)
+
+
+def _parse_nonnegative_float_env(name: str, default: float = 0.0) -> float:
+    value = os.getenv(name, str(default))
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%s; using %s", name, value, default)
+        return max(float(default), 0.0)
+
+
+def get_hspec_build_max_prompt_rows() -> int:
+    """Maximum input rows materialized per prompt build, 0 means unlimited."""
+    return _parse_nonnegative_int_env("HSPEC_BUILD_MAX_PROMPT_ROWS", 0)
+
+
+def get_hspec_build_max_prompt_raw_bytes() -> int:
+    """Maximum descriptor raw bytes materialized per prompt build, 0 means unlimited."""
+    return _parse_nonnegative_int_env("HSPEC_BUILD_MAX_PROMPT_RAW_BYTES", 0)
+
+
+def get_hspec_build_max_prompt_descs() -> int:
+    """Maximum descriptors selected per prompt build, 0 means unlimited."""
+    return _parse_nonnegative_int_env("HSPEC_BUILD_MAX_PROMPT_DESCS", 0)
+
+
+def get_hspec_build_max_rss_mb() -> float:
+    """Best-effort build actor RSS hard guard in MiB, 0 means disabled."""
+    return _parse_nonnegative_float_env("HSPEC_BUILD_MAX_RSS_MB", 0.0)
+
+
 def get_hspec_build_actor_name_prefix() -> str:
     return os.getenv("HSPEC_BUILD_ACTOR_NAME_PREFIX", "hspec_build_shard").strip() or "hspec_build_shard"
 

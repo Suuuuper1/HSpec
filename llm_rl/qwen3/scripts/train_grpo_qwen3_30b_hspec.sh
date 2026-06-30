@@ -43,6 +43,10 @@ export HSPEC_PINNED_POOL_BUCKET_ROWS="${HSPEC_PINNED_POOL_BUCKET_ROWS:-64,128,25
 export HSPEC_COPY_MAX_PENDING_TASKS="${HSPEC_COPY_MAX_PENDING_TASKS:-64}"
 export HSPEC_COPY_MAX_PENDING_ROWS="${HSPEC_COPY_MAX_PENDING_ROWS:-0}"
 export HSPEC_DROP_ON_BACKPRESSURE="${HSPEC_DROP_ON_BACKPRESSURE:-1}"
+export HSPEC_BUILD_MAX_PROMPT_ROWS="${HSPEC_BUILD_MAX_PROMPT_ROWS:-0}"
+export HSPEC_BUILD_MAX_PROMPT_RAW_BYTES="${HSPEC_BUILD_MAX_PROMPT_RAW_BYTES:-0}"
+export HSPEC_BUILD_MAX_PROMPT_DESCS="${HSPEC_BUILD_MAX_PROMPT_DESCS:-0}"
+export HSPEC_BUILD_MAX_RSS_MB="${HSPEC_BUILD_MAX_RSS_MB:-0}"
 
 # capture graph
 # export VERL_VLLM_CUDAGRAPH_MODE="${VERL_VLLM_CUDAGRAPH_MODE:-FULL}"
@@ -173,6 +177,10 @@ mkdir -p "${LOG_DIR}" "${ROLL_LEN_ROOT}" "${TB_ROOT}" "${ROLLOUT_LENGTH_DIR}" "$
     echo "hspec_copy_max_pending_tasks=${HSPEC_COPY_MAX_PENDING_TASKS}"
     echo "hspec_copy_max_pending_rows=${HSPEC_COPY_MAX_PENDING_ROWS}"
     echo "hspec_drop_on_backpressure=${HSPEC_DROP_ON_BACKPRESSURE}"
+    echo "hspec_build_max_prompt_rows=${HSPEC_BUILD_MAX_PROMPT_ROWS}"
+    echo "hspec_build_max_prompt_raw_bytes=${HSPEC_BUILD_MAX_PROMPT_RAW_BYTES}"
+    echo "hspec_build_max_prompt_descs=${HSPEC_BUILD_MAX_PROMPT_DESCS}"
+    echo "hspec_build_max_rss_mb=${HSPEC_BUILD_MAX_RSS_MB}"
     echo "hspec_profile=${HSPEC_PROFILE}"
     echo "hspec_dump=${HSPEC_DUMP}"
     echo "pca_components=${PCA_COMPONENTS}"
@@ -302,6 +310,10 @@ env \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_COPY_MAX_PENDING_TASKS='"'"${HSPEC_COPY_MAX_PENDING_TASKS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_COPY_MAX_PENDING_ROWS='"'"${HSPEC_COPY_MAX_PENDING_ROWS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DROP_ON_BACKPRESSURE='"'"${HSPEC_DROP_ON_BACKPRESSURE}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_BUILD_MAX_PROMPT_ROWS='"'"${HSPEC_BUILD_MAX_PROMPT_ROWS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_BUILD_MAX_PROMPT_RAW_BYTES='"'"${HSPEC_BUILD_MAX_PROMPT_RAW_BYTES}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_BUILD_MAX_PROMPT_DESCS='"'"${HSPEC_BUILD_MAX_PROMPT_DESCS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_BUILD_MAX_RSS_MB='"'"${HSPEC_BUILD_MAX_RSS_MB}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN='"'"${HSPEC_GEN}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_REQ_IDX='"'"${HSPEC_GEN_REQ_IDX}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_MAX_CALLS='"'"${HSPEC_GEN_MAX_CALLS}"'"' \

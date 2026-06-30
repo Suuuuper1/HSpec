@@ -640,35 +640,67 @@ class RayPPOTrainer:
         additive_keys = (
             "prompt_count",
             "desc_count",
+            "selected_desc_count",
             "legacy_payload_count",
             "build_count_delta",
             "discard_count_delta",
             "build_total_ms",
+            "build_validation_ms",
+            "build_materialize_ms",
+            "build_pca_ms",
+            "build_table_add_ms",
+            "build_input_rows",
+            "build_selected_rows",
+            "build_loaded_raw_bytes",
+            "build_loaded_fp32_bytes",
+            "build_budget_drop_count",
+            "build_budget_drop_rows",
+            "build_budget_drop_raw_bytes",
+            "build_budget_drop_oversize_count",
+            "build_rss_cap_skip_count",
+            "build_memory_error_count",
         )
         for key in additive_keys:
             value = result.get(key)
             if isinstance(value, (int, float)):
                 metric_key = f"hspec/build_result_{key}"
                 metrics[metric_key] = metrics.get(metric_key, 0.0) + float(value)
-        rss = result.get("build_actor_rss_mb")
-        if isinstance(rss, (int, float)) and float(rss) >= 0:
-            metrics["hspec/build_actor_rss_mb_max"] = max(
-                float(metrics.get("hspec/build_actor_rss_mb_max", 0.0)),
-                float(rss),
-            )
+                if key.endswith("_bytes"):
+                    mb_key = f"hspec/build_result_{key[:-6]}_mb"
+                    metrics[mb_key] = metrics.get(mb_key, 0.0) + float(value) / (1024 * 1024)
+        max_keys = (
+            "build_actor_rss_mb",
+            "build_actor_rss_before_mb",
+            "build_actor_rss_after_materialize_mb_max",
+            "build_actor_rss_after_pca_mb_max",
+            "build_actor_rss_peak_mb",
+            "build_actor_rss_delta_mb_max",
+        )
+        for key in max_keys:
+            value = result.get(key)
+            if isinstance(value, (int, float)) and float(value) >= 0:
+                metric_key = f"hspec/build_result_{key}_max"
+                metrics[metric_key] = max(float(metrics.get(metric_key, 0.0)), float(value))
+                if key == "build_actor_rss_mb":
+                    metrics["hspec/build_actor_rss_mb_max"] = max(
+                        float(metrics.get("hspec/build_actor_rss_mb_max", 0.0)),
+                        float(value),
+                    )
 
     @staticmethod
     def _hspec_pending_segment_count(records: list[HSpecPendingBuild]) -> int:
         return len({segment for record in records for segment in record.segments})
 
-    def _wait_hspec_epoch_builds(self, epoch: int, timing_raw: dict | None = None) -> None:
+    def _wait_hspec_epoch_builds(self, epoch: int, timing_raw: dict | None = None) -> dict[str, float]:
         records: list[HSpecPendingBuild] = getattr(self, "_hspec_pending_build_refs", [])
         if not records:
-            return
+            return {}
 
         epoch_records = [record for record in records if record.epoch == epoch]
         if not epoch_records:
-            return
+            return {}
+
+        build_result_metrics: dict[str, float] = {}
 
         def _wait_not_done() -> None:
             for record in epoch_records:
@@ -677,6 +709,7 @@ class RayPPOTrainer:
                 result = ray.get(record.ref)
                 record.done = True
                 record.result_metrics = self._coerce_hspec_result_metrics(result)
+                self._merge_hspec_build_result_metrics(build_result_metrics, result)
 
         if timing_raw is None:
             _wait_not_done()
@@ -733,6 +766,7 @@ class RayPPOTrainer:
             for record in records
             if record.epoch != epoch
         ]
+        return build_result_metrics
 
     def _poll_hspec_builds_nonblocking(self, metrics: dict | None = None) -> None:
         records: list[HSpecPendingBuild] = getattr(self, "_hspec_pending_build_refs", [])
@@ -2017,7 +2051,13 @@ class RayPPOTrainer:
 
                 if is_last_step:
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
-                        self._wait_hspec_epoch_builds(epoch, timing_raw)
+                        barrier_metrics = self._wait_hspec_epoch_builds(epoch, timing_raw)
+                        if barrier_metrics:
+                            barrier_metrics.update({
+                                "training/global_step": self.global_steps,
+                                "training/epoch": epoch,
+                            })
+                            logger.log(data=barrier_metrics, step=self.global_steps)
                         print(f"HSpec: final swap at epoch={epoch} step={self.global_steps}")
                         self.hspec_tables.swap()
                     pprint(f"Final validation metrics: {last_val_metrics}")
@@ -2031,6 +2071,12 @@ class RayPPOTrainer:
                     self.train_dataset.on_batch_end(batch=batch)
 
             if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
-                self._wait_hspec_epoch_builds(epoch, timing_raw)
+                barrier_metrics = self._wait_hspec_epoch_builds(epoch, timing_raw)
+                if barrier_metrics:
+                    barrier_metrics.update({
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                    })
+                    logger.log(data=barrier_metrics, step=self.global_steps)
                 print(f"HSpec: swap at epoch={epoch} (promote building -> active)")
                 self.hspec_tables.swap()

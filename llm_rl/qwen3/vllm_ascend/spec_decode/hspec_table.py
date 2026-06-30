@@ -19,8 +19,9 @@ import json
 import logging
 import os
 import socket
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import msgpack
@@ -44,6 +45,10 @@ from vllm_ascend.spec_decode.hspec_store import (
     get_hspec_build_actor_name_prefix,
     get_hspec_build_actor_num_cpus,
     get_hspec_build_blas_threads,
+    get_hspec_build_max_prompt_descs,
+    get_hspec_build_max_prompt_raw_bytes,
+    get_hspec_build_max_prompt_rows,
+    get_hspec_build_max_rss_mb,
     get_hspec_node_id,
     get_hspec_num_shards,
     get_hspec_store_root,
@@ -88,6 +93,60 @@ class HSpecBuildActorTopology:
     n_components: int
     build_actor_num_cpus: float
     build_blas_threads: int
+    build_max_prompt_rows: int
+    build_max_prompt_raw_bytes: int
+    build_max_prompt_descs: int
+    build_max_rss_mb: float
+
+
+@dataclass
+class _PromptBuildBudgetResult:
+    selected: List[HSpecTrajectoryDesc] = field(default_factory=list)
+    dropped: List[HSpecTrajectoryDesc] = field(default_factory=list)
+    input_desc_count: int = 0
+    input_rows: int = 0
+    input_raw_bytes: int = 0
+    selected_rows: int = 0
+    selected_raw_bytes: int = 0
+    dropped_rows: int = 0
+    dropped_raw_bytes: int = 0
+    oversize_drop_count: int = 0
+
+
+@dataclass
+class _PromptBuildInputs:
+    hidden_states_list: List[np.ndarray] = field(default_factory=list)
+    token_seq_list: List[np.ndarray] = field(default_factory=list)
+    rewards: List[float] = field(default_factory=list)
+    input_desc_count: int = 0
+    selected_desc_count: int = 0
+    input_rows: int = 0
+    selected_rows: int = 0
+    input_raw_bytes: int = 0
+    selected_raw_bytes: int = 0
+    loaded_raw_bytes: int = 0
+    loaded_fp32_bytes: int = 0
+    budget_drop_count: int = 0
+    budget_drop_rows: int = 0
+    budget_drop_raw_bytes: int = 0
+    budget_drop_oversize_count: int = 0
+    materialize_ms: float = 0.0
+    rss_before_bytes: int = 0
+    rss_after_materialize_bytes: int = 0
+
+
+@dataclass
+class _PromptTableBuildMetrics:
+    validation_ms: float = 0.0
+    pca_ms: float = 0.0
+    table_add_ms: float = 0.0
+    rss_before_pca_bytes: int = 0
+    rss_after_pca_bytes: int = 0
+    valid_rows: int = 0
+    valid_desc_count: int = 0
+    pca_error_count: int = 0
+    memory_error_count: int = 0
+    built: bool = False
 
 
 def _build_actor_name(shard_id: int) -> str:
@@ -116,6 +175,10 @@ def _actor_topology_error(
             "similarity_threshold": item.get("similarity_threshold"),
             "max_entries_per_prompt": item.get("max_entries_per_prompt"),
             "n_components": item.get("n_components"),
+            "build_max_prompt_rows": item.get("build_max_prompt_rows"),
+            "build_max_prompt_raw_bytes": item.get("build_max_prompt_raw_bytes"),
+            "build_max_prompt_descs": item.get("build_max_prompt_descs"),
+            "build_max_rss_mb": item.get("build_max_rss_mb"),
         }
         for item in topologies
     ]
@@ -138,6 +201,10 @@ def _validate_actor_topologies(
     expected_similarity_threshold: Optional[float] = None,
     expected_max_entries_per_prompt: Optional[int] = None,
     expected_n_components: Optional[int] = None,
+    expected_build_max_prompt_rows: Optional[int] = None,
+    expected_build_max_prompt_raw_bytes: Optional[int] = None,
+    expected_build_max_prompt_descs: Optional[int] = None,
+    expected_build_max_rss_mb: Optional[float] = None,
 ) -> None:
     if len(topologies) != expected_num_groups:
         hspec_record_store_metric("topology_actor_init_error", 1)
@@ -259,6 +326,59 @@ def _validate_actor_topologies(
                     expected_num_groups=expected_num_groups,
                     expected_node_id=expected_node_id,
                 )
+        if (
+            expected_build_max_prompt_rows is not None
+            and int(item.get("build_max_prompt_rows", -1)) != int(expected_build_max_prompt_rows)
+        ):
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports build_max_prompt_rows={item.get('build_max_prompt_rows')}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if (
+            expected_build_max_prompt_raw_bytes is not None
+            and int(item.get("build_max_prompt_raw_bytes", -1)) != int(expected_build_max_prompt_raw_bytes)
+        ):
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                "actor shard=%s reports build_max_prompt_raw_bytes=%s"
+                % (shard_id, item.get("build_max_prompt_raw_bytes")),
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if (
+            expected_build_max_prompt_descs is not None
+            and int(item.get("build_max_prompt_descs", -1)) != int(expected_build_max_prompt_descs)
+        ):
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports build_max_prompt_descs={item.get('build_max_prompt_descs')}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if expected_build_max_rss_mb is not None:
+            try:
+                actor_max_rss = float(item.get("build_max_rss_mb"))
+            except Exception as exc:
+                hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+                raise _actor_topology_error(
+                    f"actor shard={shard_id} reports invalid build_max_rss_mb={item.get('build_max_rss_mb')}",
+                    topologies=topologies,
+                    expected_num_groups=expected_num_groups,
+                    expected_node_id=expected_node_id,
+                ) from exc
+            if abs(actor_max_rss - float(expected_build_max_rss_mb)) > 1e-9:
+                hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+                raise _actor_topology_error(
+                    f"actor shard={shard_id} reports build_max_rss_mb={actor_max_rss}",
+                    topologies=topologies,
+                    expected_num_groups=expected_num_groups,
+                    expected_node_id=expected_node_id,
+                )
 
 
 def _get_actor_topologies(handles: List[ray.actor.ActorHandle]) -> List[Dict[str, Any]]:
@@ -288,13 +408,37 @@ def _raise_legacy_payload_forbidden(prompt_id: str, data: Any) -> None:
     )
 
 
-def _maybe_process_rss_mb() -> float:
+def _get_process_rss_bytes() -> int:
     try:
         import psutil
 
-        return float(psutil.Process().memory_info().rss / (1024 * 1024))
+        return int(psutil.Process(os.getpid()).memory_info().rss)
     except Exception:
-        return -1.0
+        try:
+            import resource
+
+            value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            return value * 1024 if sys.platform.startswith("linux") else value
+        except Exception:
+            return 0
+
+
+def _bytes_to_mb(value: int | float) -> float:
+    return float(value) / float(1024 * 1024)
+
+
+def _maybe_process_rss_mb() -> float:
+    rss = _get_process_rss_bytes()
+    return _bytes_to_mb(rss) if rss > 0 else -1.0
+
+
+def _desc_reward_sort_value(desc: HSpecTrajectoryDesc) -> float:
+    try:
+        if desc.reward is None:
+            return float("-inf")
+        return float(desc.reward)
+    except Exception:
+        return float("-inf")
 
 
 # Per-prompt table data  (continuous-array, reference-value storage)
@@ -491,6 +635,10 @@ class HSpecTableGroup:
         self.logical_node_id = get_hspec_node_id()
         self.build_actor_num_cpus = get_hspec_build_actor_num_cpus()
         self.build_blas_threads = get_hspec_build_blas_threads()
+        self.build_max_prompt_rows = get_hspec_build_max_prompt_rows()
+        self.build_max_prompt_raw_bytes = get_hspec_build_max_prompt_raw_bytes()
+        self.build_max_prompt_descs = get_hspec_build_max_prompt_descs()
+        self.build_max_rss_mb = get_hspec_build_max_rss_mb()
         self.actor_name = _build_actor_name(self.shard_id)
         try:
             self.ray_node_id = str(ray.get_runtime_context().get_node_id())
@@ -519,6 +667,26 @@ class HSpecTableGroup:
         self._total_draft_len = 0
         self._build_count = 0
         self._discard_count = 0
+        self._build_loaded_raw_bytes = 0
+        self._build_loaded_fp32_bytes = 0
+        self._build_input_rows = 0
+        self._build_selected_rows = 0
+        self._build_selected_desc_count = 0
+        self._build_budget_drop_count = 0
+        self._build_budget_drop_rows = 0
+        self._build_budget_drop_raw_bytes = 0
+        self._build_budget_drop_oversize_count = 0
+        self._build_rss_cap_skip_count = 0
+        self._build_memory_error_count = 0
+        self._build_validation_ms = 0.0
+        self._build_materialize_ms = 0.0
+        self._build_pca_ms = 0.0
+        self._build_table_add_ms = 0.0
+        self._build_total_ms = 0.0
+        self._build_rss_peak_bytes = 0
+        self._build_rss_after_materialize_peak_bytes = 0
+        self._build_rss_after_pca_peak_bytes = 0
+        self._build_rss_delta_peak_bytes = 0
         # Verification metrics (post rejection-sampling)
         # verify_times: number of requests that entered verification with a
         # non-empty draft (i.e., spec decode attempted).
@@ -561,6 +729,10 @@ class HSpecTableGroup:
             "n_components": int(self.n_components),
             "build_actor_num_cpus": float(self.build_actor_num_cpus),
             "build_blas_threads": int(self.build_blas_threads),
+            "build_max_prompt_rows": int(self.build_max_prompt_rows),
+            "build_max_prompt_raw_bytes": int(self.build_max_prompt_raw_bytes),
+            "build_max_prompt_descs": int(self.build_max_prompt_descs),
+            "build_max_rss_mb": float(self.build_max_rss_mb),
         }
 
     def _can_accept_descriptor_batch(self, descs: List[HSpecTrajectoryDesc]) -> bool:
@@ -583,15 +755,16 @@ class HSpecTableGroup:
             0,
         )
 
-    def _load_prompt_build_inputs_from_descs(
+    def _rss_cap_exceeded(self, rss_bytes: int) -> bool:
+        return self.build_max_rss_mb > 0 and rss_bytes > 0 and _bytes_to_mb(rss_bytes) >= self.build_max_rss_mb
+
+    def _select_prompt_descs_for_build(
         self,
         prompt_id: str,
         descs: List[HSpecTrajectoryDesc],
-    ) -> tuple[List[np.ndarray], List[np.ndarray], List[float]]:
-        hidden_states_list: List[np.ndarray] = []
-        token_seq_list: List[np.ndarray] = []
-        rewards: List[float] = []
-
+    ) -> _PromptBuildBudgetResult:
+        budget = _PromptBuildBudgetResult(input_desc_count=len(descs))
+        valid_items: List[tuple[HSpecTrajectoryDesc, int, int]] = []
         for desc in descs:
             if desc is None:
                 self._discard_count += 1
@@ -599,6 +772,119 @@ class HSpecTableGroup:
             if not self._validate_descriptor_topology(prompt_id, desc):
                 self._discard_count += 1
                 continue
+            rows = max(int(desc.length), 0)
+            try:
+                raw_bytes = max(int(estimate_hspec_trajectory_bytes(desc)), 0)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to estimate HSpec trajectory bytes for prompt_id=%s request_id=%s: %s",
+                    prompt_id,
+                    desc.request_id,
+                    exc,
+                )
+                self._discard_count += 1
+                continue
+            budget.input_rows += rows
+            budget.input_raw_bytes += raw_bytes
+            valid_items.append((desc, rows, raw_bytes))
+
+        if (
+            self.build_max_prompt_rows <= 0
+            and self.build_max_prompt_raw_bytes <= 0
+            and self.build_max_prompt_descs <= 0
+        ):
+            budget.selected = [item[0] for item in valid_items]
+            budget.selected_rows = budget.input_rows
+            budget.selected_raw_bytes = budget.input_raw_bytes
+            return budget
+
+        def _sort_key(item: tuple[HSpecTrajectoryDesc, int, int]) -> tuple[float, int, str, int, int]:
+            desc, _, _ = item
+            return (
+                -_desc_reward_sort_value(desc),
+                -int(desc.global_step),
+                str(desc.request_id),
+                int(desc.hs_offset_rows),
+                int(desc.token_offset),
+            )
+
+        selected_descs: List[HSpecTrajectoryDesc] = []
+        selected_rows = 0
+        selected_raw_bytes = 0
+        for desc, rows, raw_bytes in sorted(valid_items, key=_sort_key):
+            would_descs = len(selected_descs) + 1
+            would_rows = selected_rows + rows
+            would_raw_bytes = selected_raw_bytes + raw_bytes
+            desc_oversize = (
+                (self.build_max_prompt_descs > 0 and 1 > self.build_max_prompt_descs)
+                or (self.build_max_prompt_rows > 0 and rows > self.build_max_prompt_rows)
+                or (self.build_max_prompt_raw_bytes > 0 and raw_bytes > self.build_max_prompt_raw_bytes)
+            )
+            would_exceed = (
+                (self.build_max_prompt_descs > 0 and would_descs > self.build_max_prompt_descs)
+                or (self.build_max_prompt_rows > 0 and would_rows > self.build_max_prompt_rows)
+                or (self.build_max_prompt_raw_bytes > 0 and would_raw_bytes > self.build_max_prompt_raw_bytes)
+            )
+            if desc_oversize or would_exceed:
+                budget.dropped.append(desc)
+                budget.dropped_rows += rows
+                budget.dropped_raw_bytes += raw_bytes
+                if desc_oversize:
+                    budget.oversize_drop_count += 1
+                continue
+            selected_descs.append(desc)
+            selected_rows = would_rows
+            selected_raw_bytes = would_raw_bytes
+
+        budget.selected = selected_descs
+        budget.selected_rows = selected_rows
+        budget.selected_raw_bytes = selected_raw_bytes
+        if budget.dropped:
+            self._discard_count += len(budget.dropped)
+            logger.warning(
+                "HSpec build prompt budget drop: shard=%s prompt_id=%s input_descs=%s selected_descs=%s "
+                "input_rows=%s selected_rows=%s dropped_rows=%s input_raw_bytes=%s selected_raw_bytes=%s "
+                "dropped_raw_bytes=%s caps(descs=%s rows=%s raw_bytes=%s)",
+                self.shard_id,
+                prompt_id,
+                budget.input_desc_count,
+                len(budget.selected),
+                budget.input_rows,
+                budget.selected_rows,
+                budget.dropped_rows,
+                budget.input_raw_bytes,
+                budget.selected_raw_bytes,
+                budget.dropped_raw_bytes,
+                self.build_max_prompt_descs,
+                self.build_max_prompt_rows,
+                self.build_max_prompt_raw_bytes,
+            )
+        return budget
+
+    def _load_prompt_build_inputs_from_descs(
+        self,
+        prompt_id: str,
+        descs: List[HSpecTrajectoryDesc],
+    ) -> _PromptBuildInputs:
+        result = _PromptBuildInputs()
+        budget = self._select_prompt_descs_for_build(prompt_id, descs)
+        result.input_desc_count = budget.input_desc_count
+        result.selected_desc_count = len(budget.selected)
+        result.input_rows = budget.input_rows
+        result.selected_rows = budget.selected_rows
+        result.input_raw_bytes = budget.input_raw_bytes
+        result.selected_raw_bytes = budget.selected_raw_bytes
+        result.budget_drop_count = len(budget.dropped)
+        result.budget_drop_rows = budget.dropped_rows
+        result.budget_drop_raw_bytes = budget.dropped_raw_bytes
+        result.budget_drop_oversize_count = budget.oversize_drop_count
+
+        if not budget.selected:
+            return result
+
+        result.rss_before_bytes = _get_process_rss_bytes()
+        t_materialize = time.perf_counter()
+        for desc in budget.selected:
             try:
                 hs, tokens = load_hspec_trajectory(desc)
             except Exception as exc:
@@ -613,11 +899,21 @@ class HSpecTableGroup:
             if hs is None or tokens is None:
                 self._discard_count += 1
                 continue
-            hidden_states_list.append(np.asarray(hs, dtype=np.float32))
-            token_seq_list.append(np.asarray(tokens, dtype=np.int32))
-            rewards.append(float(desc.reward or 0.0))
+            try:
+                hs_fp32 = np.asarray(hs, dtype=np.float32)
+                tok_i32 = np.asarray(tokens, dtype=np.int32)
+            except MemoryError:
+                self._discard_count += 1
+                raise
+            result.hidden_states_list.append(hs_fp32)
+            result.token_seq_list.append(tok_i32)
+            result.rewards.append(float(desc.reward or 0.0))
+            result.loaded_raw_bytes += estimate_hspec_trajectory_bytes(desc)
+            result.loaded_fp32_bytes += int(hs_fp32.nbytes)
+        result.materialize_ms = float((time.perf_counter() - t_materialize) * 1000.0)
+        result.rss_after_materialize_bytes = _get_process_rss_bytes()
 
-        return hidden_states_list, token_seq_list, rewards
+        return result
 
     def _cleanup_trajectory_descs(self, descs: List[HSpecTrajectoryDesc]) -> None:
         cleanup = os.getenv("HSPEC_DELETE_TRAJECTORY_AFTER_BUILD", "0") != "0"
@@ -717,7 +1013,7 @@ class HSpecTableGroup:
         hidden_states_list: List[np.ndarray],
         token_seq_list: List[Any],
         rewards: List[float],
-    ):
+    ) -> _PromptTableBuildMetrics:
         """Build a complete table for one prompt.
 
         Pipeline:  validate → PCA fit → project → store entries.
@@ -728,7 +1024,9 @@ class HSpecTableGroup:
             token_seq_list:     [list[int] | ndarray] per rollout.
             rewards:            [float] per rollout.
         """
+        metrics = _PromptTableBuildMetrics()
         # ① Validate & filter
+        t_validation = time.perf_counter()
         valid_hs: List[np.ndarray] = []
         valid_tok: List[Any] = []
         valid_rew: List[float] = []
@@ -751,24 +1049,42 @@ class HSpecTableGroup:
             valid_hs.append(hs if hs.dtype == np.float32 else hs.astype(np.float32))
             valid_tok.append(tok)
             valid_rew.append(rew)
+        metrics.validation_ms = float((time.perf_counter() - t_validation) * 1000.0)
+        metrics.valid_desc_count = len(valid_hs)
+        metrics.valid_rows = int(sum(int(hs.shape[0]) for hs in valid_hs))
 
         if not valid_hs:
-            return
+            return metrics
 
         # PCA fit  (single-sequence for PPO, multi for GRPO)
         num_components = self.n_components
+        metrics.rss_before_pca_bytes = _get_process_rss_bytes()
+        t_pca = time.perf_counter()
         try:
             if len(valid_hs) == 1:
                 pca_params, proj = fit_pca_single_sequence(prompt_id, valid_hs[0], num_components)
                 proj_list = [proj]
             else:
                 pca_params, proj_list = fit_pca_multi_sequence(prompt_id, valid_hs, num_components)
+        except MemoryError:
+            metrics.pca_ms = float((time.perf_counter() - t_pca) * 1000.0)
+            metrics.rss_after_pca_bytes = _get_process_rss_bytes()
+            metrics.memory_error_count = 1
+            self._discard_count += len(valid_hs)
+            logger.warning("HSpec PCA ran out of memory for %s", prompt_id)
+            return metrics
         except Exception as exc:
+            metrics.pca_ms = float((time.perf_counter() - t_pca) * 1000.0)
+            metrics.rss_after_pca_bytes = _get_process_rss_bytes()
+            metrics.pca_error_count = 1
             logger.warning("HSpec PCA failed for %s: %s", prompt_id, exc)
             self._discard_count += len(valid_hs)
-            return
+            return metrics
+        metrics.pca_ms = float((time.perf_counter() - t_pca) * 1000.0)
+        metrics.rss_after_pca_bytes = _get_process_rss_bytes()
 
         # Create table & populate with projected keys + token refs
+        t_table_add = time.perf_counter()
         table = PromptTableData(pca_params=pca_params, max_entries=self.max_entries)
         for proj, tok, rew in zip(proj_list, valid_tok, valid_rew):
             tok_arr = (np.asarray(tok, dtype=np.int32)
@@ -777,8 +1093,11 @@ class HSpecTableGroup:
             table.add_rollout(proj, tok_arr, rew)
 
         table.compact()
+        metrics.table_add_ms = float((time.perf_counter() - t_table_add) * 1000.0)
         self._building[prompt_id] = table
         self._build_count += 1
+        metrics.built = True
+        return metrics
 
     def _build_result_metrics(
         self,
@@ -787,18 +1106,69 @@ class HSpecTableGroup:
         prompt_count: int,
         desc_count: int,
         legacy_payload_count: int,
+        selected_desc_count: int,
+        build_input_rows: int,
+        build_selected_rows: int,
+        build_loaded_raw_bytes: int,
+        build_loaded_fp32_bytes: int,
+        build_budget_drop_count: int,
+        build_budget_drop_rows: int,
+        build_budget_drop_raw_bytes: int,
+        build_budget_drop_oversize_count: int,
+        build_rss_cap_skip_count: int,
+        build_memory_error_count: int,
+        build_validation_ms: float,
+        build_materialize_ms: float,
+        build_pca_ms: float,
+        build_table_add_ms: float,
+        build_total_ms: float,
+        rss_before_bytes: int,
+        rss_after_materialize_peak_bytes: int,
+        rss_after_pca_peak_bytes: int,
+        rss_peak_bytes: int,
+        rss_delta_peak_bytes: int,
         build_count_before: int,
         discard_count_before: int,
     ) -> Dict[str, float]:
+        rss_now = _get_process_rss_bytes()
+        rss_peak_bytes = max(int(rss_peak_bytes), int(rss_now))
+        if rss_before_bytes > 0 and rss_now > 0:
+            rss_delta_peak_bytes = max(int(rss_delta_peak_bytes), max(int(rss_now) - int(rss_before_bytes), 0))
         return {
             "shard_id": float(self.shard_id),
             "prompt_count": float(prompt_count),
             "desc_count": float(desc_count),
+            "selected_desc_count": float(selected_desc_count),
             "legacy_payload_count": float(legacy_payload_count),
             "build_count_delta": float(self._build_count - build_count_before),
             "discard_count_delta": float(self._discard_count - discard_count_before),
-            "build_total_ms": float((time.perf_counter() - t0) * 1000.0),
-            "build_actor_rss_mb": _maybe_process_rss_mb(),
+            "build_total_ms": build_total_ms,
+            "build_validation_ms": float(build_validation_ms),
+            "build_materialize_ms": float(build_materialize_ms),
+            "build_pca_ms": float(build_pca_ms),
+            "build_table_add_ms": float(build_table_add_ms),
+            "build_input_rows": float(build_input_rows),
+            "build_selected_rows": float(build_selected_rows),
+            "build_loaded_raw_bytes": float(build_loaded_raw_bytes),
+            "build_loaded_fp32_bytes": float(build_loaded_fp32_bytes),
+            "build_budget_drop_count": float(build_budget_drop_count),
+            "build_budget_drop_rows": float(build_budget_drop_rows),
+            "build_budget_drop_raw_bytes": float(build_budget_drop_raw_bytes),
+            "build_budget_drop_oversize_count": float(build_budget_drop_oversize_count),
+            "build_rss_cap_skip_count": float(build_rss_cap_skip_count),
+            "build_memory_error_count": float(build_memory_error_count),
+            "build_actor_rss_mb": _bytes_to_mb(rss_now) if rss_now > 0 else -1.0,
+            "build_actor_rss_before_mb": _bytes_to_mb(rss_before_bytes) if rss_before_bytes > 0 else -1.0,
+            "build_actor_rss_after_materialize_mb_max": (
+                _bytes_to_mb(rss_after_materialize_peak_bytes)
+                if rss_after_materialize_peak_bytes > 0 else -1.0
+            ),
+            "build_actor_rss_after_pca_mb_max": (
+                _bytes_to_mb(rss_after_pca_peak_bytes)
+                if rss_after_pca_peak_bytes > 0 else -1.0
+            ),
+            "build_actor_rss_peak_mb": _bytes_to_mb(rss_peak_bytes) if rss_peak_bytes > 0 else -1.0,
+            "build_actor_rss_delta_mb_max": _bytes_to_mb(rss_delta_peak_bytes) if rss_delta_peak_bytes > 0 else 0.0,
         }
 
     def build_tables_batch(
@@ -815,6 +1185,35 @@ class HSpecTableGroup:
         desc_count = 0
         build_count_before = self._build_count
         discard_count_before = self._discard_count
+        selected_desc_count = 0
+        build_input_rows = 0
+        build_selected_rows = 0
+        build_loaded_raw_bytes = 0
+        build_loaded_fp32_bytes = 0
+        build_budget_drop_count = 0
+        build_budget_drop_rows = 0
+        build_budget_drop_raw_bytes = 0
+        build_budget_drop_oversize_count = 0
+        build_rss_cap_skip_count = 0
+        build_memory_error_count = 0
+        build_validation_ms = 0.0
+        build_materialize_ms = 0.0
+        build_pca_ms = 0.0
+        build_table_add_ms = 0.0
+        rss_before_bytes = _get_process_rss_bytes()
+        rss_peak_bytes = rss_before_bytes
+        rss_after_materialize_peak_bytes = 0
+        rss_after_pca_peak_bytes = 0
+        rss_delta_peak_bytes = 0
+
+        def _observe_rss(rss_bytes: int) -> None:
+            nonlocal rss_peak_bytes, rss_delta_peak_bytes
+            if rss_bytes <= 0:
+                return
+            rss_peak_bytes = max(rss_peak_bytes, rss_bytes)
+            if rss_before_bytes > 0:
+                rss_delta_peak_bytes = max(rss_delta_peak_bytes, max(rss_bytes - rss_before_bytes, 0))
+
         with threadpool_limits(limits=self.build_blas_threads):
             for prompt_id, data in prompt_data_dict.items():
                 if not isinstance(data, list):
@@ -838,25 +1237,142 @@ class HSpecTableGroup:
                     continue
                 self._mark_descriptor_batch_pending(descs)
                 try:
-                    hidden_states_list, token_seq_list, rewards = self._load_prompt_build_inputs_from_descs(
-                        prompt_id,
-                        descs,
+                    pre_materialize_rss = _get_process_rss_bytes()
+                    _observe_rss(pre_materialize_rss)
+                    if self._rss_cap_exceeded(pre_materialize_rss):
+                        build_rss_cap_skip_count += 1
+                        self._discard_count += len(descs)
+                        logger.warning(
+                            "HSpec build actor RSS cap exceeded before materialize: shard=%s prompt_id=%s "
+                            "rss_mb=%.2f cap_mb=%.2f dropping_descs=%s",
+                            self.shard_id,
+                            prompt_id,
+                            _bytes_to_mb(pre_materialize_rss),
+                            self.build_max_rss_mb,
+                            len(descs),
+                        )
+                        continue
+                    try:
+                        build_inputs = self._load_prompt_build_inputs_from_descs(
+                            prompt_id,
+                            descs,
+                        )
+                    except MemoryError:
+                        build_memory_error_count += 1
+                        logger.warning(
+                            "HSpec build materialize ran out of memory: shard=%s prompt_id=%s descs=%s",
+                            self.shard_id,
+                            prompt_id,
+                            len(descs),
+                        )
+                        continue
+
+                    selected_desc_count += build_inputs.selected_desc_count
+                    build_input_rows += build_inputs.input_rows
+                    build_selected_rows += build_inputs.selected_rows
+                    build_loaded_raw_bytes += build_inputs.loaded_raw_bytes
+                    build_loaded_fp32_bytes += build_inputs.loaded_fp32_bytes
+                    build_budget_drop_count += build_inputs.budget_drop_count
+                    build_budget_drop_rows += build_inputs.budget_drop_rows
+                    build_budget_drop_raw_bytes += build_inputs.budget_drop_raw_bytes
+                    build_budget_drop_oversize_count += build_inputs.budget_drop_oversize_count
+                    build_materialize_ms += build_inputs.materialize_ms
+                    rss_after_materialize_peak_bytes = max(
+                        rss_after_materialize_peak_bytes,
+                        build_inputs.rss_after_materialize_bytes,
                     )
-                    self.build_prompt_table(
+                    _observe_rss(build_inputs.rss_after_materialize_bytes)
+
+                    if not build_inputs.hidden_states_list:
+                        continue
+                    if self._rss_cap_exceeded(build_inputs.rss_after_materialize_bytes):
+                        build_rss_cap_skip_count += 1
+                        self._discard_count += len(build_inputs.hidden_states_list)
+                        logger.warning(
+                            "HSpec build actor RSS cap exceeded after materialize: shard=%s prompt_id=%s "
+                            "rss_mb=%.2f cap_mb=%.2f selected_descs=%s selected_rows=%s",
+                            self.shard_id,
+                            prompt_id,
+                            _bytes_to_mb(build_inputs.rss_after_materialize_bytes),
+                            self.build_max_rss_mb,
+                            build_inputs.selected_desc_count,
+                            build_inputs.selected_rows,
+                        )
+                        continue
+
+                    table_metrics = self.build_prompt_table(
                         prompt_id,
-                        hidden_states_list,
-                        token_seq_list,
-                        rewards,
+                        build_inputs.hidden_states_list,
+                        build_inputs.token_seq_list,
+                        build_inputs.rewards,
                     )
+                    build_validation_ms += table_metrics.validation_ms
+                    build_pca_ms += table_metrics.pca_ms
+                    build_table_add_ms += table_metrics.table_add_ms
+                    build_memory_error_count += table_metrics.memory_error_count
+                    rss_after_pca_peak_bytes = max(
+                        rss_after_pca_peak_bytes,
+                        table_metrics.rss_after_pca_bytes,
+                    )
+                    _observe_rss(table_metrics.rss_before_pca_bytes)
+                    _observe_rss(table_metrics.rss_after_pca_bytes)
                 finally:
                     self._cleanup_trajectory_descs(descs)
                     self._mark_descriptor_batch_finished(descs)
 
+        build_total_ms = float((time.perf_counter() - t0) * 1000.0)
+        self._build_selected_desc_count += selected_desc_count
+        self._build_input_rows += build_input_rows
+        self._build_selected_rows += build_selected_rows
+        self._build_loaded_raw_bytes += build_loaded_raw_bytes
+        self._build_loaded_fp32_bytes += build_loaded_fp32_bytes
+        self._build_budget_drop_count += build_budget_drop_count
+        self._build_budget_drop_rows += build_budget_drop_rows
+        self._build_budget_drop_raw_bytes += build_budget_drop_raw_bytes
+        self._build_budget_drop_oversize_count += build_budget_drop_oversize_count
+        self._build_rss_cap_skip_count += build_rss_cap_skip_count
+        self._build_memory_error_count += build_memory_error_count
+        self._build_validation_ms += build_validation_ms
+        self._build_materialize_ms += build_materialize_ms
+        self._build_pca_ms += build_pca_ms
+        self._build_table_add_ms += build_table_add_ms
+        self._build_total_ms += build_total_ms
+        self._build_rss_peak_bytes = max(self._build_rss_peak_bytes, rss_peak_bytes)
+        self._build_rss_after_materialize_peak_bytes = max(
+            self._build_rss_after_materialize_peak_bytes,
+            rss_after_materialize_peak_bytes,
+        )
+        self._build_rss_after_pca_peak_bytes = max(
+            self._build_rss_after_pca_peak_bytes,
+            rss_after_pca_peak_bytes,
+        )
+        self._build_rss_delta_peak_bytes = max(self._build_rss_delta_peak_bytes, rss_delta_peak_bytes)
         return self._build_result_metrics(
             t0=t0,
             prompt_count=prompt_count,
             desc_count=desc_count,
             legacy_payload_count=0,
+            selected_desc_count=selected_desc_count,
+            build_input_rows=build_input_rows,
+            build_selected_rows=build_selected_rows,
+            build_loaded_raw_bytes=build_loaded_raw_bytes,
+            build_loaded_fp32_bytes=build_loaded_fp32_bytes,
+            build_budget_drop_count=build_budget_drop_count,
+            build_budget_drop_rows=build_budget_drop_rows,
+            build_budget_drop_raw_bytes=build_budget_drop_raw_bytes,
+            build_budget_drop_oversize_count=build_budget_drop_oversize_count,
+            build_rss_cap_skip_count=build_rss_cap_skip_count,
+            build_memory_error_count=build_memory_error_count,
+            build_validation_ms=build_validation_ms,
+            build_materialize_ms=build_materialize_ms,
+            build_pca_ms=build_pca_ms,
+            build_table_add_ms=build_table_add_ms,
+            build_total_ms=build_total_ms,
+            rss_before_bytes=rss_before_bytes,
+            rss_after_materialize_peak_bytes=rss_after_materialize_peak_bytes,
+            rss_after_pca_peak_bytes=rss_after_pca_peak_bytes,
+            rss_peak_bytes=rss_peak_bytes,
+            rss_delta_peak_bytes=rss_delta_peak_bytes,
             build_count_before=build_count_before,
             discard_count_before=discard_count_before,
         )
@@ -872,6 +1388,23 @@ class HSpecTableGroup:
         legacy_payload_count = 0
         build_count_before = self._build_count
         discard_count_before = self._discard_count
+        build_validation_ms = 0.0
+        build_pca_ms = 0.0
+        build_table_add_ms = 0.0
+        build_memory_error_count = 0
+        rss_before_bytes = _get_process_rss_bytes()
+        rss_peak_bytes = rss_before_bytes
+        rss_after_pca_peak_bytes = 0
+        rss_delta_peak_bytes = 0
+
+        def _observe_rss(rss_bytes: int) -> None:
+            nonlocal rss_peak_bytes, rss_delta_peak_bytes
+            if rss_bytes <= 0:
+                return
+            rss_peak_bytes = max(rss_peak_bytes, rss_bytes)
+            if rss_before_bytes > 0:
+                rss_delta_peak_bytes = max(rss_delta_peak_bytes, max(rss_bytes - rss_before_bytes, 0))
+
         with threadpool_limits(limits=self.build_blas_threads):
             for prompt_id, data in prompt_data_dict.items():
                 if not _looks_like_legacy_hspec_payload(data):
@@ -882,18 +1415,58 @@ class HSpecTableGroup:
                 prompt_count += 1
                 hidden_states = data["hidden_states"]
                 legacy_payload_count += len(hidden_states) if hasattr(hidden_states, "__len__") else 1
-                self.build_prompt_table(
+                table_metrics = self.build_prompt_table(
                     prompt_id,
                     hidden_states,
                     data["tokens"],
                     data["rewards"],
                 )
+                build_validation_ms += table_metrics.validation_ms
+                build_pca_ms += table_metrics.pca_ms
+                build_table_add_ms += table_metrics.table_add_ms
+                build_memory_error_count += table_metrics.memory_error_count
+                rss_after_pca_peak_bytes = max(rss_after_pca_peak_bytes, table_metrics.rss_after_pca_bytes)
+                _observe_rss(table_metrics.rss_before_pca_bytes)
+                _observe_rss(table_metrics.rss_after_pca_bytes)
         hspec_record_store_metric("legacy_payload_count", legacy_payload_count)
+        build_total_ms = float((time.perf_counter() - t0) * 1000.0)
+        self._build_validation_ms += build_validation_ms
+        self._build_pca_ms += build_pca_ms
+        self._build_table_add_ms += build_table_add_ms
+        self._build_total_ms += build_total_ms
+        self._build_memory_error_count += build_memory_error_count
+        self._build_rss_peak_bytes = max(self._build_rss_peak_bytes, rss_peak_bytes)
+        self._build_rss_after_pca_peak_bytes = max(
+            self._build_rss_after_pca_peak_bytes,
+            rss_after_pca_peak_bytes,
+        )
+        self._build_rss_delta_peak_bytes = max(self._build_rss_delta_peak_bytes, rss_delta_peak_bytes)
         return self._build_result_metrics(
             t0=t0,
             prompt_count=prompt_count,
             desc_count=0,
             legacy_payload_count=legacy_payload_count,
+            selected_desc_count=0,
+            build_input_rows=0,
+            build_selected_rows=0,
+            build_loaded_raw_bytes=0,
+            build_loaded_fp32_bytes=0,
+            build_budget_drop_count=0,
+            build_budget_drop_rows=0,
+            build_budget_drop_raw_bytes=0,
+            build_budget_drop_oversize_count=0,
+            build_rss_cap_skip_count=0,
+            build_memory_error_count=build_memory_error_count,
+            build_validation_ms=build_validation_ms,
+            build_materialize_ms=0.0,
+            build_pca_ms=build_pca_ms,
+            build_table_add_ms=build_table_add_ms,
+            build_total_ms=build_total_ms,
+            rss_before_bytes=rss_before_bytes,
+            rss_after_materialize_peak_bytes=0,
+            rss_after_pca_peak_bytes=rss_after_pca_peak_bytes,
+            rss_peak_bytes=rss_peak_bytes,
+            rss_delta_peak_bytes=rss_delta_peak_bytes,
             build_count_before=build_count_before,
             discard_count_before=discard_count_before,
         )
@@ -1056,6 +1629,26 @@ class HSpecTableGroup:
             "reject_times_advan": self._reject_advan_count,
             "build_count": self._build_count,
             "discard_count": self._discard_count,
+            "build_selected_desc_count": self._build_selected_desc_count,
+            "build_input_rows": self._build_input_rows,
+            "build_selected_rows": self._build_selected_rows,
+            "build_loaded_raw_bytes": self._build_loaded_raw_bytes,
+            "build_loaded_fp32_bytes": self._build_loaded_fp32_bytes,
+            "build_budget_drop_count": self._build_budget_drop_count,
+            "build_budget_drop_rows": self._build_budget_drop_rows,
+            "build_budget_drop_raw_bytes": self._build_budget_drop_raw_bytes,
+            "build_budget_drop_oversize_count": self._build_budget_drop_oversize_count,
+            "build_rss_cap_skip_count": self._build_rss_cap_skip_count,
+            "build_memory_error_count": self._build_memory_error_count,
+            "build_validation_ms": self._build_validation_ms,
+            "build_materialize_ms": self._build_materialize_ms,
+            "build_pca_ms": self._build_pca_ms,
+            "build_table_add_ms": self._build_table_add_ms,
+            "build_total_ms": self._build_total_ms,
+            "build_rss_peak_bytes": self._build_rss_peak_bytes,
+            "build_rss_after_materialize_peak_bytes": self._build_rss_after_materialize_peak_bytes,
+            "build_rss_after_pca_peak_bytes": self._build_rss_after_pca_peak_bytes,
+            "build_rss_delta_peak_bytes": self._build_rss_delta_peak_bytes,
             "num_prompts": len(self._active),
             "total_entries": self.total_entries(),
             "entry_match_count": self._entry_match_count,
@@ -1079,6 +1672,26 @@ class HSpecTableGroup:
         self._total_draft_len = 0
         self._build_count = 0
         self._discard_count = 0
+        self._build_selected_desc_count = 0
+        self._build_input_rows = 0
+        self._build_selected_rows = 0
+        self._build_loaded_raw_bytes = 0
+        self._build_loaded_fp32_bytes = 0
+        self._build_budget_drop_count = 0
+        self._build_budget_drop_rows = 0
+        self._build_budget_drop_raw_bytes = 0
+        self._build_budget_drop_oversize_count = 0
+        self._build_rss_cap_skip_count = 0
+        self._build_memory_error_count = 0
+        self._build_validation_ms = 0.0
+        self._build_materialize_ms = 0.0
+        self._build_pca_ms = 0.0
+        self._build_table_add_ms = 0.0
+        self._build_total_ms = 0.0
+        self._build_rss_peak_bytes = 0
+        self._build_rss_after_materialize_peak_bytes = 0
+        self._build_rss_after_pca_peak_bytes = 0
+        self._build_rss_delta_peak_bytes = 0
         self._verify_count = 0
         self._accept_count = 0
         self._accept_len_sum = 0
@@ -1316,6 +1929,10 @@ class GlobalHSpecTableGroup:
             expected_similarity_threshold=self.similarity_threshold,
             expected_max_entries_per_prompt=self.max_entries,
             expected_n_components=self.n_components,
+            expected_build_max_prompt_rows=get_hspec_build_max_prompt_rows(),
+            expected_build_max_prompt_raw_bytes=get_hspec_build_max_prompt_raw_bytes(),
+            expected_build_max_prompt_descs=get_hspec_build_max_prompt_descs(),
+            expected_build_max_rss_mb=get_hspec_build_max_rss_mb(),
         )
 
         # ZMQ connections (lazy-initialised on first query)
@@ -1817,9 +2434,18 @@ class GlobalHSpecTableGroup:
         metrics_list = ray.get(tasks)
 
         agg: Dict[str, float] = {}
+        max_agg_keys = {
+            "build_rss_peak_bytes",
+            "build_rss_after_materialize_peak_bytes",
+            "build_rss_after_pca_peak_bytes",
+            "build_rss_delta_peak_bytes",
+        }
         for metrics in metrics_list:
             for key, value in metrics.items():
-                agg[key] = agg.get(key, 0.0) + float(value)
+                if key in max_agg_keys:
+                    agg[key] = max(agg.get(key, 0.0), float(value))
+                else:
+                    agg[key] = agg.get(key, 0.0) + float(value)
 
         # Cache-match metrics (reported from worker-local proposer).
         cache_qt = agg.get("query_times", 0)
@@ -1851,6 +2477,33 @@ class GlobalHSpecTableGroup:
             "hspec/avg_draft_length": total_draft_len / cache_mt if cache_mt > 0 else 0.0,
             "hspec/build_count": agg.get("build_count", 0),
             "hspec/discard_count": agg.get("discard_count", 0),
+            "hspec/build_selected_desc_count": agg.get("build_selected_desc_count", 0),
+            "hspec/build_input_rows": agg.get("build_input_rows", 0),
+            "hspec/build_selected_rows": agg.get("build_selected_rows", 0),
+            "hspec/build_loaded_raw_bytes": agg.get("build_loaded_raw_bytes", 0),
+            "hspec/build_loaded_fp32_bytes": agg.get("build_loaded_fp32_bytes", 0),
+            "hspec/build_loaded_raw_mb": agg.get("build_loaded_raw_bytes", 0) / (1024 * 1024),
+            "hspec/build_loaded_fp32_mb": agg.get("build_loaded_fp32_bytes", 0) / (1024 * 1024),
+            "hspec/build_budget_drop_count": agg.get("build_budget_drop_count", 0),
+            "hspec/build_budget_drop_rows": agg.get("build_budget_drop_rows", 0),
+            "hspec/build_budget_drop_raw_bytes": agg.get("build_budget_drop_raw_bytes", 0),
+            "hspec/build_budget_drop_raw_mb": agg.get("build_budget_drop_raw_bytes", 0) / (1024 * 1024),
+            "hspec/build_budget_drop_oversize_count": agg.get("build_budget_drop_oversize_count", 0),
+            "hspec/build_rss_cap_skip_count": agg.get("build_rss_cap_skip_count", 0),
+            "hspec/build_memory_error_count": agg.get("build_memory_error_count", 0),
+            "hspec/build_validation_ms": agg.get("build_validation_ms", 0),
+            "hspec/build_materialize_ms": agg.get("build_materialize_ms", 0),
+            "hspec/build_pca_ms": agg.get("build_pca_ms", 0),
+            "hspec/build_table_add_ms": agg.get("build_table_add_ms", 0),
+            "hspec/build_total_ms": agg.get("build_total_ms", 0),
+            "hspec/build_actor_rss_peak_mb": agg.get("build_rss_peak_bytes", 0) / (1024 * 1024),
+            "hspec/build_actor_rss_after_materialize_mb_max": (
+                agg.get("build_rss_after_materialize_peak_bytes", 0) / (1024 * 1024)
+            ),
+            "hspec/build_actor_rss_after_pca_mb_max": (
+                agg.get("build_rss_after_pca_peak_bytes", 0) / (1024 * 1024)
+            ),
+            "hspec/build_actor_rss_delta_mb_max": agg.get("build_rss_delta_peak_bytes", 0) / (1024 * 1024),
             "hspec/num_prompts": agg.get("num_prompts", 0),
             "hspec/total_entries": agg.get("total_entries", 0),
             "hspec/accept_times_advan": accept_times_advan,
@@ -2015,6 +2668,10 @@ def init_hspec_tables(
             expected_similarity_threshold=similarity_threshold,
             expected_max_entries_per_prompt=max_entries_per_prompt,
             expected_n_components=n_components,
+            expected_build_max_prompt_rows=get_hspec_build_max_prompt_rows(),
+            expected_build_max_prompt_raw_bytes=get_hspec_build_max_prompt_raw_bytes(),
+            expected_build_max_prompt_descs=get_hspec_build_max_prompt_descs(),
+            expected_build_max_rss_mb=get_hspec_build_max_rss_mb(),
         )
         _hspec_table_handles = existing_handles
         logger.info("HSpec: reusing %d validated build shard actors.", len(existing_handles))
@@ -2049,17 +2706,26 @@ def init_hspec_tables(
         expected_similarity_threshold=similarity_threshold,
         expected_max_entries_per_prompt=max_entries_per_prompt,
         expected_n_components=n_components,
+        expected_build_max_prompt_rows=get_hspec_build_max_prompt_rows(),
+        expected_build_max_prompt_raw_bytes=get_hspec_build_max_prompt_raw_bytes(),
+        expected_build_max_prompt_descs=get_hspec_build_max_prompt_descs(),
+        expected_build_max_rss_mb=get_hspec_build_max_rss_mb(),
     )
     hspec_record_store_metric("topology_actor_count", len(topologies))
     for item in topologies:
         logger.info(
             "HSpec build shard actor %d registered successfully: node_id=%s ray_node_id=%s "
-            "build_actor_num_cpus=%s build_blas_threads=%s",
+            "build_actor_num_cpus=%s build_blas_threads=%s build_max_prompt_rows=%s "
+            "build_max_prompt_raw_bytes=%s build_max_prompt_descs=%s build_max_rss_mb=%s",
             int(item["shard_id"]),
             item.get("logical_node_id"),
             item.get("ray_node_id"),
             item.get("build_actor_num_cpus"),
             item.get("build_blas_threads"),
+            item.get("build_max_prompt_rows"),
+            item.get("build_max_prompt_raw_bytes"),
+            item.get("build_max_prompt_descs"),
+            item.get("build_max_rss_mb"),
         )
 
 
@@ -2098,6 +2764,10 @@ def get_hspec_tables(
             expected_similarity_threshold=similarity_threshold,
             expected_max_entries_per_prompt=max_entries_per_prompt,
             expected_n_components=n_components,
+            expected_build_max_prompt_rows=get_hspec_build_max_prompt_rows(),
+            expected_build_max_prompt_raw_bytes=get_hspec_build_max_prompt_raw_bytes(),
+            expected_build_max_prompt_descs=get_hspec_build_max_prompt_descs(),
+            expected_build_max_rss_mb=get_hspec_build_max_rss_mb(),
         )
 
     return GlobalHSpecTableGroup(

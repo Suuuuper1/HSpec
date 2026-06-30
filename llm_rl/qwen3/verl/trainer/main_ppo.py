@@ -72,6 +72,10 @@ def run_ppo(config) -> None:
             get_hspec_build_actor_name_prefix,
             get_hspec_build_actor_num_cpus,
             get_hspec_build_blas_threads,
+            get_hspec_build_max_prompt_descs,
+            get_hspec_build_max_prompt_raw_bytes,
+            get_hspec_build_max_prompt_rows,
+            get_hspec_build_max_rss_mb,
             get_hspec_num_shards,
             get_hspec_node_id,
             get_hspec_store_dtype,
@@ -105,6 +109,10 @@ def run_ppo(config) -> None:
         hspec_single_node_only = hspec_single_node_only_enabled()
         hspec_topology_strict = hspec_topology_strict_enabled()
         hspec_build_actor_prefix = get_hspec_build_actor_name_prefix()
+        hspec_build_max_prompt_rows = get_hspec_build_max_prompt_rows()
+        hspec_build_max_prompt_raw_bytes = get_hspec_build_max_prompt_raw_bytes()
+        hspec_build_max_prompt_descs = get_hspec_build_max_prompt_descs()
+        hspec_build_max_rss_mb = get_hspec_build_max_rss_mb()
         total_build_actor_cpus = float(hspec_num_shards) * float(hspec_build_actor_cpus)
         if not hspec_single_node_only:
             print(
@@ -122,6 +130,10 @@ def run_ppo(config) -> None:
             f"build_actor_num_cpus={hspec_build_actor_cpus}, "
             f"build_blas_threads={hspec_build_blas_threads}, "
             f"build_actor_name_prefix={hspec_build_actor_prefix}, "
+            f"build_max_prompt_rows={hspec_build_max_prompt_rows}, "
+            f"build_max_prompt_raw_bytes={hspec_build_max_prompt_raw_bytes}, "
+            f"build_max_prompt_descs={hspec_build_max_prompt_descs}, "
+            f"build_max_rss_mb={hspec_build_max_rss_mb}, "
             f"total_build_actor_cpus={total_build_actor_cpus}, "
             f"node_rank={get_hspec_node_id()}, "
             f"legacy_dataproto_hs={hspec_legacy_dataproto_hs_enabled()}"
