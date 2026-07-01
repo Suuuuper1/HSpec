@@ -30,6 +30,18 @@ import ray
 import zmq
 from threadpoolctl import threadpool_limits
 
+from vllm_ascend.spec_decode.hspec_builder import (
+    HSpecPCAConfig,
+    HSpecPCAError,
+    HSpecPCAInsufficientSamples,
+    build_prompt_table_to_store,
+)
+from vllm_ascend.spec_decode.hspec_table_store import (
+    HSpecPromptTableDesc,
+    HSpecTableStoreWriter,
+    materialize_prompt_table,
+    open_array as open_table_array,
+)
 from vllm_ascend.spec_decode.hspec_utils import (
     PromptPCAParams,
     fit_pca_multi_sequence,
@@ -137,9 +149,32 @@ class _PromptBuildInputs:
 
 @dataclass
 class _PromptTableBuildMetrics:
+    input_desc_count: int = 0
+    selected_desc_count: int = 0
+    input_rows: int = 0
+    selected_rows: int = 0
+    input_raw_bytes: int = 0
+    selected_raw_bytes: int = 0
+    budget_drop_count: int = 0
+    budget_drop_rows: int = 0
+    budget_drop_raw_bytes: int = 0
+    budget_drop_oversize_count: int = 0
     validation_ms: float = 0.0
     pca_ms: float = 0.0
     table_add_ms: float = 0.0
+    pca_mean_ms: float = 0.0
+    pca_basis_ms: float = 0.0
+    projection_ms: float = 0.0
+    table_write_ms: float = 0.0
+    processed_fp32_tile_bytes: int = 0
+    pca_method: str = ""
+    pca_method_fallback_count: int = 0
+    pca_cov_bytes: int = 0
+    pca_randomized_rank: int = 0
+    projection_tile_count: int = 0
+    table_entry_count: int = 0
+    table_rollout_count: int = 0
+    table_token_count: int = 0
     rss_before_pca_bytes: int = 0
     rss_after_pca_bytes: int = 0
     valid_rows: int = 0
@@ -408,6 +443,12 @@ def _raise_legacy_payload_forbidden(prompt_id: str, data: Any) -> None:
     )
 
 
+def _close_memmap(array: Any) -> None:
+    mmap_obj = getattr(array, "_mmap", None)
+    if mmap_obj is not None:
+        mmap_obj.close()
+
+
 def _get_process_rss_bytes() -> int:
     try:
         import psutil
@@ -622,9 +663,11 @@ class HSpecTableGroup:
         #   _active  : read-only during decode (online query)
         #   _building: write-only during build phase
         #   swap()   : building → active at epoch boundary
-        self._active: Dict[str, PromptTableData] = {}
-        self._building: Dict[str, PromptTableData] = {}
+        self._active: Dict[str, HSpecPromptTableDesc] = {}
+        self._building: Dict[str, HSpecPromptTableDesc] = {}
         self._active_version: int = 0
+        self._table_writer: Optional[HSpecTableStoreWriter] = None
+        self._building_version: Optional[int] = None
 
         self.similarity_threshold = similarity_threshold
         self.max_entries = max_entries_per_prompt
@@ -639,6 +682,7 @@ class HSpecTableGroup:
         self.build_max_prompt_raw_bytes = get_hspec_build_max_prompt_raw_bytes()
         self.build_max_prompt_descs = get_hspec_build_max_prompt_descs()
         self.build_max_rss_mb = get_hspec_build_max_rss_mb()
+        self._pca_config = HSpecPCAConfig.from_env(self.n_components)
         self.actor_name = _build_actor_name(self.shard_id)
         try:
             self.ray_node_id = str(ray.get_runtime_context().get_node_id())
@@ -682,6 +726,18 @@ class HSpecTableGroup:
         self._build_materialize_ms = 0.0
         self._build_pca_ms = 0.0
         self._build_table_add_ms = 0.0
+        self._build_pca_mean_ms = 0.0
+        self._build_pca_basis_ms = 0.0
+        self._build_projection_ms = 0.0
+        self._build_table_write_ms = 0.0
+        self._build_processed_fp32_tile_bytes = 0
+        self._build_projection_tile_count = 0
+        self._build_pca_method_randomized_count = 0
+        self._build_pca_method_covariance_count = 0
+        self._build_pca_method_svd_reference_count = 0
+        self._build_pca_method_fallback_count = 0
+        self._build_pca_cov_bytes_max = 0
+        self._build_pca_randomized_rank_max = 0
         self._build_total_ms = 0.0
         self._build_rss_peak_bytes = 0
         self._build_rss_after_materialize_peak_bytes = 0
@@ -1007,6 +1063,107 @@ class HSpecTableGroup:
 
     # Build
 
+    def _get_or_create_table_writer(self) -> HSpecTableStoreWriter:
+        if self._table_writer is not None:
+            return self._table_writer
+        version = int(self._active_version) + 1
+        self._building_version = version
+        self._table_writer = HSpecTableStoreWriter(
+            root=get_hspec_table_store_root(),
+            shard_id=self.shard_id,
+            version=version,
+        )
+        return self._table_writer
+
+    def build_prompt_table_from_descs(
+        self,
+        prompt_id: str,
+        descs: List[HSpecTrajectoryDesc],
+    ) -> _PromptTableBuildMetrics:
+        """Build one prompt table from raw-store descriptors into mmap table store."""
+        metrics = _PromptTableBuildMetrics()
+        t_validation = time.perf_counter()
+        budget = self._select_prompt_descs_for_build(prompt_id, descs)
+        metrics.validation_ms = float((time.perf_counter() - t_validation) * 1000.0)
+        metrics.input_desc_count = budget.input_desc_count
+        metrics.selected_desc_count = len(budget.selected)
+        metrics.input_rows = budget.input_rows
+        metrics.selected_rows = budget.selected_rows
+        metrics.input_raw_bytes = budget.input_raw_bytes
+        metrics.selected_raw_bytes = budget.selected_raw_bytes
+        metrics.budget_drop_count = len(budget.dropped)
+        metrics.budget_drop_rows = budget.dropped_rows
+        metrics.budget_drop_raw_bytes = budget.dropped_raw_bytes
+        metrics.budget_drop_oversize_count = budget.oversize_drop_count
+        metrics.valid_desc_count = len(budget.selected)
+        metrics.valid_rows = budget.selected_rows
+        if not budget.selected:
+            return metrics
+
+        metrics.rss_before_pca_bytes = _get_process_rss_bytes()
+        writer = self._get_or_create_table_writer()
+        try:
+            table_desc, build_metrics = build_prompt_table_to_store(
+                prompt_id=prompt_id,
+                descs=budget.selected,
+                writer=writer,
+                n_components=self.n_components,
+                max_entries=self.max_entries,
+                pca_config=self._pca_config,
+                blas_threads=self.build_blas_threads,
+            )
+        except HSpecPCAInsufficientSamples as exc:
+            self._discard_count += len(budget.selected)
+            logger.debug(
+                "HSpec descriptor table skipped for prompt_id=%s: %s",
+                prompt_id,
+                exc,
+            )
+            return metrics
+        except MemoryError:
+            metrics.memory_error_count = 1
+            self._discard_count += len(budget.selected)
+            logger.warning(
+                "HSpec descriptor table build ran out of memory: shard=%s prompt_id=%s selected_descs=%s",
+                self.shard_id,
+                prompt_id,
+                len(budget.selected),
+            )
+            return metrics
+        except HSpecPCAError as exc:
+            metrics.pca_error_count = 1
+            self._discard_count += len(budget.selected)
+            logger.warning("HSpec descriptor PCA failed for %s: %s", prompt_id, exc)
+            return metrics
+        except Exception as exc:
+            metrics.pca_error_count = 1
+            self._discard_count += len(budget.selected)
+            logger.warning("HSpec descriptor table build failed for %s: %s",
+                           prompt_id,
+                           exc)
+            return metrics
+
+        metrics.rss_after_pca_bytes = _get_process_rss_bytes()
+        metrics.pca_mean_ms = float(build_metrics.pca_mean_ms)
+        metrics.pca_basis_ms = float(build_metrics.pca_basis_ms)
+        metrics.pca_ms = float(build_metrics.pca_total_ms)
+        metrics.table_add_ms = float(build_metrics.projection_ms + build_metrics.table_write_ms)
+        metrics.projection_ms = float(build_metrics.projection_ms)
+        metrics.table_write_ms = float(build_metrics.table_write_ms)
+        metrics.processed_fp32_tile_bytes = int(build_metrics.processed_fp32_tile_bytes)
+        metrics.pca_method = str(build_metrics.pca_method)
+        metrics.pca_method_fallback_count = int(build_metrics.method_fallback_count)
+        metrics.pca_cov_bytes = int(build_metrics.covariance_bytes)
+        metrics.pca_randomized_rank = int(build_metrics.randomized_rank)
+        metrics.projection_tile_count = int(build_metrics.projection_tile_count)
+        metrics.table_entry_count = int(build_metrics.n_entries)
+        metrics.table_rollout_count = int(build_metrics.n_rollouts)
+        metrics.table_token_count = int(build_metrics.token_count)
+        self._building[prompt_id] = table_desc
+        self._build_count += 1
+        metrics.built = True
+        return metrics
+
     def build_prompt_table(
         self,
         prompt_id: str,
@@ -1129,6 +1286,18 @@ class HSpecTableGroup:
         rss_delta_peak_bytes: int,
         build_count_before: int,
         discard_count_before: int,
+        build_pca_mean_ms: float = 0.0,
+        build_pca_basis_ms: float = 0.0,
+        build_projection_ms: float = 0.0,
+        build_table_write_ms: float = 0.0,
+        build_processed_fp32_tile_bytes: int = 0,
+        build_projection_tile_count: int = 0,
+        build_pca_method_randomized_count: int = 0,
+        build_pca_method_covariance_count: int = 0,
+        build_pca_method_svd_reference_count: int = 0,
+        build_pca_method_fallback_count: int = 0,
+        build_pca_cov_bytes_max: int = 0,
+        build_pca_randomized_rank_max: int = 0,
     ) -> Dict[str, float]:
         rss_now = _get_process_rss_bytes()
         rss_peak_bytes = max(int(rss_peak_bytes), int(rss_now))
@@ -1147,6 +1316,18 @@ class HSpecTableGroup:
             "build_materialize_ms": float(build_materialize_ms),
             "build_pca_ms": float(build_pca_ms),
             "build_table_add_ms": float(build_table_add_ms),
+            "build_pca_mean_ms": float(build_pca_mean_ms),
+            "build_pca_basis_ms": float(build_pca_basis_ms),
+            "build_projection_ms": float(build_projection_ms),
+            "build_table_write_ms": float(build_table_write_ms),
+            "build_processed_fp32_tile_bytes": float(build_processed_fp32_tile_bytes),
+            "build_projection_tile_count": float(build_projection_tile_count),
+            "build_pca_method_randomized_count": float(build_pca_method_randomized_count),
+            "build_pca_method_covariance_count": float(build_pca_method_covariance_count),
+            "build_pca_method_svd_reference_count": float(build_pca_method_svd_reference_count),
+            "build_pca_method_fallback_count": float(build_pca_method_fallback_count),
+            "build_pca_cov_bytes_max": float(build_pca_cov_bytes_max),
+            "build_pca_randomized_rank_max": float(build_pca_randomized_rank_max),
             "build_input_rows": float(build_input_rows),
             "build_selected_rows": float(build_selected_rows),
             "build_loaded_raw_bytes": float(build_loaded_raw_bytes),
@@ -1200,6 +1381,18 @@ class HSpecTableGroup:
         build_materialize_ms = 0.0
         build_pca_ms = 0.0
         build_table_add_ms = 0.0
+        build_pca_mean_ms = 0.0
+        build_pca_basis_ms = 0.0
+        build_projection_ms = 0.0
+        build_table_write_ms = 0.0
+        build_processed_fp32_tile_bytes = 0
+        build_projection_tile_count = 0
+        build_pca_method_randomized_count = 0
+        build_pca_method_covariance_count = 0
+        build_pca_method_svd_reference_count = 0
+        build_pca_method_fallback_count = 0
+        build_pca_cov_bytes_max = 0
+        build_pca_randomized_rank_max = 0
         rss_before_bytes = _get_process_rss_bytes()
         rss_peak_bytes = rss_before_bytes
         rss_after_materialize_peak_bytes = 0
@@ -1214,111 +1407,85 @@ class HSpecTableGroup:
             if rss_before_bytes > 0:
                 rss_delta_peak_bytes = max(rss_delta_peak_bytes, max(rss_bytes - rss_before_bytes, 0))
 
-        with threadpool_limits(limits=self.build_blas_threads):
-            for prompt_id, data in prompt_data_dict.items():
-                if not isinstance(data, list):
-                    if hspec_strict_descriptor_mode_enabled() or _looks_like_legacy_hspec_payload(data):
-                        _raise_legacy_payload_forbidden(prompt_id, data)
+        for prompt_id, data in prompt_data_dict.items():
+            if not isinstance(data, list):
+                if hspec_strict_descriptor_mode_enabled() or _looks_like_legacy_hspec_payload(data):
                     _raise_legacy_payload_forbidden(prompt_id, data)
-                descs = [coerce_hspec_desc(item) for item in data if item is not None]
-                if not descs:
-                    continue
-                prompt_count += 1
-                desc_count += len(descs)
-                hspec_record_store_metric("descriptor_payload_count", len(descs))
-                if not self._can_accept_descriptor_batch(descs):
-                    logger.warning(
-                        "HSpec build queue budget exceeded on shard=%s, dropping %s descriptors for prompt_id=%s",
-                        self.shard_id,
-                        len(descs),
-                        prompt_id,
-                    )
+                _raise_legacy_payload_forbidden(prompt_id, data)
+            descs = [coerce_hspec_desc(item) for item in data if item is not None]
+            if not descs:
+                continue
+            prompt_count += 1
+            desc_count += len(descs)
+            hspec_record_store_metric("descriptor_payload_count", len(descs))
+            if not self._can_accept_descriptor_batch(descs):
+                logger.warning(
+                    "HSpec build queue budget exceeded on shard=%s, dropping %s descriptors for prompt_id=%s",
+                    self.shard_id,
+                    len(descs),
+                    prompt_id,
+                )
+                self._discard_count += len(descs)
+                continue
+            self._mark_descriptor_batch_pending(descs)
+            try:
+                pre_build_rss = _get_process_rss_bytes()
+                _observe_rss(pre_build_rss)
+                if self._rss_cap_exceeded(pre_build_rss):
+                    build_rss_cap_skip_count += 1
                     self._discard_count += len(descs)
-                    continue
-                self._mark_descriptor_batch_pending(descs)
-                try:
-                    pre_materialize_rss = _get_process_rss_bytes()
-                    _observe_rss(pre_materialize_rss)
-                    if self._rss_cap_exceeded(pre_materialize_rss):
-                        build_rss_cap_skip_count += 1
-                        self._discard_count += len(descs)
-                        logger.warning(
-                            "HSpec build actor RSS cap exceeded before materialize: shard=%s prompt_id=%s "
-                            "rss_mb=%.2f cap_mb=%.2f dropping_descs=%s",
-                            self.shard_id,
-                            prompt_id,
-                            _bytes_to_mb(pre_materialize_rss),
-                            self.build_max_rss_mb,
-                            len(descs),
-                        )
-                        continue
-                    try:
-                        build_inputs = self._load_prompt_build_inputs_from_descs(
-                            prompt_id,
-                            descs,
-                        )
-                    except MemoryError:
-                        build_memory_error_count += 1
-                        logger.warning(
-                            "HSpec build materialize ran out of memory: shard=%s prompt_id=%s descs=%s",
-                            self.shard_id,
-                            prompt_id,
-                            len(descs),
-                        )
-                        continue
-
-                    selected_desc_count += build_inputs.selected_desc_count
-                    build_input_rows += build_inputs.input_rows
-                    build_selected_rows += build_inputs.selected_rows
-                    build_loaded_raw_bytes += build_inputs.loaded_raw_bytes
-                    build_loaded_fp32_bytes += build_inputs.loaded_fp32_bytes
-                    build_budget_drop_count += build_inputs.budget_drop_count
-                    build_budget_drop_rows += build_inputs.budget_drop_rows
-                    build_budget_drop_raw_bytes += build_inputs.budget_drop_raw_bytes
-                    build_budget_drop_oversize_count += build_inputs.budget_drop_oversize_count
-                    build_materialize_ms += build_inputs.materialize_ms
-                    rss_after_materialize_peak_bytes = max(
-                        rss_after_materialize_peak_bytes,
-                        build_inputs.rss_after_materialize_bytes,
-                    )
-                    _observe_rss(build_inputs.rss_after_materialize_bytes)
-
-                    if not build_inputs.hidden_states_list:
-                        continue
-                    if self._rss_cap_exceeded(build_inputs.rss_after_materialize_bytes):
-                        build_rss_cap_skip_count += 1
-                        self._discard_count += len(build_inputs.hidden_states_list)
-                        logger.warning(
-                            "HSpec build actor RSS cap exceeded after materialize: shard=%s prompt_id=%s "
-                            "rss_mb=%.2f cap_mb=%.2f selected_descs=%s selected_rows=%s",
-                            self.shard_id,
-                            prompt_id,
-                            _bytes_to_mb(build_inputs.rss_after_materialize_bytes),
-                            self.build_max_rss_mb,
-                            build_inputs.selected_desc_count,
-                            build_inputs.selected_rows,
-                        )
-                        continue
-
-                    table_metrics = self.build_prompt_table(
+                    logger.warning(
+                        "HSpec build actor RSS cap exceeded before descriptor table build: "
+                        "shard=%s prompt_id=%s rss_mb=%.2f cap_mb=%.2f dropping_descs=%s",
+                        self.shard_id,
                         prompt_id,
-                        build_inputs.hidden_states_list,
-                        build_inputs.token_seq_list,
-                        build_inputs.rewards,
+                        _bytes_to_mb(pre_build_rss),
+                        self.build_max_rss_mb,
+                        len(descs),
                     )
-                    build_validation_ms += table_metrics.validation_ms
-                    build_pca_ms += table_metrics.pca_ms
-                    build_table_add_ms += table_metrics.table_add_ms
-                    build_memory_error_count += table_metrics.memory_error_count
-                    rss_after_pca_peak_bytes = max(
-                        rss_after_pca_peak_bytes,
-                        table_metrics.rss_after_pca_bytes,
-                    )
-                    _observe_rss(table_metrics.rss_before_pca_bytes)
-                    _observe_rss(table_metrics.rss_after_pca_bytes)
-                finally:
-                    self._cleanup_trajectory_descs(descs)
-                    self._mark_descriptor_batch_finished(descs)
+                    continue
+
+                table_metrics = self.build_prompt_table_from_descs(prompt_id, descs)
+                selected_desc_count += table_metrics.selected_desc_count
+                build_input_rows += table_metrics.input_rows
+                build_selected_rows += table_metrics.selected_rows
+                build_loaded_raw_bytes += table_metrics.selected_raw_bytes
+                build_budget_drop_count += table_metrics.budget_drop_count
+                build_budget_drop_rows += table_metrics.budget_drop_rows
+                build_budget_drop_raw_bytes += table_metrics.budget_drop_raw_bytes
+                build_budget_drop_oversize_count += table_metrics.budget_drop_oversize_count
+                build_validation_ms += table_metrics.validation_ms
+                build_pca_ms += table_metrics.pca_ms
+                build_table_add_ms += table_metrics.table_add_ms
+                build_pca_mean_ms += table_metrics.pca_mean_ms
+                build_pca_basis_ms += table_metrics.pca_basis_ms
+                build_projection_ms += table_metrics.projection_ms
+                build_table_write_ms += table_metrics.table_write_ms
+                build_processed_fp32_tile_bytes += table_metrics.processed_fp32_tile_bytes
+                build_projection_tile_count += table_metrics.projection_tile_count
+                build_pca_method_fallback_count += table_metrics.pca_method_fallback_count
+                build_pca_cov_bytes_max = max(build_pca_cov_bytes_max,
+                                              table_metrics.pca_cov_bytes)
+                build_pca_randomized_rank_max = max(
+                    build_pca_randomized_rank_max,
+                    table_metrics.pca_randomized_rank,
+                )
+                if table_metrics.pca_method == "randomized":
+                    build_pca_method_randomized_count += 1
+                elif table_metrics.pca_method == "covariance":
+                    build_pca_method_covariance_count += 1
+                elif table_metrics.pca_method == "svd_reference":
+                    build_pca_method_svd_reference_count += 1
+                build_memory_error_count += table_metrics.memory_error_count
+                rss_after_pca_peak_bytes = max(
+                    rss_after_pca_peak_bytes,
+                    table_metrics.rss_after_pca_bytes,
+                )
+                _observe_rss(table_metrics.rss_before_pca_bytes)
+                _observe_rss(table_metrics.rss_after_pca_bytes)
+            finally:
+                self._cleanup_trajectory_descs(descs)
+                self._mark_descriptor_batch_finished(descs)
 
         build_total_ms = float((time.perf_counter() - t0) * 1000.0)
         self._build_selected_desc_count += selected_desc_count
@@ -1336,6 +1503,22 @@ class HSpecTableGroup:
         self._build_materialize_ms += build_materialize_ms
         self._build_pca_ms += build_pca_ms
         self._build_table_add_ms += build_table_add_ms
+        self._build_pca_mean_ms += build_pca_mean_ms
+        self._build_pca_basis_ms += build_pca_basis_ms
+        self._build_projection_ms += build_projection_ms
+        self._build_table_write_ms += build_table_write_ms
+        self._build_processed_fp32_tile_bytes += build_processed_fp32_tile_bytes
+        self._build_projection_tile_count += build_projection_tile_count
+        self._build_pca_method_randomized_count += build_pca_method_randomized_count
+        self._build_pca_method_covariance_count += build_pca_method_covariance_count
+        self._build_pca_method_svd_reference_count += build_pca_method_svd_reference_count
+        self._build_pca_method_fallback_count += build_pca_method_fallback_count
+        self._build_pca_cov_bytes_max = max(self._build_pca_cov_bytes_max,
+                                            build_pca_cov_bytes_max)
+        self._build_pca_randomized_rank_max = max(
+            self._build_pca_randomized_rank_max,
+            build_pca_randomized_rank_max,
+        )
         self._build_total_ms += build_total_ms
         self._build_rss_peak_bytes = max(self._build_rss_peak_bytes, rss_peak_bytes)
         self._build_rss_after_materialize_peak_bytes = max(
@@ -1375,6 +1558,18 @@ class HSpecTableGroup:
             rss_delta_peak_bytes=rss_delta_peak_bytes,
             build_count_before=build_count_before,
             discard_count_before=discard_count_before,
+            build_pca_mean_ms=build_pca_mean_ms,
+            build_pca_basis_ms=build_pca_basis_ms,
+            build_projection_ms=build_projection_ms,
+            build_table_write_ms=build_table_write_ms,
+            build_processed_fp32_tile_bytes=build_processed_fp32_tile_bytes,
+            build_projection_tile_count=build_projection_tile_count,
+            build_pca_method_randomized_count=build_pca_method_randomized_count,
+            build_pca_method_covariance_count=build_pca_method_covariance_count,
+            build_pca_method_svd_reference_count=build_pca_method_svd_reference_count,
+            build_pca_method_fallback_count=build_pca_method_fallback_count,
+            build_pca_cov_bytes_max=build_pca_cov_bytes_max,
+            build_pca_randomized_rank_max=build_pca_randomized_rank_max,
         )
 
     def build_tables_batch_legacy(self, prompt_data_dict: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
@@ -1489,6 +1684,44 @@ class HSpecTableGroup:
             return []
 
         table = self._active[prompt_id]
+        if isinstance(table, HSpecPromptTableDesc):
+            try:
+                data = materialize_prompt_table(table)
+                pca_params = PromptPCAParams(
+                    prompt_id=prompt_id,
+                    mean=data["mean"],
+                    components=data["components"],
+                    n_samples=int(table.n_samples),
+                )
+                legacy = PromptTableData(
+                    pca_params=pca_params,
+                    max_entries=max(int(table.n_entries), 1),
+                    initial_wnd=int(table.wnd_size),
+                    max_wnd=int(table.max_wnd),
+                    min_wnd=int(table.min_wnd),
+                )
+                legacy.keys = np.ascontiguousarray(data["keys"], dtype=np.float16)
+                legacy.rollout_seqs = [
+                    np.ascontiguousarray(seq, dtype=np.int32)
+                    for seq in data["rollout_seqs"]
+                ]
+                legacy.entry_rollout_idx = np.ascontiguousarray(
+                    data["entry_rollout_idx"], dtype=np.int32)
+                legacy.entry_offset = np.ascontiguousarray(data["entry_offset"],
+                                                           dtype=np.int32)
+                legacy.rewards = np.ascontiguousarray(
+                    data.get("rewards")
+                    if data.get("rewards") is not None
+                    else np.zeros((int(table.n_entries),), dtype=np.float32),
+                    dtype=np.float32,
+                )
+                legacy.n_entries = int(table.n_entries)
+                legacy.max_entries = int(table.n_entries)
+                table = legacy
+            except Exception:
+                logger.debug("Failed to materialize descriptor table for debug query",
+                             exc_info=True)
+                return []
         # Project  → (K,)
         z = table.pca_params.project(hidden_state.reshape(1, -1).astype(np.float32, copy=False)).squeeze(0)
 
@@ -1517,19 +1750,40 @@ class HSpecTableGroup:
         if prompt_id not in self._active:
             return None
         table = self._active[prompt_id]
+        if isinstance(table, HSpecPromptTableDesc):
+            mean_arr = open_table_array(table.mean)
+            comp_arr = open_table_array(table.components)
+            try:
+                return (
+                    np.array(mean_arr, dtype=np.float32, copy=True),
+                    np.array(comp_arr, dtype=np.float32, copy=True),
+                )
+            finally:
+                _close_memmap(mean_arr)
+                _close_memmap(comp_arr)
         return (table.pca_params.mean.copy(), table.pca_params.components.copy())
 
     def get_prompt_keys(self, prompt_id: str):
         """Return keys ndarray ``(n_entries, K)`` for prompt, or ``None``."""
         if prompt_id not in self._active:
             return None
-        return self._active[prompt_id].get_keys_numpy()
+        table = self._active[prompt_id]
+        if isinstance(table, HSpecPromptTableDesc):
+            keys_arr = open_table_array(table.keys)
+            try:
+                return np.array(keys_arr, copy=True)
+            finally:
+                _close_memmap(keys_arr)
+        return table.get_keys_numpy()
 
     def get_prompt_table_data(self, prompt_id: str):
         """Return serialisable dict with full table data for proposer cache."""
         if prompt_id not in self._active:
             return None
         table = self._active[prompt_id]
+        if isinstance(table, HSpecPromptTableDesc):
+            hspec_record_store_metric("table_prefetch_legacy_array_count", 1)
+            return materialize_prompt_table(table)
         return {
             "mean": table.pca_params.mean,
             "components": table.pca_params.components,
@@ -1564,15 +1818,28 @@ class HSpecTableGroup:
         return len(self._active)
 
     def total_entries(self) -> int:
-        return sum(t.n_entries for t in self._active.values())
+        return sum(int(getattr(t, "n_entries", 0)) for t in self._active.values())
 
     # Double-buffer version management
 
     def swap(self):
         """Swap building → active.  Resets query metrics for new epoch."""
+        if self._table_writer is not None:
+            try:
+                self._table_writer.seal({
+                    "step": "phase2_step3_swap",
+                })
+            except Exception:
+                logger.warning("Failed to seal HSpec table store writer before swap",
+                               exc_info=True)
         self._active = self._building
         self._building = {}
-        self._active_version += 1
+        if self._building_version is not None:
+            self._active_version = int(self._building_version)
+        else:
+            self._active_version += 1
+        self._table_writer = None
+        self._building_version = None
         self._reset_metrics()
         logger.info(
             "HSpec swap: active_version=%d, prompts=%d, entries=%d",
@@ -1601,6 +1868,10 @@ class HSpecTableGroup:
                 result[pid] = None
                 continue
             table = self._active[pid]
+            if isinstance(table, HSpecPromptTableDesc):
+                hspec_record_store_metric("table_prefetch_legacy_array_count", 1)
+                result[pid] = materialize_prompt_table(table)
+                continue
             result[pid] = {
                 "mean": table.pca_params.mean.copy(),
                 "components": table.pca_params.components.copy(),
@@ -1644,6 +1915,18 @@ class HSpecTableGroup:
             "build_materialize_ms": self._build_materialize_ms,
             "build_pca_ms": self._build_pca_ms,
             "build_table_add_ms": self._build_table_add_ms,
+            "build_pca_mean_ms": self._build_pca_mean_ms,
+            "build_pca_basis_ms": self._build_pca_basis_ms,
+            "build_projection_ms": self._build_projection_ms,
+            "build_table_write_ms": self._build_table_write_ms,
+            "build_processed_fp32_tile_bytes": self._build_processed_fp32_tile_bytes,
+            "build_projection_tile_count": self._build_projection_tile_count,
+            "build_pca_method_randomized_count": self._build_pca_method_randomized_count,
+            "build_pca_method_covariance_count": self._build_pca_method_covariance_count,
+            "build_pca_method_svd_reference_count": self._build_pca_method_svd_reference_count,
+            "build_pca_method_fallback_count": self._build_pca_method_fallback_count,
+            "build_pca_cov_bytes_max": self._build_pca_cov_bytes_max,
+            "build_pca_randomized_rank_max": self._build_pca_randomized_rank_max,
             "build_total_ms": self._build_total_ms,
             "build_rss_peak_bytes": self._build_rss_peak_bytes,
             "build_rss_after_materialize_peak_bytes": self._build_rss_after_materialize_peak_bytes,
@@ -1687,6 +1970,18 @@ class HSpecTableGroup:
         self._build_materialize_ms = 0.0
         self._build_pca_ms = 0.0
         self._build_table_add_ms = 0.0
+        self._build_pca_mean_ms = 0.0
+        self._build_pca_basis_ms = 0.0
+        self._build_projection_ms = 0.0
+        self._build_table_write_ms = 0.0
+        self._build_processed_fp32_tile_bytes = 0
+        self._build_projection_tile_count = 0
+        self._build_pca_method_randomized_count = 0
+        self._build_pca_method_covariance_count = 0
+        self._build_pca_method_svd_reference_count = 0
+        self._build_pca_method_fallback_count = 0
+        self._build_pca_cov_bytes_max = 0
+        self._build_pca_randomized_rank_max = 0
         self._build_total_ms = 0.0
         self._build_rss_peak_bytes = 0
         self._build_rss_after_materialize_peak_bytes = 0
@@ -1805,6 +2100,68 @@ class HSpecTableGroup:
                 info[label] = None
                 continue
             t = store[prompt_id]
+            if isinstance(t, HSpecPromptTableDesc):
+                mean_arr = open_table_array(t.mean)
+                comp_arr = open_table_array(t.components)
+                keys_arr = open_table_array(t.keys)
+                entry_rollout_idx_arr = open_table_array(t.entry_rollout_idx)
+                entry_offset_arr = open_table_array(t.entry_offset)
+                token_buffer_arr = open_table_array(t.token_buffer)
+                rollout_offset_arr = open_table_array(t.rollout_token_offset)
+                rollout_len_arr = open_table_array(t.rollout_token_len)
+                try:
+                    key_sample = None
+                    key_norm_sample = None
+                    if t.n_entries > 0 and keys_arr.shape[0] > 0:
+                        first_key = np.array(keys_arr[0], dtype=np.float32, copy=True)
+                        key_sample = first_key[:8].tolist()
+                        key_norm_sample = float(np.linalg.norm(first_key))
+                    draft_sample = None
+                    if t.n_entries > 0:
+                        ridx = int(entry_rollout_idx_arr[0])
+                        off = int(entry_offset_arr[0])
+                        if 0 <= ridx < int(t.n_rollouts):
+                            base = int(rollout_offset_arr[ridx])
+                            length = int(rollout_len_arr[ridx])
+                            draft_sample = np.array(
+                                token_buffer_arr[base + off:base + min(length, off + min(5, t.wnd_size))],
+                                dtype=np.int32,
+                                copy=True,
+                            ).tolist()
+                    rollout_lens = np.array(rollout_len_arr, dtype=np.int32,
+                                            copy=True).tolist()
+                    info[label] = {
+                        "storage": "descriptor",
+                        "version": int(t.version),
+                        "table_file": str(t.table_file),
+                        "n_entries": int(t.n_entries),
+                        "pca_method": str(t.pca_method),
+                        "pca_mean_shape": list(mean_arr.shape),
+                        "pca_components_shape": list(comp_arr.shape),
+                        "pca_mean_norm": float(np.linalg.norm(mean_arr)),
+                        "keys_shape": list(keys_arr.shape),
+                        "key_sample_first8": key_sample,
+                        "key_norm_sample": key_norm_sample,
+                        "rollout_seqs_count": int(t.n_rollouts),
+                        "rollout_seq_lens": rollout_lens,
+                        "wnd_size": int(t.wnd_size),
+                        "max_wnd": int(t.max_wnd),
+                        "min_wnd": int(t.min_wnd),
+                        "draft_sample_entry0": draft_sample,
+                    }
+                finally:
+                    for arr in (
+                        mean_arr,
+                        comp_arr,
+                        keys_arr,
+                        entry_rollout_idx_arr,
+                        entry_offset_arr,
+                        token_buffer_arr,
+                        rollout_offset_arr,
+                        rollout_len_arr,
+                    ):
+                        _close_memmap(arr)
+                continue
             keys_np = t.get_keys_numpy()
             # Sample first key for sanity check
             key_sample = None
@@ -1821,6 +2178,7 @@ class HSpecTableGroup:
                 if seq is not None:
                     draft_sample = seq[off: off + min(5, t.wnd_size)].tolist()
             info[label] = {
+                "storage": "legacy_arrays",
                 "n_entries": t.n_entries,
                 "pca_mean_shape": list(t.pca_params.mean.shape),
                 "pca_components_shape": list(t.pca_params.components.shape),
@@ -2439,6 +2797,8 @@ class GlobalHSpecTableGroup:
             "build_rss_after_materialize_peak_bytes",
             "build_rss_after_pca_peak_bytes",
             "build_rss_delta_peak_bytes",
+            "build_pca_cov_bytes_max",
+            "build_pca_randomized_rank_max",
         }
         for metrics in metrics_list:
             for key, value in metrics.items():
@@ -2495,6 +2855,26 @@ class GlobalHSpecTableGroup:
             "hspec/build_materialize_ms": agg.get("build_materialize_ms", 0),
             "hspec/build_pca_ms": agg.get("build_pca_ms", 0),
             "hspec/build_table_add_ms": agg.get("build_table_add_ms", 0),
+            "hspec/build_pca_mean_ms": agg.get("build_pca_mean_ms", 0),
+            "hspec/build_pca_basis_ms": agg.get("build_pca_basis_ms", 0),
+            "hspec/build_projection_ms": agg.get("build_projection_ms", 0),
+            "hspec/build_table_write_ms": agg.get("build_table_write_ms", 0),
+            "hspec/build_processed_fp32_tile_bytes": agg.get(
+                "build_processed_fp32_tile_bytes", 0),
+            "hspec/build_processed_fp32_tile_mb": agg.get(
+                "build_processed_fp32_tile_bytes", 0) / (1024 * 1024),
+            "hspec/build_projection_tile_count": agg.get("build_projection_tile_count", 0),
+            "hspec/build_pca_method_randomized_count": agg.get(
+                "build_pca_method_randomized_count", 0),
+            "hspec/build_pca_method_covariance_count": agg.get(
+                "build_pca_method_covariance_count", 0),
+            "hspec/build_pca_method_svd_reference_count": agg.get(
+                "build_pca_method_svd_reference_count", 0),
+            "hspec/build_pca_method_fallback_count": agg.get(
+                "build_pca_method_fallback_count", 0),
+            "hspec/build_pca_cov_bytes": agg.get("build_pca_cov_bytes_max", 0),
+            "hspec/build_pca_randomized_rank": agg.get(
+                "build_pca_randomized_rank_max", 0),
             "hspec/build_total_ms": agg.get("build_total_ms", 0),
             "hspec/build_actor_rss_peak_mb": agg.get("build_rss_peak_bytes", 0) / (1024 * 1024),
             "hspec/build_actor_rss_after_materialize_mb_max": (

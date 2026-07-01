@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
+"""Streaming table builder primitives for HSpec Phase 2.
+
 This module is intentionally CPU/NumPy only. It reads descriptor-backed raw
 hidden-state mmap files by tile, computes prompt-level PCA parameters, and
-does not touch Ray actors, torch tensors, NPU streams, table-store writers, or
-the decode hot path.
+projects keys directly into mmap table-store arrays. It does not touch Ray
+actors, torch tensors, NPU streams, or the decode hot path.
 """
 
 from __future__ import annotations
@@ -43,6 +44,9 @@ from vllm_ascend.spec_decode.hspec_store import (
     load_hspec_trajectory,
 )
 from vllm_ascend.spec_decode.hspec_table_store import (
+    HSpecPromptTableDesc,
+    HSpecTableStoreWriter,
+    TABLE_STORE_SCHEMA_VERSION,
     get_hspec_pca_accum_dtype,
     get_hspec_pca_cov_max_bytes,
     get_hspec_pca_method,
@@ -75,6 +79,10 @@ class HSpecPCADimensionMismatch(HSpecPCAError):
 
 class HSpecPCAReferenceBudgetExceeded(HSpecPCAError):
     """Raised when full-SVD debug reference would exceed its safety budget."""
+
+
+class HSpecTableBuildEmpty(HSpecPCAInsufficientSamples):
+    """Raised when descriptors cannot produce any value-shifted table entry."""
 
 
 @dataclass(frozen=True)
@@ -200,10 +208,68 @@ class HSpecPCAResult:
         )
 
 
+@dataclass
+class HSpecPromptTableBuildMetrics:
+    input_desc_count: int = 0
+    included_desc_count: int = 0
+    input_rows: int = 0
+    included_rows: int = 0
+    n_entries: int = 0
+    n_rollouts: int = 0
+    token_count: int = 0
+    hidden_dim: int = 0
+    n_components: int = 0
+    pca_method: str = ""
+    pca_mean_ms: float = 0.0
+    pca_basis_ms: float = 0.0
+    pca_total_ms: float = 0.0
+    projection_ms: float = 0.0
+    table_write_ms: float = 0.0
+    total_ms: float = 0.0
+    tile_rows: int = 0
+    projection_tile_count: int = 0
+    processed_fp32_tile_bytes: int = 0
+    covariance_bytes: int = 0
+    randomized_rank: int = 0
+    method_fallback_count: int = 0
+    memory_error_count: int = 0
+    build_error_count: int = 0
+
+    def to_dict(self) -> dict[str, float | int | str]:
+        return dict(asdict(self))
+
+
+@dataclass(frozen=True)
+class _PromptTablePlanItem:
+    desc: HSpecTrajectoryDesc
+    rollout_idx: int
+    length: int
+    n_entries: int
+    reward: float
+
+
+@dataclass(frozen=True)
+class _PromptTablePlan:
+    items: tuple[_PromptTablePlanItem, ...]
+    entry_count: int
+    token_count: int
+    rollout_count: int
+    input_rows: int
+
+
 def _close_memmap(array: Any) -> None:
     mmap_obj = getattr(array, "_mmap", None)
     if mmap_obj is not None:
         mmap_obj.close()
+
+
+def _flush_close_memmap(array: Any) -> None:
+    try:
+        flush = getattr(array, "flush", None)
+        if flush is not None:
+            flush()
+    finally:
+        _close_memmap(array)
 
 
 def _coerce_desc_list(
@@ -292,6 +358,62 @@ def _record_builder_metrics(metrics: HSpecPCAMetrics) -> None:
         hspec_record_store_metric("pca_error_count", int(metrics.pca_error_count))
     hspec_record_store_metric_max("pca_cov_bytes_max", int(metrics.covariance_bytes))
     hspec_record_store_metric_max("pca_randomized_rank_max", int(metrics.randomized_rank))
+
+
+def _record_table_build_metrics(metrics: HSpecPromptTableBuildMetrics) -> None:
+    hspec_record_store_metric("table_build_projection_ms_total",
+                              int(round(metrics.projection_ms)))
+    hspec_record_store_metric("table_build_write_ms_total",
+                              int(round(metrics.table_write_ms)))
+    hspec_record_store_metric("table_build_projection_tile_count",
+                              int(metrics.projection_tile_count))
+    hspec_record_store_metric("table_build_entry_count", int(metrics.n_entries))
+    hspec_record_store_metric("table_build_rollout_count", int(metrics.n_rollouts))
+    hspec_record_store_metric("table_build_token_count", int(metrics.token_count))
+    if metrics.build_error_count:
+        hspec_record_store_metric("table_build_error_count",
+                                  int(metrics.build_error_count))
+
+
+def _plan_prompt_table(
+    descs: Sequence[HSpecTrajectoryDesc | dict[str, Any]],
+    *,
+    max_entries: int,
+) -> _PromptTablePlan:
+    desc_list = _coerce_desc_list(descs)
+    remaining_entries = max(int(max_entries), 0)
+    input_rows = 0
+    token_count = 0
+    entry_count = 0
+    items: list[_PromptTablePlanItem] = []
+    for desc_obj in desc_list:
+        desc = coerce_hspec_desc(desc_obj)
+        length = max(int(desc.length), 0)
+        input_rows += length
+        if remaining_entries <= 0:
+            continue
+        rollout_entries = max(length - 1, 0)
+        if rollout_entries <= 0:
+            continue
+        n_add = min(rollout_entries, remaining_entries)
+        items.append(
+            _PromptTablePlanItem(
+                desc=desc,
+                rollout_idx=len(items),
+                length=length,
+                n_entries=n_add,
+                reward=float(desc.reward or 0.0),
+            ))
+        entry_count += n_add
+        token_count += length
+        remaining_entries -= n_add
+    return _PromptTablePlan(
+        items=tuple(items),
+        entry_count=int(entry_count),
+        token_count=int(token_count),
+        rollout_count=len(items),
+        input_rows=int(input_rows),
+    )
 
 
 def iter_prompt_hidden_tiles(
@@ -722,3 +844,230 @@ def fit_prompt_pca_streaming(
     result = replace(result, metrics=metrics)
     _record_builder_metrics(metrics)
     return result
+
+
+def _open_writer_arrays(
+    writer: HSpecTableStoreWriter,
+    descs: dict[str, Any],
+) -> dict[str, np.memmap]:
+    opened: dict[str, np.memmap] = {}
+    try:
+        for name, desc in descs.items():
+            opened[name] = writer.open_memmap(desc, mode="r+")
+        return opened
+    except Exception:
+        for arr in opened.values():
+            _flush_close_memmap(arr)
+        raise
+
+
+def _close_writer_arrays(arrays: dict[str, np.memmap]) -> None:
+    for arr in arrays.values():
+        _flush_close_memmap(arr)
+
+
+def build_prompt_table_to_store(
+    *,
+    prompt_id: str,
+    descs: Sequence[HSpecTrajectoryDesc | dict[str, Any]],
+    writer: HSpecTableStoreWriter,
+    n_components: int,
+    max_entries: int,
+    pca_config: Optional[HSpecPCAConfig] = None,
+    blas_threads: int = 1,
+    wnd_size: int = 8,
+    max_wnd: int = 28,
+    min_wnd: int = 2,
+) -> tuple[HSpecPromptTableDesc, HSpecPromptTableBuildMetrics]:
+    """Build one prompt table directly into a versioned mmap table store."""
+    t_total = time.perf_counter()
+    metrics = HSpecPromptTableBuildMetrics()
+    try:
+        desc_list = _coerce_desc_list(descs)
+        plan = _plan_prompt_table(desc_list, max_entries=max_entries)
+        metrics.input_desc_count = len(desc_list)
+        metrics.input_rows = int(plan.input_rows)
+        metrics.included_desc_count = int(plan.rollout_count)
+        metrics.included_rows = int(sum(item.length for item in plan.items))
+        metrics.n_entries = int(plan.entry_count)
+        metrics.n_rollouts = int(plan.rollout_count)
+        metrics.token_count = int(plan.token_count)
+        if plan.entry_count <= 0 or plan.rollout_count <= 0:
+            raise HSpecTableBuildEmpty(
+                f"HSpec table build requires at least one value-shifted entry "
+                f"for prompt_id={prompt_id}"
+            )
+
+        config = pca_config or HSpecPCAConfig.from_env(int(n_components))
+        if int(config.n_components) != int(n_components):
+            config = replace(config, n_components=int(n_components))
+        metrics.tile_rows = int(config.tile_rows)
+        pca_descs = [item.desc for item in plan.items]
+        pca_result = fit_prompt_pca_streaming(
+            str(prompt_id),
+            pca_descs,
+            config=config,
+            blas_threads=blas_threads,
+        )
+        pca_metrics = pca_result.metrics
+        metrics.pca_method = str(pca_result.method)
+        metrics.pca_mean_ms = float(pca_metrics.mean_ms)
+        metrics.pca_basis_ms = float(pca_metrics.basis_ms)
+        metrics.pca_total_ms = float(pca_metrics.total_ms)
+        metrics.covariance_bytes = int(pca_metrics.covariance_bytes)
+        metrics.randomized_rank = int(pca_metrics.randomized_rank)
+        metrics.method_fallback_count = int(pca_metrics.method_fallback_count)
+        metrics.processed_fp32_tile_bytes += int(
+            pca_metrics.processed_fp32_tile_bytes)
+
+        mean = np.ascontiguousarray(pca_result.mean, dtype=np.float32)
+        components = np.ascontiguousarray(pca_result.components, dtype=np.float32)
+        hidden_dim = int(mean.shape[0])
+        comp_count = int(components.shape[0])
+        metrics.hidden_dim = hidden_dim
+        metrics.n_components = comp_count
+
+        t_table_write = time.perf_counter()
+        mean_desc = writer.reserve_array((hidden_dim,), "float32")
+        components_desc = writer.reserve_array((comp_count, hidden_dim), "float32")
+        keys_desc = writer.reserve_array((plan.entry_count, comp_count),
+                                         config.keys_dtype)
+        token_buffer_desc = writer.reserve_array((plan.token_count,), "int32")
+        rollout_offset_desc = writer.reserve_array((plan.rollout_count,), "int64")
+        rollout_len_desc = writer.reserve_array((plan.rollout_count,), "int32")
+        entry_rollout_idx_desc = writer.reserve_array((plan.entry_count,), "int32")
+        entry_offset_desc = writer.reserve_array((plan.entry_count,), "int32")
+        rewards_desc = writer.reserve_array((plan.entry_count,), "float32")
+
+        arrays = _open_writer_arrays(
+            writer,
+            {
+                "mean": mean_desc,
+                "components": components_desc,
+                "keys": keys_desc,
+                "token_buffer": token_buffer_desc,
+                "rollout_offset": rollout_offset_desc,
+                "rollout_len": rollout_len_desc,
+                "entry_rollout_idx": entry_rollout_idx_desc,
+                "entry_offset": entry_offset_desc,
+                "rewards": rewards_desc,
+            },
+        )
+        try:
+            arrays["mean"][...] = mean
+            arrays["components"][...] = components
+
+            mean_fp32 = mean
+            components_t = np.ascontiguousarray(components.T, dtype=np.float32)
+            keys_dtype = np.dtype(config.keys_dtype)
+            row_cursor = 0
+            token_cursor = 0
+            with _threadpool_context(blas_threads):
+                for item in plan.items:
+                    raw_hs = None
+                    raw_tokens = None
+                    try:
+                        raw_hs, raw_tokens = load_hspec_trajectory(item.desc)
+                        length = int(item.length)
+                        n_add = int(item.n_entries)
+                        rollout_idx = int(item.rollout_idx)
+                        token_slice = np.asarray(raw_tokens[:length], dtype=np.int32)
+                        arrays["token_buffer"][token_cursor:token_cursor + length] = token_slice
+                        arrays["rollout_offset"][rollout_idx] = int(token_cursor)
+                        arrays["rollout_len"][rollout_idx] = int(length)
+
+                        row_end = row_cursor + n_add
+                        arrays["entry_rollout_idx"][row_cursor:row_end] = rollout_idx
+                        arrays["entry_offset"][row_cursor:row_end] = np.arange(
+                            1,
+                            n_add + 1,
+                            dtype=np.int32,
+                        )
+                        arrays["rewards"][row_cursor:row_end] = float(item.reward)
+
+                        for tile_start in range(0, n_add, int(config.tile_rows)):
+                            tile_stop = min(tile_start + int(config.tile_rows), n_add)
+                            t_projection = time.perf_counter()
+                            h_tile = np.asarray(
+                                raw_hs[tile_start:tile_stop],
+                                dtype=np.float32,
+                                order="C",
+                            )
+                            h_tile = np.ascontiguousarray(h_tile)
+                            z = (h_tile - mean_fp32) @ components_t
+                            metrics.projection_ms += float(
+                                (time.perf_counter() - t_projection) * 1000.0)
+                            keys_start = row_cursor + tile_start
+                            keys_stop = row_cursor + tile_stop
+                            arrays["keys"][keys_start:keys_stop] = z.astype(
+                                keys_dtype,
+                                copy=False,
+                            )
+                            metrics.projection_tile_count += 1
+                            metrics.processed_fp32_tile_bytes += int(h_tile.nbytes)
+                        row_cursor = row_end
+                        token_cursor += length
+                    finally:
+                        if raw_tokens is not None:
+                            _close_memmap(raw_tokens)
+                        if raw_hs is not None:
+                            _close_memmap(raw_hs)
+            if row_cursor != int(plan.entry_count):
+                raise RuntimeError(
+                    f"HSpec table row cursor mismatch for prompt_id={prompt_id}: "
+                    f"row_cursor={row_cursor} entries={plan.entry_count}"
+                )
+            if token_cursor != int(plan.token_count):
+                raise RuntimeError(
+                    f"HSpec table token cursor mismatch for prompt_id={prompt_id}: "
+                    f"token_cursor={token_cursor} token_count={plan.token_count}"
+                )
+        finally:
+            _close_writer_arrays(arrays)
+            metrics.table_write_ms = max(
+                float((time.perf_counter() - t_table_write) * 1000.0)
+                - float(metrics.projection_ms),
+                0.0,
+            )
+
+        table_desc = HSpecPromptTableDesc(
+            schema_version=TABLE_STORE_SCHEMA_VERSION,
+            prompt_id=str(prompt_id),
+            version=int(writer.version),
+            shard_id=int(writer.shard_id),
+            table_file=str(writer.table_file),
+            n_entries=int(plan.entry_count),
+            n_rollouts=int(plan.rollout_count),
+            hidden_dim=hidden_dim,
+            n_components=comp_count,
+            n_samples=int(pca_result.n_samples),
+            pca_method=str(pca_result.method),
+            mean=mean_desc,
+            components=components_desc,
+            keys=keys_desc,
+            token_buffer=token_buffer_desc,
+            rollout_token_offset=rollout_offset_desc,
+            rollout_token_len=rollout_len_desc,
+            entry_rollout_idx=entry_rollout_idx_desc,
+            entry_offset=entry_offset_desc,
+            rewards=rewards_desc,
+            wnd_size=int(wnd_size),
+            max_wnd=int(max_wnd),
+            min_wnd=int(min_wnd),
+            created_time_ns=time.time_ns(),
+        )
+        writer.commit_prompt(table_desc)
+        metrics.total_ms = float((time.perf_counter() - t_total) * 1000.0)
+        _record_table_build_metrics(metrics)
+        return table_desc, metrics
+    except MemoryError:
+        metrics.memory_error_count += 1
+        metrics.build_error_count += 1
+        metrics.total_ms = float((time.perf_counter() - t_total) * 1000.0)
+        _record_table_build_metrics(metrics)
+        raise
+    except Exception:
+        metrics.build_error_count += 1
+        metrics.total_ms = float((time.perf_counter() - t_total) * 1000.0)
+        _record_table_build_metrics(metrics)
+        raise

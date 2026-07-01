@@ -123,6 +123,13 @@ _store_metrics: Dict[str, int] = {
     "pca_processed_fp32_tile_bytes": 0,
     "pca_insufficient_samples_count": 0,
     "pca_error_count": 0,
+    "table_build_projection_ms_total": 0,
+    "table_build_write_ms_total": 0,
+    "table_build_projection_tile_count": 0,
+    "table_build_entry_count": 0,
+    "table_build_rollout_count": 0,
+    "table_build_token_count": 0,
+    "table_build_error_count": 0,
 }
 
 
