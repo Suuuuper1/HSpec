@@ -111,6 +111,18 @@ _store_metrics: Dict[str, int] = {
     "table_store_gc_deleted_versions": 0,
     "table_prefetch_descriptor_count": 0,
     "table_prefetch_legacy_array_count": 0,
+    "pca_mean_ms_total": 0,
+    "pca_basis_ms_total": 0,
+    "pca_method_randomized_count": 0,
+    "pca_method_covariance_count": 0,
+    "pca_method_svd_reference_count": 0,
+    "pca_method_fallback_count": 0,
+    "pca_cov_bytes_max": 0,
+    "pca_randomized_rank_max": 0,
+    "pca_tile_count": 0,
+    "pca_processed_fp32_tile_bytes": 0,
+    "pca_insufficient_samples_count": 0,
+    "pca_error_count": 0,
 }
 
 
@@ -172,6 +184,13 @@ def hspec_record_store_metric(name: str, value: int = 1) -> None:
     filesystem scans, object-store queries, or ndarray size traversal.
     """
     _metric_add(str(name), int(value))
+
+
+def hspec_record_store_metric_max(name: str, value: int) -> None:
+    """Record a process-local HSpec metric with max aggregation semantics."""
+    with _store_metrics_lock:
+        key = str(name)
+        _store_metrics[key] = max(int(_store_metrics.get(key, 0)), int(value))
 
 
 def get_hspec_store_dtype() -> str:
