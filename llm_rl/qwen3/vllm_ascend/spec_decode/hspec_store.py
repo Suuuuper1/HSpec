@@ -95,6 +95,22 @@ _store_metrics: Dict[str, int] = {
     "descriptor_shard_mismatch": 0,
     "descriptor_prompt_mismatch": 0,
     "descriptor_shard_normalized": 0,
+    "table_store_descriptor_count": 0,
+    "table_store_array_descriptor_count": 0,
+    "table_store_reserved_bytes": 0,
+    "table_store_committed_prompts": 0,
+    "table_store_manifest_write_error": 0,
+    "table_store_active_manifest_write_error": 0,
+    "table_store_fsync_count": 0,
+    "table_store_reader_load_error": 0,
+    "table_store_materialize_count": 0,
+    "table_store_bytes_written": 0,
+    "table_store_prompt_count": 0,
+    "table_store_entry_count": 0,
+    "table_store_version": 0,
+    "table_store_gc_deleted_versions": 0,
+    "table_prefetch_descriptor_count": 0,
+    "table_prefetch_legacy_array_count": 0,
 }
 
 

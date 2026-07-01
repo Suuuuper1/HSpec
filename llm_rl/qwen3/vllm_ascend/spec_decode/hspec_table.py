@@ -2565,6 +2565,38 @@ class GlobalHSpecTableGroup:
             store_metrics.get("descriptor_prompt_mismatch", 0))
         result["hspec/descriptor_shard_normalized"] = float(
             store_metrics.get("descriptor_shard_normalized", 0))
+        result["hspec/table_store_descriptor_count"] = float(
+            store_metrics.get("table_store_descriptor_count", 0))
+        result["hspec/table_store_array_descriptor_count"] = float(
+            store_metrics.get("table_store_array_descriptor_count", 0))
+        result["hspec/table_store_reserved_bytes"] = float(
+            store_metrics.get("table_store_reserved_bytes", 0))
+        result["hspec/table_store_committed_prompts"] = float(
+            store_metrics.get("table_store_committed_prompts", 0))
+        result["hspec/table_store_manifest_write_error"] = float(
+            store_metrics.get("table_store_manifest_write_error", 0))
+        result["hspec/table_store_active_manifest_write_error"] = float(
+            store_metrics.get("table_store_active_manifest_write_error", 0))
+        result["hspec/table_store_fsync_count"] = float(
+            store_metrics.get("table_store_fsync_count", 0))
+        result["hspec/table_store_reader_load_error"] = float(
+            store_metrics.get("table_store_reader_load_error", 0))
+        result["hspec/table_store_materialize_count"] = float(
+            store_metrics.get("table_store_materialize_count", 0))
+        result["hspec/table_store_bytes_written"] = float(
+            store_metrics.get("table_store_bytes_written", 0))
+        result["hspec/table_store_prompt_count"] = float(
+            store_metrics.get("table_store_prompt_count", 0))
+        result["hspec/table_store_entry_count"] = float(
+            store_metrics.get("table_store_entry_count", 0))
+        result["hspec/table_store_version"] = float(
+            store_metrics.get("table_store_version", 0))
+        result["hspec/table_store_gc_deleted_versions"] = float(
+            store_metrics.get("table_store_gc_deleted_versions", 0))
+        result["hspec/table_prefetch_descriptor_count"] = float(
+            store_metrics.get("table_prefetch_descriptor_count", 0))
+        result["hspec/table_prefetch_legacy_array_count"] = float(
+            store_metrics.get("table_prefetch_legacy_array_count", 0))
 
         abs_deltas = set()
         for key in agg:

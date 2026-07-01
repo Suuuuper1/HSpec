@@ -67,6 +67,20 @@ def run_ppo(config) -> None:
 
     if config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
         from vllm_ascend.spec_decode.hspec_table import init_hspec_tables
+        from vllm_ascend.spec_decode.hspec_table_store import (
+            get_hspec_pca_accum_dtype,
+            get_hspec_pca_cov_max_bytes,
+            get_hspec_pca_method,
+            get_hspec_pca_random_oversample,
+            get_hspec_pca_random_seed,
+            get_hspec_pca_tile_rows,
+            get_hspec_table_file_align_bytes,
+            get_hspec_table_keys_dtype,
+            get_hspec_table_prefetch_mode,
+            get_hspec_table_store_retain_versions,
+            hspec_table_store_fsync_on_seal_enabled,
+            hspec_table_store_gc_after_swap_enabled,
+        )
         from vllm_ascend.spec_decode.hspec_store import (
             assert_hspec_num_shards_configured_for_production,
             get_hspec_build_actor_name_prefix,
@@ -156,6 +170,18 @@ def run_ppo(config) -> None:
             f"raw_store_max_bytes={get_hspec_raw_store_max_bytes()}, "
             f"raw_store_max_files={get_hspec_raw_store_max_files()}, "
             f"store_retain_batches={get_hspec_store_retain_batches()}, "
+            f"pca_method={get_hspec_pca_method()}, "
+            f"pca_tile_rows={get_hspec_pca_tile_rows()}, "
+            f"pca_random_oversample={get_hspec_pca_random_oversample()}, "
+            f"pca_random_seed={get_hspec_pca_random_seed()}, "
+            f"pca_cov_max_bytes={get_hspec_pca_cov_max_bytes()}, "
+            f"pca_accum_dtype={get_hspec_pca_accum_dtype()}, "
+            f"table_keys_dtype={get_hspec_table_keys_dtype()}, "
+            f"table_file_align_bytes={get_hspec_table_file_align_bytes()}, "
+            f"table_prefetch_mode={get_hspec_table_prefetch_mode()}, "
+            f"table_store_retain_versions={get_hspec_table_store_retain_versions()}, "
+            f"table_store_gc_after_swap={hspec_table_store_gc_after_swap_enabled()}, "
+            f"table_store_fsync_on_seal={hspec_table_store_fsync_on_seal_enabled()}, "
             f"pinned_pool_bytes={os.getenv('HSPEC_PINNED_POOL_BYTES', str(256 * 1024 * 1024))}, "
             f"pinned_pool_max_slots={os.getenv('HSPEC_PINNED_POOL_MAX_SLOTS', '64')}, "
             f"pinned_pool_bucket_rows={os.getenv('HSPEC_PINNED_POOL_BUCKET_ROWS', '64,128,256,512,1024,2048,4096')}, "
