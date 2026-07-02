@@ -769,6 +769,17 @@ class HSpecTableGroup:
         self._entry_abs_delta_verify: Dict[int, int] = {}
         self._entry_abs_delta_accept: Dict[int, int] = {}
         self._entry_abs_delta_accept_len_sum: Dict[int, int] = {}
+        self._proposer_prefetch_descriptor_payload_count = 0
+        self._proposer_prefetch_legacy_payload_count = 0
+        self._proposer_prefetch_absent_payload_count = 0
+        self._proposer_descriptor_cache_build_count = 0
+        self._proposer_legacy_cache_build_count = 0
+        self._proposer_cache_build_error_count = 0
+        self._proposer_descriptor_materialize_ms = 0.0
+        self._proposer_descriptor_prefix_ms = 0.0
+        self._proposer_descriptor_h2d_submit_ms = 0.0
+        self._proposer_descriptor_bytes = 0
+        self._proposer_descriptor_entries = 0
 
         # ZMQ state
         self.running = False
@@ -2058,6 +2069,17 @@ class HSpecTableGroup:
             "entry_verify_count": self._entry_verify_count,
             "entry_accept_count": self._entry_accept_count,
             "entry_accept_len_sum": self._entry_accept_len_sum,
+            "proposer_prefetch_descriptor_payload_count": self._proposer_prefetch_descriptor_payload_count,
+            "proposer_prefetch_legacy_payload_count": self._proposer_prefetch_legacy_payload_count,
+            "proposer_prefetch_absent_payload_count": self._proposer_prefetch_absent_payload_count,
+            "proposer_descriptor_cache_build_count": self._proposer_descriptor_cache_build_count,
+            "proposer_legacy_cache_build_count": self._proposer_legacy_cache_build_count,
+            "proposer_cache_build_error_count": self._proposer_cache_build_error_count,
+            "proposer_descriptor_materialize_ms": self._proposer_descriptor_materialize_ms,
+            "proposer_descriptor_prefix_ms": self._proposer_descriptor_prefix_ms,
+            "proposer_descriptor_h2d_submit_ms": self._proposer_descriptor_h2d_submit_ms,
+            "proposer_descriptor_bytes": self._proposer_descriptor_bytes,
+            "proposer_descriptor_entries": self._proposer_descriptor_entries,
         }
         for abs_delta, count in self._entry_abs_delta_verify.items():
             metrics[f"entry_abs_delta_verify_{abs_delta}"] = float(count)
@@ -2119,6 +2141,17 @@ class HSpecTableGroup:
         self._entry_abs_delta_verify = {}
         self._entry_abs_delta_accept = {}
         self._entry_abs_delta_accept_len_sum = {}
+        self._proposer_prefetch_descriptor_payload_count = 0
+        self._proposer_prefetch_legacy_payload_count = 0
+        self._proposer_prefetch_absent_payload_count = 0
+        self._proposer_descriptor_cache_build_count = 0
+        self._proposer_legacy_cache_build_count = 0
+        self._proposer_cache_build_error_count = 0
+        self._proposer_descriptor_materialize_ms = 0.0
+        self._proposer_descriptor_prefix_ms = 0.0
+        self._proposer_descriptor_h2d_submit_ms = 0.0
+        self._proposer_descriptor_bytes = 0
+        self._proposer_descriptor_entries = 0
 
     # Online metrics reporting (from worker-local proposer)
 
@@ -2199,6 +2232,36 @@ class HSpecTableGroup:
                 key = int(abs_delta)
                 self._entry_abs_delta_accept_len_sum[key] = (
                     self._entry_abs_delta_accept_len_sum.get(key, 0) + int(total_len))
+        except Exception:
+            pass
+
+    def report_proposer_cache_metrics(
+        self,
+        metrics: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """Aggregate descriptor-cache metrics from worker-local proposers."""
+        if not isinstance(metrics, dict):
+            return
+        additive_map = {
+            "prefetch_descriptor_payload_count": "_proposer_prefetch_descriptor_payload_count",
+            "prefetch_legacy_payload_count": "_proposer_prefetch_legacy_payload_count",
+            "prefetch_absent_payload_count": "_proposer_prefetch_absent_payload_count",
+            "descriptor_cache_build_count": "_proposer_descriptor_cache_build_count",
+            "legacy_cache_build_count": "_proposer_legacy_cache_build_count",
+            "cache_build_error_count": "_proposer_cache_build_error_count",
+            "descriptor_materialize_ms": "_proposer_descriptor_materialize_ms",
+            "descriptor_prefix_ms": "_proposer_descriptor_prefix_ms",
+            "descriptor_h2d_submit_ms": "_proposer_descriptor_h2d_submit_ms",
+            "descriptor_bytes": "_proposer_descriptor_bytes",
+            "descriptor_entries": "_proposer_descriptor_entries",
+        }
+        try:
+            for key, attr in additive_map.items():
+                value = metrics.get(key)
+                if not isinstance(value, (int, float)):
+                    continue
+                current = getattr(self, attr, 0)
+                setattr(self, attr, current + value)
         except Exception:
             pass
 
@@ -2579,6 +2642,18 @@ class GlobalHSpecTableGroup:
         except Exception:
             return None
 
+    def report_proposer_cache_metrics_async(
+        self,
+        metrics: Dict[str, float],
+    ) -> Optional[ray.ObjectRef]:
+        """Fire-and-forget reporting for proposer descriptor-cache metrics."""
+        if not self.groups:
+            return None
+        try:
+            return self.groups[0].report_proposer_cache_metrics.remote(metrics)
+        except Exception:
+            return None
+
     # Build  (async, non-blocking)
     def build_tables_async(
         self,
@@ -2916,6 +2991,18 @@ class GlobalHSpecTableGroup:
                 "hspec/entry_verify_times": 0,
                 "hspec/entry_accept_times": 0,
                 "hspec/entry_avg_accept_length": 0.0,
+                "hspec/proposer_prefetch_descriptor_payload_count": 0,
+                "hspec/proposer_prefetch_legacy_payload_count": 0,
+                "hspec/proposer_prefetch_absent_payload_count": 0,
+                "hspec/proposer_descriptor_cache_build_count": 0,
+                "hspec/proposer_legacy_cache_build_count": 0,
+                "hspec/proposer_cache_build_error_count": 0,
+                "hspec/proposer_descriptor_materialize_ms": 0.0,
+                "hspec/proposer_descriptor_prefix_ms": 0.0,
+                "hspec/proposer_descriptor_h2d_submit_ms": 0.0,
+                "hspec/proposer_descriptor_bytes": 0,
+                "hspec/proposer_descriptor_mb": 0.0,
+                "hspec/proposer_descriptor_entries": 0,
             }
         tasks = [g.compute_metrics.remote() for g in self.groups]
         metrics_list = ray.get(tasks)
@@ -3118,6 +3205,31 @@ class GlobalHSpecTableGroup:
             store_metrics.get("table_prefetch_descriptor_count", 0))
         result["hspec/table_prefetch_legacy_array_count"] = float(
             store_metrics.get("table_prefetch_legacy_array_count", 0))
+        result["hspec/proposer_prefetch_descriptor_payload_count"] = float(
+            agg.get("proposer_prefetch_descriptor_payload_count", 0))
+        result["hspec/proposer_prefetch_legacy_payload_count"] = float(
+            agg.get("proposer_prefetch_legacy_payload_count", 0))
+        result["hspec/proposer_prefetch_absent_payload_count"] = float(
+            agg.get("proposer_prefetch_absent_payload_count", 0))
+        result["hspec/proposer_descriptor_cache_build_count"] = float(
+            agg.get("proposer_descriptor_cache_build_count", 0))
+        result["hspec/proposer_legacy_cache_build_count"] = float(
+            agg.get("proposer_legacy_cache_build_count", 0))
+        result["hspec/proposer_cache_build_error_count"] = float(
+            agg.get("proposer_cache_build_error_count", 0))
+        result["hspec/proposer_descriptor_materialize_ms"] = float(
+            agg.get("proposer_descriptor_materialize_ms", 0))
+        result["hspec/proposer_descriptor_prefix_ms"] = float(
+            agg.get("proposer_descriptor_prefix_ms", 0))
+        result["hspec/proposer_descriptor_h2d_submit_ms"] = float(
+            agg.get("proposer_descriptor_h2d_submit_ms", 0))
+        result["hspec/proposer_descriptor_bytes"] = float(
+            agg.get("proposer_descriptor_bytes", 0))
+        result["hspec/proposer_descriptor_mb"] = (
+            float(agg.get("proposer_descriptor_bytes", 0)) / (1024 * 1024)
+        )
+        result["hspec/proposer_descriptor_entries"] = float(
+            agg.get("proposer_descriptor_entries", 0))
 
         abs_deltas = set()
         for key in agg:

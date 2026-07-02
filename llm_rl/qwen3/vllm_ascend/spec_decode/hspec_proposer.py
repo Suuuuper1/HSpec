@@ -42,6 +42,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.spec_decode.hspec_table import GlobalHSpecTableGroup, get_hspec_tables
+from vllm_ascend.spec_decode.hspec_table_store import (
+    HSpecPromptTableDesc,
+    open_array,
+)
 from vllm_ascend.spec_decode.hspec_utils import (
     hspec_profile_context_enabled,
     hspec_record_function,
@@ -110,6 +114,12 @@ def _now_ns() -> int:
 
 def _ns_to_ms(ns: int) -> float:
     return float(ns) / 1_000_000.0
+
+
+def _close_hspec_memmap(array: np.ndarray | None) -> None:
+    mmap_obj = getattr(array, "_mmap", None)
+    if mmap_obj is not None:
+        mmap_obj.close()
 
 
 # Worker-local cached prompt table (on-device tensors + CPU refs)
@@ -514,6 +524,7 @@ class HSpecProposer(Proposer):
         self._stat_prefetch_ready = 0
         self._stat_accept_sum = 0
         self._stat_accept_count = 0
+        self._proposer_metric_deltas = defaultdict(float)
         self._last_log_t = time.time()
         self._log_every_calls = int(os.environ.get("HSPEC_LOG_EVERY_CALLS", "200"))
         self._log_every_s = float(os.environ.get("HSPEC_LOG_EVERY_S", "10"))
@@ -579,10 +590,13 @@ class HSpecProposer(Proposer):
         if not prompt_ids:
             return
 
-        # Consume any futures that became ready since last call
-        self._poll_pending()
+        # Consume any futures that became ready since last call. This happens
+        # before the model forward, so descriptor mmap/H2D work stays outside
+        # the proposal hot path.
+        self._poll_pending(materialize_ready=True)
         # Fire new async fetches for cache misses
         self._fire_prefetch_async(prompt_ids)
+        self._maybe_report_metrics(force_proposer_metrics=True)
 
     def prefetch_prompt_token_ids_batch(
         self,
@@ -611,11 +625,12 @@ class HSpecProposer(Proposer):
         if not prompt_ids:
             return 0
 
-        self._poll_pending()
+        self._poll_pending(materialize_ready=True)
         for pid in set(prompt_ids):
             self._not_in_table.discard(pid)
         before = len(self._pending_pids)
         self._fire_prefetch_async(prompt_ids, include_absent=True)
+        self._maybe_report_metrics(force_proposer_metrics=True)
         return max(len(self._pending_pids) - before, 0)
 
     def prefetch_prompt_ids_batch(self, prompt_ids: List[str]) -> int:
@@ -629,20 +644,28 @@ class HSpecProposer(Proposer):
         if not prompt_ids:
             return 0
 
-        self._poll_pending()
+        self._poll_pending(materialize_ready=True)
         for pid in set(prompt_ids):
             self._not_in_table.discard(pid)
         before = len(self._pending_pids)
         self._fire_prefetch_async(prompt_ids, include_absent=True)
+        self._maybe_report_metrics(force_proposer_metrics=True)
         return max(len(self._pending_pids) - before, 0)
 
-    def _poll_pending(self) -> None:
+    def _poll_pending(
+        self,
+        *,
+        materialize_ready: bool = True,
+        max_ready_refs: Optional[int] = None,
+    ) -> None:
         """Non-blocking: consume any ready prefetch futures.
 
         Uses ``ray.wait(timeout=0)`` which returns immediately with
         whatever futures are already completed.
         """
         if not self._pending_fetches:
+            return
+        if not materialize_ready:
             return
 
         import ray as _ray
@@ -652,6 +675,8 @@ class HSpecProposer(Proposer):
         ready_refs, _ = _ray.wait(all_futures, num_returns=len(all_futures), timeout=0)
         if not ready_refs:
             return
+        if max_ready_refs is not None and int(max_ready_refs) > 0:
+            ready_refs = ready_refs[:int(max_ready_refs)]
         ready_set = set(ready_refs)
 
         version_bumped = False
@@ -678,23 +703,53 @@ class HSpecProposer(Proposer):
                         version_bumped = True
                         cache_mutated = True
 
-                    # Populate cache with fresh data
+                    # Populate cache with fresh data.
                     for pid in pids:
                         data = table_data.get(pid)
-                        if data is not None:
-                            try:
+                        if data is None:
+                            self._not_in_table.add(pid)
+                            self._record_proposer_metric("prefetch_absent_payload_count", 1)
+                            cache_mutated = True
+                            continue
+                        try:
+                            if isinstance(data, HSpecPromptTableDesc):
+                                if int(data.version) != int(version):
+                                    raise ValueError(
+                                        "HSpec descriptor version mismatch: "
+                                        f"prompt_id={pid!r} desc.version={data.version} "
+                                        f"active_version={version}"
+                                    )
+                                self._record_proposer_metric(
+                                    "prefetch_descriptor_payload_count", 1)
+                                cached = self._build_cached_table_from_descriptor(
+                                    data, prompt_id=pid)
+                                self._record_proposer_metric(
+                                    "descriptor_cache_build_count", 1)
+                            elif isinstance(data, dict):
+                                self._record_proposer_metric(
+                                    "prefetch_legacy_payload_count", 1)
                                 cached = self._build_cached_table(data, prompt_id=pid)
-                                self._cache[pid] = cached
-                                self._cache.move_to_end(pid)
-                                cache_mutated = True
-                            except Exception:
-                                self._not_in_table.add(pid)
-                                cache_mutated = True
-                        else:
+                                self._record_proposer_metric(
+                                    "legacy_cache_build_count", 1)
+                            else:
+                                raise TypeError(
+                                    f"Unsupported HSpec prefetch payload type: {type(data)!r}"
+                                )
+                            self._cache[pid] = cached
+                            self._cache.move_to_end(pid)
+                            cache_mutated = True
+                        except Exception:
+                            self._record_proposer_metric("cache_build_error_count", 1)
+                            logger.debug(
+                                "HSpec: failed to build proposer cache for prompt_id=%r",
+                                pid,
+                                exc_info=True,
+                            )
                             self._not_in_table.add(pid)
                             cache_mutated = True
             except Exception:
                 # On error mark prompts as absent to avoid infinite retry
+                self._record_proposer_metric("cache_build_error_count", len(pids))
                 for pid in pids:
                     self._not_in_table.add(pid)
                 cache_mutated = True
@@ -886,9 +941,16 @@ class HSpecProposer(Proposer):
         # executed locally on the worker.
         self._maybe_report_metrics()
 
-    def _maybe_report_metrics(self) -> None:
+    def _maybe_report_metrics(self, force_proposer_metrics: bool = False) -> None:
         """Non-blocking metrics reporting (fire-and-forget Ray RPC)."""
-        if self._stat_calls - self._last_report_calls < self._report_every_calls:
+        proposer_metrics = dict(getattr(self, "_proposer_metric_deltas", {}))
+        has_proposer_metrics = bool(proposer_metrics)
+        if (
+            not force_proposer_metrics
+            and self._stat_calls - self._last_report_calls < self._report_every_calls
+        ):
+            return
+        if force_proposer_metrics and not has_proposer_metrics:
             return
         self._last_report_calls = self._stat_calls
 
@@ -903,7 +965,13 @@ class HSpecProposer(Proposer):
             or bool(self._entry_pending_abs_delta_accept)
             or bool(self._entry_pending_abs_delta_accept_len_sum)
         )
-        if dq <= 0 and dh <= 0 and ddl <= 0 and not has_entry_pending:
+        if (
+            dq <= 0
+            and dh <= 0
+            and ddl <= 0
+            and not has_entry_pending
+            and not has_proposer_metrics
+        ):
             return
 
         self._reported_queries = int(self._stat_queries)
@@ -945,6 +1013,20 @@ class HSpecProposer(Proposer):
                 self._entry_pending_abs_delta_accept.clear()
                 self._entry_pending_abs_delta_accept_len_sum.clear()
 
+        if has_proposer_metrics:
+            try:
+                self._proposer_metric_deltas.clear()
+                if hasattr(self.hspec_tables, "report_proposer_cache_metrics_async"):
+                    self.hspec_tables.report_proposer_cache_metrics_async(proposer_metrics)
+            except Exception:
+                pass
+
+    def _record_proposer_metric(self, key: str, value: float = 1.0) -> None:
+        try:
+            self._proposer_metric_deltas[str(key)] += float(value)
+        except Exception:
+            pass
+
     @staticmethod
     def _build_rollout_entry_spans(
         entry_rollout_idx: np.ndarray,
@@ -970,61 +1052,154 @@ class HSpecProposer(Proposer):
     def _clamp_wnd_size(wnd_size: int, min_wnd: int, max_wnd: int) -> int:
         return max(int(min_wnd), min(int(wnd_size), int(max_wnd)))
 
-    def _build_cached_table(
+    @staticmethod
+    def _copy_table_array_from_desc(array_desc, dtype) -> np.ndarray:
+        mmap_arr = open_array(array_desc, mode="r")
+        try:
+            return np.ascontiguousarray(
+                np.array(mmap_arr, dtype=dtype, copy=True))
+        finally:
+            _close_hspec_memmap(mmap_arr)
+
+    @staticmethod
+    def _build_draft_prefix_from_token_refs(
+        token_buffer: np.ndarray,
+        rollout_offsets: np.ndarray,
+        rollout_lens: np.ndarray,
+        entry_rollout_idx: np.ndarray,
+        entry_offset: np.ndarray,
+        n_entries: int,
+        max_wnd: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        n_entries = int(n_entries)
+        max_wnd = int(max_wnd)
+        draft_prefix_tokens = np.zeros((n_entries, max_wnd), dtype=np.int32)
+        draft_prefix_lens = np.zeros((n_entries,), dtype=np.int32)
+        if n_entries <= 0 or max_wnd <= 0:
+            return draft_prefix_tokens, draft_prefix_lens
+
+        ridx = np.asarray(entry_rollout_idx[:n_entries], dtype=np.int64)
+        off = np.asarray(entry_offset[:n_entries], dtype=np.int64)
+        rollout_offsets = np.asarray(rollout_offsets, dtype=np.int64)
+        rollout_lens = np.asarray(rollout_lens, dtype=np.int64)
+        token_buffer = np.asarray(token_buffer, dtype=np.int32)
+        if ridx.size and (int(ridx.min()) < 0 or int(ridx.max()) >= len(rollout_offsets)):
+            raise ValueError(
+                "HSpec descriptor entry_rollout_idx out of bounds: "
+                f"min={int(ridx.min())} max={int(ridx.max())} n_rollouts={len(rollout_offsets)}"
+            )
+        if off.size and int(off.min()) < 0:
+            raise ValueError("HSpec descriptor entry_offset must be non-negative")
+        if len(rollout_offsets) != len(rollout_lens):
+            raise ValueError("HSpec descriptor rollout offset/len shape mismatch")
+        if len(rollout_offsets) > 0:
+            rollout_end = rollout_offsets + rollout_lens
+            if int(rollout_offsets.min()) < 0 or int(rollout_lens.min()) < 0:
+                raise ValueError("HSpec descriptor rollout token refs must be non-negative")
+            if int(rollout_end.max()) > int(token_buffer.shape[0]):
+                raise ValueError(
+                    "HSpec descriptor rollout token refs exceed token_buffer: "
+                    f"end={int(rollout_end.max())} token_count={int(token_buffer.shape[0])}"
+                )
+        rollout_len_for_entry = rollout_lens[ridx]
+        if np.any(off > rollout_len_for_entry):
+            raise ValueError("HSpec descriptor entry_offset exceeds rollout length")
+
+        starts = rollout_offsets[ridx] + off
+        available = rollout_len_for_entry - off
+        lens = np.minimum(max_wnd, np.maximum(available, 0)).astype(np.int32)
+        draft_prefix_lens[:] = lens
+        cols = np.arange(max_wnd, dtype=np.int64)
+        max_index_elems = 1_000_000
+        block_rows = max(1, max_index_elems // max(max_wnd, 1))
+        for row_start in range(0, n_entries, block_rows):
+            row_end = min(n_entries, row_start + block_rows)
+            row_starts = starts[row_start:row_end]
+            row_lens = draft_prefix_lens[row_start:row_end]
+            idx = row_starts[:, None] + cols[None, :]
+            mask = cols[None, :] < row_lens[:, None]
+            if np.any(mask):
+                draft_prefix_tokens[row_start:row_end][mask] = token_buffer[idx[mask]]
+        return draft_prefix_tokens, draft_prefix_lens
+
+    def _finalize_cached_table(
         self,
-        data: dict,
-        prompt_id: Optional[str] = None,
+        *,
+        mean_np: np.ndarray,
+        components_np: np.ndarray,
+        keys_np: np.ndarray,
+        rollout_seqs: List[np.ndarray],
+        entry_rollout_idx: np.ndarray,
+        entry_offset: np.ndarray,
+        n_entries: int,
+        wnd_size: int,
+        max_wnd: int,
+        min_wnd: int,
+        prompt_id: Optional[str],
+        draft_prefix_tokens: Optional[np.ndarray] = None,
+        draft_prefix_lens: Optional[np.ndarray] = None,
+        metric_prefix: Optional[str] = None,
     ) -> _CachedPromptTable:
-        """Convert serialised table data dict → on-device cached table."""
-        # NOTE: Ray may deserialize numpy arrays as non-writable (read-only)
-        # views; torch.from_numpy warns about undefined behaviour on write.
-        # These tensors are read-only in our usage, but we still copy here to
-        # silence warnings and keep behaviour well-defined. This is *prefetch*
-        # (not in the hot loop).
-        mean_np = np.array(data["mean"], dtype=np.float32, copy=True)
-        comp_np = np.array(data["components"], dtype=np.float32, copy=True)
-        keys_np = np.array(data["keys"], dtype=np.float32, copy=True)
-        components_t_cpu = np.ascontiguousarray(comp_np.transpose(1, 0))
+        n_entries = int(n_entries)
+        max_wnd = int(max_wnd)
+        min_wnd = int(min_wnd)
+        if n_entries <= 0:
+            raise ValueError("HSpec cached table requires positive n_entries")
 
+        mean_np = np.ascontiguousarray(mean_np, dtype=np.float32)
+        components_np = np.ascontiguousarray(components_np, dtype=np.float32)
+        keys_np = np.ascontiguousarray(keys_np, dtype=np.float32)
+        components_t_cpu = np.ascontiguousarray(components_np.transpose(1, 0))
+        entry_rollout_idx = np.ascontiguousarray(
+            np.asarray(entry_rollout_idx[:n_entries], dtype=np.int32))
+        entry_offset = np.ascontiguousarray(
+            np.asarray(entry_offset[:n_entries], dtype=np.int32))
+        rollout_seqs = [
+            np.asarray(seq, dtype=np.int32)
+            for seq in rollout_seqs
+        ]
+        if not rollout_seqs:
+            raise ValueError("HSpec cached table requires at least one rollout")
+        if entry_rollout_idx.shape[0] < n_entries or entry_offset.shape[0] < n_entries:
+            raise ValueError("HSpec cached table entry arrays shorter than n_entries")
+        if int(entry_rollout_idx.min()) < 0 or int(entry_rollout_idx.max()) >= len(rollout_seqs):
+            raise ValueError("HSpec cached table entry_rollout_idx out of bounds")
+
+        t0_h2d = _now_ns()
         mean = torch.from_numpy(mean_np).to(self.device, non_blocking=True)
-        components = torch.from_numpy(comp_np).to(self.device, non_blocking=True)
+        components = torch.from_numpy(components_np).to(self.device, non_blocking=True)
         keys = torch.from_numpy(keys_np).to(self.device, non_blocking=True)
+        h2d_ms = _ns_to_ms(_now_ns() - t0_h2d)
+        if metric_prefix:
+            self._record_proposer_metric(f"{metric_prefix}_h2d_submit_ms", h2d_ms)
 
-        # Ensure rollout_seqs are numpy arrays on CPU
-        rollout_seqs = []
-        for s in data["rollout_seqs"]:
-            if isinstance(s, np.ndarray):
-                rollout_seqs.append(s)
-            else:
-                rollout_seqs.append(np.asarray(s, dtype=np.int32))
-
-        entry_rollout_idx = np.asarray(data["entry_rollout_idx"], dtype=np.int32)
-        n_entries = int(data["n_entries"])
         rollout_entry_starts, rollout_entry_lens = self._build_rollout_entry_spans(
             entry_rollout_idx, n_entries, len(rollout_seqs))
-
-        max_wnd = int(data.get("max_wnd", 28))
-        min_wnd = int(data.get("min_wnd", 2))
-        wnd_size = int(data.get("wnd_size", self._default_wnd_size))
         if prompt_id:
-            prior = self._prompt_wnd_priors.get(prompt_id)
+            prior = getattr(self, "_prompt_wnd_priors", {}).get(prompt_id)
             if prior is not None:
                 wnd_size = int(prior)
         wnd_size = self._clamp_wnd_size(wnd_size, min_wnd, max_wnd)
-        draft_prefix_tokens = np.zeros((n_entries, max_wnd), dtype=np.int32)
-        draft_prefix_lens = np.zeros((n_entries,), dtype=np.int32)
+
+        if draft_prefix_tokens is None or draft_prefix_lens is None:
+            draft_prefix_tokens = np.zeros((n_entries, max_wnd), dtype=np.int32)
+            draft_prefix_lens = np.zeros((n_entries,), dtype=np.int32)
+            for entry_idx in range(n_entries):
+                ridx = int(entry_rollout_idx[entry_idx])
+                off = int(entry_offset[entry_idx])
+                seq = rollout_seqs[ridx]
+                take = min(max_wnd, max(0, len(seq) - off))
+                if take > 0:
+                    draft_prefix_tokens[entry_idx, :take] = seq[off:off + take]
+                draft_prefix_lens[entry_idx] = take
+        else:
+            draft_prefix_tokens = np.ascontiguousarray(
+                np.asarray(draft_prefix_tokens, dtype=np.int32))
+            draft_prefix_lens = np.ascontiguousarray(
+                np.asarray(draft_prefix_lens, dtype=np.int32))
+
         entry_bias = np.zeros((n_entries,), dtype=np.int8)
         entry_hits = np.zeros((n_entries,), dtype=np.uint16)
-        entry_offset = np.asarray(data["entry_offset"], dtype=np.int32)
-        for entry_idx in range(n_entries):
-            ridx = int(entry_rollout_idx[entry_idx])
-            off = int(entry_offset[entry_idx])
-            seq = rollout_seqs[ridx]
-            take = min(max_wnd, max(0, len(seq) - off))
-            if take > 0:
-                draft_prefix_tokens[entry_idx, :take] = seq[off:off + take]
-            draft_prefix_lens[entry_idx] = take
-
         return _CachedPromptTable(
             mean_cpu=mean_np,
             components_t_cpu=components_t_cpu,
@@ -1045,8 +1220,159 @@ class HSpecProposer(Proposer):
             min_wnd=min_wnd,
             entry_bias=entry_bias,
             entry_hits=entry_hits,
-            entry_blend_horizon=self._entry_blend_horizon,
-            max_entry_bias=min(self._entry_bias_cap, max(0, max_wnd - min_wnd)),
+            entry_blend_horizon=getattr(self, "_entry_blend_horizon", 4),
+            max_entry_bias=min(
+                getattr(self, "_entry_bias_cap", 8),
+                max(0, max_wnd - min_wnd),
+            ),
+        )
+
+    def _build_cached_table_from_descriptor(
+        self,
+        desc: HSpecPromptTableDesc,
+        prompt_id: Optional[str] = None,
+    ) -> _CachedPromptTable:
+        """Build a worker-local cache from mmap table descriptors."""
+        if prompt_id and str(desc.prompt_id) != str(prompt_id):
+            raise ValueError(
+                f"HSpec descriptor prompt mismatch: desc={desc.prompt_id!r} "
+                f"requested={prompt_id!r}"
+            )
+        n_entries = int(desc.n_entries)
+        n_rollouts = int(desc.n_rollouts)
+        hidden_dim = int(desc.hidden_dim)
+        n_components = int(desc.n_components)
+        if n_entries <= 0 or n_rollouts <= 0:
+            raise ValueError("HSpec descriptor table is empty")
+        if hidden_dim <= 0 or n_components <= 0:
+            raise ValueError("HSpec descriptor PCA dimensions must be positive")
+
+        t0_materialize = _now_ns()
+        mean_np = self._copy_table_array_from_desc(desc.mean, np.float32)
+        components_np = self._copy_table_array_from_desc(desc.components, np.float32)
+        keys_np = self._copy_table_array_from_desc(desc.keys, np.float32)
+        token_buffer = self._copy_table_array_from_desc(desc.token_buffer, np.int32)
+        rollout_offsets = self._copy_table_array_from_desc(
+            desc.rollout_token_offset, np.int64)
+        rollout_lens = self._copy_table_array_from_desc(desc.rollout_token_len, np.int32)
+        entry_rollout_idx = self._copy_table_array_from_desc(
+            desc.entry_rollout_idx, np.int32)
+        entry_offset = self._copy_table_array_from_desc(desc.entry_offset, np.int32)
+        t1_materialize = _now_ns()
+
+        if mean_np.shape != (hidden_dim,):
+            raise ValueError(f"HSpec descriptor mean shape mismatch: {mean_np.shape}")
+        if components_np.shape != (n_components, hidden_dim):
+            raise ValueError(
+                f"HSpec descriptor components shape mismatch: {components_np.shape}"
+            )
+        if keys_np.shape != (n_entries, n_components):
+            raise ValueError(f"HSpec descriptor keys shape mismatch: {keys_np.shape}")
+        if entry_rollout_idx.shape[0] < n_entries or entry_offset.shape[0] < n_entries:
+            raise ValueError("HSpec descriptor entry arrays shorter than n_entries")
+        if rollout_offsets.shape[0] < n_rollouts or rollout_lens.shape[0] < n_rollouts:
+            raise ValueError("HSpec descriptor rollout arrays shorter than n_rollouts")
+
+        rollout_offsets = np.ascontiguousarray(rollout_offsets[:n_rollouts], dtype=np.int64)
+        rollout_lens = np.ascontiguousarray(rollout_lens[:n_rollouts], dtype=np.int32)
+        entry_rollout_idx = np.ascontiguousarray(
+            entry_rollout_idx[:n_entries], dtype=np.int32)
+        entry_offset = np.ascontiguousarray(entry_offset[:n_entries], dtype=np.int32)
+
+        t0_prefix = _now_ns()
+        rollout_seqs = []
+        for offset, length in zip(rollout_offsets.tolist(), rollout_lens.tolist()):
+            start = int(offset)
+            end = start + int(length)
+            rollout_seqs.append(token_buffer[start:end])
+        draft_prefix_tokens, draft_prefix_lens = self._build_draft_prefix_from_token_refs(
+            token_buffer,
+            rollout_offsets,
+            rollout_lens,
+            entry_rollout_idx,
+            entry_offset,
+            n_entries,
+            int(desc.max_wnd),
+        )
+        t1_prefix = _now_ns()
+
+        cached = self._finalize_cached_table(
+            mean_np=mean_np,
+            components_np=components_np,
+            keys_np=keys_np,
+            rollout_seqs=rollout_seqs,
+            entry_rollout_idx=entry_rollout_idx,
+            entry_offset=entry_offset,
+            n_entries=n_entries,
+            wnd_size=int(desc.wnd_size),
+            max_wnd=int(desc.max_wnd),
+            min_wnd=int(desc.min_wnd),
+            prompt_id=str(prompt_id or desc.prompt_id),
+            draft_prefix_tokens=draft_prefix_tokens,
+            draft_prefix_lens=draft_prefix_lens,
+            metric_prefix="descriptor",
+        )
+        self._record_proposer_metric(
+            "descriptor_materialize_ms", _ns_to_ms(t1_materialize - t0_materialize))
+        self._record_proposer_metric(
+            "descriptor_prefix_ms", _ns_to_ms(t1_prefix - t0_prefix))
+        self._record_proposer_metric(
+            "descriptor_bytes",
+            mean_np.nbytes
+            + components_np.nbytes
+            + keys_np.nbytes
+            + token_buffer.nbytes
+            + rollout_offsets.nbytes
+            + rollout_lens.nbytes
+            + entry_rollout_idx.nbytes
+            + entry_offset.nbytes,
+        )
+        self._record_proposer_metric("descriptor_entries", n_entries)
+        return cached
+
+    def _build_cached_table(
+        self,
+        data: dict,
+        prompt_id: Optional[str] = None,
+    ) -> _CachedPromptTable:
+        """Convert serialised table data dict → on-device cached table."""
+        # NOTE: Ray may deserialize numpy arrays as non-writable (read-only)
+        # views; torch.from_numpy warns about undefined behaviour on write.
+        # These tensors are read-only in our usage, but we still copy here to
+        # silence warnings and keep behaviour well-defined. This is *prefetch*
+        # (not in the hot loop).
+        mean_np = np.array(data["mean"], dtype=np.float32, copy=True)
+        components_np = np.array(data["components"], dtype=np.float32, copy=True)
+        keys_np = np.array(data["keys"], dtype=np.float32, copy=True)
+
+        # Ensure rollout_seqs are numpy arrays on CPU
+        rollout_seqs = []
+        for s in data["rollout_seqs"]:
+            if isinstance(s, np.ndarray):
+                rollout_seqs.append(np.asarray(s, dtype=np.int32))
+            else:
+                rollout_seqs.append(np.asarray(s, dtype=np.int32))
+
+        entry_rollout_idx = np.asarray(data["entry_rollout_idx"], dtype=np.int32)
+        n_entries = int(data["n_entries"])
+
+        max_wnd = int(data.get("max_wnd", 28))
+        min_wnd = int(data.get("min_wnd", 2))
+        wnd_size = int(data.get("wnd_size", getattr(self, "_default_wnd_size", 8)))
+        entry_offset = np.asarray(data["entry_offset"], dtype=np.int32)
+
+        return self._finalize_cached_table(
+            mean_np=mean_np,
+            components_np=components_np,
+            keys_np=keys_np,
+            rollout_seqs=rollout_seqs,
+            entry_rollout_idx=entry_rollout_idx,
+            entry_offset=entry_offset,
+            n_entries=n_entries,
+            wnd_size=wnd_size,
+            max_wnd=max_wnd,
+            min_wnd=min_wnd,
+            prompt_id=prompt_id,
         )
 
     @staticmethod
@@ -1357,13 +1683,13 @@ class HSpecProposer(Proposer):
             except Exception:
                 logger.exception("HSPEC DEBUG: failed to log prompt/hidden_state info")
 
-        # 2. Consume ready prefetch futures (non-blocking).
-        # prefetch_for_batch() was already called before the forward pass.
-        # Here we poll for any newly-ready futures and fire for prompts
-        # that might have arrived after the early prefetch.
+        # 2. Keep the proposal hot path free of mmap/H2D work.
+        # prefetch_for_batch() already consumes ready futures before forward.
+        # This no-materialize poll is intentionally a cheap guard so a ready
+        # descriptor never gets ray.get'ed and mmap'ed in generate_token_ids().
         t0_poll = _now_ns() if gen_enabled else 0
         with hspec_record_function("hspec/proposal/poll_pending"):
-            self._poll_pending()
+            self._poll_pending(materialize_ready=False)
         t1_poll = _now_ns() if gen_enabled else 0
 
         t0_fire = _now_ns() if gen_enabled else 0
