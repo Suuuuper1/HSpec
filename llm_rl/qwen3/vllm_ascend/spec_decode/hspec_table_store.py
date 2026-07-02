@@ -35,6 +35,7 @@ import numpy as np
 from vllm_ascend.spec_decode.hspec_store import (
     get_hspec_table_store_root,
     hspec_record_store_metric,
+    hspec_record_store_metric_max,
 )
 
 logger = logging.getLogger(__name__)
@@ -690,7 +691,8 @@ class HSpecTableStoreWriter:
                                       int(manifest["prompt_count"]))
             hspec_record_store_metric("table_store_entry_count",
                                       int(manifest["entry_count"]))
-            hspec_record_store_metric("table_store_version", int(self.version))
+            hspec_record_store_metric_max("table_store_version",
+                                          int(self.version))
             self._sealed = True
             self._manifest = dict(manifest)
         return dict(manifest)

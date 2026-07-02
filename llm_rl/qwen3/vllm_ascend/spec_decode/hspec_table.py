@@ -83,6 +83,61 @@ from vllm_ascend.spec_decode.hspec_store import (
 logger = logging.getLogger(__name__)
 _unsafe_descriptor_cleanup_warned = False
 _LEGACY_HSPEC_PAYLOAD_KEYS = frozenset({"hidden_states", "tokens", "rewards", "prompt_token_ids"})
+_TABLE_STORE_ADDITIVE_METRIC_KEYS = frozenset({
+    "table_store_reserved_bytes",
+    "table_store_array_descriptor_count",
+    "table_store_committed_prompts",
+    "table_store_descriptor_count",
+    "table_store_manifest_write_error",
+    "table_store_active_manifest_write_error",
+    "table_store_fsync_count",
+    "table_store_reader_load_error",
+    "table_store_materialize_count",
+    "table_store_bytes_written",
+    "table_store_prompt_count",
+    "table_store_entry_count",
+    "table_swap_empty_count",
+    "table_store_gc_scanned_versions",
+    "table_store_gc_retained_versions",
+    "table_store_gc_deleted_versions",
+    "table_store_gc_delete_error",
+    "table_store_active_manifest_clear_error",
+    "table_prefetch_descriptor_count",
+    "table_prefetch_legacy_array_count",
+})
+_TABLE_STORE_MAX_METRIC_KEYS = frozenset({
+    "table_store_version",
+})
+_DRIVER_LOCAL_ALWAYS_METRIC_KEYS = frozenset({
+    "topology_actor_init_error",
+    "topology_actor_reuse_mismatch",
+    "topology_actor_node_mismatch",
+    "topology_actor_shard_mismatch",
+    "topology_actor_num_groups_mismatch",
+    "descriptor_topology_violation",
+    "descriptor_node_mismatch",
+    "descriptor_shard_mismatch",
+    "descriptor_prompt_mismatch",
+    "descriptor_shard_normalized",
+})
+_DRIVER_LOCAL_NONZERO_METRIC_KEYS = frozenset({
+    "raw_store_bytes",
+    "desc_count",
+    "collect_dropped",
+    "segment_sealed",
+    "segment_rotated",
+    "segment_manifest_write_error",
+    "raw_store_budget_gc_skipped",
+    "unsafe_descriptor_cleanup_suppressed",
+    "segment_delete_count",
+    "segment_delete_bytes",
+    "raw_store_epoch_gc_segments",
+    "raw_store_epoch_gc_deleted",
+    "raw_store_epoch_gc_skipped",
+    "raw_store_epoch_gc_error",
+    "build_submission_count",
+    "build_submission_segments",
+})
 
 
 @dataclass(frozen=True)
@@ -2087,6 +2142,11 @@ class HSpecTableGroup:
             metrics[f"entry_abs_delta_accept_{abs_delta}"] = float(count)
         for abs_delta, total_len in self._entry_abs_delta_accept_len_sum.items():
             metrics[f"entry_abs_delta_accept_len_sum_{abs_delta}"] = float(total_len)
+        actor_store_metrics = collect_hspec_store_metrics(reset=True)
+        for key in _TABLE_STORE_ADDITIVE_METRIC_KEYS:
+            metrics[key] = float(actor_store_metrics.get(key, 0))
+        for key in _TABLE_STORE_MAX_METRIC_KEYS:
+            metrics[key] = float(actor_store_metrics.get(key, 0))
         return metrics
 
     def _reset_metrics(self):
@@ -3016,6 +3076,7 @@ class GlobalHSpecTableGroup:
             "build_pca_cov_bytes_max",
             "build_pca_randomized_rank_max",
             "active_version",
+            "table_store_version",
         }
         for metrics in metrics_list:
             for key, value in metrics.items():
@@ -3118,93 +3179,16 @@ class GlobalHSpecTableGroup:
                 entry_accept_len_sum / entry_verify_count if entry_verify_count > 0 else 0.0),
         }
 
-        store_metrics = collect_hspec_store_metrics(reset=True)
-        result["hspec/raw_store_bytes"] = float(store_metrics.get("raw_store_bytes", 0))
-        result["hspec/desc_count"] = float(store_metrics.get("desc_count", 0))
-        result["hspec/collect_dropped"] = float(store_metrics.get("collect_dropped", 0))
-        result["hspec/segment_sealed"] = float(store_metrics.get("segment_sealed", 0))
-        result["hspec/segment_rotated"] = float(store_metrics.get("segment_rotated", 0))
-        result["hspec/segment_manifest_write_error"] = float(
-            store_metrics.get("segment_manifest_write_error", 0))
-        result["hspec/raw_store_budget_gc_skipped"] = float(
-            store_metrics.get("raw_store_budget_gc_skipped", 0))
-        result["hspec/unsafe_descriptor_cleanup_suppressed"] = float(
-            store_metrics.get("unsafe_descriptor_cleanup_suppressed", 0))
-        result["hspec/segment_delete_count"] = float(store_metrics.get("segment_delete_count", 0))
-        result["hspec/segment_delete_bytes"] = float(store_metrics.get("segment_delete_bytes", 0))
-        result["hspec/raw_store_epoch_gc_segments"] = float(
-            store_metrics.get("raw_store_epoch_gc_segments", 0))
-        result["hspec/raw_store_epoch_gc_deleted"] = float(
-            store_metrics.get("raw_store_epoch_gc_deleted", 0))
-        result["hspec/raw_store_epoch_gc_skipped"] = float(
-            store_metrics.get("raw_store_epoch_gc_skipped", 0))
-        result["hspec/raw_store_epoch_gc_error"] = float(
-            store_metrics.get("raw_store_epoch_gc_error", 0))
-        result["hspec/build_submission_count"] = float(store_metrics.get("build_submission_count", 0))
-        result["hspec/build_submission_segments"] = float(store_metrics.get("build_submission_segments", 0))
+        driver_store_metrics = collect_hspec_store_metrics(reset=True)
+        for key in _DRIVER_LOCAL_NONZERO_METRIC_KEYS:
+            value = float(driver_store_metrics.get(key, 0))
+            if value != 0.0:
+                result[f"hspec/{key}"] = value
         result["hspec/topology_actor_count"] = float(len(self.actor_topologies))
-        result["hspec/topology_actor_init_error"] = float(
-            store_metrics.get("topology_actor_init_error", 0))
-        result["hspec/topology_actor_reuse_mismatch"] = float(
-            store_metrics.get("topology_actor_reuse_mismatch", 0))
-        result["hspec/topology_actor_node_mismatch"] = float(
-            store_metrics.get("topology_actor_node_mismatch", 0))
-        result["hspec/topology_actor_shard_mismatch"] = float(
-            store_metrics.get("topology_actor_shard_mismatch", 0))
-        result["hspec/topology_actor_num_groups_mismatch"] = float(
-            store_metrics.get("topology_actor_num_groups_mismatch", 0))
-        result["hspec/descriptor_topology_violation"] = float(
-            store_metrics.get("descriptor_topology_violation", 0))
-        result["hspec/descriptor_node_mismatch"] = float(
-            store_metrics.get("descriptor_node_mismatch", 0))
-        result["hspec/descriptor_shard_mismatch"] = float(
-            store_metrics.get("descriptor_shard_mismatch", 0))
-        result["hspec/descriptor_prompt_mismatch"] = float(
-            store_metrics.get("descriptor_prompt_mismatch", 0))
-        result["hspec/descriptor_shard_normalized"] = float(
-            store_metrics.get("descriptor_shard_normalized", 0))
-        result["hspec/table_store_descriptor_count"] = float(
-            store_metrics.get("table_store_descriptor_count", 0))
-        result["hspec/table_store_array_descriptor_count"] = float(
-            store_metrics.get("table_store_array_descriptor_count", 0))
-        result["hspec/table_store_reserved_bytes"] = float(
-            store_metrics.get("table_store_reserved_bytes", 0))
-        result["hspec/table_store_committed_prompts"] = float(
-            store_metrics.get("table_store_committed_prompts", 0))
-        result["hspec/table_store_manifest_write_error"] = float(
-            store_metrics.get("table_store_manifest_write_error", 0))
-        result["hspec/table_store_active_manifest_write_error"] = float(
-            store_metrics.get("table_store_active_manifest_write_error", 0))
-        result["hspec/table_store_fsync_count"] = float(
-            store_metrics.get("table_store_fsync_count", 0))
-        result["hspec/table_store_reader_load_error"] = float(
-            store_metrics.get("table_store_reader_load_error", 0))
-        result["hspec/table_store_materialize_count"] = float(
-            store_metrics.get("table_store_materialize_count", 0))
-        result["hspec/table_store_bytes_written"] = float(
-            store_metrics.get("table_store_bytes_written", 0))
-        result["hspec/table_store_prompt_count"] = float(
-            store_metrics.get("table_store_prompt_count", 0))
-        result["hspec/table_store_entry_count"] = float(
-            store_metrics.get("table_store_entry_count", 0))
-        result["hspec/table_store_version"] = float(
-            store_metrics.get("table_store_version", 0))
-        result["hspec/table_swap_empty_count"] = float(
-            store_metrics.get("table_swap_empty_count", 0))
-        result["hspec/table_store_gc_scanned_versions"] = float(
-            store_metrics.get("table_store_gc_scanned_versions", 0))
-        result["hspec/table_store_gc_retained_versions"] = float(
-            store_metrics.get("table_store_gc_retained_versions", 0))
-        result["hspec/table_store_gc_deleted_versions"] = float(
-            store_metrics.get("table_store_gc_deleted_versions", 0))
-        result["hspec/table_store_gc_delete_error"] = float(
-            store_metrics.get("table_store_gc_delete_error", 0))
-        result["hspec/table_store_active_manifest_clear_error"] = float(
-            store_metrics.get("table_store_active_manifest_clear_error", 0))
-        result["hspec/table_prefetch_descriptor_count"] = float(
-            store_metrics.get("table_prefetch_descriptor_count", 0))
-        result["hspec/table_prefetch_legacy_array_count"] = float(
-            store_metrics.get("table_prefetch_legacy_array_count", 0))
+        for key in _DRIVER_LOCAL_ALWAYS_METRIC_KEYS:
+            result[f"hspec/{key}"] = float(driver_store_metrics.get(key, 0))
+        for key in _TABLE_STORE_ADDITIVE_METRIC_KEYS | _TABLE_STORE_MAX_METRIC_KEYS:
+            result[f"hspec/{key}"] = float(agg.get(key, 0))
         result["hspec/proposer_prefetch_descriptor_payload_count"] = float(
             agg.get("proposer_prefetch_descriptor_payload_count", 0))
         result["hspec/proposer_prefetch_legacy_payload_count"] = float(
