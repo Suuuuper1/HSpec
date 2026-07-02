@@ -230,6 +230,10 @@ class _PromptTableBuildMetrics:
     pca_basis_ms: float = 0.0
     projection_ms: float = 0.0
     table_write_ms: float = 0.0
+    pca_mean_processed_fp32_tile_bytes: int = 0
+    pca_basis_processed_fp32_tile_bytes: int = 0
+    pca_reference_processed_fp32_tile_bytes: int = 0
+    projection_processed_fp32_tile_bytes: int = 0
     processed_fp32_tile_bytes: int = 0
     pca_method: str = ""
     pca_method_fallback_count: int = 0
@@ -794,6 +798,10 @@ class HSpecTableGroup:
         self._build_pca_basis_ms = 0.0
         self._build_projection_ms = 0.0
         self._build_table_write_ms = 0.0
+        self._build_pca_mean_processed_fp32_tile_bytes = 0
+        self._build_pca_basis_processed_fp32_tile_bytes = 0
+        self._build_pca_reference_processed_fp32_tile_bytes = 0
+        self._build_projection_processed_fp32_tile_bytes = 0
         self._build_processed_fp32_tile_bytes = 0
         self._build_projection_tile_count = 0
         self._build_pca_method_randomized_count = 0
@@ -1291,6 +1299,14 @@ class HSpecTableGroup:
         metrics.table_add_ms = float(build_metrics.projection_ms + build_metrics.table_write_ms)
         metrics.projection_ms = float(build_metrics.projection_ms)
         metrics.table_write_ms = float(build_metrics.table_write_ms)
+        metrics.pca_mean_processed_fp32_tile_bytes = int(
+            build_metrics.pca_mean_processed_fp32_tile_bytes)
+        metrics.pca_basis_processed_fp32_tile_bytes = int(
+            build_metrics.pca_basis_processed_fp32_tile_bytes)
+        metrics.pca_reference_processed_fp32_tile_bytes = int(
+            build_metrics.pca_reference_processed_fp32_tile_bytes)
+        metrics.projection_processed_fp32_tile_bytes = int(
+            build_metrics.projection_processed_fp32_tile_bytes)
         metrics.processed_fp32_tile_bytes = int(build_metrics.processed_fp32_tile_bytes)
         metrics.pca_method = str(build_metrics.pca_method)
         metrics.pca_method_fallback_count = int(build_metrics.method_fallback_count)
@@ -1431,6 +1447,10 @@ class HSpecTableGroup:
         build_pca_basis_ms: float = 0.0,
         build_projection_ms: float = 0.0,
         build_table_write_ms: float = 0.0,
+        build_pca_mean_processed_fp32_tile_bytes: int = 0,
+        build_pca_basis_processed_fp32_tile_bytes: int = 0,
+        build_pca_reference_processed_fp32_tile_bytes: int = 0,
+        build_projection_processed_fp32_tile_bytes: int = 0,
         build_processed_fp32_tile_bytes: int = 0,
         build_projection_tile_count: int = 0,
         build_pca_method_randomized_count: int = 0,
@@ -1461,6 +1481,10 @@ class HSpecTableGroup:
             "build_pca_basis_ms": float(build_pca_basis_ms),
             "build_projection_ms": float(build_projection_ms),
             "build_table_write_ms": float(build_table_write_ms),
+            "build_pca_mean_processed_fp32_tile_bytes": float(build_pca_mean_processed_fp32_tile_bytes),
+            "build_pca_basis_processed_fp32_tile_bytes": float(build_pca_basis_processed_fp32_tile_bytes),
+            "build_pca_reference_processed_fp32_tile_bytes": float(build_pca_reference_processed_fp32_tile_bytes),
+            "build_projection_processed_fp32_tile_bytes": float(build_projection_processed_fp32_tile_bytes),
             "build_processed_fp32_tile_bytes": float(build_processed_fp32_tile_bytes),
             "build_projection_tile_count": float(build_projection_tile_count),
             "build_pca_method_randomized_count": float(build_pca_method_randomized_count),
@@ -1526,6 +1550,10 @@ class HSpecTableGroup:
         build_pca_basis_ms = 0.0
         build_projection_ms = 0.0
         build_table_write_ms = 0.0
+        build_pca_mean_processed_fp32_tile_bytes = 0
+        build_pca_basis_processed_fp32_tile_bytes = 0
+        build_pca_reference_processed_fp32_tile_bytes = 0
+        build_projection_processed_fp32_tile_bytes = 0
         build_processed_fp32_tile_bytes = 0
         build_projection_tile_count = 0
         build_pca_method_randomized_count = 0
@@ -1602,6 +1630,14 @@ class HSpecTableGroup:
                 build_pca_basis_ms += table_metrics.pca_basis_ms
                 build_projection_ms += table_metrics.projection_ms
                 build_table_write_ms += table_metrics.table_write_ms
+                build_pca_mean_processed_fp32_tile_bytes += (
+                    table_metrics.pca_mean_processed_fp32_tile_bytes)
+                build_pca_basis_processed_fp32_tile_bytes += (
+                    table_metrics.pca_basis_processed_fp32_tile_bytes)
+                build_pca_reference_processed_fp32_tile_bytes += (
+                    table_metrics.pca_reference_processed_fp32_tile_bytes)
+                build_projection_processed_fp32_tile_bytes += (
+                    table_metrics.projection_processed_fp32_tile_bytes)
                 build_processed_fp32_tile_bytes += table_metrics.processed_fp32_tile_bytes
                 build_projection_tile_count += table_metrics.projection_tile_count
                 build_pca_method_fallback_count += table_metrics.pca_method_fallback_count
@@ -1648,6 +1684,14 @@ class HSpecTableGroup:
         self._build_pca_basis_ms += build_pca_basis_ms
         self._build_projection_ms += build_projection_ms
         self._build_table_write_ms += build_table_write_ms
+        self._build_pca_mean_processed_fp32_tile_bytes += (
+            build_pca_mean_processed_fp32_tile_bytes)
+        self._build_pca_basis_processed_fp32_tile_bytes += (
+            build_pca_basis_processed_fp32_tile_bytes)
+        self._build_pca_reference_processed_fp32_tile_bytes += (
+            build_pca_reference_processed_fp32_tile_bytes)
+        self._build_projection_processed_fp32_tile_bytes += (
+            build_projection_processed_fp32_tile_bytes)
         self._build_processed_fp32_tile_bytes += build_processed_fp32_tile_bytes
         self._build_projection_tile_count += build_projection_tile_count
         self._build_pca_method_randomized_count += build_pca_method_randomized_count
@@ -1703,6 +1747,10 @@ class HSpecTableGroup:
             build_pca_basis_ms=build_pca_basis_ms,
             build_projection_ms=build_projection_ms,
             build_table_write_ms=build_table_write_ms,
+            build_pca_mean_processed_fp32_tile_bytes=build_pca_mean_processed_fp32_tile_bytes,
+            build_pca_basis_processed_fp32_tile_bytes=build_pca_basis_processed_fp32_tile_bytes,
+            build_pca_reference_processed_fp32_tile_bytes=build_pca_reference_processed_fp32_tile_bytes,
+            build_projection_processed_fp32_tile_bytes=build_projection_processed_fp32_tile_bytes,
             build_processed_fp32_tile_bytes=build_processed_fp32_tile_bytes,
             build_projection_tile_count=build_projection_tile_count,
             build_pca_method_randomized_count=build_pca_method_randomized_count,
@@ -2163,6 +2211,10 @@ class HSpecTableGroup:
             "build_pca_basis_ms": self._build_pca_basis_ms,
             "build_projection_ms": self._build_projection_ms,
             "build_table_write_ms": self._build_table_write_ms,
+            "build_pca_mean_processed_fp32_tile_bytes": self._build_pca_mean_processed_fp32_tile_bytes,
+            "build_pca_basis_processed_fp32_tile_bytes": self._build_pca_basis_processed_fp32_tile_bytes,
+            "build_pca_reference_processed_fp32_tile_bytes": self._build_pca_reference_processed_fp32_tile_bytes,
+            "build_projection_processed_fp32_tile_bytes": self._build_projection_processed_fp32_tile_bytes,
             "build_processed_fp32_tile_bytes": self._build_processed_fp32_tile_bytes,
             "build_projection_tile_count": self._build_projection_tile_count,
             "build_pca_method_randomized_count": self._build_pca_method_randomized_count,
@@ -2235,6 +2287,10 @@ class HSpecTableGroup:
         self._build_pca_basis_ms = 0.0
         self._build_projection_ms = 0.0
         self._build_table_write_ms = 0.0
+        self._build_pca_mean_processed_fp32_tile_bytes = 0
+        self._build_pca_basis_processed_fp32_tile_bytes = 0
+        self._build_pca_reference_processed_fp32_tile_bytes = 0
+        self._build_projection_processed_fp32_tile_bytes = 0
         self._build_processed_fp32_tile_bytes = 0
         self._build_projection_tile_count = 0
         self._build_pca_method_randomized_count = 0
@@ -3198,6 +3254,22 @@ class GlobalHSpecTableGroup:
             "hspec/build_pca_basis_ms": agg.get("build_pca_basis_ms", 0),
             "hspec/build_projection_ms": agg.get("build_projection_ms", 0),
             "hspec/build_table_write_ms": agg.get("build_table_write_ms", 0),
+            "hspec/build_pca_mean_processed_fp32_tile_bytes": agg.get(
+                "build_pca_mean_processed_fp32_tile_bytes", 0),
+            "hspec/build_pca_mean_processed_fp32_tile_mb": agg.get(
+                "build_pca_mean_processed_fp32_tile_bytes", 0) / (1024 * 1024),
+            "hspec/build_pca_basis_processed_fp32_tile_bytes": agg.get(
+                "build_pca_basis_processed_fp32_tile_bytes", 0),
+            "hspec/build_pca_basis_processed_fp32_tile_mb": agg.get(
+                "build_pca_basis_processed_fp32_tile_bytes", 0) / (1024 * 1024),
+            "hspec/build_pca_reference_processed_fp32_tile_bytes": agg.get(
+                "build_pca_reference_processed_fp32_tile_bytes", 0),
+            "hspec/build_pca_reference_processed_fp32_tile_mb": agg.get(
+                "build_pca_reference_processed_fp32_tile_bytes", 0) / (1024 * 1024),
+            "hspec/build_projection_processed_fp32_tile_bytes": agg.get(
+                "build_projection_processed_fp32_tile_bytes", 0),
+            "hspec/build_projection_processed_fp32_tile_mb": agg.get(
+                "build_projection_processed_fp32_tile_bytes", 0) / (1024 * 1024),
             "hspec/build_processed_fp32_tile_bytes": agg.get(
                 "build_processed_fp32_tile_bytes", 0),
             "hspec/build_processed_fp32_tile_mb": agg.get(

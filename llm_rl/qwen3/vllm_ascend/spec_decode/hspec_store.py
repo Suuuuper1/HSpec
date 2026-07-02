@@ -126,6 +126,9 @@ _store_metrics: Dict[str, int] = {
     "pca_cov_bytes_max": 0,
     "pca_randomized_rank_max": 0,
     "pca_tile_count": 0,
+    "pca_mean_processed_fp32_tile_bytes": 0,
+    "pca_basis_processed_fp32_tile_bytes": 0,
+    "pca_reference_processed_fp32_tile_bytes": 0,
     "pca_processed_fp32_tile_bytes": 0,
     "pca_insufficient_samples_count": 0,
     "pca_error_count": 0,
@@ -135,6 +138,11 @@ _store_metrics: Dict[str, int] = {
     "table_build_entry_count": 0,
     "table_build_rollout_count": 0,
     "table_build_token_count": 0,
+    "table_build_pca_mean_processed_fp32_tile_bytes": 0,
+    "table_build_pca_basis_processed_fp32_tile_bytes": 0,
+    "table_build_pca_reference_processed_fp32_tile_bytes": 0,
+    "table_build_projection_processed_fp32_tile_bytes": 0,
+    "table_build_processed_fp32_tile_bytes": 0,
     "table_build_error_count": 0,
 }
 

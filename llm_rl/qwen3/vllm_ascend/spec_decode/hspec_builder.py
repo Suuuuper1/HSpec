@@ -155,6 +155,9 @@ class HSpecPCAMetrics:
     hidden_dim: int = 0
     tile_rows: int = 0
     tile_count: int = 0
+    mean_processed_fp32_tile_bytes: int = 0
+    basis_processed_fp32_tile_bytes: int = 0
+    reference_processed_fp32_tile_bytes: int = 0
     processed_fp32_tile_bytes: int = 0
     mean_ms: float = 0.0
     basis_ms: float = 0.0
@@ -228,6 +231,10 @@ class HSpecPromptTableBuildMetrics:
     total_ms: float = 0.0
     tile_rows: int = 0
     projection_tile_count: int = 0
+    pca_mean_processed_fp32_tile_bytes: int = 0
+    pca_basis_processed_fp32_tile_bytes: int = 0
+    pca_reference_processed_fp32_tile_bytes: int = 0
+    projection_processed_fp32_tile_bytes: int = 0
     processed_fp32_tile_bytes: int = 0
     covariance_bytes: int = 0
     randomized_rank: int = 0
@@ -335,6 +342,18 @@ def _record_builder_metrics(metrics: HSpecPCAMetrics) -> None:
     hspec_record_store_metric("pca_basis_ms_total", int(round(metrics.basis_ms)))
     hspec_record_store_metric("pca_tile_count", int(metrics.tile_count))
     hspec_record_store_metric(
+        "pca_mean_processed_fp32_tile_bytes",
+        int(metrics.mean_processed_fp32_tile_bytes),
+    )
+    hspec_record_store_metric(
+        "pca_basis_processed_fp32_tile_bytes",
+        int(metrics.basis_processed_fp32_tile_bytes),
+    )
+    hspec_record_store_metric(
+        "pca_reference_processed_fp32_tile_bytes",
+        int(metrics.reference_processed_fp32_tile_bytes),
+    )
+    hspec_record_store_metric(
         "pca_processed_fp32_tile_bytes",
         int(metrics.processed_fp32_tile_bytes),
     )
@@ -370,6 +389,26 @@ def _record_table_build_metrics(metrics: HSpecPromptTableBuildMetrics) -> None:
     hspec_record_store_metric("table_build_entry_count", int(metrics.n_entries))
     hspec_record_store_metric("table_build_rollout_count", int(metrics.n_rollouts))
     hspec_record_store_metric("table_build_token_count", int(metrics.token_count))
+    hspec_record_store_metric(
+        "table_build_pca_mean_processed_fp32_tile_bytes",
+        int(metrics.pca_mean_processed_fp32_tile_bytes),
+    )
+    hspec_record_store_metric(
+        "table_build_pca_basis_processed_fp32_tile_bytes",
+        int(metrics.pca_basis_processed_fp32_tile_bytes),
+    )
+    hspec_record_store_metric(
+        "table_build_pca_reference_processed_fp32_tile_bytes",
+        int(metrics.pca_reference_processed_fp32_tile_bytes),
+    )
+    hspec_record_store_metric(
+        "table_build_projection_processed_fp32_tile_bytes",
+        int(metrics.projection_processed_fp32_tile_bytes),
+    )
+    hspec_record_store_metric(
+        "table_build_processed_fp32_tile_bytes",
+        int(metrics.processed_fp32_tile_bytes),
+    )
     if metrics.build_error_count:
         hspec_record_store_metric("table_build_error_count",
                                   int(metrics.build_error_count))
@@ -481,7 +520,9 @@ def compute_streaming_mean(
             sum_h += tile.sum(axis=0, dtype=sum_dtype)
             n_samples += int(tile.shape[0])
             metrics.tile_count += 1
-            metrics.processed_fp32_tile_bytes += int(tile.nbytes)
+            tile_bytes = int(tile.nbytes)
+            metrics.mean_processed_fp32_tile_bytes += tile_bytes
+            metrics.processed_fp32_tile_bytes += tile_bytes
         if n_samples < 2:
             metrics.insufficient_samples_count += 1
             raise HSpecPCAInsufficientSamples(
@@ -560,6 +601,9 @@ def compute_pca_tiled_covariance(
                     f"tile hidden_dim mismatch for prompt_id={prompt_id}: "
                     f"tile_shape={tile.shape}, expected_dim={hidden_dim}"
                 )
+            tile_bytes = int(tile.nbytes)
+            metrics.basis_processed_fp32_tile_bytes += tile_bytes
+            metrics.processed_fp32_tile_bytes += tile_bytes
             tile -= mean_fp32
             centered = tile.astype(accum_dtype, copy=False)
             cov += centered.T @ centered
@@ -645,6 +689,9 @@ def compute_pca_randomized_cov(
                     f"tile hidden_dim mismatch for prompt_id={prompt_id}: "
                     f"tile_shape={tile.shape}, expected_dim={hidden_dim}"
                 )
+            tile_bytes = int(tile.nbytes)
+            metrics.basis_processed_fp32_tile_bytes += tile_bytes
+            metrics.processed_fp32_tile_bytes += tile_bytes
             tile -= mean_fp32
             sketch = tile @ omega
             y += tile.T @ sketch
@@ -654,6 +701,9 @@ def compute_pca_randomized_cov(
 
         b = np.zeros((rank, rank), dtype=np.float32)
         for _, _, tile in iter_prompt_hidden_tiles(desc_list, config.tile_rows, dtype=np.float32):
+            tile_bytes = int(tile.nbytes)
+            metrics.basis_processed_fp32_tile_bytes += tile_bytes
+            metrics.processed_fp32_tile_bytes += tile_bytes
             tile -= mean_fp32
             aq = tile @ q
             b += aq.T @ aq
@@ -719,6 +769,9 @@ def _fit_pca_svd_reference_guarded(
     arrays: list[np.ndarray] = []
     try:
         for _, _, tile in iter_prompt_hidden_tiles(desc_list, config.tile_rows, dtype=np.float32):
+            tile_bytes = int(tile.nbytes)
+            metrics.reference_processed_fp32_tile_bytes += tile_bytes
+            metrics.processed_fp32_tile_bytes += tile_bytes
             arrays.append(tile)
         if not arrays:
             raise HSpecPCAInsufficientSamples(
@@ -917,8 +970,18 @@ def build_prompt_table_to_store(
         metrics.covariance_bytes = int(pca_metrics.covariance_bytes)
         metrics.randomized_rank = int(pca_metrics.randomized_rank)
         metrics.method_fallback_count = int(pca_metrics.method_fallback_count)
-        metrics.processed_fp32_tile_bytes += int(
-            pca_metrics.processed_fp32_tile_bytes)
+        metrics.pca_mean_processed_fp32_tile_bytes = int(
+            pca_metrics.mean_processed_fp32_tile_bytes)
+        metrics.pca_basis_processed_fp32_tile_bytes = int(
+            pca_metrics.basis_processed_fp32_tile_bytes)
+        metrics.pca_reference_processed_fp32_tile_bytes = int(
+            pca_metrics.reference_processed_fp32_tile_bytes)
+        metrics.processed_fp32_tile_bytes = (
+            metrics.pca_mean_processed_fp32_tile_bytes
+            + metrics.pca_basis_processed_fp32_tile_bytes
+            + metrics.pca_reference_processed_fp32_tile_bytes
+            + metrics.projection_processed_fp32_tile_bytes
+        )
 
         mean = np.ascontiguousarray(pca_result.mean, dtype=np.float32)
         components = np.ascontiguousarray(pca_result.components, dtype=np.float32)
@@ -1004,7 +1067,9 @@ def build_prompt_table_to_store(
                                 copy=False,
                             )
                             metrics.projection_tile_count += 1
-                            metrics.processed_fp32_tile_bytes += int(h_tile.nbytes)
+                            tile_bytes = int(h_tile.nbytes)
+                            metrics.projection_processed_fp32_tile_bytes += tile_bytes
+                            metrics.processed_fp32_tile_bytes += tile_bytes
                         row_cursor = row_end
                         token_cursor += length
                     finally:

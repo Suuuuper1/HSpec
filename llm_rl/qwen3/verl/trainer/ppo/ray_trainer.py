@@ -659,6 +659,12 @@ class RayPPOTrainer:
             "build_budget_drop_oversize_count",
             "build_rss_cap_skip_count",
             "build_memory_error_count",
+            "build_pca_mean_processed_fp32_tile_bytes",
+            "build_pca_basis_processed_fp32_tile_bytes",
+            "build_pca_reference_processed_fp32_tile_bytes",
+            "build_projection_processed_fp32_tile_bytes",
+            "build_processed_fp32_tile_bytes",
+            "build_projection_tile_count",
         )
         for key in additive_keys:
             value = result.get(key)
