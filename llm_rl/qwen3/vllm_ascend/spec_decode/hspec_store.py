@@ -104,6 +104,7 @@ _store_metrics: Dict[str, int] = {
     "table_store_fsync_count": 0,
     "table_store_reader_load_error": 0,
     "table_store_materialize_count": 0,
+    "table_store_stale_version_error": 0,
     "table_store_bytes_written": 0,
     "table_store_prompt_count": 0,
     "table_store_entry_count": 0,
@@ -380,6 +381,19 @@ def get_hspec_store_root() -> str:
 def get_hspec_table_store_root() -> str:
     default_root = os.path.join(get_hspec_store_root(), "table_store")
     return os.getenv("HSPEC_TABLE_STORE_DIR", default_root)
+
+
+def get_hspec_store_isolation_mode() -> str:
+    value = os.getenv("HSPEC_STORE_ISOLATION_MODE", "clean").strip().lower()
+    if value in {"clean", "unique", "reuse"}:
+        return value
+    logger.warning(
+        "Ignoring invalid HSPEC_STORE_ISOLATION_MODE=%s; using clean", value)
+    return "clean"
+
+
+def hspec_require_fresh_table_store_enabled() -> bool:
+    return os.getenv("HSPEC_REQUIRE_FRESH_TABLE_STORE", "0") != "0"
 
 
 def get_hspec_raw_store_max_bytes() -> int:

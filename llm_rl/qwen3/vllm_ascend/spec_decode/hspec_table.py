@@ -69,9 +69,11 @@ from vllm_ascend.spec_decode.hspec_store import (
     get_hspec_build_max_rss_mb,
     get_hspec_node_id,
     get_hspec_num_shards,
+    get_hspec_store_isolation_mode,
     get_hspec_store_root,
     get_hspec_table_store_root,
     hspec_legacy_dataproto_hs_enabled,
+    hspec_require_fresh_table_store_enabled,
     hspec_record_store_metric,
     hspec_segment_key_from_desc,
     hspec_single_node_only_enabled,
@@ -93,6 +95,7 @@ _TABLE_STORE_ADDITIVE_METRIC_KEYS = frozenset({
     "table_store_fsync_count",
     "table_store_reader_load_error",
     "table_store_materialize_count",
+    "table_store_stale_version_error",
     "table_store_bytes_written",
     "table_store_prompt_count",
     "table_store_entry_count",
@@ -753,6 +756,7 @@ class HSpecTableGroup:
             get_hspec_table_store_root(),
             f"shard_{self.shard_id:03d}",
         )
+        self._validate_fresh_table_store_on_init()
         os.makedirs(self.table_store_root, exist_ok=True)
         self._build_queue_max_descs = max(
             int(os.getenv("HSPEC_BUILD_QUEUE_MAX_DESCS", "0")),
@@ -839,6 +843,60 @@ class HSpecTableGroup:
         # ZMQ state
         self.running = False
 
+    def _validate_fresh_table_store_on_init(self) -> None:
+        """Check table-store run isolation once at actor startup."""
+        try:
+            existing_versions = list_table_store_versions(
+                root=get_hspec_table_store_root(),
+                shard_id=self.shard_id,
+            )
+        except Exception:
+            hspec_record_store_metric("table_store_reader_load_error", 1)
+            logger.exception(
+                "Failed to inspect HSpec table store versions during actor init: "
+                "shard_id=%s table_store_base_root=%s",
+                self.shard_id,
+                get_hspec_table_store_root(),
+            )
+            raise
+        if not existing_versions:
+            return
+
+        mode = get_hspec_store_isolation_mode()
+        require_fresh = hspec_require_fresh_table_store_enabled() or mode == "clean"
+        preview = existing_versions[:8]
+        if require_fresh:
+            hspec_record_store_metric("table_store_stale_version_error", 1)
+            raise RuntimeError(
+                "HSpec table store is not fresh; cleanup was requested but old "
+                "versions remain. "
+                f"shard_id={self.shard_id} versions={preview} "
+                f"table_store_base_root={get_hspec_table_store_root()!r} "
+                f"store_isolation_mode={mode!r} "
+                f"require_fresh_table_store={hspec_require_fresh_table_store_enabled()}. "
+                "Clean HSPEC_TABLE_STORE_DIR before startup, set "
+                "HSPEC_STORE_ISOLATION_MODE=unique, or explicitly choose "
+                "HSPEC_STORE_ISOLATION_MODE=reuse for debug/resume."
+            )
+        if mode == "reuse":
+            logger.warning(
+                "HSpec table store reuse mode found existing versions: "
+                "shard_id=%s versions=%s table_store_base_root=%s",
+                self.shard_id,
+                preview,
+                get_hspec_table_store_root(),
+            )
+        else:
+            logger.warning(
+                "HSpec table store found existing versions with "
+                "HSPEC_REQUIRE_FRESH_TABLE_STORE=0: shard_id=%s versions=%s "
+                "table_store_base_root=%s store_isolation_mode=%s",
+                self.shard_id,
+                preview,
+                get_hspec_table_store_root(),
+                mode,
+            )
+
     def get_topology(self) -> Dict[str, Any]:
         return {
             "actor_name": str(self.actor_name),
@@ -850,6 +908,9 @@ class HSpecTableGroup:
             "ray_node_id": str(self.ray_node_id),
             "table_store_root": str(self.table_store_root),
             "table_store_base_root": str(get_hspec_table_store_root()),
+            "store_isolation_mode": str(get_hspec_store_isolation_mode()),
+            "require_fresh_table_store": bool(
+                hspec_require_fresh_table_store_enabled()),
             "hspec_store_root": str(get_hspec_store_root()),
             "similarity_threshold": float(self.similarity_threshold),
             "max_entries_per_prompt": int(self.max_entries),

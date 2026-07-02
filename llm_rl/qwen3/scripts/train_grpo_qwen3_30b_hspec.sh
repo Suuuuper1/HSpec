@@ -12,6 +12,7 @@ CUSTOM_OPP_PATH="${PROJECT_ROOT}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascen
 CUSTOM_OP_API_LIB="${CUSTOM_OPP_PATH}/op_api/lib"
 RUN_NAME="${RUN_NAME:-qwen3_30b_hspec_single}"
 HSPEC_RUN_NAME="${HSPEC_RUN_NAME:-${RUN_NAME}}"
+source "${SCRIPT_DIR}/hspec_store_lifecycle.sh"
 
 if [ -d "${CUSTOM_OPP_PATH}" ]; then
     export ASCEND_CUSTOM_OPP_PATH="${CUSTOM_OPP_PATH}:${ASCEND_CUSTOM_OPP_PATH:-}"
@@ -28,15 +29,13 @@ export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 export HSPEC_LEGACY_DATAPROTO_HS="${HSPEC_LEGACY_DATAPROTO_HS:-0}"
 export HSPEC_STRICT_DESCRIPTOR_MODE="${HSPEC_STRICT_DESCRIPTOR_MODE:-1}"
 export HSPEC_STORE_DTYPE="${HSPEC_STORE_DTYPE:-float16}"
-export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_store/${HSPEC_RUN_NAME}}"
-export HSPEC_TABLE_STORE_DIR="${HSPEC_TABLE_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_table_store/${HSPEC_RUN_NAME}}"
+hspec_configure_store_lifecycle unique
 export HSPEC_SINGLE_NODE_ONLY="${HSPEC_SINGLE_NODE_ONLY:-1}"
 export HSPEC_TOPOLOGY_STRICT="${HSPEC_TOPOLOGY_STRICT:-1}"
 export HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS="${HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS:-1}"
 export HSPEC_STEP0_RUNTIME_ASSERTS="${HSPEC_STEP0_RUNTIME_ASSERTS:-0}"
 export HSPEC_BUILD_ACTOR_NUM_CPUS="${HSPEC_BUILD_ACTOR_NUM_CPUS:-1}"
 export HSPEC_BUILD_BLAS_THREADS="${HSPEC_BUILD_BLAS_THREADS:-1}"
-export HSPEC_BUILD_ACTOR_NAME_PREFIX="${HSPEC_BUILD_ACTOR_NAME_PREFIX:-hspec_build_${HSPEC_RUN_NAME}}"
 export HSPEC_DELETE_TRAJECTORY_AFTER_BUILD="${HSPEC_DELETE_TRAJECTORY_AFTER_BUILD:-0}"
 export HSPEC_RAW_STORE_GC_AFTER_EPOCH="${HSPEC_RAW_STORE_GC_AFTER_EPOCH:-1}"
 export HSPEC_SEGMENT_FSYNC_ON_SEAL="${HSPEC_SEGMENT_FSYNC_ON_SEAL:-0}"
@@ -158,6 +157,7 @@ ROLLOUT_LOG_PATH="${ROLLOUT_LOG_PATH:-${LOG_DIR}/${RUN_NAME}.log}"
 OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b.txt}"
 
 mkdir -p "${LOG_DIR}" "${ROLL_LEN_ROOT}" "${TB_ROOT}" "${ROLLOUT_LENGTH_DIR}" "$(dirname "${OUT}")"
+hspec_maybe_clean_store_dirs
 
 if [ "${USE_HSPEC_DECODE}" != "0" ] && [ "${NODES}" != "1" ] && \
    [ "${HSPEC_EXPERIMENTAL_ALLOW_MULTI_NODE_UNSAFE:-0}" = "0" ]; then
@@ -183,6 +183,13 @@ fi
     echo "hspec_legacy_dataproto_hs=${HSPEC_LEGACY_DATAPROTO_HS}"
     echo "hspec_strict_descriptor_mode=${HSPEC_STRICT_DESCRIPTOR_MODE}"
     echo "hspec_store_dtype=${HSPEC_STORE_DTYPE}"
+    echo "hspec_store_isolation_mode=${HSPEC_STORE_ISOLATION_MODE}"
+    echo "hspec_run_uid=${HSPEC_RUN_UID}"
+    echo "hspec_clean_store_on_start=${HSPEC_CLEAN_STORE_ON_START}"
+    echo "hspec_clean_raw_store_on_start=${HSPEC_CLEAN_RAW_STORE_ON_START}"
+    echo "hspec_clean_table_store_on_start=${HSPEC_CLEAN_TABLE_STORE_ON_START}"
+    echo "hspec_allow_clean_outside_project=${HSPEC_ALLOW_CLEAN_OUTSIDE_PROJECT}"
+    echo "hspec_require_fresh_table_store=${HSPEC_REQUIRE_FRESH_TABLE_STORE}"
     echo "hspec_store_dir=${HSPEC_STORE_DIR}"
     echo "hspec_table_store_dir=${HSPEC_TABLE_STORE_DIR}"
     echo "hspec_infer_tp=${HSPEC_INFER_TP}"
@@ -343,6 +350,13 @@ env \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LEGACY_DATAPROTO_HS='"'"${HSPEC_LEGACY_DATAPROTO_HS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STRICT_DESCRIPTOR_MODE='"'"${HSPEC_STRICT_DESCRIPTOR_MODE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DTYPE='"'"${HSPEC_STORE_DTYPE}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_ISOLATION_MODE='"'"${HSPEC_STORE_ISOLATION_MODE}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RUN_UID='"'"${HSPEC_RUN_UID}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_CLEAN_STORE_ON_START='"'"${HSPEC_CLEAN_STORE_ON_START}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_CLEAN_RAW_STORE_ON_START='"'"${HSPEC_CLEAN_RAW_STORE_ON_START}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_CLEAN_TABLE_STORE_ON_START='"'"${HSPEC_CLEAN_TABLE_STORE_ON_START}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ALLOW_CLEAN_OUTSIDE_PROJECT='"'"${HSPEC_ALLOW_CLEAN_OUTSIDE_PROJECT}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_REQUIRE_FRESH_TABLE_STORE='"'"${HSPEC_REQUIRE_FRESH_TABLE_STORE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DIR='"'"${HSPEC_STORE_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TABLE_STORE_DIR='"'"${HSPEC_TABLE_STORE_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUM_SHARDS='"'"${HSPEC_NUM_SHARDS}"'"' \

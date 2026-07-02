@@ -96,11 +96,13 @@ def run_ppo(config) -> None:
             get_hspec_raw_store_max_files,
             get_hspec_store_retain_batches,
             get_hspec_store_dtype,
+            get_hspec_store_isolation_mode,
             get_hspec_store_root,
             get_hspec_table_store_root,
             hspec_legacy_dataproto_hs_enabled,
             hspec_raw_store_budget_delete_enabled,
             hspec_raw_store_gc_after_epoch_enabled,
+            hspec_require_fresh_table_store_enabled,
             hspec_segment_fsync_on_seal_enabled,
             hspec_single_node_only_enabled,
             hspec_strict_descriptor_mode_enabled,
@@ -153,6 +155,12 @@ def run_ppo(config) -> None:
         print(
             "HSpec Phase1 config: "
             f"store_dtype={hspec_store_dtype}, "
+            f"store_isolation_mode={get_hspec_store_isolation_mode()}, "
+            f"run_uid={os.getenv('HSPEC_RUN_UID', '')}, "
+            f"clean_store_on_start={os.getenv('HSPEC_CLEAN_STORE_ON_START', '0')}, "
+            f"clean_raw_store_on_start={os.getenv('HSPEC_CLEAN_RAW_STORE_ON_START', '0')}, "
+            f"clean_table_store_on_start={os.getenv('HSPEC_CLEAN_TABLE_STORE_ON_START', '0')}, "
+            f"require_fresh_table_store={hspec_require_fresh_table_store_enabled()}, "
             f"store_dir={get_hspec_store_root()}, "
             f"table_store_dir={get_hspec_table_store_root()}, "
             f"strict_descriptor_mode={hspec_strict_descriptor_mode_enabled()}, "
