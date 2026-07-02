@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Versioned mmap table-store metadata for HSpec Phase 2.
-
+"""
 This module intentionally stays off the decode hot path. Step 1 only provides
 descriptor, manifest, and writer/reader skeletons so later Phase 2 steps can
 move active HSpec tables out of Ray actor heap without changing build/query
@@ -26,6 +25,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -664,6 +664,7 @@ class HSpecTableStoreWriter:
                 "version": int(self.version),
                 "shard_id": int(self.shard_id),
                 "version_dir": str(self.version_dir),
+                "manifest_path": str(self.manifest_path),
                 "table_file": str(self.table_file),
                 "prompt_index_path": str(self.prompt_index_path),
                 "prompt_count": len(self._prompt_index),
@@ -802,6 +803,142 @@ def write_active_version_manifest(
         hspec_record_store_metric("table_store_active_manifest_write_error", 1)
         raise
     return payload
+
+
+def list_table_store_versions(
+    root: str | Path | None = None,
+    shard_id: int = 0,
+) -> list[int]:
+    """Return sealed/building version ids present for one shard.
+
+    This helper is intentionally low-frequency: it is used when opening a new
+    building writer or after swap for GC, never on the decode hot path.
+    """
+    base_root = Path(root or get_hspec_table_store_root()).resolve()
+    shard_root = base_root / f"shard_{int(shard_id):03d}"
+    if not shard_root.exists():
+        return []
+    versions: list[int] = []
+    for child in shard_root.iterdir():
+        if not child.is_dir():
+            continue
+        name = child.name
+        if not name.startswith("version_"):
+            continue
+        suffix = name[len("version_"):]
+        if not suffix.isdigit():
+            continue
+        versions.append(int(suffix))
+    return sorted(versions)
+
+
+def _read_version_status(version_dir: Path) -> str:
+    manifest_path = version_dir / VERSION_MANIFEST_NAME
+    if not manifest_path.exists():
+        return ""
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        return str(manifest.get("status", ""))
+    except Exception:
+        hspec_record_store_metric("table_store_reader_load_error", 1)
+        logger.debug("Failed to read HSpec table version manifest %s",
+                     manifest_path,
+                     exc_info=True)
+        return ""
+
+
+def gc_table_store_versions(
+    root: str | Path | None = None,
+    shard_id: int = 0,
+    *,
+    active_version: int,
+    retain_versions: int,
+) -> dict[str, Any]:
+    """Best-effort GC for old table-store versions.
+
+    Active and recent versions are always retained. Delete failures are
+    reported as metrics and never raised, which keeps Windows mmap lifecycle
+    quirks from blocking the training loop.
+    """
+    base_root = Path(root or get_hspec_table_store_root()).resolve()
+    shard_id_i = int(shard_id)
+    active_version_i = int(active_version)
+    retain_versions_i = max(int(retain_versions), 1)
+    shard_root = base_root / f"shard_{shard_id_i:03d}"
+    versions = list_table_store_versions(base_root, shard_id_i)
+    hspec_record_store_metric("table_store_gc_scanned_versions", len(versions))
+    if not versions:
+        return {
+            "scanned_versions": 0,
+            "retained_versions": 0,
+            "deleted_versions": 0,
+            "delete_errors": 0,
+            "kept": [],
+            "deleted": [],
+        }
+
+    statuses: dict[int, str] = {
+        version: _read_version_status(shard_root / f"version_{version:06d}")
+        for version in versions
+    }
+    recent_candidates = [
+        version for version in versions
+        if statuses.get(version, "") != "gc_deletable"
+    ]
+    recent = set(recent_candidates[-retain_versions_i:])
+
+    deleted: list[int] = []
+    delete_errors = 0
+    for version in versions:
+        version_dir = shard_root / f"version_{version:06d}"
+        status = statuses.get(version, "")
+        if active_version_i > 0 and version == active_version_i:
+            continue
+        if status != "gc_deletable" and (
+            version in recent or version > active_version_i
+        ):
+            continue
+        if status and status not in {"sealed", "gc_deletable"}:
+            continue
+        try:
+            shutil.rmtree(version_dir)
+            deleted.append(version)
+            hspec_record_store_metric("table_store_gc_deleted_versions", 1)
+        except Exception:
+            delete_errors += 1
+            hspec_record_store_metric("table_store_gc_delete_error", 1)
+            logger.debug("Failed to GC HSpec table store version %s",
+                         version_dir,
+                         exc_info=True)
+
+    retained_count = len([version for version in versions if version not in deleted])
+    hspec_record_store_metric("table_store_gc_retained_versions", retained_count)
+    return {
+        "scanned_versions": len(versions),
+        "retained_versions": retained_count,
+        "deleted_versions": len(deleted),
+        "delete_errors": delete_errors,
+        "kept": sorted(version for version in versions if version not in deleted),
+        "deleted": deleted,
+    }
+
+
+def clear_active_version_manifest(shard_root: str | Path) -> None:
+    """Remove active_version.json if present.
+
+    Clear is a management/debug operation. Failure should not leave the actor
+    unusable, but it is observable through metrics.
+    """
+    active_path = Path(shard_root) / ACTIVE_VERSION_NAME
+    try:
+        if active_path.exists():
+            active_path.unlink()
+    except Exception:
+        hspec_record_store_metric("table_store_active_manifest_clear_error", 1)
+        logger.debug("Failed to clear HSpec active version manifest %s",
+                     active_path,
+                     exc_info=True)
 
 
 def _prompt_desc_live_bytes(desc: HSpecPromptTableDesc) -> int:

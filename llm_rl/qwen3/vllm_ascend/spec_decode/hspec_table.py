@@ -15,7 +15,6 @@
 HSpec: Hidden State based Speculative Decoding query table.
 """
 
-import json
 import logging
 import os
 import socket
@@ -39,8 +38,15 @@ from vllm_ascend.spec_decode.hspec_builder import (
 from vllm_ascend.spec_decode.hspec_table_store import (
     HSpecPromptTableDesc,
     HSpecTableStoreWriter,
+    clear_active_version_manifest,
+    gc_table_store_versions,
+    get_hspec_table_prefetch_mode,
+    get_hspec_table_store_retain_versions,
+    hspec_table_store_gc_after_swap_enabled,
+    list_table_store_versions,
     materialize_prompt_table,
     open_array as open_table_array,
+    write_active_version_manifest,
 )
 from vllm_ascend.spec_decode.hspec_utils import (
     PromptPCAParams,
@@ -693,7 +699,6 @@ class HSpecTableGroup:
             f"shard_{self.shard_id:03d}",
         )
         os.makedirs(self.table_store_root, exist_ok=True)
-        self._active_version_path = os.path.join(self.table_store_root, "active_version.json")
         self._build_queue_max_descs = max(
             int(os.getenv("HSPEC_BUILD_QUEUE_MAX_DESCS", "0")),
             0,
@@ -1048,25 +1053,34 @@ class HSpecTableGroup:
             return False
         return True
 
-    def _write_active_version_manifest(self) -> None:
-        payload = {
-            "active_version": int(self._active_version),
-            "shard_id": int(self.shard_id),
-            "num_prompts": int(len(self._active)),
-            "total_entries": int(self.total_entries()),
-        }
+    def _next_table_store_version(self) -> int:
+        versions = list_table_store_versions(
+            root=get_hspec_table_store_root(),
+            shard_id=self.shard_id,
+        )
+        max_disk_version = max(versions, default=0)
+        return max(int(self._active_version), int(max_disk_version)) + 1
+
+    def _maybe_gc_table_store_versions(self) -> None:
+        if not hspec_table_store_gc_after_swap_enabled():
+            return
         try:
-            with open(self._active_version_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+            gc_table_store_versions(
+                root=get_hspec_table_store_root(),
+                shard_id=self.shard_id,
+                active_version=self._active_version,
+                retain_versions=get_hspec_table_store_retain_versions(),
+            )
         except Exception:
-            logger.debug("Failed to write HSpec active version manifest", exc_info=True)
+            logger.debug("Failed during best-effort HSpec table-store GC",
+                         exc_info=True)
 
     # Build
 
     def _get_or_create_table_writer(self) -> HSpecTableStoreWriter:
         if self._table_writer is not None:
             return self._table_writer
-        version = int(self._active_version) + 1
+        version = self._next_table_store_version()
         self._building_version = version
         self._table_writer = HSpecTableStoreWriter(
             root=get_hspec_table_store_root(),
@@ -1805,8 +1819,11 @@ class HSpecTableGroup:
         """Clear all tables (both active and building) and reset metrics."""
         self._active.clear()
         self._building.clear()
+        self._table_writer = None
+        self._building_version = None
+        self._active_version = 0
         self._reset_metrics()
-        self._write_active_version_manifest()
+        clear_active_version_manifest(self.table_store_root)
 
     def exist(self, prompt_id: str) -> bool:
         return prompt_id in self._active
@@ -1823,23 +1840,107 @@ class HSpecTableGroup:
     # Double-buffer version management
 
     def swap(self):
-        """Swap building → active.  Resets query metrics for new epoch."""
-        if self._table_writer is not None:
-            try:
-                self._table_writer.seal({
-                    "step": "phase2_step3_swap",
-                })
-            except Exception:
-                logger.warning("Failed to seal HSpec table store writer before swap",
-                               exc_info=True)
-        self._active = self._building
-        self._building = {}
-        if self._building_version is not None:
-            self._active_version = int(self._building_version)
-        else:
+        """Publish building tables as the active version at epoch boundary."""
+        if not self._building:
+            hspec_record_store_metric("table_swap_empty_count", 1)
+            writer = self._table_writer
+            if writer is not None:
+                try:
+                    writer.seal({
+                        "step": "phase2_step4_empty_swap",
+                        "status": "gc_deletable",
+                    })
+                except Exception:
+                    logger.warning(
+                        "Failed to seal empty HSpec table store writer; "
+                        "keeping previous active table.",
+                        exc_info=True,
+                    )
+            self._building = {}
+            self._table_writer = None
+            self._building_version = None
+            self._maybe_gc_table_store_versions()
+            self._reset_metrics()
+            logger.info(
+                "HSpec swap skipped empty building set: active_version=%d, "
+                "prompts=%d, entries=%d",
+                self._active_version,
+                len(self._active),
+                self.total_entries(),
+            )
+            return
+
+        writer = self._table_writer
+        if writer is None:
+            has_descriptor = any(
+                isinstance(table, HSpecPromptTableDesc)
+                for table in self._building.values()
+            )
+            if has_descriptor:
+                raise RuntimeError(
+                    "HSpec descriptor building tables exist without a table "
+                    "store writer; refusing to publish an inconsistent active "
+                    "version."
+                )
+            self._active = dict(self._building)
+            self._building = {}
             self._active_version += 1
+            self._reset_metrics()
+            logger.info(
+                "HSpec legacy swap: active_version=%d, prompts=%d, entries=%d",
+                self._active_version,
+                len(self._active),
+                self.total_entries(),
+            )
+            return
+
+        building_version = int(
+            self._building_version if self._building_version is not None
+            else writer.version
+        )
+        new_active: Dict[str, HSpecPromptTableDesc] = {}
+        for pid, table in self._building.items():
+            if not isinstance(table, HSpecPromptTableDesc):
+                raise TypeError(
+                    "HSpec cannot publish mixed descriptor/legacy building "
+                    f"tables; prompt_id={pid!r} type={type(table)!r}"
+                )
+            if int(table.version) != building_version:
+                raise ValueError(
+                    "HSpec prompt table descriptor version mismatch: "
+                    f"prompt_id={pid!r} desc.version={table.version} "
+                    f"building_version={building_version}"
+                )
+            if int(table.shard_id) != int(self.shard_id):
+                raise ValueError(
+                    "HSpec prompt table descriptor shard mismatch: "
+                    f"prompt_id={pid!r} desc.shard_id={table.shard_id} "
+                    f"actor.shard_id={self.shard_id}"
+                )
+            new_active[str(pid)] = table
+
+        manifest = writer.seal({
+            "step": "phase2_step4_swap",
+            "active_publish_pending": True,
+        })
+        prompt_count = len(new_active)
+        entry_count = sum(int(desc.n_entries) for desc in new_active.values())
+        write_active_version_manifest(
+            self.table_store_root,
+            active_version=building_version,
+            shard_id=self.shard_id,
+            version_dir=manifest["version_dir"],
+            manifest_path=manifest.get("manifest_path", writer.manifest_path),
+            prompt_count=prompt_count,
+            entry_count=entry_count,
+        )
+
+        self._active = new_active
+        self._active_version = building_version
+        self._building = {}
         self._table_writer = None
         self._building_version = None
+        self._maybe_gc_table_store_versions()
         self._reset_metrics()
         logger.info(
             "HSpec swap: active_version=%d, prompts=%d, entries=%d",
@@ -1852,17 +1953,33 @@ class HSpecTableGroup:
         """Return current active table version (epoch counter)."""
         return self._active_version
 
+    def get_active_table_desc_batch(
+        self,
+        prompt_ids: List[str],
+    ) -> Tuple[int, Dict[str, Optional[HSpecPromptTableDesc]]]:
+        """Batch fetch active table descriptors without materializing arrays."""
+        result: Dict[str, Optional[HSpecPromptTableDesc]] = {}
+        hit_count = 0
+        for pid in prompt_ids:
+            table = self._active.get(pid)
+            if isinstance(table, HSpecPromptTableDesc):
+                result[pid] = table
+                hit_count += 1
+            else:
+                result[pid] = None
+        hspec_record_store_metric("table_prefetch_descriptor_count", hit_count)
+        return (self._active_version, result)
+
     def get_active_table_data_batch(
         self,
         prompt_ids: List[str],
-    ) -> Tuple[int, Dict[str, Optional[Dict]]]:
-        """Batch fetch table data from *active* tables for proposer prefetch.
+    ) -> Tuple[int, Dict[str, Optional[Dict[str, Any]]]]:
+        """Legacy array prefetch fallback for active tables.
 
-        Returns ``(active_version, {prompt_id: table_data | None})``.
-        The version is piggy-backed so the proposer can detect epoch
-        swaps without a separate RPC – one fewer round trip.
+        Descriptor mode must call ``get_active_table_desc_batch()`` to avoid
+        Ray object-store table arrays.
         """
-        result: Dict[str, Optional[Dict]] = {}
+        result: Dict[str, Optional[Dict[str, Any]]] = {}
         for pid in prompt_ids:
             if pid not in self._active:
                 result[pid] = None
@@ -1932,6 +2049,7 @@ class HSpecTableGroup:
             "build_rss_after_materialize_peak_bytes": self._build_rss_after_materialize_peak_bytes,
             "build_rss_after_pca_peak_bytes": self._build_rss_after_pca_peak_bytes,
             "build_rss_delta_peak_bytes": self._build_rss_delta_peak_bytes,
+            "active_version": self._active_version,
             "num_prompts": len(self._active),
             "total_entries": self.total_entries(),
             "entry_match_count": self._entry_match_count,
@@ -2691,19 +2809,23 @@ class GlobalHSpecTableGroup:
         return [g.swap.remote() for g in self.groups]
 
     def get_active_version(self) -> int:
-        """Return active table version (queries one actor)."""
+        """Return max active table version across actors."""
         if not self.groups:
             return 0
-        return ray.get(self.groups[0].get_active_version.remote())
+        versions = ray.get([group.get_active_version.remote() for group in self.groups])
+        return max((int(version) for version in versions), default=0)
 
-    def prefetch_batch(self, prompt_ids: List[str]) -> Dict[str, Optional[Dict]]:
-        """Batch-fetch table data from active tables (for proposer cache).
+    def prefetch_batch(self, prompt_ids: List[str]) -> Tuple[int, Dict[str, Optional[Any]]]:
+        """Batch-fetch active table payloads for proposer cache.
 
         One Ray call per partition → minimal overhead.  Returns
-        ``{prompt_id: serialised_table_data | None}``.
+        ``(latest_version, {prompt_id: payload | None})``.  The default
+        payload is ``HSpecPromptTableDesc``; ``legacy_arrays`` mode returns
+        the old materialized table-data dict.
         """
         from collections import defaultdict
 
+        mode = get_hspec_table_prefetch_mode()
         partition_prompts: Dict[int, List[str]] = defaultdict(list)
         for pid in prompt_ids:
             partition_prompts[self._get_partition_id(pid)].append(pid)
@@ -2711,9 +2833,12 @@ class GlobalHSpecTableGroup:
         futures: Dict[int, ray.ObjectRef] = {}
         for part, pids in partition_prompts.items():
             if part < len(self.groups):
-                futures[part] = self.groups[part].get_active_table_data_batch.remote(pids)
+                if mode == "legacy_arrays":
+                    futures[part] = self.groups[part].get_active_table_data_batch.remote(pids)
+                else:
+                    futures[part] = self.groups[part].get_active_table_desc_batch.remote(pids)
 
-        result: Dict[str, Optional[Dict]] = {}
+        result: Dict[str, Optional[Any]] = {}
         latest_version = -1
         for part, future in futures.items():
             version, batch_data = ray.get(future)
@@ -2725,12 +2850,13 @@ class GlobalHSpecTableGroup:
         """Fire async prefetch – **non-blocking**, returns immediately.
 
         Returns ``[(ObjectRef, [prompt_ids]), ...]`` where each
-        ObjectRef resolves to ``(active_version, {pid: data | None})``.
-        Callers should poll with ``ray.wait(timeout=0)`` instead of
-        blocking on ``ray.get()``.
+        ObjectRef resolves to ``(active_version, {pid: payload | None})``.
+        Descriptor mode returns ``HSpecPromptTableDesc`` payloads; explicit
+        ``legacy_arrays`` mode returns the old materialized table dicts.
         """
         from collections import defaultdict
 
+        mode = get_hspec_table_prefetch_mode()
         partition_prompts: Dict[int, List[str]] = defaultdict(list)
         for pid in prompt_ids:
             partition_prompts[self._get_partition_id(pid)].append(pid)
@@ -2738,7 +2864,10 @@ class GlobalHSpecTableGroup:
         result: List[Tuple[ray.ObjectRef, List[str]]] = []
         for part, pids in partition_prompts.items():
             if part < len(self.groups):
-                future = self.groups[part].get_active_table_data_batch.remote(pids)
+                if mode == "legacy_arrays":
+                    future = self.groups[part].get_active_table_data_batch.remote(pids)
+                else:
+                    future = self.groups[part].get_active_table_desc_batch.remote(pids)
                 result.append((future, pids))
         return result
 
@@ -2799,6 +2928,7 @@ class GlobalHSpecTableGroup:
             "build_rss_delta_peak_bytes",
             "build_pca_cov_bytes_max",
             "build_pca_randomized_rank_max",
+            "active_version",
         }
         for metrics in metrics_list:
             for key, value in metrics.items():
@@ -2884,6 +3014,7 @@ class GlobalHSpecTableGroup:
                 agg.get("build_rss_after_pca_peak_bytes", 0) / (1024 * 1024)
             ),
             "hspec/build_actor_rss_delta_mb_max": agg.get("build_rss_delta_peak_bytes", 0) / (1024 * 1024),
+            "hspec/active_version": agg.get("active_version", 0),
             "hspec/num_prompts": agg.get("num_prompts", 0),
             "hspec/total_entries": agg.get("total_entries", 0),
             "hspec/accept_times_advan": accept_times_advan,
@@ -2971,8 +3102,18 @@ class GlobalHSpecTableGroup:
             store_metrics.get("table_store_entry_count", 0))
         result["hspec/table_store_version"] = float(
             store_metrics.get("table_store_version", 0))
+        result["hspec/table_swap_empty_count"] = float(
+            store_metrics.get("table_swap_empty_count", 0))
+        result["hspec/table_store_gc_scanned_versions"] = float(
+            store_metrics.get("table_store_gc_scanned_versions", 0))
+        result["hspec/table_store_gc_retained_versions"] = float(
+            store_metrics.get("table_store_gc_retained_versions", 0))
         result["hspec/table_store_gc_deleted_versions"] = float(
             store_metrics.get("table_store_gc_deleted_versions", 0))
+        result["hspec/table_store_gc_delete_error"] = float(
+            store_metrics.get("table_store_gc_delete_error", 0))
+        result["hspec/table_store_active_manifest_clear_error"] = float(
+            store_metrics.get("table_store_active_manifest_clear_error", 0))
         result["hspec/table_prefetch_descriptor_count"] = float(
             store_metrics.get("table_prefetch_descriptor_count", 0))
         result["hspec/table_prefetch_legacy_array_count"] = float(
