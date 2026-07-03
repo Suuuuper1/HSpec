@@ -97,7 +97,6 @@ _TABLE_STORE_ADDITIVE_METRIC_KEYS = frozenset({
     "table_store_materialize_count",
     "table_store_stale_version_error",
     "table_store_descriptor_path_mismatch",
-    "strict_descriptor_violation",
     "table_store_bytes_written",
     "table_store_prompt_count",
     "table_store_entry_count",
@@ -143,6 +142,9 @@ _DRIVER_LOCAL_NONZERO_METRIC_KEYS = frozenset({
     "build_submission_count",
     "build_submission_segments",
 })
+_ACTOR_DRIVER_ADDITIVE_METRIC_KEYS = frozenset({
+    "strict_descriptor_violation",
+})
 
 
 @dataclass(frozen=True)
@@ -165,6 +167,11 @@ class HSpecBuildActorTopology:
     ray_node_id: str
     table_store_root: str
     table_store_base_root: str
+    store_isolation_mode: str
+    run_uid: str
+    clean_store_on_start: str
+    clean_table_store_on_start: str
+    require_fresh_table_store: bool
     hspec_store_root: str
     similarity_threshold: float
     max_entries_per_prompt: int
@@ -259,6 +266,18 @@ def _build_actor_name(shard_id: int) -> str:
     return f"{prefix}_{int(shard_id)}"
 
 
+def _get_hspec_run_uid() -> str:
+    return os.getenv("HSPEC_RUN_UID", "")
+
+
+def _get_hspec_clean_store_on_start() -> str:
+    return os.getenv("HSPEC_CLEAN_STORE_ON_START", "0")
+
+
+def _get_hspec_clean_table_store_on_start() -> str:
+    return os.getenv("HSPEC_CLEAN_TABLE_STORE_ON_START", "0")
+
+
 def _actor_topology_error(
     message: str,
     *,
@@ -275,6 +294,11 @@ def _actor_topology_error(
             "ray_node_id": item.get("ray_node_id"),
             "table_store_root": item.get("table_store_root"),
             "table_store_base_root": item.get("table_store_base_root"),
+            "store_isolation_mode": item.get("store_isolation_mode"),
+            "run_uid": item.get("run_uid"),
+            "clean_store_on_start": item.get("clean_store_on_start"),
+            "clean_table_store_on_start": item.get("clean_table_store_on_start"),
+            "require_fresh_table_store": item.get("require_fresh_table_store"),
             "build_actor_num_cpus": item.get("build_actor_num_cpus"),
             "build_blas_threads": item.get("build_blas_threads"),
             "similarity_threshold": item.get("similarity_threshold"),
@@ -389,6 +413,61 @@ def _validate_actor_topologies(
             hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
             raise _actor_topology_error(
                 f"actor shard={shard_id} reports table_store_base_root={item.get('table_store_base_root')!r}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        actor_isolation_mode = str(item.get("store_isolation_mode", ""))
+        current_isolation_mode = str(get_hspec_store_isolation_mode())
+        if actor_isolation_mode != current_isolation_mode:
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports store_isolation_mode={actor_isolation_mode!r}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        actor_run_uid = str(item.get("run_uid", ""))
+        current_run_uid = str(_get_hspec_run_uid())
+        actor_requires_fresh = bool(item.get("require_fresh_table_store", False))
+        current_requires_fresh = bool(hspec_require_fresh_table_store_enabled())
+        clean_reuse_sensitive = (
+            current_isolation_mode in {"clean", "unique"}
+            or current_requires_fresh
+            or _get_hspec_clean_store_on_start() != "0"
+            or _get_hspec_clean_table_store_on_start() != "0"
+        )
+        if clean_reuse_sensitive and actor_run_uid != current_run_uid:
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                f"actor shard={shard_id} reports run_uid={actor_run_uid!r}, expected {current_run_uid!r}",
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if actor_requires_fresh != current_requires_fresh:
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                "actor shard=%s reports require_fresh_table_store=%s"
+                % (shard_id, actor_requires_fresh),
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if str(item.get("clean_table_store_on_start", "0")) != _get_hspec_clean_table_store_on_start():
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                "actor shard=%s reports clean_table_store_on_start=%r"
+                % (shard_id, item.get("clean_table_store_on_start")),
+                topologies=topologies,
+                expected_num_groups=expected_num_groups,
+                expected_node_id=expected_node_id,
+            )
+        if str(item.get("clean_store_on_start", "0")) != _get_hspec_clean_store_on_start():
+            hspec_record_store_metric("topology_actor_reuse_mismatch", 1)
+            raise _actor_topology_error(
+                "actor shard=%s reports clean_store_on_start=%r"
+                % (shard_id, item.get("clean_store_on_start")),
                 topologies=topologies,
                 expected_num_groups=expected_num_groups,
                 expected_node_id=expected_node_id,
@@ -919,6 +998,9 @@ class HSpecTableGroup:
             "table_store_root": str(self.table_store_root),
             "table_store_base_root": str(get_hspec_table_store_root()),
             "store_isolation_mode": str(get_hspec_store_isolation_mode()),
+            "run_uid": str(_get_hspec_run_uid()),
+            "clean_store_on_start": str(_get_hspec_clean_store_on_start()),
+            "clean_table_store_on_start": str(_get_hspec_clean_table_store_on_start()),
             "require_fresh_table_store": bool(
                 hspec_require_fresh_table_store_enabled()),
             "hspec_store_root": str(get_hspec_store_root()),
@@ -2260,6 +2342,8 @@ class HSpecTableGroup:
         actor_store_metrics = collect_hspec_store_metrics(reset=True)
         for key in _TABLE_STORE_ADDITIVE_METRIC_KEYS:
             metrics[key] = float(actor_store_metrics.get(key, 0))
+        for key in _ACTOR_DRIVER_ADDITIVE_METRIC_KEYS:
+            metrics[key] = float(actor_store_metrics.get(key, 0))
         for key in _TABLE_STORE_MAX_METRIC_KEYS:
             metrics[key] = float(actor_store_metrics.get(key, 0))
         return metrics
@@ -3324,6 +3408,10 @@ class GlobalHSpecTableGroup:
             result[f"hspec/{key}"] = float(driver_store_metrics.get(key, 0))
         for key in _TABLE_STORE_ADDITIVE_METRIC_KEYS | _TABLE_STORE_MAX_METRIC_KEYS:
             result[f"hspec/{key}"] = float(agg.get(key, 0))
+        for key in _ACTOR_DRIVER_ADDITIVE_METRIC_KEYS:
+            actor_value = float(agg.get(key, 0))
+            driver_value = float(driver_store_metrics.get(key, 0))
+            result[f"hspec/{key}"] = actor_value + driver_value
         result["hspec/proposer_prefetch_descriptor_payload_count"] = float(
             agg.get("proposer_prefetch_descriptor_payload_count", 0))
         result["hspec/proposer_prefetch_legacy_payload_count"] = float(

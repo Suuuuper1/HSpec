@@ -23,6 +23,10 @@ hspec_configure_store_lifecycle() {
         export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_store/${HSPEC_RUN_NAME}/${HSPEC_RUN_UID}}"
         export HSPEC_TABLE_STORE_DIR="${HSPEC_TABLE_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_table_store/${HSPEC_RUN_NAME}/${HSPEC_RUN_UID}}"
         export HSPEC_BUILD_ACTOR_NAME_PREFIX="${HSPEC_BUILD_ACTOR_NAME_PREFIX:-hspec_build_${HSPEC_RUN_NAME}_${HSPEC_RUN_UID}}"
+    elif [ "${HSPEC_STORE_ISOLATION_MODE}" = "clean" ]; then
+        export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_store/${HSPEC_RUN_NAME}}"
+        export HSPEC_TABLE_STORE_DIR="${HSPEC_TABLE_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_table_store/${HSPEC_RUN_NAME}}"
+        export HSPEC_BUILD_ACTOR_NAME_PREFIX="${HSPEC_BUILD_ACTOR_NAME_PREFIX:-hspec_build_${HSPEC_RUN_NAME}_${HSPEC_RUN_UID}}"
     else
         export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_store/${HSPEC_RUN_NAME}}"
         export HSPEC_TABLE_STORE_DIR="${HSPEC_TABLE_STORE_DIR:-${PROJECT_ROOT}/outputs/hspec_table_store/${HSPEC_RUN_NAME}}"
