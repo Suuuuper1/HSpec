@@ -454,6 +454,10 @@ class HSpecProposer(Proposer):
         self._cache_version: int = -1
         self._max_cache_size: int = 512
         self._cache_generation: int = 0
+        self._hot_path_strict: bool = (
+            os.environ.get("HSPEC_PROPOSER_HOT_PATH_STRICT", "1") != "0"
+        )
+        self._in_generate_token_ids: bool = False
 
         # Async prefetch state (never blocking in hot loop)
         # Each entry: (ray.ObjectRef, [prompt_ids]) where the future
@@ -552,7 +556,7 @@ class HSpecProposer(Proposer):
         logger.info(
             "HSpec proposer initialised: threshold=%.3f, max_draft=%d, cache_cap=%d, "
             "fully_batched_match=1, numba_rebuild=%s, entry_blend_horizon=%d, entry_bias_cap=%d, "
-            "abs_delta_cap=%s safe<=%d mid<=%d mid_cap=%d far_cap=%d",
+            "abs_delta_cap=%s safe<=%d mid<=%d mid_cap=%d far_cap=%d hot_path_strict=%s",
             self.similarity_threshold,
             self.max_draft_tokens,
             self._max_cache_size,
@@ -564,6 +568,7 @@ class HSpecProposer(Proposer):
             int(self._abs_delta_mid_threshold),
             int(self._abs_delta_mid_cap),
             int(self._abs_delta_far_cap),
+            str(bool(self._hot_path_strict)),
         )
 
         if self._use_numba_rebuild:
@@ -1027,6 +1032,19 @@ class HSpecProposer(Proposer):
         except Exception:
             pass
 
+    def _guard_no_hot_path_materialize(self, operation: str) -> bool:
+        if not getattr(self, "_in_generate_token_ids", False):
+            return True
+        self._record_proposer_metric("hot_path_violation_count", 1)
+        message = (
+            "HSpec hot path attempted descriptor materialization or table H2D: "
+            f"{operation}"
+        )
+        if getattr(self, "_hot_path_strict", True):
+            raise RuntimeError(message)
+        logger.debug(message)
+        return False
+
     @staticmethod
     def _build_rollout_entry_spans(
         entry_rollout_idx: np.ndarray,
@@ -1052,8 +1070,8 @@ class HSpecProposer(Proposer):
     def _clamp_wnd_size(wnd_size: int, min_wnd: int, max_wnd: int) -> int:
         return max(int(min_wnd), min(int(wnd_size), int(max_wnd)))
 
-    @staticmethod
-    def _copy_table_array_from_desc(array_desc, dtype) -> np.ndarray:
+    def _copy_table_array_from_desc(self, array_desc, dtype) -> np.ndarray:
+        self._guard_no_hot_path_materialize("copy_table_array_from_desc")
         mmap_arr = open_array(array_desc, mode="r")
         try:
             return np.ascontiguousarray(
@@ -1165,6 +1183,7 @@ class HSpecProposer(Proposer):
         if int(entry_rollout_idx.min()) < 0 or int(entry_rollout_idx.max()) >= len(rollout_seqs):
             raise ValueError("HSpec cached table entry_rollout_idx out of bounds")
 
+        self._guard_no_hot_path_materialize("finalize_cached_table_h2d")
         t0_h2d = _now_ns()
         mean = torch.from_numpy(mean_np).to(self.device, non_blocking=True)
         components = torch.from_numpy(components_np).to(self.device, non_blocking=True)
@@ -1233,6 +1252,8 @@ class HSpecProposer(Proposer):
         prompt_id: Optional[str] = None,
     ) -> _CachedPromptTable:
         """Build a worker-local cache from mmap table descriptors."""
+        self._guard_no_hot_path_materialize(
+            "build_cached_table_from_descriptor")
         if prompt_id and str(desc.prompt_id) != str(prompt_id):
             raise ValueError(
                 f"HSpec descriptor prompt mismatch: desc={desc.prompt_id!r} "
@@ -1336,6 +1357,7 @@ class HSpecProposer(Proposer):
         prompt_id: Optional[str] = None,
     ) -> _CachedPromptTable:
         """Convert serialised table data dict → on-device cached table."""
+        self._guard_no_hot_path_materialize("build_cached_table_legacy")
         # NOTE: Ray may deserialize numpy arrays as non-writable (read-only)
         # views; torch.from_numpy warns about undefined behaviour on write.
         # These tensors are read-only in our usage, but we still copy here to
@@ -1562,6 +1584,34 @@ class HSpecProposer(Proposer):
     # main interface
     
     def generate_token_ids(
+        self,
+        valid_sampled_token_ids: List[List[int]],
+        sampling_metadata: SamplingMetadata = None,
+        scheduler_output: SchedulerOutput = None,
+        spec_decode_metadata: SpecDecodeMetadata = None,
+        positions: torch.Tensor = None,
+        num_scheduled_tokens: int = 0,
+        hidden_states: torch.Tensor = None,
+        attn_metadata=None,
+        aux_hidden_states: torch.Tensor = None,
+    ) -> List[List[int]]:
+        self._in_generate_token_ids = True
+        try:
+            return self._generate_token_ids_impl(
+                valid_sampled_token_ids=valid_sampled_token_ids,
+                sampling_metadata=sampling_metadata,
+                scheduler_output=scheduler_output,
+                spec_decode_metadata=spec_decode_metadata,
+                positions=positions,
+                num_scheduled_tokens=num_scheduled_tokens,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                aux_hidden_states=aux_hidden_states,
+            )
+        finally:
+            self._in_generate_token_ids = False
+
+    def _generate_token_ids_impl(
         self,
         valid_sampled_token_ids: List[List[int]],
         sampling_metadata: SamplingMetadata = None,

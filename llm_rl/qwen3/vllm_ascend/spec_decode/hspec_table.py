@@ -107,7 +107,10 @@ _TABLE_STORE_ADDITIVE_METRIC_KEYS = frozenset({
     "table_store_gc_delete_error",
     "table_store_active_manifest_clear_error",
     "table_prefetch_descriptor_count",
+    "table_prefetch_descriptor_miss_legacy_active",
     "table_prefetch_legacy_array_count",
+    "table_prefetch_legacy_blocked_count",
+    "zmq_query_disabled_count",
 })
 _TABLE_STORE_MAX_METRIC_KEYS = frozenset({
     "table_store_version",
@@ -276,6 +279,31 @@ def _get_hspec_clean_store_on_start() -> str:
 
 def _get_hspec_clean_table_store_on_start() -> str:
     return os.getenv("HSPEC_CLEAN_TABLE_STORE_ON_START", "0")
+
+
+def hspec_allow_legacy_table_prefetch_enabled() -> bool:
+    return os.getenv("HSPEC_ALLOW_LEGACY_TABLE_PREFETCH", "0") != "0"
+
+
+def hspec_zmq_query_enabled() -> bool:
+    return os.getenv("HSPEC_ENABLE_ZMQ_QUERY", "0") != "0"
+
+
+def _ensure_legacy_table_prefetch_allowed(context: str) -> bool:
+    if hspec_allow_legacy_table_prefetch_enabled():
+        return True
+    hspec_record_store_metric("table_prefetch_legacy_blocked_count", 1)
+    message = (
+        "HSpec legacy table array prefetch is disabled by default in Phase 3. "
+        "Set HSPEC_ALLOW_LEGACY_TABLE_PREFETCH=1 together with "
+        "HSPEC_TABLE_PREFETCH_MODE=legacy_arrays only for explicit debug/A-B. "
+        f"context={context}"
+    )
+    if hspec_strict_descriptor_mode_enabled():
+        hspec_record_store_metric("strict_descriptor_violation", 1)
+        raise RuntimeError(message)
+    logger.warning(message)
+    return False
 
 
 def _actor_topology_error(
@@ -928,6 +956,7 @@ class HSpecTableGroup:
         self._proposer_descriptor_h2d_submit_ms = 0.0
         self._proposer_descriptor_bytes = 0
         self._proposer_descriptor_entries = 0
+        self._proposer_hot_path_violation_count = 0
 
         # ZMQ state
         self.running = False
@@ -1958,7 +1987,11 @@ class HSpecTableGroup:
 
         table = self._active[prompt_id]
         if isinstance(table, HSpecPromptTableDesc):
+            if not _ensure_legacy_table_prefetch_allowed(
+                    "HSpecTableGroup.query_descriptor_materialize"):
+                return []
             try:
+                hspec_record_store_metric("table_prefetch_legacy_array_count", 1)
                 data = materialize_prompt_table(table)
                 pca_params = PromptPCAParams(
                     prompt_id=prompt_id,
@@ -2051,6 +2084,9 @@ class HSpecTableGroup:
 
     def get_prompt_table_data(self, prompt_id: str):
         """Return serialisable dict with full table data for proposer cache."""
+        if not _ensure_legacy_table_prefetch_allowed(
+                "HSpecTableGroup.get_prompt_table_data"):
+            return None
         if prompt_id not in self._active:
             return None
         table = self._active[prompt_id]
@@ -2225,6 +2261,9 @@ class HSpecTableGroup:
                 result[pid] = table
                 hit_count += 1
             else:
+                if table is not None:
+                    hspec_record_store_metric(
+                        "table_prefetch_descriptor_miss_legacy_active", 1)
                 result[pid] = None
         hspec_record_store_metric("table_prefetch_descriptor_count", hit_count)
         return (self._active_version, result)
@@ -2238,14 +2277,18 @@ class HSpecTableGroup:
         Descriptor mode must call ``get_active_table_desc_batch()`` to avoid
         Ray object-store table arrays.
         """
+        if not _ensure_legacy_table_prefetch_allowed(
+                "HSpecTableGroup.get_active_table_data_batch"):
+            return (self._active_version,
+                    {str(pid): None for pid in prompt_ids})
         result: Dict[str, Optional[Dict[str, Any]]] = {}
         for pid in prompt_ids:
             if pid not in self._active:
                 result[pid] = None
                 continue
             table = self._active[pid]
+            hspec_record_store_metric("table_prefetch_legacy_array_count", 1)
             if isinstance(table, HSpecPromptTableDesc):
-                hspec_record_store_metric("table_prefetch_legacy_array_count", 1)
                 result[pid] = materialize_prompt_table(table)
                 continue
             result[pid] = {
@@ -2332,6 +2375,7 @@ class HSpecTableGroup:
             "proposer_descriptor_h2d_submit_ms": self._proposer_descriptor_h2d_submit_ms,
             "proposer_descriptor_bytes": self._proposer_descriptor_bytes,
             "proposer_descriptor_entries": self._proposer_descriptor_entries,
+            "proposer_hot_path_violation_count": self._proposer_hot_path_violation_count,
         }
         for abs_delta, count in self._entry_abs_delta_verify.items():
             metrics[f"entry_abs_delta_verify_{abs_delta}"] = float(count)
@@ -2415,6 +2459,7 @@ class HSpecTableGroup:
         self._proposer_descriptor_h2d_submit_ms = 0.0
         self._proposer_descriptor_bytes = 0
         self._proposer_descriptor_entries = 0
+        self._proposer_hot_path_violation_count = 0
 
     # Online metrics reporting (from worker-local proposer)
 
@@ -2517,6 +2562,7 @@ class HSpecTableGroup:
             "descriptor_h2d_submit_ms": "_proposer_descriptor_h2d_submit_ms",
             "descriptor_bytes": "_proposer_descriptor_bytes",
             "descriptor_entries": "_proposer_descriptor_entries",
+            "hot_path_violation_count": "_proposer_hot_path_violation_count",
         }
         try:
             for key, attr in additive_map.items():
@@ -2643,6 +2689,10 @@ class HSpecTableGroup:
 
     def run(self):
         """Run blocking ZMQ REP server (call via ``actor.run.remote()``)."""
+        if not hspec_zmq_query_enabled():
+            hspec_record_store_metric("zmq_query_disabled_count", 1)
+            logger.info("HSpecTableGroup ZMQ server disabled by HSPEC_ENABLE_ZMQ_QUERY=0")
+            return
         ctx = zmq.Context()
         sock = ctx.socket(zmq.REP)
         sock.bind(f"tcp://*:{self.port}")
@@ -3083,6 +3133,12 @@ class GlobalHSpecTableGroup:
         projects them internally via PCA.  Step 2 will optimise this by
         sending pre-projected K-dim vectors from on-device cache.
         """
+        if not hspec_zmq_query_enabled():
+            hspec_record_store_metric("zmq_query_disabled_count", 1)
+            raise RuntimeError(
+                "HSpec ZMQ query path is disabled by default in Phase 3. "
+                "Set HSPEC_ENABLE_ZMQ_QUERY=1 only for explicit debug."
+            )
         self._ensure_zmq()
 
         parts: Dict[int, Dict[str, list]] = {
@@ -3164,6 +3220,9 @@ class GlobalHSpecTableGroup:
         from collections import defaultdict
 
         mode = get_hspec_table_prefetch_mode()
+        if mode == "legacy_arrays" and not _ensure_legacy_table_prefetch_allowed(
+                "GlobalHSpecTableGroup.prefetch_batch"):
+            mode = "descriptor"
         partition_prompts: Dict[int, List[str]] = defaultdict(list)
         for pid in prompt_ids:
             partition_prompts[self._get_partition_id(pid)].append(pid)
@@ -3195,6 +3254,9 @@ class GlobalHSpecTableGroup:
         from collections import defaultdict
 
         mode = get_hspec_table_prefetch_mode()
+        if mode == "legacy_arrays" and not _ensure_legacy_table_prefetch_allowed(
+                "GlobalHSpecTableGroup.prefetch_batch_async"):
+            mode = "descriptor"
         partition_prompts: Dict[int, List[str]] = defaultdict(list)
         for pid in prompt_ids:
             partition_prompts[self._get_partition_id(pid)].append(pid)
@@ -3266,6 +3328,7 @@ class GlobalHSpecTableGroup:
                 "hspec/proposer_descriptor_bytes": 0,
                 "hspec/proposer_descriptor_mb": 0.0,
                 "hspec/proposer_descriptor_entries": 0,
+                "hspec/proposer_hot_path_violation_count": 0,
             }
         tasks = [g.compute_metrics.remote() for g in self.groups]
         metrics_list = ray.get(tasks)
@@ -3437,6 +3500,8 @@ class GlobalHSpecTableGroup:
         )
         result["hspec/proposer_descriptor_entries"] = float(
             agg.get("proposer_descriptor_entries", 0))
+        result["hspec/proposer_hot_path_violation_count"] = float(
+            agg.get("proposer_hot_path_violation_count", 0))
 
         abs_deltas = set()
         for key in agg:
@@ -3463,6 +3528,12 @@ class GlobalHSpecTableGroup:
     # ZMQ helpers
 
     def _ensure_zmq(self):
+        if not hspec_zmq_query_enabled():
+            hspec_record_store_metric("zmq_query_disabled_count", 1)
+            raise RuntimeError(
+                "HSpec ZMQ query path is disabled by default in Phase 3. "
+                "Set HSPEC_ENABLE_ZMQ_QUERY=1 only for explicit debug."
+            )
         if self._zmq_sockets:
             return
         self._zmq_ctx = zmq.Context()
@@ -3485,10 +3556,17 @@ class GlobalHSpecTableGroup:
 
     def run_server(self):
         """Start ZMQ servers on all actors (non-blocking futures)."""
+        if not hspec_zmq_query_enabled():
+            hspec_record_store_metric("zmq_query_disabled_count", 1)
+            logger.info("HSpec ZMQ servers are disabled by HSPEC_ENABLE_ZMQ_QUERY=0")
+            return []
         return [g.run.remote() for g in self.groups]
 
     def stop_server(self):
         """Send stop command to all ZMQ servers."""
+        if not hspec_zmq_query_enabled():
+            hspec_record_store_metric("zmq_query_disabled_count", 1)
+            return
         self._ensure_zmq()
         for sid in list(self._zmq_sockets):
             self._zmq_send(sid, {"method": "stop", "params": {}})

@@ -556,6 +556,58 @@ def materialize_prompt_table(desc_obj: HSpecPromptTableDesc | dict[str, Any]) ->
     return result
 
 
+def estimate_array_desc_nbytes(desc_obj: HSpecArrayDesc | dict[str, Any]) -> int:
+    """Estimate an mmap array's bytes from descriptor metadata only."""
+    desc = coerce_array_desc(desc_obj)
+    return _array_nbytes(tuple(desc.shape), np.dtype(desc.dtype))
+
+
+def iter_prompt_table_array_descs(desc_obj: HSpecPromptTableDesc | dict[str, Any]):
+    """Yield all array descriptors in a prompt table without opening mmap files."""
+    desc = coerce_prompt_table_desc(desc_obj)
+    yield "mean", desc.mean
+    yield "components", desc.components
+    yield "keys", desc.keys
+    yield "token_buffer", desc.token_buffer
+    yield "rollout_token_offset", desc.rollout_token_offset
+    yield "rollout_token_len", desc.rollout_token_len
+    yield "entry_rollout_idx", desc.entry_rollout_idx
+    yield "entry_offset", desc.entry_offset
+    if desc.rewards is not None:
+        yield "rewards", desc.rewards
+
+
+def estimate_prompt_table_desc_nbytes(
+    desc_obj: HSpecPromptTableDesc | dict[str, Any],
+) -> dict[str, int]:
+    """Estimate prompt table storage by category without touching files."""
+    desc = coerce_prompt_table_desc(desc_obj)
+    mean = estimate_array_desc_nbytes(desc.mean)
+    components = estimate_array_desc_nbytes(desc.components)
+    keys = estimate_array_desc_nbytes(desc.keys)
+    token_buffer = estimate_array_desc_nbytes(desc.token_buffer)
+    entry_arrays = (
+        estimate_array_desc_nbytes(desc.rollout_token_offset)
+        + estimate_array_desc_nbytes(desc.rollout_token_len)
+        + estimate_array_desc_nbytes(desc.entry_rollout_idx)
+        + estimate_array_desc_nbytes(desc.entry_offset)
+    )
+    rewards = (
+        estimate_array_desc_nbytes(desc.rewards)
+        if desc.rewards is not None else 0
+    )
+    total = mean + components + keys + token_buffer + entry_arrays + rewards
+    return {
+        "mean": mean,
+        "components": components,
+        "keys": keys,
+        "token_buffer": token_buffer,
+        "entry_arrays": entry_arrays,
+        "rewards": rewards,
+        "total": total,
+    }
+
+
 class HSpecTableStoreWriter:
     """Append-only writer skeleton for one shard/version table.bin."""
 

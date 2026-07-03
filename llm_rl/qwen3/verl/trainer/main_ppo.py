@@ -66,7 +66,11 @@ def run_ppo(config) -> None:
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
     if config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
-        from vllm_ascend.spec_decode.hspec_table import init_hspec_tables
+        from vllm_ascend.spec_decode.hspec_table import (
+            hspec_allow_legacy_table_prefetch_enabled,
+            hspec_zmq_query_enabled,
+            init_hspec_tables,
+        )
         from vllm_ascend.spec_decode.hspec_table_store import (
             get_hspec_pca_accum_dtype,
             get_hspec_pca_cov_max_bytes,
@@ -189,6 +193,9 @@ def run_ppo(config) -> None:
             f"table_keys_dtype={get_hspec_table_keys_dtype()}, "
             f"table_file_align_bytes={get_hspec_table_file_align_bytes()}, "
             f"table_prefetch_mode={get_hspec_table_prefetch_mode()}, "
+            f"allow_legacy_table_prefetch={hspec_allow_legacy_table_prefetch_enabled()}, "
+            f"enable_zmq_query={hspec_zmq_query_enabled()}, "
+            f"proposer_hot_path_strict={os.getenv('HSPEC_PROPOSER_HOT_PATH_STRICT', '1')}, "
             f"table_store_retain_versions={get_hspec_table_store_retain_versions()}, "
             f"table_store_gc_after_swap={hspec_table_store_gc_after_swap_enabled()}, "
             f"table_store_fsync_on_seal={hspec_table_store_fsync_on_seal_enabled()}, "
