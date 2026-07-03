@@ -105,6 +105,7 @@ _store_metrics: Dict[str, int] = {
     "table_store_reader_load_error": 0,
     "table_store_materialize_count": 0,
     "table_store_stale_version_error": 0,
+    "table_store_descriptor_path_mismatch": 0,
     "table_store_bytes_written": 0,
     "table_store_prompt_count": 0,
     "table_store_entry_count": 0,

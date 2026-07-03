@@ -96,6 +96,8 @@ _TABLE_STORE_ADDITIVE_METRIC_KEYS = frozenset({
     "table_store_reader_load_error",
     "table_store_materialize_count",
     "table_store_stale_version_error",
+    "table_store_descriptor_path_mismatch",
+    "strict_descriptor_violation",
     "table_store_bytes_written",
     "table_store_prompt_count",
     "table_store_entry_count",

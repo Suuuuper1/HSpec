@@ -36,6 +36,7 @@ from vllm_ascend.spec_decode.hspec_store import (
     get_hspec_table_store_root,
     hspec_record_store_metric,
     hspec_record_store_metric_max,
+    hspec_strict_descriptor_mode_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -345,14 +346,17 @@ class HSpecPromptTableDesc:
         for field in array_fields + (("rewards",) if self.rewards is not None else ()):
             arr = getattr(self, field)
             if arr is not None and str(Path(arr.path).resolve()) != table_file:
-                logger.warning(
+                hspec_record_store_metric("table_store_descriptor_path_mismatch", 1)
+                message = (
                     "HSpecPromptTableDesc array path differs from table_file: "
-                    "prompt_id=%s field=%s path=%s table_file=%s",
-                    self.prompt_id,
-                    field,
-                    arr.path,
-                    self.table_file,
+                    f"prompt_id={self.prompt_id!r} version={self.version} "
+                    f"shard_id={self.shard_id} field={field} "
+                    f"path={arr.path!r} table_file={self.table_file!r}"
                 )
+                if hspec_strict_descriptor_mode_enabled():
+                    hspec_record_store_metric("strict_descriptor_violation", 1)
+                    raise ValueError(message)
+                logger.warning(message)
 
     def to_dict(self) -> dict[str, Any]:
         return prompt_table_desc_to_dict(self)
