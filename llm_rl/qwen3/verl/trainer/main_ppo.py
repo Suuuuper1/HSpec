@@ -112,16 +112,16 @@ def run_ppo(config) -> None:
         unsafe_multi_node = os.getenv("HSPEC_EXPERIMENTAL_ALLOW_MULTI_NODE_UNSAFE", "0") != "0"
         if int(config.trainer.nnodes) != 1 and not unsafe_multi_node:
             raise RuntimeError(
-                "HSpec Phase 1 descriptor path supports single-node only. "
-                "Descriptor raw-store paths are node-local; multi-node requires node-local "
-                "build affinity, which is not implemented in Phase 1. For experiments only, "
+                "HSpec descriptor/raw-store/table-store path currently supports single-node only. "
+                "Descriptor raw-store and mmap table-store files are node-local; multi-node requires "
+                "node-local build actor routing, which is not implemented yet. For experiments only, "
                 "set HSPEC_EXPERIMENTAL_ALLOW_MULTI_NODE_UNSAFE=1."
             )
         if unsafe_multi_node:
             print(
                 "WARNING: HSPEC_EXPERIMENTAL_ALLOW_MULTI_NODE_UNSAFE=1 is set. "
-                "This only bypasses the startup guard. HSpec Phase 1 still does not "
-                "provide node-local build actor routing and must not be used for "
+                "This only bypasses the startup guard. HSpec descriptor-table-store path "
+                "still does not provide node-local build actor routing and must not be used for "
                 "production measurements."
             )
 
@@ -150,16 +150,18 @@ def run_ppo(config) -> None:
         if not hspec_single_node_only:
             print(
                 "WARNING: HSPEC_SINGLE_NODE_ONLY=0 disables descriptor node checks, "
-                "but Phase 1 still does not implement multi-node local-file build routing."
+                "but HSpec descriptor-table-store path still does not implement "
+                "multi-node local-file build routing."
             )
         print(
-            "HSpec Phase1 config: "
+            "HSpec descriptor/table-store config: "
             f"store_dtype={hspec_store_dtype}, "
             f"store_isolation_mode={get_hspec_store_isolation_mode()}, "
             f"run_uid={os.getenv('HSPEC_RUN_UID', '')}, "
             f"clean_store_on_start={os.getenv('HSPEC_CLEAN_STORE_ON_START', '0')}, "
             f"clean_raw_store_on_start={os.getenv('HSPEC_CLEAN_RAW_STORE_ON_START', '0')}, "
             f"clean_table_store_on_start={os.getenv('HSPEC_CLEAN_TABLE_STORE_ON_START', '0')}, "
+            f"allow_clean_outside_project={os.getenv('HSPEC_ALLOW_CLEAN_OUTSIDE_PROJECT', '0')}, "
             f"require_fresh_table_store={hspec_require_fresh_table_store_enabled()}, "
             f"store_dir={get_hspec_store_root()}, "
             f"table_store_dir={get_hspec_table_store_root()}, "
