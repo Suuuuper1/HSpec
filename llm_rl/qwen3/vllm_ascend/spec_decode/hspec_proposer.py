@@ -70,6 +70,23 @@ HSPEC_GEN_MAX_CALLS = int(os.getenv("HSPEC_GEN_MAX_CALLS", "0"))
 HSPEC_ADVAN_NGRAM = int(os.getenv("HSPEC_ADVAN_NGRAM", "3"))
 
 
+def _get_env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except Exception:
+        value = int(default)
+    return max(int(value), int(minimum))
+
+
+def _tensor_nbytes(tensor: Any) -> int:
+    if not isinstance(tensor, torch.Tensor):
+        return 0
+    try:
+        return int(tensor.numel()) * int(tensor.element_size())
+    except Exception:
+        return 0
+
+
 if _HSPEC_NUMBA_AVAILABLE:
 
     @njit(cache=True, parallel=True)
@@ -452,7 +469,22 @@ class HSpecProposer(Proposer):
         self._cache: OrderedDict[str, _CachedPromptTable] = OrderedDict()
         self._not_in_table: Set[str] = set()
         self._cache_version: int = -1
-        self._max_cache_size: int = 512
+        self._max_cache_size: int = _get_env_int(
+            "HSPEC_PROPOSER_CACHE_MAX_PROMPTS", 512, 0)
+        self._cache_max_cpu_bytes: int = _get_env_int(
+            "HSPEC_PROPOSER_CACHE_MAX_CPU_BYTES", 0, 0)
+        self._cache_max_npu_bytes: int = _get_env_int(
+            "HSPEC_PROPOSER_CACHE_MAX_NPU_BYTES", 0, 0)
+        self._cache_max_entries: int = _get_env_int(
+            "HSPEC_PROPOSER_CACHE_MAX_ENTRIES", 0, 0)
+        self._max_ready_prefetch_materialize: int = _get_env_int(
+            "HSPEC_MAX_READY_PREFETCH_MATERIALIZE", 0, 0)
+        self._max_ready_prefetch_bytes: int = _get_env_int(
+            "HSPEC_MAX_READY_PREFETCH_BYTES", 0, 0)
+        self._cache_cpu_bytes: int = 0
+        self._cache_npu_bytes: int = 0
+        self._cache_entries: int = 0
+        self._cache_prompt_bytes: Dict[str, tuple[int, int, int]] = {}
         self._cache_generation: int = 0
         self._hot_path_strict: bool = (
             os.environ.get("HSPEC_PROPOSER_HOT_PATH_STRICT", "1") != "0"
@@ -529,6 +561,7 @@ class HSpecProposer(Proposer):
         self._stat_accept_sum = 0
         self._stat_accept_count = 0
         self._proposer_metric_deltas = defaultdict(float)
+        self._proposer_metric_gauges: Dict[str, float] = {}
         self._last_log_t = time.time()
         self._log_every_calls = int(os.environ.get("HSPEC_LOG_EVERY_CALLS", "200"))
         self._log_every_s = float(os.environ.get("HSPEC_LOG_EVERY_S", "10"))
@@ -556,7 +589,9 @@ class HSpecProposer(Proposer):
         logger.info(
             "HSpec proposer initialised: threshold=%.3f, max_draft=%d, cache_cap=%d, "
             "fully_batched_match=1, numba_rebuild=%s, entry_blend_horizon=%d, entry_bias_cap=%d, "
-            "abs_delta_cap=%s safe<=%d mid<=%d mid_cap=%d far_cap=%d hot_path_strict=%s",
+            "abs_delta_cap=%s safe<=%d mid<=%d mid_cap=%d far_cap=%d hot_path_strict=%s "
+            "cache_max_cpu_bytes=%d cache_max_npu_bytes=%d cache_max_entries=%d "
+            "max_ready_prefetch_materialize=%d max_ready_prefetch_bytes=%d",
             self.similarity_threshold,
             self.max_draft_tokens,
             self._max_cache_size,
@@ -569,6 +604,11 @@ class HSpecProposer(Proposer):
             int(self._abs_delta_mid_cap),
             int(self._abs_delta_far_cap),
             str(bool(self._hot_path_strict)),
+            int(self._cache_max_cpu_bytes),
+            int(self._cache_max_npu_bytes),
+            int(self._cache_max_entries),
+            int(self._max_ready_prefetch_materialize),
+            int(self._max_ready_prefetch_bytes),
         )
 
         if self._use_numba_rebuild:
@@ -598,7 +638,8 @@ class HSpecProposer(Proposer):
         # Consume any futures that became ready since last call. This happens
         # before the model forward, so descriptor mmap/H2D work stays outside
         # the proposal hot path.
-        self._poll_pending(materialize_ready=True)
+        self._poll_pending(materialize_ready=True,
+                           priority_prompt_ids=prompt_ids)
         # Fire new async fetches for cache misses
         self._fire_prefetch_async(prompt_ids)
         self._maybe_report_metrics(force_proposer_metrics=True)
@@ -630,7 +671,8 @@ class HSpecProposer(Proposer):
         if not prompt_ids:
             return 0
 
-        self._poll_pending(materialize_ready=True)
+        self._poll_pending(materialize_ready=True,
+                           priority_prompt_ids=prompt_ids)
         for pid in set(prompt_ids):
             self._not_in_table.discard(pid)
         before = len(self._pending_pids)
@@ -649,7 +691,8 @@ class HSpecProposer(Proposer):
         if not prompt_ids:
             return 0
 
-        self._poll_pending(materialize_ready=True)
+        self._poll_pending(materialize_ready=True,
+                           priority_prompt_ids=prompt_ids)
         for pid in set(prompt_ids):
             self._not_in_table.discard(pid)
         before = len(self._pending_pids)
@@ -662,6 +705,7 @@ class HSpecProposer(Proposer):
         *,
         materialize_ready: bool = True,
         max_ready_refs: Optional[int] = None,
+        priority_prompt_ids: Optional[List[str]] = None,
     ) -> None:
         """Non-blocking: consume any ready prefetch futures.
 
@@ -680,11 +724,30 @@ class HSpecProposer(Proposer):
         ready_refs, _ = _ray.wait(all_futures, num_returns=len(all_futures), timeout=0)
         if not ready_refs:
             return
-        if max_ready_refs is not None and int(max_ready_refs) > 0:
-            ready_refs = ready_refs[:int(max_ready_refs)]
-        ready_set = set(ready_refs)
+        ready_set_all = set(ready_refs)
+        priority_set = {str(pid) for pid in (priority_prompt_ids or []) if pid}
+        ready_entries = [
+            (idx, future, pids)
+            for idx, (future, pids) in enumerate(self._pending_fetches)
+            if future in ready_set_all
+        ]
+        ready_entries.sort(
+            key=lambda item: (
+                0 if priority_set.intersection(str(pid) for pid in item[2]) else 1,
+                item[0],
+            )
+        )
+        ref_budget = int(max_ready_refs or self._max_ready_prefetch_materialize)
+        if ref_budget > 0 and len(ready_entries) > ref_budget:
+            self._record_proposer_metric(
+                "prefetch_ready_ref_throttle_count",
+                len(ready_entries) - ref_budget,
+            )
+            ready_entries = ready_entries[:ref_budget]
+        ready_set = {future for _, future, _ in ready_entries}
 
         version_bumped = False
+        materialized_bytes_this_call = 0
         still_pending: List[tuple] = []
         for future, pids in self._pending_fetches:
             if future not in ready_set:
@@ -692,6 +755,7 @@ class HSpecProposer(Proposer):
                 continue
 
             # Consume this ready future
+            deferred_pids: List[str] = []
             try:
                 version, table_data = _ray.get(future)
                 self._stat_prefetch_ready += 1
@@ -702,7 +766,7 @@ class HSpecProposer(Proposer):
                 else:
                     if version > self._cache_version:
                         # Epoch swap detected → invalidate old cache
-                        self._cache.clear()
+                        self._clear_prompt_cache()
                         self._not_in_table.clear()
                         self._cache_version = version
                         version_bumped = True
@@ -715,6 +779,15 @@ class HSpecProposer(Proposer):
                             self._not_in_table.add(pid)
                             self._record_proposer_metric("prefetch_absent_payload_count", 1)
                             cache_mutated = True
+                            continue
+                        estimated_bytes = self._estimate_pending_payload_bytes(data)
+                        if (self._max_ready_prefetch_bytes > 0
+                                and materialized_bytes_this_call > 0
+                                and materialized_bytes_this_call + estimated_bytes
+                                > self._max_ready_prefetch_bytes):
+                            deferred_pids.append(pid)
+                            self._record_proposer_metric(
+                                "prefetch_ready_bytes_throttle_count", 1)
                             continue
                         try:
                             if isinstance(data, HSpecPromptTableDesc):
@@ -740,8 +813,11 @@ class HSpecProposer(Proposer):
                                 raise TypeError(
                                     f"Unsupported HSpec prefetch payload type: {type(data)!r}"
                                 )
-                            self._cache[pid] = cached
-                            self._cache.move_to_end(pid)
+                            materialized_bytes_this_call += int(estimated_bytes)
+                            if self._admit_cached_table(pid, cached):
+                                self._not_in_table.discard(pid)
+                            else:
+                                self._not_in_table.add(pid)
                             cache_mutated = True
                         except Exception:
                             self._record_proposer_metric("cache_build_error_count", 1)
@@ -752,6 +828,8 @@ class HSpecProposer(Proposer):
                             )
                             self._not_in_table.add(pid)
                             cache_mutated = True
+                    if deferred_pids:
+                        still_pending.append((future, deferred_pids))
             except Exception:
                 # On error mark prompts as absent to avoid infinite retry
                 self._record_proposer_metric("cache_build_error_count", len(pids))
@@ -762,6 +840,8 @@ class HSpecProposer(Proposer):
             # Remove consumed pids from pending set
             for pid in pids:
                 self._pending_pids.discard(pid)
+            for pid in deferred_pids:
+                self._pending_pids.add(pid)
 
         self._pending_fetches = still_pending
 
@@ -771,11 +851,6 @@ class HSpecProposer(Proposer):
         if version_bumped and self._pending_fetches:
             self._pending_fetches = []
             self._pending_pids.clear()
-
-        # LRU eviction
-        while len(self._cache) > self._max_cache_size:
-            self._cache.popitem(last=False)
-            cache_mutated = True
 
         if cache_mutated:
             self._cache_generation += 1
@@ -949,6 +1024,7 @@ class HSpecProposer(Proposer):
     def _maybe_report_metrics(self, force_proposer_metrics: bool = False) -> None:
         """Non-blocking metrics reporting (fire-and-forget Ray RPC)."""
         proposer_metrics = dict(getattr(self, "_proposer_metric_deltas", {}))
+        proposer_metrics.update(getattr(self, "_proposer_metric_gauges", {}))
         has_proposer_metrics = bool(proposer_metrics)
         if (
             not force_proposer_metrics
@@ -1031,6 +1107,189 @@ class HSpecProposer(Proposer):
             self._proposer_metric_deltas[str(key)] += float(value)
         except Exception:
             pass
+
+    def _record_proposer_gauge(self, key: str, value: float) -> None:
+        try:
+            self._proposer_metric_gauges[str(key)] = float(value)
+        except Exception:
+            pass
+
+    def _update_cache_live_gauges(self) -> None:
+        self._record_proposer_gauge("cache_live_cpu_bytes",
+                                    float(self._cache_cpu_bytes))
+        self._record_proposer_gauge("cache_live_npu_bytes",
+                                    float(self._cache_npu_bytes))
+        self._record_proposer_gauge("cache_live_entries",
+                                    float(self._cache_entries))
+        self._record_proposer_gauge("cache_live_prompts",
+                                    float(len(self._cache)))
+
+    def _estimate_cached_table_bytes(
+        self,
+        cached: _CachedPromptTable,
+    ) -> tuple[int, int, int]:
+        cpu_bytes = 0
+        seen_arrays: Set[int] = set()
+
+        def add_array(arr: Any) -> None:
+            nonlocal cpu_bytes
+            if not isinstance(arr, np.ndarray):
+                return
+            arr_id = id(arr)
+            if arr_id in seen_arrays:
+                return
+            seen_arrays.add(arr_id)
+            try:
+                cpu_bytes += int(arr.nbytes)
+            except Exception:
+                pass
+
+        for arr in (
+            cached.mean_cpu,
+            cached.components_t_cpu,
+            cached.keys_cpu,
+            cached.entry_rollout_idx,
+            cached.entry_offset,
+            cached.draft_prefix_tokens,
+            cached.draft_prefix_lens,
+            cached.rollout_entry_starts,
+            cached.rollout_entry_lens,
+            cached.entry_bias,
+            cached.entry_hits,
+        ):
+            add_array(arr)
+        for seq in cached.rollout_seqs:
+            add_array(seq)
+
+        npu_bytes = (
+            _tensor_nbytes(cached.mean)
+            + _tensor_nbytes(cached.components)
+            + _tensor_nbytes(cached.keys)
+        )
+        entries = int(cached.n_entries)
+        return int(cpu_bytes), int(npu_bytes), entries
+
+    def _estimate_pending_payload_bytes(self, data: Any) -> int:
+        if isinstance(data, HSpecPromptTableDesc):
+            try:
+                return (
+                    int(data.mean.nbytes)
+                    + int(data.components.nbytes)
+                    + int(data.keys.nbytes)
+                    + int(data.token_buffer.nbytes)
+                    + int(data.rollout_token_offset.nbytes)
+                    + int(data.rollout_token_len.nbytes)
+                    + int(data.entry_rollout_idx.nbytes)
+                    + int(data.entry_offset.nbytes)
+                    + (int(data.rewards.nbytes) if data.rewards is not None else 0)
+                )
+            except Exception:
+                return 0
+        if isinstance(data, dict):
+            total = 0
+            for value in data.values():
+                if isinstance(value, np.ndarray):
+                    total += int(value.nbytes)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, np.ndarray):
+                            total += int(item.nbytes)
+            return int(total)
+        return 0
+
+    def _remove_cached_prompt(
+        self,
+        pid: str,
+        *,
+        record_eviction: bool,
+    ) -> bool:
+        cached = self._cache.pop(pid, None)
+        if cached is None:
+            self._cache_prompt_bytes.pop(pid, None)
+            return False
+        cpu_bytes, npu_bytes, entries = self._cache_prompt_bytes.pop(
+            pid, self._estimate_cached_table_bytes(cached))
+        self._cache_cpu_bytes = max(0, int(self._cache_cpu_bytes) - int(cpu_bytes))
+        self._cache_npu_bytes = max(0, int(self._cache_npu_bytes) - int(npu_bytes))
+        self._cache_entries = max(0, int(self._cache_entries) - int(entries))
+        if record_eviction:
+            self._record_proposer_metric("cache_eviction_count", 1)
+            self._record_proposer_metric("cache_eviction_cpu_bytes", cpu_bytes)
+            self._record_proposer_metric("cache_eviction_npu_bytes", npu_bytes)
+            self._record_proposer_metric("cache_eviction_entries", entries)
+        self._update_cache_live_gauges()
+        return True
+
+    def _clear_prompt_cache(self) -> None:
+        self._cache.clear()
+        self._cache_prompt_bytes.clear()
+        self._cache_cpu_bytes = 0
+        self._cache_npu_bytes = 0
+        self._cache_entries = 0
+        self._batched_table_cache = None
+        self._update_cache_live_gauges()
+
+    def _cache_fits_after_add(
+        self,
+        cpu_bytes: int,
+        npu_bytes: int,
+        entries: int,
+    ) -> bool:
+        if self._max_cache_size > 0 and len(self._cache) + 1 > self._max_cache_size:
+            return False
+        if (self._cache_max_cpu_bytes > 0
+                and self._cache_cpu_bytes + int(cpu_bytes) > self._cache_max_cpu_bytes):
+            return False
+        if (self._cache_max_npu_bytes > 0
+                and self._cache_npu_bytes + int(npu_bytes) > self._cache_max_npu_bytes):
+            return False
+        if (self._cache_max_entries > 0
+                and self._cache_entries + int(entries) > self._cache_max_entries):
+            return False
+        return True
+
+    def _admit_cached_table(self, pid: str, cached: _CachedPromptTable) -> bool:
+        cpu_bytes, npu_bytes, entries = self._estimate_cached_table_bytes(cached)
+        oversize = (
+            (self._cache_max_cpu_bytes > 0 and cpu_bytes > self._cache_max_cpu_bytes)
+            or (self._cache_max_npu_bytes > 0 and npu_bytes > self._cache_max_npu_bytes)
+            or (self._cache_max_entries > 0 and entries > self._cache_max_entries)
+        )
+        if oversize:
+            self._record_proposer_metric("cache_budget_skip_count", 1)
+            self._record_proposer_metric("cache_oversize_skip_count", 1)
+            self._record_proposer_metric("cache_oversize_cpu_bytes", cpu_bytes)
+            self._record_proposer_metric("cache_oversize_npu_bytes", npu_bytes)
+            self._record_proposer_metric("cache_oversize_entries", entries)
+            self._update_cache_live_gauges()
+            return False
+
+        if pid in self._cache:
+            self._remove_cached_prompt(pid, record_eviction=False)
+
+        while self._cache and not self._cache_fits_after_add(
+                cpu_bytes, npu_bytes, entries):
+            old_pid = next(iter(self._cache))
+            self._remove_cached_prompt(old_pid, record_eviction=True)
+
+        if not self._cache_fits_after_add(cpu_bytes, npu_bytes, entries):
+            self._record_proposer_metric("cache_budget_skip_count", 1)
+            self._update_cache_live_gauges()
+            return False
+
+        self._cache[pid] = cached
+        self._cache.move_to_end(pid)
+        self._cache_prompt_bytes[pid] = (
+            int(cpu_bytes), int(npu_bytes), int(entries))
+        self._cache_cpu_bytes += int(cpu_bytes)
+        self._cache_npu_bytes += int(npu_bytes)
+        self._cache_entries += int(entries)
+        self._record_proposer_metric("cache_admit_count", 1)
+        self._record_proposer_metric("cache_admit_cpu_bytes", cpu_bytes)
+        self._record_proposer_metric("cache_admit_npu_bytes", npu_bytes)
+        self._record_proposer_metric("cache_admit_entries", entries)
+        self._update_cache_live_gauges()
+        return True
 
     def _guard_no_hot_path_materialize(self, operation: str) -> bool:
         if not getattr(self, "_in_generate_token_ids", False):

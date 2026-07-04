@@ -957,6 +957,26 @@ class HSpecTableGroup:
         self._proposer_descriptor_bytes = 0
         self._proposer_descriptor_entries = 0
         self._proposer_hot_path_violation_count = 0
+        self._proposer_cache_live_cpu_bytes = 0
+        self._proposer_cache_live_npu_bytes = 0
+        self._proposer_cache_live_entries = 0
+        self._proposer_cache_live_prompts = 0
+        self._proposer_cache_admit_count = 0
+        self._proposer_cache_admit_cpu_bytes = 0
+        self._proposer_cache_admit_npu_bytes = 0
+        self._proposer_cache_admit_entries = 0
+        self._proposer_cache_eviction_count = 0
+        self._proposer_cache_eviction_cpu_bytes = 0
+        self._proposer_cache_eviction_npu_bytes = 0
+        self._proposer_cache_eviction_entries = 0
+        self._proposer_cache_budget_skip_count = 0
+        self._proposer_cache_oversize_skip_count = 0
+        self._proposer_cache_oversize_cpu_bytes = 0
+        self._proposer_cache_oversize_npu_bytes = 0
+        self._proposer_cache_oversize_entries = 0
+        self._proposer_prefetch_ready_ref_throttle_count = 0
+        self._proposer_prefetch_ready_bytes_throttle_count = 0
+        self._proposer_prefetch_ready_bytes_oversize_pass_count = 0
 
         # ZMQ state
         self.running = False
@@ -2376,6 +2396,26 @@ class HSpecTableGroup:
             "proposer_descriptor_bytes": self._proposer_descriptor_bytes,
             "proposer_descriptor_entries": self._proposer_descriptor_entries,
             "proposer_hot_path_violation_count": self._proposer_hot_path_violation_count,
+            "proposer_cache_live_cpu_bytes": self._proposer_cache_live_cpu_bytes,
+            "proposer_cache_live_npu_bytes": self._proposer_cache_live_npu_bytes,
+            "proposer_cache_live_entries": self._proposer_cache_live_entries,
+            "proposer_cache_live_prompts": self._proposer_cache_live_prompts,
+            "proposer_cache_admit_count": self._proposer_cache_admit_count,
+            "proposer_cache_admit_cpu_bytes": self._proposer_cache_admit_cpu_bytes,
+            "proposer_cache_admit_npu_bytes": self._proposer_cache_admit_npu_bytes,
+            "proposer_cache_admit_entries": self._proposer_cache_admit_entries,
+            "proposer_cache_eviction_count": self._proposer_cache_eviction_count,
+            "proposer_cache_eviction_cpu_bytes": self._proposer_cache_eviction_cpu_bytes,
+            "proposer_cache_eviction_npu_bytes": self._proposer_cache_eviction_npu_bytes,
+            "proposer_cache_eviction_entries": self._proposer_cache_eviction_entries,
+            "proposer_cache_budget_skip_count": self._proposer_cache_budget_skip_count,
+            "proposer_cache_oversize_skip_count": self._proposer_cache_oversize_skip_count,
+            "proposer_cache_oversize_cpu_bytes": self._proposer_cache_oversize_cpu_bytes,
+            "proposer_cache_oversize_npu_bytes": self._proposer_cache_oversize_npu_bytes,
+            "proposer_cache_oversize_entries": self._proposer_cache_oversize_entries,
+            "proposer_prefetch_ready_ref_throttle_count": self._proposer_prefetch_ready_ref_throttle_count,
+            "proposer_prefetch_ready_bytes_throttle_count": self._proposer_prefetch_ready_bytes_throttle_count,
+            "proposer_prefetch_ready_bytes_oversize_pass_count": self._proposer_prefetch_ready_bytes_oversize_pass_count,
         }
         for abs_delta, count in self._entry_abs_delta_verify.items():
             metrics[f"entry_abs_delta_verify_{abs_delta}"] = float(count)
@@ -2460,6 +2500,26 @@ class HSpecTableGroup:
         self._proposer_descriptor_bytes = 0
         self._proposer_descriptor_entries = 0
         self._proposer_hot_path_violation_count = 0
+        self._proposer_cache_live_cpu_bytes = 0
+        self._proposer_cache_live_npu_bytes = 0
+        self._proposer_cache_live_entries = 0
+        self._proposer_cache_live_prompts = 0
+        self._proposer_cache_admit_count = 0
+        self._proposer_cache_admit_cpu_bytes = 0
+        self._proposer_cache_admit_npu_bytes = 0
+        self._proposer_cache_admit_entries = 0
+        self._proposer_cache_eviction_count = 0
+        self._proposer_cache_eviction_cpu_bytes = 0
+        self._proposer_cache_eviction_npu_bytes = 0
+        self._proposer_cache_eviction_entries = 0
+        self._proposer_cache_budget_skip_count = 0
+        self._proposer_cache_oversize_skip_count = 0
+        self._proposer_cache_oversize_cpu_bytes = 0
+        self._proposer_cache_oversize_npu_bytes = 0
+        self._proposer_cache_oversize_entries = 0
+        self._proposer_prefetch_ready_ref_throttle_count = 0
+        self._proposer_prefetch_ready_bytes_throttle_count = 0
+        self._proposer_prefetch_ready_bytes_oversize_pass_count = 0
 
     # Online metrics reporting (from worker-local proposer)
 
@@ -2563,6 +2623,28 @@ class HSpecTableGroup:
             "descriptor_bytes": "_proposer_descriptor_bytes",
             "descriptor_entries": "_proposer_descriptor_entries",
             "hot_path_violation_count": "_proposer_hot_path_violation_count",
+            "cache_admit_count": "_proposer_cache_admit_count",
+            "cache_admit_cpu_bytes": "_proposer_cache_admit_cpu_bytes",
+            "cache_admit_npu_bytes": "_proposer_cache_admit_npu_bytes",
+            "cache_admit_entries": "_proposer_cache_admit_entries",
+            "cache_eviction_count": "_proposer_cache_eviction_count",
+            "cache_eviction_cpu_bytes": "_proposer_cache_eviction_cpu_bytes",
+            "cache_eviction_npu_bytes": "_proposer_cache_eviction_npu_bytes",
+            "cache_eviction_entries": "_proposer_cache_eviction_entries",
+            "cache_budget_skip_count": "_proposer_cache_budget_skip_count",
+            "cache_oversize_skip_count": "_proposer_cache_oversize_skip_count",
+            "cache_oversize_cpu_bytes": "_proposer_cache_oversize_cpu_bytes",
+            "cache_oversize_npu_bytes": "_proposer_cache_oversize_npu_bytes",
+            "cache_oversize_entries": "_proposer_cache_oversize_entries",
+            "prefetch_ready_ref_throttle_count": "_proposer_prefetch_ready_ref_throttle_count",
+            "prefetch_ready_bytes_throttle_count": "_proposer_prefetch_ready_bytes_throttle_count",
+            "prefetch_ready_bytes_oversize_pass_count": "_proposer_prefetch_ready_bytes_oversize_pass_count",
+        }
+        max_map = {
+            "cache_live_cpu_bytes": "_proposer_cache_live_cpu_bytes",
+            "cache_live_npu_bytes": "_proposer_cache_live_npu_bytes",
+            "cache_live_entries": "_proposer_cache_live_entries",
+            "cache_live_prompts": "_proposer_cache_live_prompts",
         }
         try:
             for key, attr in additive_map.items():
@@ -2571,6 +2653,12 @@ class HSpecTableGroup:
                     continue
                 current = getattr(self, attr, 0)
                 setattr(self, attr, current + value)
+            for key, attr in max_map.items():
+                value = metrics.get(key)
+                if not isinstance(value, (int, float)):
+                    continue
+                current = getattr(self, attr, 0)
+                setattr(self, attr, max(current, value))
         except Exception:
             pass
 
@@ -3329,6 +3417,28 @@ class GlobalHSpecTableGroup:
                 "hspec/proposer_descriptor_mb": 0.0,
                 "hspec/proposer_descriptor_entries": 0,
                 "hspec/proposer_hot_path_violation_count": 0,
+                "hspec/proposer_cache_live_cpu_bytes": 0,
+                "hspec/proposer_cache_live_cpu_mb": 0.0,
+                "hspec/proposer_cache_live_npu_bytes": 0,
+                "hspec/proposer_cache_live_npu_mb": 0.0,
+                "hspec/proposer_cache_live_entries": 0,
+                "hspec/proposer_cache_live_prompts": 0,
+                "hspec/proposer_cache_admit_count": 0,
+                "hspec/proposer_cache_admit_cpu_bytes": 0,
+                "hspec/proposer_cache_admit_npu_bytes": 0,
+                "hspec/proposer_cache_admit_entries": 0,
+                "hspec/proposer_cache_eviction_count": 0,
+                "hspec/proposer_cache_eviction_cpu_bytes": 0,
+                "hspec/proposer_cache_eviction_npu_bytes": 0,
+                "hspec/proposer_cache_eviction_entries": 0,
+                "hspec/proposer_cache_budget_skip_count": 0,
+                "hspec/proposer_cache_oversize_skip_count": 0,
+                "hspec/proposer_cache_oversize_cpu_bytes": 0,
+                "hspec/proposer_cache_oversize_npu_bytes": 0,
+                "hspec/proposer_cache_oversize_entries": 0,
+                "hspec/proposer_prefetch_ready_ref_throttle_count": 0,
+                "hspec/proposer_prefetch_ready_bytes_throttle_count": 0,
+                "hspec/proposer_prefetch_ready_bytes_oversize_pass_count": 0,
             }
         tasks = [g.compute_metrics.remote() for g in self.groups]
         metrics_list = ray.get(tasks)
@@ -3343,6 +3453,10 @@ class GlobalHSpecTableGroup:
             "build_pca_randomized_rank_max",
             "active_version",
             "table_store_version",
+            "proposer_cache_live_cpu_bytes",
+            "proposer_cache_live_npu_bytes",
+            "proposer_cache_live_entries",
+            "proposer_cache_live_prompts",
         }
         for metrics in metrics_list:
             for key, value in metrics.items():
@@ -3502,6 +3616,39 @@ class GlobalHSpecTableGroup:
             agg.get("proposer_descriptor_entries", 0))
         result["hspec/proposer_hot_path_violation_count"] = float(
             agg.get("proposer_hot_path_violation_count", 0))
+        result["hspec/proposer_cache_live_cpu_bytes"] = float(
+            agg.get("proposer_cache_live_cpu_bytes", 0))
+        result["hspec/proposer_cache_live_cpu_mb"] = (
+            float(agg.get("proposer_cache_live_cpu_bytes", 0)) / (1024 * 1024)
+        )
+        result["hspec/proposer_cache_live_npu_bytes"] = float(
+            agg.get("proposer_cache_live_npu_bytes", 0))
+        result["hspec/proposer_cache_live_npu_mb"] = (
+            float(agg.get("proposer_cache_live_npu_bytes", 0)) / (1024 * 1024)
+        )
+        result["hspec/proposer_cache_live_entries"] = float(
+            agg.get("proposer_cache_live_entries", 0))
+        result["hspec/proposer_cache_live_prompts"] = float(
+            agg.get("proposer_cache_live_prompts", 0))
+        for key in (
+            "cache_admit_count",
+            "cache_admit_cpu_bytes",
+            "cache_admit_npu_bytes",
+            "cache_admit_entries",
+            "cache_eviction_count",
+            "cache_eviction_cpu_bytes",
+            "cache_eviction_npu_bytes",
+            "cache_eviction_entries",
+            "cache_budget_skip_count",
+            "cache_oversize_skip_count",
+            "cache_oversize_cpu_bytes",
+            "cache_oversize_npu_bytes",
+            "cache_oversize_entries",
+            "prefetch_ready_ref_throttle_count",
+            "prefetch_ready_bytes_throttle_count",
+            "prefetch_ready_bytes_oversize_pass_count",
+        ):
+            result[f"hspec/proposer_{key}"] = float(agg.get(f"proposer_{key}", 0))
 
         abs_deltas = set()
         for key in agg:
