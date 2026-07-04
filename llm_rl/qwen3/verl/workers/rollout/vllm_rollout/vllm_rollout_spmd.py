@@ -97,8 +97,49 @@ logging.getLogger("torch._dynamo").setLevel(logging.CRITICAL)
 
 # Print resolved speculative config once per process.
 _PRINTED_VLLM_SPEC_CONFIG = False
+_PRINTED_HSPEC_PHASE3_RUNTIME = False
 _HSPEC_ALIGN_DEBUG = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
 _HSPEC_ALIGN_DEBUG_PREVIEW = int(os.getenv("HSPEC_ALIGN_DEBUG_PREVIEW", "8"))
+
+
+def _maybe_log_hspec_phase3_runtime(
+    *,
+    use_hspec: bool,
+    collect_hspec: bool,
+    is_validate: bool,
+    rank: int,
+) -> None:
+    """Log Phase 3 runtime semantics once per rollout worker process."""
+    if not use_hspec:
+        return
+    global _PRINTED_HSPEC_PHASE3_RUNTIME
+    if _PRINTED_HSPEC_PHASE3_RUNTIME:
+        return
+    _PRINTED_HSPEC_PHASE3_RUNTIME = True
+    if int(rank) != 0:
+        return
+    logger.warning(
+        "HSpec Phase 3 rollout runtime: "
+        "table_prefetch_mode=%s allow_legacy_table_prefetch=%s enable_zmq_query=%s "
+        "full_batch_prefetch=%s proposer_cache_max_cpu_bytes=%s proposer_cache_max_npu_bytes=%s "
+        "proposer_batch_cache_prebuild=%s allow_hot_batch_cache_build=%s "
+        "proposer_batch_cache_max_npu_bytes=%s proposer_prefix_cache=%s "
+        "proposer_store_per_prompt_npu=%s validation=%s collect_hspec=%s "
+        "validation_policy=query_prefetch_enabled_collection_disabled",
+        os.getenv("HSPEC_TABLE_PREFETCH_MODE", "descriptor"),
+        os.getenv("HSPEC_ALLOW_LEGACY_TABLE_PREFETCH", "0"),
+        os.getenv("HSPEC_ENABLE_ZMQ_QUERY", "0"),
+        os.getenv("HSPEC_FULL_BATCH_PREFETCH", "1"),
+        os.getenv("HSPEC_PROPOSER_CACHE_MAX_CPU_BYTES", "0"),
+        os.getenv("HSPEC_PROPOSER_CACHE_MAX_NPU_BYTES", "0"),
+        os.getenv("HSPEC_PROPOSER_BATCH_CACHE_PREBUILD", "1"),
+        os.getenv("HSPEC_ALLOW_HOT_BATCH_CACHE_BUILD", "0"),
+        os.getenv("HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES", "0"),
+        os.getenv("HSPEC_PROPOSER_PREFIX_CACHE", "0"),
+        os.getenv("HSPEC_PROPOSER_STORE_PER_PROMPT_NPU", "0"),
+        str(bool(is_validate)),
+        str(bool(collect_hspec)),
+    )
 
 
 def _get_model_hidden_size(model_runner: Any) -> int | None:
@@ -523,6 +564,12 @@ class vLLMRollout(BaseRollout):
         profile_this_step = hspec_profile_enabled_for_step(global_step)
         profiler = None
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _maybe_log_hspec_phase3_runtime(
+            use_hspec=bool(use_hspec),
+            collect_hspec=bool(collect_hspec),
+            is_validate=bool(is_validate),
+            rank=int(rank),
+        )
 
         non_tensor_batch = prompts.non_tensor_batch
         if "raw_prompt_ids" not in non_tensor_batch:
