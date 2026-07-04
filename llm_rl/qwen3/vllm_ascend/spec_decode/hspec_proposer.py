@@ -346,6 +346,7 @@ class _BatchedPromptTableCache:
 
     __slots__ = (
         "req_ids",
+        "prompt_ids",
         "cache_generation",
         "batch_indices",
         "batch_idx_to_row",
@@ -355,11 +356,14 @@ class _BatchedPromptTableCache:
         "keys_batch",
         "key_lengths",
         "invalid_key_mask",
+        "ready_event",
+        "estimated_npu_bytes",
     )
 
     def __init__(
         self,
         req_ids: tuple[str, ...],
+        prompt_ids: tuple[str, ...],
         cache_generation: int,
         batch_indices: List[int],
         batch_idx_to_row: Dict[int, int],
@@ -369,8 +373,11 @@ class _BatchedPromptTableCache:
         keys_batch: torch.Tensor,
         key_lengths: torch.Tensor,
         invalid_key_mask: torch.Tensor,
+        ready_event: Optional[Any] = None,
+        estimated_npu_bytes: int = 0,
     ):
         self.req_ids = req_ids
+        self.prompt_ids = prompt_ids
         self.cache_generation = cache_generation
         self.batch_indices = batch_indices
         self.batch_idx_to_row = batch_idx_to_row
@@ -380,6 +387,8 @@ class _BatchedPromptTableCache:
         self.keys_batch = keys_batch
         self.key_lengths = key_lengths
         self.invalid_key_mask = invalid_key_mask
+        self.ready_event = ready_event
+        self.estimated_npu_bytes = int(estimated_npu_bytes)
 
 
 # Helper function for detokenization (with internal debug when HSPEC_DEBUG=1)
@@ -517,6 +526,16 @@ class HSpecProposer(Proposer):
             "HSPEC_MAX_READY_PREFETCH_MATERIALIZE", 0, 0)
         self._max_ready_prefetch_bytes: int = _get_env_int(
             "HSPEC_MAX_READY_PREFETCH_BYTES", 0, 0)
+        self._batch_cache_prebuild: bool = (
+            os.environ.get("HSPEC_PROPOSER_BATCH_CACHE_PREBUILD", "1") != "0"
+        )
+        self._allow_hot_batch_cache_build: bool = (
+            os.environ.get("HSPEC_ALLOW_HOT_BATCH_CACHE_BUILD", "0") != "0"
+        )
+        self._batch_cache_max_npu_bytes: int = _get_env_int(
+            "HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES", 0, 0)
+        self._batch_cache_copy_stream: Optional[Any] = None
+        self._batch_cache_copy_stream_disabled: bool = False
         self._prefix_cache_enabled: bool = (
             os.environ.get("HSPEC_PROPOSER_PREFIX_CACHE", "0") != "0"
         )
@@ -595,8 +614,8 @@ class HSpecProposer(Proposer):
         # same prompt token ids across decode steps for a live request.
         self._req_prompt_ids: Dict[str, str] = {}
         # Batch-aligned prompt-id cache. prefetch_for_batch() runs before every
-        # forward pass, so generate_token_ids() can usually reuse this exact
-        # alignment with just a req-id tuple comparison.
+        # forward pass. Phase 3 Step 4 also uses this hook to prebuild the
+        # padded NPU batch table cache before generate_token_ids().
         self._cached_batch_req_ids: tuple[str, ...] = ()
         self._cached_batch_prompt_ids: List[str] = []
         self._batched_table_cache: Optional[_BatchedPromptTableCache] = None
@@ -649,6 +668,7 @@ class HSpecProposer(Proposer):
             "abs_delta_cap=%s safe<=%d mid<=%d mid_cap=%d far_cap=%d hot_path_strict=%s "
             "cache_max_cpu_bytes=%d cache_max_npu_bytes=%d cache_max_entries=%d "
             "max_ready_prefetch_materialize=%d max_ready_prefetch_bytes=%d "
+            "batch_cache_prebuild=%s allow_hot_batch_cache_build=%s batch_cache_max_npu_bytes=%d "
             "prefix_cache=%s store_per_prompt_npu=%s keys_cpu_dtype=%s keys_device_dtype=%s",
             self.similarity_threshold,
             self.max_draft_tokens,
@@ -667,6 +687,9 @@ class HSpecProposer(Proposer):
             int(self._cache_max_entries),
             int(self._max_ready_prefetch_materialize),
             int(self._max_ready_prefetch_bytes),
+            str(bool(self._batch_cache_prebuild)),
+            str(bool(self._allow_hot_batch_cache_build)),
+            int(self._batch_cache_max_npu_bytes),
             str(bool(self._prefix_cache_enabled)),
             str(bool(self._store_per_prompt_npu)),
             str(self._keys_cpu_dtype_mode),
@@ -693,17 +716,25 @@ class HSpecProposer(Proposer):
         returns ``draft=[]`` for that request (graceful degradation).
         """
         prompt_ids = self._get_prompt_ids_for_batch(req_ids)
-        prompt_ids = [pid for pid in prompt_ids if pid]
-        if not prompt_ids:
+        fetch_prompt_ids = [pid for pid in prompt_ids if pid]
+        if not fetch_prompt_ids:
             return
 
         # Consume any futures that became ready since last call. This happens
         # before the model forward, so descriptor mmap/H2D work stays outside
         # the proposal hot path.
         self._poll_pending(materialize_ready=True,
-                           priority_prompt_ids=prompt_ids)
+                           priority_prompt_ids=fetch_prompt_ids)
+        if self._batch_cache_prebuild:
+            self._prepare_batched_table_cache(
+                req_ids,
+                prompt_ids,
+                dtype=torch.float32,
+                device=self.device,
+                hot_path=False,
+            )
         # Fire new async fetches for cache misses
-        self._fire_prefetch_async(prompt_ids)
+        self._fire_prefetch_async(fetch_prompt_ids)
         self._maybe_report_metrics(force_proposer_metrics=True)
 
     def prefetch_prompt_token_ids_batch(
@@ -1001,10 +1032,151 @@ class HSpecProposer(Proposer):
         dtype: torch.dtype,
         device: torch.device,
     ) -> Optional[_BatchedPromptTableCache]:
+        """Compatibility wrapper for explicit debug fallback only.
+
+        Production Step 4 flow prepares this cache from prefetch_for_batch()
+        and generate_token_ids() consumes it with _get_prebuilt_batched_table_cache().
+        """
+        return self._prepare_batched_table_cache(
+            req_ids,
+            prompt_ids,
+            dtype=dtype,
+            device=device,
+            hot_path=True,
+        )
+
+    def _batch_cache_matches(
+        self,
+        cached: Optional[_BatchedPromptTableCache],
+        req_ids_tuple: tuple[str, ...],
+        prompt_ids_tuple: tuple[str, ...],
+    ) -> bool:
+        return (
+            cached is not None
+            and cached.req_ids == req_ids_tuple
+            and cached.prompt_ids == prompt_ids_tuple
+            and cached.cache_generation == self._cache_generation
+        )
+
+    @staticmethod
+    def _dtype_element_size(dtype: torch.dtype) -> int:
+        try:
+            return int(torch.empty((), dtype=dtype).element_size())
+        except Exception:
+            return 4
+
+    def _estimate_batched_table_cache_nbytes(
+        self,
+        cached_tables: List[_CachedPromptTable],
+        dtype: torch.dtype,
+    ) -> int:
+        if not cached_tables:
+            return 0
+        try:
+            num_rows = len(cached_tables)
+            k_max = max(int(cached.components_t_cpu.shape[1])
+                        for cached in cached_tables)
+            m_max = max(int(cached.n_entries) for cached in cached_tables)
+            hidden_dim = int(cached_tables[0].mean_cpu.shape[0])
+            model_elem = self._dtype_element_size(dtype)
+            key_elem = self._dtype_element_size(self._keys_device_dtype)
+            total = (
+                num_rows * hidden_dim * model_elem
+                + num_rows * hidden_dim * k_max * model_elem
+                + num_rows * m_max * k_max * key_elem
+                + num_rows * self._dtype_element_size(torch.long)
+                + num_rows * m_max * self._dtype_element_size(torch.bool)
+            )
+            return int(total)
+        except Exception:
+            return 0
+
+    def _get_batch_cache_stream_context(self) -> tuple[Any, bool]:
+        if self._batch_cache_copy_stream_disabled:
+            return nullcontext(), False
+        npu_mod = getattr(torch, "npu", None)
+        if npu_mod is None:
+            return nullcontext(), False
+        try:
+            stream_fn = getattr(npu_mod, "stream", None)
+            stream_cls = getattr(npu_mod, "Stream", None)
+            event_cls = getattr(npu_mod, "Event", None)
+            if stream_fn is None or stream_cls is None or event_cls is None:
+                self._batch_cache_copy_stream_disabled = True
+                return nullcontext(), False
+            if self._batch_cache_copy_stream is None:
+                self._batch_cache_copy_stream = stream_cls()
+            return stream_fn(self._batch_cache_copy_stream), True
+        except Exception:
+            self._batch_cache_copy_stream_disabled = True
+            logger.debug("HSpec: batch cache copy stream unavailable", exc_info=True)
+            return nullcontext(), False
+
+    def _record_batch_cache_ready_event(self) -> Optional[Any]:
+        npu_mod = getattr(torch, "npu", None)
+        if npu_mod is None:
+            return None
+        try:
+            event_cls = getattr(npu_mod, "Event", None)
+            if event_cls is None:
+                return None
+            event = event_cls()
+            event.record()
+            return event
+        except Exception:
+            logger.debug("HSpec: failed to record batch cache ready event",
+                         exc_info=True)
+            return None
+
+    def _batch_cache_event_ready(self, cached: _BatchedPromptTableCache) -> bool:
+        event = getattr(cached, "ready_event", None)
+        if event is None:
+            return True
+        try:
+            query = getattr(event, "query", None)
+            if query is None:
+                return True
+            return bool(query())
+        except Exception:
+            logger.debug("HSpec: batch cache event query failed", exc_info=True)
+            return True
+
+    def _get_prebuilt_batched_table_cache(
+        self,
+        req_ids: List[str],
+        prompt_ids: List[str],
+    ) -> Optional[_BatchedPromptTableCache]:
         req_ids_tuple = tuple(str(req_id) for req_id in req_ids)
+        prompt_ids_tuple = tuple(str(pid) for pid in prompt_ids)
         cached = self._batched_table_cache
-        if cached is not None and cached.req_ids == req_ids_tuple and cached.cache_generation == self._cache_generation:
-            return cached
+        if not self._batch_cache_matches(cached, req_ids_tuple, prompt_ids_tuple):
+            return None
+        if cached is None:
+            return None
+        if not self._batch_cache_event_ready(cached):
+            self._record_proposer_metric("batch_cache_event_not_ready_count", 1)
+            return None
+        return cached
+
+    def _prepare_batched_table_cache(
+        self,
+        req_ids: List[str],
+        prompt_ids: List[str],
+        dtype: torch.dtype,
+        device: torch.device,
+        *,
+        hot_path: bool = False,
+    ) -> Optional[_BatchedPromptTableCache]:
+        if hot_path and not self._allow_hot_batch_cache_build:
+            self._record_proposer_metric("batch_cache_miss_no_hot_build", 1)
+            return self._get_prebuilt_batched_table_cache(req_ids, prompt_ids)
+
+        req_ids_tuple = tuple(str(req_id) for req_id in req_ids)
+        prompt_ids_tuple = tuple(str(pid) for pid in prompt_ids)
+        cached = self._batched_table_cache
+        if self._batch_cache_matches(cached, req_ids_tuple, prompt_ids_tuple):
+            if cached is not None and (not hot_path or self._batch_cache_event_ready(cached)):
+                return cached
 
         batch_indices: List[int] = []
         cached_tables: List[_CachedPromptTable] = []
@@ -1020,8 +1192,34 @@ class HSpecProposer(Proposer):
             self._batched_table_cache = None
             return None
 
-        mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask = (
-            self._build_batched_table_tensors(cached_tables, dtype, device))
+        estimated_npu_bytes = self._estimate_batched_table_cache_nbytes(
+            cached_tables, dtype)
+        if (self._batch_cache_max_npu_bytes > 0
+                and estimated_npu_bytes > self._batch_cache_max_npu_bytes):
+            self._batched_table_cache = None
+            self._record_proposer_metric("batch_cache_budget_skip_count", 1)
+            self._record_proposer_metric(
+                "batch_cache_budget_skip_bytes", estimated_npu_bytes)
+            self._record_proposer_gauge("batch_cache_npu_bytes", 0)
+            return None
+
+        build_t0 = _now_ns()
+        ready_event: Optional[Any] = None
+        if hot_path:
+            mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask = (
+                self._build_batched_table_tensors(cached_tables, dtype, device))
+        else:
+            stream_context, used_copy_stream = self._get_batch_cache_stream_context()
+            with stream_context:
+                mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask = (
+                    self._build_batched_table_tensors(cached_tables, dtype, device))
+                if used_copy_stream:
+                    ready_event = self._record_batch_cache_ready_event()
+            if used_copy_stream and ready_event is None:
+                self._record_proposer_metric(
+                    "batch_cache_event_record_error_count", 1)
+                return None
+        build_t1 = _now_ns()
 
         with hspec_record_function("hspec/proposal/build_batch_idx_to_row"):
             batch_idx_to_row = {batch_idx: row for row, batch_idx in enumerate(batch_indices)}
@@ -1029,6 +1227,7 @@ class HSpecProposer(Proposer):
         with hspec_record_function("hspec/proposal/build_cached"):
             cached = _BatchedPromptTableCache(
                 req_ids=req_ids_tuple,
+                prompt_ids=prompt_ids_tuple,
                 cache_generation=self._cache_generation,
                 batch_indices=batch_indices,
                 batch_idx_to_row=batch_idx_to_row,
@@ -1038,8 +1237,19 @@ class HSpecProposer(Proposer):
                 keys_batch=keys_batch,
                 key_lengths=key_lengths,
                 invalid_key_mask=invalid_key_mask,
+                ready_event=ready_event,
+                estimated_npu_bytes=estimated_npu_bytes,
             )
             self._batched_table_cache = cached
+        build_ms = _ns_to_ms(build_t1 - build_t0)
+        if hot_path:
+            self._record_proposer_metric("batch_cache_hot_build_count", 1)
+            self._record_proposer_metric("batch_cache_hot_build_ms", build_ms)
+        else:
+            self._record_proposer_metric("batch_cache_prebuild_count", 1)
+            self._record_proposer_metric("batch_cache_prebuild_ms", build_ms)
+            self._record_proposer_metric("batch_cache_h2d_submit_ms", build_ms)
+        self._record_proposer_gauge("batch_cache_npu_bytes", estimated_npu_bytes)
         return cached
 
     def _maybe_log_metrics(self) -> None:
@@ -2143,14 +2353,22 @@ class HSpecProposer(Proposer):
         active_table_rows: List[int] = []
         active_cached_tables: List[_CachedPromptTable] = []
         active_base_positions: List[int] = []
-        batch_table_cache = self._get_or_build_batched_table_cache(
+        batch_table_cache = self._get_prebuilt_batched_table_cache(
             req_ids,
             prompt_ids,
-            dtype=torch.float32,
-            device=hidden_states.device,
         )
+        if batch_table_cache is None:
+            if self._allow_hot_batch_cache_build:
+                batch_table_cache = self._get_or_build_batched_table_cache(
+                    req_ids,
+                    prompt_ids,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+            else:
+                self._record_proposer_metric("batch_cache_miss_no_hot_build", 1)
         if batch_table_cache is None and gen_enabled and batch_size > 0:
-            trace_skip_reason = "prompt_not_cached"
+            trace_skip_reason = "batch_cache_not_prebuilt"
 
         with (hspec_record_function("hspec/proposal/get_active_batch_indices_and_rows", use_npu_stream=True)
               if prof_enabled else nullcontext()):

@@ -977,6 +977,17 @@ class HSpecTableGroup:
         self._proposer_prefetch_ready_ref_throttle_count = 0
         self._proposer_prefetch_ready_bytes_throttle_count = 0
         self._proposer_prefetch_ready_bytes_oversize_pass_count = 0
+        self._proposer_batch_cache_prebuild_count = 0
+        self._proposer_batch_cache_prebuild_ms = 0.0
+        self._proposer_batch_cache_h2d_submit_ms = 0.0
+        self._proposer_batch_cache_npu_bytes = 0
+        self._proposer_batch_cache_budget_skip_count = 0
+        self._proposer_batch_cache_budget_skip_bytes = 0
+        self._proposer_batch_cache_miss_no_hot_build = 0
+        self._proposer_batch_cache_event_not_ready_count = 0
+        self._proposer_batch_cache_event_record_error_count = 0
+        self._proposer_batch_cache_hot_build_count = 0
+        self._proposer_batch_cache_hot_build_ms = 0.0
 
         # ZMQ state
         self.running = False
@@ -2416,6 +2427,17 @@ class HSpecTableGroup:
             "proposer_prefetch_ready_ref_throttle_count": self._proposer_prefetch_ready_ref_throttle_count,
             "proposer_prefetch_ready_bytes_throttle_count": self._proposer_prefetch_ready_bytes_throttle_count,
             "proposer_prefetch_ready_bytes_oversize_pass_count": self._proposer_prefetch_ready_bytes_oversize_pass_count,
+            "proposer_batch_cache_prebuild_count": self._proposer_batch_cache_prebuild_count,
+            "proposer_batch_cache_prebuild_ms": self._proposer_batch_cache_prebuild_ms,
+            "proposer_batch_cache_h2d_submit_ms": self._proposer_batch_cache_h2d_submit_ms,
+            "proposer_batch_cache_npu_bytes": self._proposer_batch_cache_npu_bytes,
+            "proposer_batch_cache_budget_skip_count": self._proposer_batch_cache_budget_skip_count,
+            "proposer_batch_cache_budget_skip_bytes": self._proposer_batch_cache_budget_skip_bytes,
+            "proposer_batch_cache_miss_no_hot_build": self._proposer_batch_cache_miss_no_hot_build,
+            "proposer_batch_cache_event_not_ready_count": self._proposer_batch_cache_event_not_ready_count,
+            "proposer_batch_cache_event_record_error_count": self._proposer_batch_cache_event_record_error_count,
+            "proposer_batch_cache_hot_build_count": self._proposer_batch_cache_hot_build_count,
+            "proposer_batch_cache_hot_build_ms": self._proposer_batch_cache_hot_build_ms,
         }
         for abs_delta, count in self._entry_abs_delta_verify.items():
             metrics[f"entry_abs_delta_verify_{abs_delta}"] = float(count)
@@ -2520,6 +2542,17 @@ class HSpecTableGroup:
         self._proposer_prefetch_ready_ref_throttle_count = 0
         self._proposer_prefetch_ready_bytes_throttle_count = 0
         self._proposer_prefetch_ready_bytes_oversize_pass_count = 0
+        self._proposer_batch_cache_prebuild_count = 0
+        self._proposer_batch_cache_prebuild_ms = 0.0
+        self._proposer_batch_cache_h2d_submit_ms = 0.0
+        self._proposer_batch_cache_npu_bytes = 0
+        self._proposer_batch_cache_budget_skip_count = 0
+        self._proposer_batch_cache_budget_skip_bytes = 0
+        self._proposer_batch_cache_miss_no_hot_build = 0
+        self._proposer_batch_cache_event_not_ready_count = 0
+        self._proposer_batch_cache_event_record_error_count = 0
+        self._proposer_batch_cache_hot_build_count = 0
+        self._proposer_batch_cache_hot_build_ms = 0.0
 
     # Online metrics reporting (from worker-local proposer)
 
@@ -2639,12 +2672,23 @@ class HSpecTableGroup:
             "prefetch_ready_ref_throttle_count": "_proposer_prefetch_ready_ref_throttle_count",
             "prefetch_ready_bytes_throttle_count": "_proposer_prefetch_ready_bytes_throttle_count",
             "prefetch_ready_bytes_oversize_pass_count": "_proposer_prefetch_ready_bytes_oversize_pass_count",
+            "batch_cache_prebuild_count": "_proposer_batch_cache_prebuild_count",
+            "batch_cache_prebuild_ms": "_proposer_batch_cache_prebuild_ms",
+            "batch_cache_h2d_submit_ms": "_proposer_batch_cache_h2d_submit_ms",
+            "batch_cache_budget_skip_count": "_proposer_batch_cache_budget_skip_count",
+            "batch_cache_budget_skip_bytes": "_proposer_batch_cache_budget_skip_bytes",
+            "batch_cache_miss_no_hot_build": "_proposer_batch_cache_miss_no_hot_build",
+            "batch_cache_event_not_ready_count": "_proposer_batch_cache_event_not_ready_count",
+            "batch_cache_event_record_error_count": "_proposer_batch_cache_event_record_error_count",
+            "batch_cache_hot_build_count": "_proposer_batch_cache_hot_build_count",
+            "batch_cache_hot_build_ms": "_proposer_batch_cache_hot_build_ms",
         }
         max_map = {
             "cache_live_cpu_bytes": "_proposer_cache_live_cpu_bytes",
             "cache_live_npu_bytes": "_proposer_cache_live_npu_bytes",
             "cache_live_entries": "_proposer_cache_live_entries",
             "cache_live_prompts": "_proposer_cache_live_prompts",
+            "batch_cache_npu_bytes": "_proposer_batch_cache_npu_bytes",
         }
         try:
             for key, attr in additive_map.items():
@@ -3439,6 +3483,19 @@ class GlobalHSpecTableGroup:
                 "hspec/proposer_prefetch_ready_ref_throttle_count": 0,
                 "hspec/proposer_prefetch_ready_bytes_throttle_count": 0,
                 "hspec/proposer_prefetch_ready_bytes_oversize_pass_count": 0,
+                "hspec/proposer_batch_cache_prebuild_count": 0,
+                "hspec/proposer_batch_cache_prebuild_ms": 0.0,
+                "hspec/proposer_batch_cache_h2d_submit_ms": 0.0,
+                "hspec/proposer_batch_cache_npu_bytes": 0,
+                "hspec/proposer_batch_cache_npu_mb": 0.0,
+                "hspec/proposer_batch_cache_budget_skip_count": 0,
+                "hspec/proposer_batch_cache_budget_skip_bytes": 0,
+                "hspec/proposer_batch_cache_budget_skip_mb": 0.0,
+                "hspec/proposer_batch_cache_miss_no_hot_build": 0,
+                "hspec/proposer_batch_cache_event_not_ready_count": 0,
+                "hspec/proposer_batch_cache_event_record_error_count": 0,
+                "hspec/proposer_batch_cache_hot_build_count": 0,
+                "hspec/proposer_batch_cache_hot_build_ms": 0.0,
             }
         tasks = [g.compute_metrics.remote() for g in self.groups]
         metrics_list = ray.get(tasks)
@@ -3457,6 +3514,7 @@ class GlobalHSpecTableGroup:
             "proposer_cache_live_npu_bytes",
             "proposer_cache_live_entries",
             "proposer_cache_live_prompts",
+            "proposer_batch_cache_npu_bytes",
         }
         for metrics in metrics_list:
             for key, value in metrics.items():
@@ -3647,8 +3705,26 @@ class GlobalHSpecTableGroup:
             "prefetch_ready_ref_throttle_count",
             "prefetch_ready_bytes_throttle_count",
             "prefetch_ready_bytes_oversize_pass_count",
+            "batch_cache_prebuild_count",
+            "batch_cache_prebuild_ms",
+            "batch_cache_h2d_submit_ms",
+            "batch_cache_budget_skip_count",
+            "batch_cache_budget_skip_bytes",
+            "batch_cache_miss_no_hot_build",
+            "batch_cache_event_not_ready_count",
+            "batch_cache_event_record_error_count",
+            "batch_cache_hot_build_count",
+            "batch_cache_hot_build_ms",
         ):
             result[f"hspec/proposer_{key}"] = float(agg.get(f"proposer_{key}", 0))
+        result["hspec/proposer_batch_cache_npu_bytes"] = float(
+            agg.get("proposer_batch_cache_npu_bytes", 0))
+        result["hspec/proposer_batch_cache_npu_mb"] = (
+            float(agg.get("proposer_batch_cache_npu_bytes", 0)) / (1024 * 1024)
+        )
+        result["hspec/proposer_batch_cache_budget_skip_mb"] = (
+            float(agg.get("proposer_batch_cache_budget_skip_bytes", 0)) / (1024 * 1024)
+        )
 
         abs_deltas = set()
         for key in agg:
