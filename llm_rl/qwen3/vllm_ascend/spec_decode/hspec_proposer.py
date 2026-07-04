@@ -142,7 +142,11 @@ def _close_hspec_memmap(array: np.ndarray | None) -> None:
 # Worker-local cached prompt table (on-device tensors + CPU refs)
 
 class _CachedPromptTable:
-    """Per-prompt cached table data with on-device query tensors."""
+    """Per-prompt cached table data with compact CPU refs.
+
+    Per-prompt NPU tensors and prefix matrices are optional debug/A-B caches.
+    The production path uses CPU refs plus a prebuilt batch table cache.
+    """
 
     __slots__ = (
         "mean_cpu",
@@ -151,6 +155,9 @@ class _CachedPromptTable:
         "mean",
         "components",
         "keys",
+        "token_buffer",
+        "rollout_token_offset",
+        "rollout_token_len",
         "rollout_seqs",
         "entry_rollout_idx",
         "entry_offset",
@@ -173,14 +180,17 @@ class _CachedPromptTable:
         mean_cpu: np.ndarray,
         components_t_cpu: np.ndarray,
         keys_cpu: np.ndarray,
-        mean: torch.Tensor,
-        components: torch.Tensor,
-        keys: torch.Tensor,
-        rollout_seqs: list,
+        mean: Optional[torch.Tensor],
+        components: Optional[torch.Tensor],
+        keys: Optional[torch.Tensor],
+        token_buffer: np.ndarray,
+        rollout_token_offset: np.ndarray,
+        rollout_token_len: np.ndarray,
+        rollout_seqs: Optional[list],
         entry_rollout_idx: np.ndarray,
         entry_offset: np.ndarray,
-        draft_prefix_tokens: np.ndarray,
-        draft_prefix_lens: np.ndarray,
+        draft_prefix_tokens: Optional[np.ndarray],
+        draft_prefix_lens: Optional[np.ndarray],
         rollout_entry_starts: np.ndarray,
         rollout_entry_lens: np.ndarray,
         n_entries: int,
@@ -194,15 +204,18 @@ class _CachedPromptTable:
     ):
         self.mean_cpu = mean_cpu                      # (D,) float32, CPU
         self.components_t_cpu = components_t_cpu      # (D,K) float32, CPU
-        self.keys_cpu = keys_cpu                      # (M,K) float32, CPU
-        self.mean = mean                            # (D,)  float32, device
-        self.components = components                  # (K,D) float32, device
-        self.keys = keys                              # (M,K) float32, device, L2-norm'd
-        self.rollout_seqs = rollout_seqs              # list[np.ndarray int32], CPU
+        self.keys_cpu = keys_cpu                      # (M,K) table dtype or float32, CPU
+        self.mean = mean                              # optional (D,) device
+        self.components = components                  # optional (K,D) device
+        self.keys = keys                              # optional (M,K) device
+        self.token_buffer = token_buffer              # flat int32 token store, CPU
+        self.rollout_token_offset = rollout_token_offset  # (R,) int64, CPU
+        self.rollout_token_len = rollout_token_len        # (R,) int32, CPU
+        self.rollout_seqs = rollout_seqs              # optional legacy/debug CPU views
         self.entry_rollout_idx = entry_rollout_idx    # (M,) int32, CPU
         self.entry_offset = entry_offset              # (M,) int32, CPU
-        self.draft_prefix_tokens = draft_prefix_tokens  # (M, W) int32, CPU
-        self.draft_prefix_lens = draft_prefix_lens      # (M,) int32, CPU
+        self.draft_prefix_tokens = draft_prefix_tokens  # optional (M, W) int32
+        self.draft_prefix_lens = draft_prefix_lens      # optional (M,) int32
         self.rollout_entry_starts = rollout_entry_starts  # (R,) int32, CPU
         self.rollout_entry_lens = rollout_entry_lens      # (R,) int32, CPU
         self.n_entries = n_entries
@@ -223,13 +236,36 @@ class _CachedPromptTable:
         self.max_entry_bias = max(int(max_entry_bias), 0)
 
     def get_draft_tokens(self, entry_idx: int, max_tokens: int) -> List[int]:
-        """O(1) slice into the rollout token buffer."""
+        """O(1) draft lookup, using lazy token refs by default."""
         if entry_idx < 0 or entry_idx >= self.n_entries:
             return []
-        take = min(int(max_tokens), int(self.draft_prefix_lens[entry_idx]))
+        max_tokens = int(max_tokens)
+        if max_tokens <= 0:
+            return []
+        if self.draft_prefix_tokens is not None and self.draft_prefix_lens is not None:
+            take = min(max_tokens, int(self.draft_prefix_lens[entry_idx]))
+            if take <= 0:
+                return []
+            return self.draft_prefix_tokens[entry_idx, :take].tolist()
+
+        ridx = int(self.entry_rollout_idx[entry_idx])
+        if ridx < 0 or ridx >= int(self.rollout_token_offset.shape[0]):
+            return []
+        off = int(self.entry_offset[entry_idx])
+        base = int(self.rollout_token_offset[ridx])
+        length = int(self.rollout_token_len[ridx])
+        take = min(max_tokens, max(0, length - off))
         if take <= 0:
             return []
-        return self.draft_prefix_tokens[entry_idx, :take].tolist()
+        return self.token_buffer[base + off:base + off + take].tolist()
+
+    def get_rollout_tokens(self, rollout_idx: int) -> np.ndarray:
+        ridx = int(rollout_idx)
+        if ridx < 0 or ridx >= int(self.rollout_token_offset.shape[0]):
+            return np.empty((0,), dtype=np.int32)
+        base = int(self.rollout_token_offset[ridx])
+        length = int(self.rollout_token_len[ridx])
+        return self.token_buffer[base:base + length]
 
     def update_window(
         self,
@@ -481,6 +517,27 @@ class HSpecProposer(Proposer):
             "HSPEC_MAX_READY_PREFETCH_MATERIALIZE", 0, 0)
         self._max_ready_prefetch_bytes: int = _get_env_int(
             "HSPEC_MAX_READY_PREFETCH_BYTES", 0, 0)
+        self._prefix_cache_enabled: bool = (
+            os.environ.get("HSPEC_PROPOSER_PREFIX_CACHE", "0") != "0"
+        )
+        self._store_per_prompt_npu: bool = (
+            os.environ.get("HSPEC_PROPOSER_STORE_PER_PROMPT_NPU", "0") != "0"
+        )
+        self._keys_cpu_dtype_mode: str = os.environ.get(
+            "HSPEC_PROPOSER_KEYS_CPU_DTYPE", "table").strip().lower()
+        if self._keys_cpu_dtype_mode not in {"table", "float32"}:
+            logger.warning(
+                "Invalid HSPEC_PROPOSER_KEYS_CPU_DTYPE=%r; fallback to table",
+                self._keys_cpu_dtype_mode,
+            )
+            self._keys_cpu_dtype_mode = "table"
+        self._keys_device_dtype: torch.dtype = (
+            torch.float16
+            if os.environ.get(
+                "HSPEC_PROPOSER_KEYS_DEVICE_DTYPE", "float32").strip().lower()
+            in {"float16", "fp16", "half"}
+            else torch.float32
+        )
         self._cache_cpu_bytes: int = 0
         self._cache_npu_bytes: int = 0
         self._cache_entries: int = 0
@@ -591,7 +648,8 @@ class HSpecProposer(Proposer):
             "fully_batched_match=1, numba_rebuild=%s, entry_blend_horizon=%d, entry_bias_cap=%d, "
             "abs_delta_cap=%s safe<=%d mid<=%d mid_cap=%d far_cap=%d hot_path_strict=%s "
             "cache_max_cpu_bytes=%d cache_max_npu_bytes=%d cache_max_entries=%d "
-            "max_ready_prefetch_materialize=%d max_ready_prefetch_bytes=%d",
+            "max_ready_prefetch_materialize=%d max_ready_prefetch_bytes=%d "
+            "prefix_cache=%s store_per_prompt_npu=%s keys_cpu_dtype=%s keys_device_dtype=%s",
             self.similarity_threshold,
             self.max_draft_tokens,
             self._max_cache_size,
@@ -609,6 +667,10 @@ class HSpecProposer(Proposer):
             int(self._cache_max_entries),
             int(self._max_ready_prefetch_materialize),
             int(self._max_ready_prefetch_bytes),
+            str(bool(self._prefix_cache_enabled)),
+            str(bool(self._store_per_prompt_npu)),
+            str(self._keys_cpu_dtype_mode),
+            str(self._keys_device_dtype),
         )
 
         if self._use_numba_rebuild:
@@ -1148,6 +1210,9 @@ class HSpecProposer(Proposer):
             cached.mean_cpu,
             cached.components_t_cpu,
             cached.keys_cpu,
+            cached.token_buffer,
+            cached.rollout_token_offset,
+            cached.rollout_token_len,
             cached.entry_rollout_idx,
             cached.entry_offset,
             cached.draft_prefix_tokens,
@@ -1158,7 +1223,7 @@ class HSpecProposer(Proposer):
             cached.entry_hits,
         ):
             add_array(arr)
-        for seq in cached.rollout_seqs:
+        for seq in cached.rollout_seqs or ():
             add_array(seq)
 
         npu_bytes = (
@@ -1329,7 +1394,7 @@ class HSpecProposer(Proposer):
     def _clamp_wnd_size(wnd_size: int, min_wnd: int, max_wnd: int) -> int:
         return max(int(min_wnd), min(int(wnd_size), int(max_wnd)))
 
-    def _copy_table_array_from_desc(self, array_desc, dtype) -> np.ndarray:
+    def _copy_table_array_from_desc(self, array_desc, dtype=None) -> np.ndarray:
         self._guard_no_hot_path_materialize("copy_table_array_from_desc")
         mmap_arr = open_array(array_desc, mode="r")
         try:
@@ -1399,13 +1464,40 @@ class HSpecProposer(Proposer):
                 draft_prefix_tokens[row_start:row_end][mask] = token_buffer[idx[mask]]
         return draft_prefix_tokens, draft_prefix_lens
 
+    @staticmethod
+    def _flatten_rollout_seqs(
+        rollout_seqs: List[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        offsets = np.zeros((len(rollout_seqs),), dtype=np.int64)
+        lens = np.zeros((len(rollout_seqs),), dtype=np.int32)
+        total = 0
+        seqs: List[np.ndarray] = []
+        for idx, seq in enumerate(rollout_seqs):
+            arr = np.ascontiguousarray(np.asarray(seq, dtype=np.int32))
+            offsets[idx] = total
+            lens[idx] = int(arr.shape[0])
+            total += int(arr.shape[0])
+            seqs.append(arr)
+        if total <= 0:
+            token_buffer = np.empty((0,), dtype=np.int32)
+        else:
+            token_buffer = np.empty((total,), dtype=np.int32)
+            cursor = 0
+            for arr in seqs:
+                end = cursor + int(arr.shape[0])
+                token_buffer[cursor:end] = arr
+                cursor = end
+        return token_buffer, offsets, lens
+
     def _finalize_cached_table(
         self,
         *,
         mean_np: np.ndarray,
         components_np: np.ndarray,
         keys_np: np.ndarray,
-        rollout_seqs: List[np.ndarray],
+        token_buffer: np.ndarray,
+        rollout_token_offset: np.ndarray,
+        rollout_token_len: np.ndarray,
         entry_rollout_idx: np.ndarray,
         entry_offset: np.ndarray,
         n_entries: int,
@@ -1413,6 +1505,7 @@ class HSpecProposer(Proposer):
         max_wnd: int,
         min_wnd: int,
         prompt_id: Optional[str],
+        rollout_seqs: Optional[List[np.ndarray]] = None,
         draft_prefix_tokens: Optional[np.ndarray] = None,
         draft_prefix_lens: Optional[np.ndarray] = None,
         metric_prefix: Optional[str] = None,
@@ -1425,56 +1518,79 @@ class HSpecProposer(Proposer):
 
         mean_np = np.ascontiguousarray(mean_np, dtype=np.float32)
         components_np = np.ascontiguousarray(components_np, dtype=np.float32)
-        keys_np = np.ascontiguousarray(keys_np, dtype=np.float32)
+        if self._keys_cpu_dtype_mode == "float32":
+            keys_np = np.ascontiguousarray(keys_np, dtype=np.float32)
+        else:
+            keys_np = np.ascontiguousarray(keys_np)
         components_t_cpu = np.ascontiguousarray(components_np.transpose(1, 0))
+        token_buffer = np.ascontiguousarray(np.asarray(token_buffer, dtype=np.int32))
+        rollout_token_offset = np.ascontiguousarray(
+            np.asarray(rollout_token_offset, dtype=np.int64))
+        rollout_token_len = np.ascontiguousarray(
+            np.asarray(rollout_token_len, dtype=np.int32))
         entry_rollout_idx = np.ascontiguousarray(
             np.asarray(entry_rollout_idx[:n_entries], dtype=np.int32))
         entry_offset = np.ascontiguousarray(
             np.asarray(entry_offset[:n_entries], dtype=np.int32))
-        rollout_seqs = [
-            np.asarray(seq, dtype=np.int32)
-            for seq in rollout_seqs
-        ]
-        if not rollout_seqs:
+        n_rollouts = int(rollout_token_len.shape[0])
+        if n_rollouts <= 0:
             raise ValueError("HSpec cached table requires at least one rollout")
         if entry_rollout_idx.shape[0] < n_entries or entry_offset.shape[0] < n_entries:
             raise ValueError("HSpec cached table entry arrays shorter than n_entries")
-        if int(entry_rollout_idx.min()) < 0 or int(entry_rollout_idx.max()) >= len(rollout_seqs):
+        if int(entry_rollout_idx.min()) < 0 or int(entry_rollout_idx.max()) >= n_rollouts:
             raise ValueError("HSpec cached table entry_rollout_idx out of bounds")
+        if int(rollout_token_offset.min()) < 0 or int(rollout_token_len.min()) < 0:
+            raise ValueError("HSpec cached table rollout token refs must be non-negative")
+        rollout_end = rollout_token_offset + rollout_token_len.astype(np.int64)
+        if int(rollout_end.max()) > int(token_buffer.shape[0]):
+            raise ValueError("HSpec cached table rollout refs exceed token_buffer")
+        rollout_len_for_entry = rollout_token_len[entry_rollout_idx]
+        if np.any(entry_offset < 0) or np.any(entry_offset > rollout_len_for_entry):
+            raise ValueError("HSpec cached table entry_offset exceeds rollout length")
 
-        self._guard_no_hot_path_materialize("finalize_cached_table_h2d")
-        t0_h2d = _now_ns()
-        mean = torch.from_numpy(mean_np).to(self.device, non_blocking=True)
-        components = torch.from_numpy(components_np).to(self.device, non_blocking=True)
-        keys = torch.from_numpy(keys_np).to(self.device, non_blocking=True)
-        h2d_ms = _ns_to_ms(_now_ns() - t0_h2d)
-        if metric_prefix:
-            self._record_proposer_metric(f"{metric_prefix}_h2d_submit_ms", h2d_ms)
+        mean = None
+        components = None
+        keys = None
+        if self._store_per_prompt_npu:
+            self._guard_no_hot_path_materialize("finalize_cached_table_h2d")
+            t0_h2d = _now_ns()
+            mean = torch.from_numpy(mean_np).to(
+                self.device, dtype=torch.float32, non_blocking=True)
+            components = torch.from_numpy(components_np).to(
+                self.device, dtype=torch.float32, non_blocking=True)
+            keys = torch.from_numpy(keys_np).to(
+                self.device, dtype=self._keys_device_dtype, non_blocking=True)
+            h2d_ms = _ns_to_ms(_now_ns() - t0_h2d)
+            if metric_prefix:
+                self._record_proposer_metric(f"{metric_prefix}_h2d_submit_ms", h2d_ms)
 
         rollout_entry_starts, rollout_entry_lens = self._build_rollout_entry_spans(
-            entry_rollout_idx, n_entries, len(rollout_seqs))
+            entry_rollout_idx, n_entries, n_rollouts)
         if prompt_id:
             prior = getattr(self, "_prompt_wnd_priors", {}).get(prompt_id)
             if prior is not None:
                 wnd_size = int(prior)
         wnd_size = self._clamp_wnd_size(wnd_size, min_wnd, max_wnd)
 
-        if draft_prefix_tokens is None or draft_prefix_lens is None:
-            draft_prefix_tokens = np.zeros((n_entries, max_wnd), dtype=np.int32)
-            draft_prefix_lens = np.zeros((n_entries,), dtype=np.int32)
-            for entry_idx in range(n_entries):
-                ridx = int(entry_rollout_idx[entry_idx])
-                off = int(entry_offset[entry_idx])
-                seq = rollout_seqs[ridx]
-                take = min(max_wnd, max(0, len(seq) - off))
-                if take > 0:
-                    draft_prefix_tokens[entry_idx, :take] = seq[off:off + take]
-                draft_prefix_lens[entry_idx] = take
+        if self._prefix_cache_enabled:
+            if draft_prefix_tokens is None or draft_prefix_lens is None:
+                draft_prefix_tokens, draft_prefix_lens = self._build_draft_prefix_from_token_refs(
+                    token_buffer,
+                    rollout_token_offset,
+                    rollout_token_len,
+                    entry_rollout_idx,
+                    entry_offset,
+                    n_entries,
+                    max_wnd,
+                )
+            else:
+                draft_prefix_tokens = np.ascontiguousarray(
+                    np.asarray(draft_prefix_tokens, dtype=np.int32))
+                draft_prefix_lens = np.ascontiguousarray(
+                    np.asarray(draft_prefix_lens, dtype=np.int32))
         else:
-            draft_prefix_tokens = np.ascontiguousarray(
-                np.asarray(draft_prefix_tokens, dtype=np.int32))
-            draft_prefix_lens = np.ascontiguousarray(
-                np.asarray(draft_prefix_lens, dtype=np.int32))
+            draft_prefix_tokens = None
+            draft_prefix_lens = None
 
         entry_bias = np.zeros((n_entries,), dtype=np.int8)
         entry_hits = np.zeros((n_entries,), dtype=np.uint16)
@@ -1485,6 +1601,9 @@ class HSpecProposer(Proposer):
             mean=mean,
             components=components,
             keys=keys,
+            token_buffer=token_buffer,
+            rollout_token_offset=rollout_token_offset,
+            rollout_token_len=rollout_token_len,
             rollout_seqs=rollout_seqs,
             entry_rollout_idx=entry_rollout_idx,
             entry_offset=entry_offset,
@@ -1530,7 +1649,8 @@ class HSpecProposer(Proposer):
         t0_materialize = _now_ns()
         mean_np = self._copy_table_array_from_desc(desc.mean, np.float32)
         components_np = self._copy_table_array_from_desc(desc.components, np.float32)
-        keys_np = self._copy_table_array_from_desc(desc.keys, np.float32)
+        keys_dtype = np.float32 if self._keys_cpu_dtype_mode == "float32" else None
+        keys_np = self._copy_table_array_from_desc(desc.keys, keys_dtype)
         token_buffer = self._copy_table_array_from_desc(desc.token_buffer, np.int32)
         rollout_offsets = self._copy_table_array_from_desc(
             desc.rollout_token_offset, np.int64)
@@ -1560,27 +1680,27 @@ class HSpecProposer(Proposer):
         entry_offset = np.ascontiguousarray(entry_offset[:n_entries], dtype=np.int32)
 
         t0_prefix = _now_ns()
-        rollout_seqs = []
-        for offset, length in zip(rollout_offsets.tolist(), rollout_lens.tolist()):
-            start = int(offset)
-            end = start + int(length)
-            rollout_seqs.append(token_buffer[start:end])
-        draft_prefix_tokens, draft_prefix_lens = self._build_draft_prefix_from_token_refs(
-            token_buffer,
-            rollout_offsets,
-            rollout_lens,
-            entry_rollout_idx,
-            entry_offset,
-            n_entries,
-            int(desc.max_wnd),
-        )
+        draft_prefix_tokens = None
+        draft_prefix_lens = None
+        if self._prefix_cache_enabled:
+            draft_prefix_tokens, draft_prefix_lens = self._build_draft_prefix_from_token_refs(
+                token_buffer,
+                rollout_offsets,
+                rollout_lens,
+                entry_rollout_idx,
+                entry_offset,
+                n_entries,
+                int(desc.max_wnd),
+            )
         t1_prefix = _now_ns()
 
         cached = self._finalize_cached_table(
             mean_np=mean_np,
             components_np=components_np,
             keys_np=keys_np,
-            rollout_seqs=rollout_seqs,
+            token_buffer=token_buffer,
+            rollout_token_offset=rollout_offsets,
+            rollout_token_len=rollout_lens,
             entry_rollout_idx=entry_rollout_idx,
             entry_offset=entry_offset,
             n_entries=n_entries,
@@ -1594,8 +1714,9 @@ class HSpecProposer(Proposer):
         )
         self._record_proposer_metric(
             "descriptor_materialize_ms", _ns_to_ms(t1_materialize - t0_materialize))
-        self._record_proposer_metric(
-            "descriptor_prefix_ms", _ns_to_ms(t1_prefix - t0_prefix))
+        if self._prefix_cache_enabled:
+            self._record_proposer_metric(
+                "descriptor_prefix_ms", _ns_to_ms(t1_prefix - t0_prefix))
         self._record_proposer_metric(
             "descriptor_bytes",
             mean_np.nbytes
@@ -1624,7 +1745,8 @@ class HSpecProposer(Proposer):
         # (not in the hot loop).
         mean_np = np.array(data["mean"], dtype=np.float32, copy=True)
         components_np = np.array(data["components"], dtype=np.float32, copy=True)
-        keys_np = np.array(data["keys"], dtype=np.float32, copy=True)
+        keys_dtype = np.float32 if self._keys_cpu_dtype_mode == "float32" else None
+        keys_np = np.array(data["keys"], dtype=keys_dtype, copy=True)
 
         # Ensure rollout_seqs are numpy arrays on CPU
         rollout_seqs = []
@@ -1633,6 +1755,8 @@ class HSpecProposer(Proposer):
                 rollout_seqs.append(np.asarray(s, dtype=np.int32))
             else:
                 rollout_seqs.append(np.asarray(s, dtype=np.int32))
+        token_buffer, rollout_offsets, rollout_lens = self._flatten_rollout_seqs(
+            rollout_seqs)
 
         entry_rollout_idx = np.asarray(data["entry_rollout_idx"], dtype=np.int32)
         n_entries = int(data["n_entries"])
@@ -1646,7 +1770,9 @@ class HSpecProposer(Proposer):
             mean_np=mean_np,
             components_np=components_np,
             keys_np=keys_np,
-            rollout_seqs=rollout_seqs,
+            token_buffer=token_buffer,
+            rollout_token_offset=rollout_offsets,
+            rollout_token_len=rollout_lens,
             entry_rollout_idx=entry_rollout_idx,
             entry_offset=entry_offset,
             n_entries=n_entries,
@@ -1708,9 +1834,9 @@ class HSpecProposer(Proposer):
             empty_bool = torch.empty((0,), dtype=torch.bool, device=device)
             return empty, empty, empty, empty_long, empty_bool
 
-        k_max = max(int(cached.components.shape[0]) for cached in cached_tables)
+        k_max = max(int(cached.components_t_cpu.shape[1]) for cached in cached_tables)
         m_max = max(int(cached.n_entries) for cached in cached_tables)
-        hidden_dim = int(cached_tables[0].mean.shape[0])
+        hidden_dim = int(cached_tables[0].mean_cpu.shape[0])
         # Rebuild on CPU to avoid many tiny NPU slice/copy kernels, then upload
         with (hspec_record_function("hspec/proposal/rebuild_on_cpu")
               if prof_enabled else nullcontext()):
@@ -1758,7 +1884,8 @@ class HSpecProposer(Proposer):
             mean_batch = torch.from_numpy(mean_batch_cpu).to(device=device, dtype=dtype, non_blocking=True)
             components_t_batch = torch.from_numpy(components_t_batch_cpu).to(
                 device=device, dtype=dtype, non_blocking=True)
-            keys_batch = torch.from_numpy(keys_batch_cpu).to(device=device, dtype=dtype, non_blocking=True)
+            keys_batch = torch.from_numpy(keys_batch_cpu).to(
+                device=device, dtype=self._keys_device_dtype, non_blocking=True)
             key_lengths = torch.from_numpy(key_lengths_cpu).to(
                 device=device, dtype=torch.long, non_blocking=True)
             invalid_key_mask = torch.from_numpy(invalid_key_mask_cpu).to(
@@ -1773,6 +1900,8 @@ class HSpecProposer(Proposer):
         invalid_key_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fully batched similarity matching with precomputed key padding mask."""
+        if keys_batch.dtype != z_batch.dtype:
+            z_batch = z_batch.to(dtype=keys_batch.dtype)
         sims = torch.bmm(keys_batch, z_batch.unsqueeze(-1)).squeeze(-1)
         if invalid_key_mask.numel() > 0:
             sims = sims.masked_fill(invalid_key_mask, torch.finfo(sims.dtype).min)
@@ -2165,27 +2294,33 @@ class HSpecProposer(Proposer):
                         table_info_lines.append(
                             f"cache_table {corr_id} | decoded_tokens_at_match={decoded_tokens_at_match} | "
                             f"n_entries={n_entries} wnd_size={cached_for_debug.wnd_size} "
-                            f"mean.shape={tuple(cached_for_debug.mean.shape)} "
-                            f"components.shape={tuple(cached_for_debug.components.shape)} "
-                            f"keys.shape={tuple(cached_for_debug.keys.shape)} | "
+                            f"mean.shape={tuple(cached_for_debug.mean_cpu.shape)} "
+                            f"components_t.shape={tuple(cached_for_debug.components_t_cpu.shape)} "
+                            f"keys_cpu.shape={tuple(cached_for_debug.keys_cpu.shape)} "
+                            f"per_prompt_npu={cached_for_debug.keys is not None} | "
                             f"best_hit_entry={best_idx_val} → draft_tokens_for_next_step (see entry below)"
                         )
                         tokenizer = _get_tokenizer_safe(self.runner)
                         for entry_idx in range(n_entries):
                             ridx = int(cached_for_debug.entry_rollout_idx[entry_idx])
                             off = int(cached_for_debug.entry_offset[entry_idx])
-                            seq = cached_for_debug.rollout_seqs[ridx]
-                            draft_tokens = seq[off: off + cached_for_debug.wnd_size].tolist()
+                            draft_tokens = cached_for_debug.get_draft_tokens(
+                                entry_idx, cached_for_debug.wnd_size)
                             # Detokenize rollout sequence
                             rollout_text = _detokenize_safe(tokenizer, draft_tokens)
                             # Get similarity for this entry (if keys available)
                             try:
                                 # Use the projected anchor_hs to compute similarity
                                 if trace_anchor is not None:
-                                    hs_f = trace_anchor.float()
-                                    z = (hs_f - cached_for_debug.mean) @ cached_for_debug.components.T
-                                    # z = F.normalize(z, dim=0)
-                                    entry_sim = float((cached_for_debug.keys[entry_idx] @ z).item())
+                                    hs_np = trace_anchor.detach().float().cpu().numpy()
+                                    z_np = (
+                                        (hs_np - cached_for_debug.mean_cpu)
+                                        @ cached_for_debug.components_t_cpu
+                                    )
+                                    key_np = cached_for_debug.keys_cpu[entry_idx].astype(
+                                        np.float32, copy=False)
+                                    entry_sim = float(
+                                        key_np.dot(z_np.astype(np.float32, copy=False)))
                                 else:
                                     entry_sim = float("nan")
                             except Exception:
@@ -2284,7 +2419,7 @@ class HSpecProposer(Proposer):
                 entry_bias, entry_hits = cached.get_entry_state(matched_entry_idx)
                 histo_ngram_match = self._has_same_histo_ngram(
                     current_tokens,
-                    cached.rollout_seqs[matched_rollout_idx],
+                    cached.get_rollout_tokens(matched_rollout_idx),
                     matched_pos,
                 )
                 self._entry_pending_match_count += 1
