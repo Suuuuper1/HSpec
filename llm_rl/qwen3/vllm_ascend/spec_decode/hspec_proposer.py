@@ -44,6 +44,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm_ascend.spec_decode.hspec_table import GlobalHSpecTableGroup, get_hspec_tables
 from vllm_ascend.spec_decode.hspec_table_store import (
     HSpecPromptTableDesc,
+    estimate_prompt_table_desc_nbytes,
     open_array,
 )
 from vllm_ascend.spec_decode.hspec_utils import (
@@ -874,14 +875,27 @@ class HSpecProposer(Proposer):
                             cache_mutated = True
                             continue
                         estimated_bytes = self._estimate_pending_payload_bytes(data)
-                        if (self._max_ready_prefetch_bytes > 0
-                                and materialized_bytes_this_call > 0
-                                and materialized_bytes_this_call + estimated_bytes
-                                > self._max_ready_prefetch_bytes):
-                            deferred_pids.append(pid)
-                            self._record_proposer_metric(
-                                "prefetch_ready_bytes_throttle_count", 1)
-                            continue
+                        byte_budget = int(self._max_ready_prefetch_bytes)
+                        if byte_budget > 0 and estimated_bytes > 0:
+                            would_exceed = (
+                                materialized_bytes_this_call
+                                + int(estimated_bytes)
+                                > byte_budget
+                            )
+                            if would_exceed and materialized_bytes_this_call > 0:
+                                deferred_pids.append(pid)
+                                self._record_proposer_metric(
+                                    "prefetch_ready_bytes_throttle_count", 1)
+                                self._record_proposer_metric(
+                                    "prefetch_ready_bytes_deferred",
+                                    int(estimated_bytes))
+                                continue
+                            if would_exceed and materialized_bytes_this_call == 0:
+                                self._record_proposer_metric(
+                                    "prefetch_ready_bytes_oversize_pass_count", 1)
+                                self._record_proposer_metric(
+                                    "prefetch_ready_bytes_oversize_pass_bytes",
+                                    int(estimated_bytes))
                         try:
                             if isinstance(data, HSpecPromptTableDesc):
                                 if int(data.version) != int(version):
@@ -1447,18 +1461,19 @@ class HSpecProposer(Proposer):
     def _estimate_pending_payload_bytes(self, data: Any) -> int:
         if isinstance(data, HSpecPromptTableDesc):
             try:
-                return (
-                    int(data.mean.nbytes)
-                    + int(data.components.nbytes)
-                    + int(data.keys.nbytes)
-                    + int(data.token_buffer.nbytes)
-                    + int(data.rollout_token_offset.nbytes)
-                    + int(data.rollout_token_len.nbytes)
-                    + int(data.entry_rollout_idx.nbytes)
-                    + int(data.entry_offset.nbytes)
-                    + (int(data.rewards.nbytes) if data.rewards is not None else 0)
-                )
+                parts = estimate_prompt_table_desc_nbytes(data)
+                total = int(parts.get("total", 0))
+                if self._keys_cpu_dtype_mode == "float32":
+                    key_count = 1
+                    for dim in tuple(data.keys.shape):
+                        key_count *= int(dim)
+                    table_key_bytes = int(parts.get("keys", 0))
+                    fp32_key_bytes = int(key_count) * np.dtype(np.float32).itemsize
+                    total += max(0, fp32_key_bytes - table_key_bytes)
+                return max(int(total), 0)
             except Exception:
+                self._record_proposer_metric(
+                    "prefetch_ready_bytes_estimate_error_count", 1)
                 return 0
         if isinstance(data, dict):
             total = 0

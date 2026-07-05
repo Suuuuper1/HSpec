@@ -976,7 +976,10 @@ class HSpecTableGroup:
         self._proposer_cache_oversize_entries = 0
         self._proposer_prefetch_ready_ref_throttle_count = 0
         self._proposer_prefetch_ready_bytes_throttle_count = 0
+        self._proposer_prefetch_ready_bytes_deferred = 0
         self._proposer_prefetch_ready_bytes_oversize_pass_count = 0
+        self._proposer_prefetch_ready_bytes_oversize_pass_bytes = 0
+        self._proposer_prefetch_ready_bytes_estimate_error_count = 0
         self._proposer_batch_cache_prebuild_count = 0
         self._proposer_batch_cache_prebuild_ms = 0.0
         self._proposer_batch_cache_h2d_submit_ms = 0.0
@@ -2426,7 +2429,10 @@ class HSpecTableGroup:
             "proposer_cache_oversize_entries": self._proposer_cache_oversize_entries,
             "proposer_prefetch_ready_ref_throttle_count": self._proposer_prefetch_ready_ref_throttle_count,
             "proposer_prefetch_ready_bytes_throttle_count": self._proposer_prefetch_ready_bytes_throttle_count,
+            "proposer_prefetch_ready_bytes_deferred": self._proposer_prefetch_ready_bytes_deferred,
             "proposer_prefetch_ready_bytes_oversize_pass_count": self._proposer_prefetch_ready_bytes_oversize_pass_count,
+            "proposer_prefetch_ready_bytes_oversize_pass_bytes": self._proposer_prefetch_ready_bytes_oversize_pass_bytes,
+            "proposer_prefetch_ready_bytes_estimate_error_count": self._proposer_prefetch_ready_bytes_estimate_error_count,
             "proposer_batch_cache_prebuild_count": self._proposer_batch_cache_prebuild_count,
             "proposer_batch_cache_prebuild_ms": self._proposer_batch_cache_prebuild_ms,
             "proposer_batch_cache_h2d_submit_ms": self._proposer_batch_cache_h2d_submit_ms,
@@ -2541,7 +2547,10 @@ class HSpecTableGroup:
         self._proposer_cache_oversize_entries = 0
         self._proposer_prefetch_ready_ref_throttle_count = 0
         self._proposer_prefetch_ready_bytes_throttle_count = 0
+        self._proposer_prefetch_ready_bytes_deferred = 0
         self._proposer_prefetch_ready_bytes_oversize_pass_count = 0
+        self._proposer_prefetch_ready_bytes_oversize_pass_bytes = 0
+        self._proposer_prefetch_ready_bytes_estimate_error_count = 0
         self._proposer_batch_cache_prebuild_count = 0
         self._proposer_batch_cache_prebuild_ms = 0.0
         self._proposer_batch_cache_h2d_submit_ms = 0.0
@@ -2671,7 +2680,10 @@ class HSpecTableGroup:
             "cache_oversize_entries": "_proposer_cache_oversize_entries",
             "prefetch_ready_ref_throttle_count": "_proposer_prefetch_ready_ref_throttle_count",
             "prefetch_ready_bytes_throttle_count": "_proposer_prefetch_ready_bytes_throttle_count",
+            "prefetch_ready_bytes_deferred": "_proposer_prefetch_ready_bytes_deferred",
             "prefetch_ready_bytes_oversize_pass_count": "_proposer_prefetch_ready_bytes_oversize_pass_count",
+            "prefetch_ready_bytes_oversize_pass_bytes": "_proposer_prefetch_ready_bytes_oversize_pass_bytes",
+            "prefetch_ready_bytes_estimate_error_count": "_proposer_prefetch_ready_bytes_estimate_error_count",
             "batch_cache_prebuild_count": "_proposer_batch_cache_prebuild_count",
             "batch_cache_prebuild_ms": "_proposer_batch_cache_prebuild_ms",
             "batch_cache_h2d_submit_ms": "_proposer_batch_cache_h2d_submit_ms",
@@ -3482,7 +3494,12 @@ class GlobalHSpecTableGroup:
                 "hspec/proposer_cache_oversize_entries": 0,
                 "hspec/proposer_prefetch_ready_ref_throttle_count": 0,
                 "hspec/proposer_prefetch_ready_bytes_throttle_count": 0,
+                "hspec/proposer_prefetch_ready_bytes_deferred": 0,
+                "hspec/proposer_prefetch_ready_bytes_deferred_mb": 0.0,
                 "hspec/proposer_prefetch_ready_bytes_oversize_pass_count": 0,
+                "hspec/proposer_prefetch_ready_bytes_oversize_pass_bytes": 0,
+                "hspec/proposer_prefetch_ready_bytes_oversize_pass_mb": 0.0,
+                "hspec/proposer_prefetch_ready_bytes_estimate_error_count": 0,
                 "hspec/proposer_batch_cache_prebuild_count": 0,
                 "hspec/proposer_batch_cache_prebuild_ms": 0.0,
                 "hspec/proposer_batch_cache_h2d_submit_ms": 0.0,
@@ -3704,7 +3721,10 @@ class GlobalHSpecTableGroup:
             "cache_oversize_entries",
             "prefetch_ready_ref_throttle_count",
             "prefetch_ready_bytes_throttle_count",
+            "prefetch_ready_bytes_deferred",
             "prefetch_ready_bytes_oversize_pass_count",
+            "prefetch_ready_bytes_oversize_pass_bytes",
+            "prefetch_ready_bytes_estimate_error_count",
             "batch_cache_prebuild_count",
             "batch_cache_prebuild_ms",
             "batch_cache_h2d_submit_ms",
@@ -3724,6 +3744,13 @@ class GlobalHSpecTableGroup:
         )
         result["hspec/proposer_batch_cache_budget_skip_mb"] = (
             float(agg.get("proposer_batch_cache_budget_skip_bytes", 0)) / (1024 * 1024)
+        )
+        result["hspec/proposer_prefetch_ready_bytes_deferred_mb"] = (
+            float(agg.get("proposer_prefetch_ready_bytes_deferred", 0)) / (1024 * 1024)
+        )
+        result["hspec/proposer_prefetch_ready_bytes_oversize_pass_mb"] = (
+            float(agg.get("proposer_prefetch_ready_bytes_oversize_pass_bytes", 0))
+            / (1024 * 1024)
         )
 
         abs_deltas = set()

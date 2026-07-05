@@ -220,6 +220,11 @@ class HSpecArrayDesc:
         object.__setattr__(self, "dtype", dtype.name)
         object.__setattr__(self, "order", order)
 
+    @property
+    def nbytes(self) -> int:
+        """Estimated array bytes from descriptor metadata only."""
+        return _array_nbytes(tuple(self.shape), np.dtype(self.dtype))
+
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["shape"] = list(self.shape)
