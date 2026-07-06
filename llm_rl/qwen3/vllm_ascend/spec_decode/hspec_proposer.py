@@ -898,7 +898,7 @@ class HSpecProposer(Proposer):
                                     int(estimated_bytes))
                         try:
                             if isinstance(data, HSpecPromptTableDesc):
-                                if int(data.version) != int(version):
+                                if int(data.version) > int(version):
                                     raise ValueError(
                                         "HSpec descriptor version mismatch: "
                                         f"prompt_id={pid!r} desc.version={data.version} "

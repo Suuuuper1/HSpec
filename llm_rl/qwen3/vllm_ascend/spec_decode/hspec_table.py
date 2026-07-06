@@ -36,6 +36,7 @@ from vllm_ascend.spec_decode.hspec_builder import (
     build_prompt_table_to_store,
 )
 from vllm_ascend.spec_decode.hspec_table_store import (
+    HSpecActivePromptRecord,
     HSpecPromptTableDesc,
     HSpecTableStoreWriter,
     clear_active_version_manifest,
@@ -47,6 +48,7 @@ from vllm_ascend.spec_decode.hspec_table_store import (
     list_table_store_versions,
     materialize_prompt_table,
     open_array as open_table_array,
+    write_active_prompt_index,
     write_active_version_manifest,
 )
 from vllm_ascend.spec_decode.hspec_utils import (
@@ -94,6 +96,8 @@ _TABLE_STORE_ADDITIVE_METRIC_KEYS = frozenset({
     "table_store_descriptor_count",
     "table_store_manifest_write_error",
     "table_store_active_manifest_write_error",
+    "table_store_active_prompt_index_write_error",
+    "table_store_active_prompt_index_prompts",
     "table_store_fsync_count",
     "table_store_reader_load_error",
     "table_store_materialize_count",
@@ -116,6 +120,7 @@ _TABLE_STORE_ADDITIVE_METRIC_KEYS = frozenset({
 })
 _TABLE_STORE_MAX_METRIC_KEYS = frozenset({
     "table_store_version",
+    "table_store_referenced_versions",
 })
 _DRIVER_LOCAL_ALWAYS_METRIC_KEYS = frozenset({
     "topology_actor_init_error",
@@ -916,7 +921,9 @@ class HSpecTableGroup:
         #   _building: write-only during build phase
         #   swap()   : building → active at epoch boundary
         self._active: Dict[str, HSpecPromptTableDesc] = {}
+        self._active_records: Dict[str, HSpecActivePromptRecord] = {}
         self._building: Dict[str, HSpecPromptTableDesc] = {}
+        self._building_records_by_epoch: Dict[int, Dict[str, HSpecActivePromptRecord]] = {}
         self._active_version: int = 0
         self._table_writer: Optional[HSpecTableStoreWriter] = None
         self._building_version: Optional[int] = None
@@ -1525,6 +1532,54 @@ class HSpecTableGroup:
         max_disk_version = max(versions, default=0)
         return max(int(self._active_version), int(max_disk_version)) + 1
 
+    def _sync_active_descs_from_records(self) -> None:
+        self._active = {
+            prompt_id: record.desc
+            for prompt_id, record in self._active_records.items()
+            if bool(record.complete)
+        }
+
+    def _active_referenced_versions(self) -> set[int]:
+        if self._active_records:
+            return {
+                int(record.desc.version)
+                for record in self._active_records.values()
+                if int(record.desc.version) >= 0
+            }
+        return {
+            int(desc.version)
+            for desc in self._active.values()
+            if isinstance(desc, HSpecPromptTableDesc)
+            and int(desc.version) >= 0
+        }
+
+    def _active_manifest_referenced_versions(self) -> set[int]:
+        referenced = set(self._active_referenced_versions())
+        if int(self._active_version) >= 0:
+            referenced.add(int(self._active_version))
+        return referenced
+
+    def _record_from_desc(
+        self,
+        desc: HSpecPromptTableDesc,
+        *,
+        active_epoch: int,
+        complete: bool = True,
+    ) -> HSpecActivePromptRecord:
+        previous = self._active_records.get(str(desc.prompt_id))
+        return HSpecActivePromptRecord.from_desc(
+            desc,
+            active_epoch=int(active_epoch),
+            source_epoch=int(desc.version),
+            complete=bool(complete),
+            last_access_step=int(getattr(previous, "last_access_step", 0) if previous else 0),
+            access_count=int(getattr(previous, "access_count", 0) if previous else 0),
+            hit_count=int(getattr(previous, "hit_count", 0) if previous else 0),
+            reward_mean=float(getattr(previous, "reward_mean", 0.0) if previous else 0.0),
+            reward_max=float(getattr(previous, "reward_max", 0.0) if previous else 0.0),
+            eviction_score=float(getattr(previous, "eviction_score", 0.0) if previous else 0.0),
+        )
+
     def _maybe_gc_table_store_versions(self) -> None:
         if not hspec_table_store_gc_after_swap_enabled():
             return
@@ -1534,6 +1589,7 @@ class HSpecTableGroup:
                 shard_id=self.shard_id,
                 active_version=self._active_version,
                 retain_versions=get_hspec_table_store_retain_versions(),
+                referenced_versions=self._active_referenced_versions(),
             )
         except Exception:
             logger.debug("Failed during best-effort HSpec table-store GC",
@@ -1646,6 +1702,13 @@ class HSpecTableGroup:
         metrics.table_rollout_count = int(build_metrics.n_rollouts)
         metrics.table_token_count = int(build_metrics.token_count)
         self._building[prompt_id] = table_desc
+        self._building_records_by_epoch.setdefault(
+            int(table_desc.version), {}
+        )[str(prompt_id)] = self._record_from_desc(
+            table_desc,
+            active_epoch=int(table_desc.version),
+            complete=True,
+        )
         self._build_count += 1
         metrics.built = True
         return metrics
@@ -2375,12 +2438,17 @@ class HSpecTableGroup:
 
     def delete(self, prompt_id: str):
         """Delete a prompt's table from building side."""
+        prompt_id = str(prompt_id)
         self._building.pop(prompt_id, None)
+        for records in self._building_records_by_epoch.values():
+            records.pop(prompt_id, None)
 
     def clear(self):
         """Clear all tables (both active and building) and reset metrics."""
         self._active.clear()
+        self._active_records.clear()
         self._building.clear()
+        self._building_records_by_epoch.clear()
         self._table_writer = None
         self._building_version = None
         self._active_version = 0
@@ -2388,7 +2456,7 @@ class HSpecTableGroup:
         clear_active_version_manifest(self.table_store_root)
 
     def exist(self, prompt_id: str) -> bool:
-        return prompt_id in self._active
+        return str(prompt_id) in self._active
 
     def get_prompt_ids(self) -> List[str]:
         return list(self._active.keys())
@@ -2397,6 +2465,8 @@ class HSpecTableGroup:
         return len(self._active)
 
     def total_entries(self) -> int:
+        if self._active_records:
+            return sum(int(record.desc.n_entries) for record in self._active_records.values())
         return sum(int(getattr(t, "n_entries", 0)) for t in self._active.values())
 
     # Double-buffer version management
@@ -2419,6 +2489,7 @@ class HSpecTableGroup:
                         exc_info=True,
                     )
             self._building = {}
+            self._building_records_by_epoch.clear()
             self._table_writer = None
             self._building_version = None
             self._maybe_gc_table_store_versions()
@@ -2445,7 +2516,9 @@ class HSpecTableGroup:
                     "version."
                 )
             self._active = dict(self._building)
+            self._active_records = {}
             self._building = {}
+            self._building_records_by_epoch.clear()
             self._active_version += 1
             self._reset_metrics()
             logger.info(
@@ -2460,7 +2533,8 @@ class HSpecTableGroup:
             self._building_version if self._building_version is not None
             else writer.version
         )
-        new_active: Dict[str, HSpecPromptTableDesc] = {}
+        new_records: Dict[str, HSpecActivePromptRecord] = {}
+        records_for_version = self._building_records_by_epoch.get(building_version, {})
         for pid, table in self._building.items():
             if not isinstance(table, HSpecPromptTableDesc):
                 raise TypeError(
@@ -2479,14 +2553,48 @@ class HSpecTableGroup:
                     f"prompt_id={pid!r} desc.shard_id={table.shard_id} "
                     f"actor.shard_id={self.shard_id}"
                 )
-            new_active[str(pid)] = table
+            record = records_for_version.get(str(pid))
+            if record is None or record.desc != table:
+                record = self._record_from_desc(
+                    table,
+                    active_epoch=building_version,
+                    complete=True,
+                )
+            else:
+                record = HSpecActivePromptRecord.from_desc(
+                    record.desc,
+                    active_epoch=building_version,
+                    source_epoch=int(record.source_epoch),
+                    complete=bool(record.complete),
+                    last_access_step=int(record.last_access_step),
+                    access_count=int(record.access_count),
+                    hit_count=int(record.hit_count),
+                    reward_mean=float(record.reward_mean),
+                    reward_max=float(record.reward_max),
+                    eviction_score=float(record.eviction_score),
+                )
+            new_records[str(pid)] = record
 
         manifest = writer.seal({
-            "step": "phase2_step4_swap",
+            "step": "phase4_step3_full_swap",
             "active_publish_pending": True,
         })
-        prompt_count = len(new_active)
-        entry_count = sum(int(desc.n_entries) for desc in new_active.values())
+        prompt_count = len(new_records)
+        entry_count = sum(int(record.desc.n_entries) for record in new_records.values())
+        active_bytes = sum(int(record.live_bytes) for record in new_records.values())
+        referenced_versions = sorted({
+            int(record.desc.version) for record in new_records.values()
+        })
+        new_active = {
+            prompt_id: record.desc
+            for prompt_id, record in new_records.items()
+            if bool(record.complete)
+        }
+        active_prompt_index_path = write_active_prompt_index(
+            self.table_store_root,
+            new_records,
+            index_dir=manifest["version_dir"],
+        )
         write_active_version_manifest(
             self.table_store_root,
             active_version=building_version,
@@ -2495,11 +2603,18 @@ class HSpecTableGroup:
             manifest_path=manifest.get("manifest_path", writer.manifest_path),
             prompt_count=prompt_count,
             entry_count=entry_count,
+            active_epoch=building_version,
+            active_prompt_index_path=active_prompt_index_path,
+            referenced_versions=referenced_versions,
+            active_bytes=active_bytes,
+            partial=False,
         )
 
+        self._active_records = new_records
         self._active = new_active
         self._active_version = building_version
         self._building = {}
+        self._building_records_by_epoch.clear()
         self._table_writer = None
         self._building_version = None
         self._maybe_gc_table_store_versions()
@@ -2575,12 +2690,15 @@ class HSpecTableGroup:
     # Metrics
 
     def _active_table_desc_bytes(self) -> int:
+        if self._active_records:
+            return sum(int(record.live_bytes) for record in self._active_records.values())
         total = 0
         for table in self._active.values():
             if not isinstance(table, HSpecPromptTableDesc):
                 continue
             try:
-                total += int(estimate_prompt_table_desc_nbytes(table))
+                parts = estimate_prompt_table_desc_nbytes(table)
+                total += int(parts.get("total", 0))
             except Exception:
                 hspec_record_store_metric("table_store_reader_load_error", 1)
         return total
@@ -2647,6 +2765,8 @@ class HSpecTableGroup:
             "table_active_bytes": self._active_table_desc_bytes(),
             "table_active_prompts": len(self._active),
             "table_active_entries": self.total_entries(),
+            "table_store_referenced_versions": len(
+                self._active_manifest_referenced_versions()),
             "table_eviction_count": self._table_eviction_count,
             "table_eviction_bytes": self._table_eviction_bytes,
             "table_eviction_entries": self._table_eviction_entries,
@@ -3834,6 +3954,7 @@ class GlobalHSpecTableGroup:
                 "hspec/table_active_bytes": 0,
                 "hspec/table_active_prompts": 0,
                 "hspec/table_active_entries": 0,
+                "hspec/table_store_referenced_versions": 0,
                 "hspec/table_eviction_count": 0,
                 "hspec/table_partial_swap_count": 0,
                 "hspec/proposer_prompt_access_report_count": 0,
@@ -3860,6 +3981,7 @@ class GlobalHSpecTableGroup:
             "build_pca_randomized_rank_max",
             "active_version",
             "table_store_version",
+            "table_store_referenced_versions",
             "proposer_cache_live_cpu_bytes",
             "proposer_cache_live_npu_bytes",
             "proposer_cache_live_entries",
@@ -3989,6 +4111,7 @@ class GlobalHSpecTableGroup:
             "hspec/table_active_mb": agg.get("table_active_bytes", 0) / (1024 * 1024),
             "hspec/table_active_prompts": agg.get("table_active_prompts", 0),
             "hspec/table_active_entries": agg.get("table_active_entries", 0),
+            "hspec/table_store_referenced_versions": agg.get("table_store_referenced_versions", 0),
             "hspec/table_eviction_count": agg.get("table_eviction_count", 0),
             "hspec/table_eviction_bytes": agg.get("table_eviction_bytes", 0),
             "hspec/table_eviction_mb": agg.get("table_eviction_bytes", 0) / (1024 * 1024),

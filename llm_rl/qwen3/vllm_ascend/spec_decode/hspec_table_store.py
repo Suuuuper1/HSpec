@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 TABLE_STORE_SCHEMA_VERSION = 1
 TABLE_BIN_NAME = "table.bin"
 PROMPT_INDEX_NAME = "prompt_index.jsonl"
+ACTIVE_PROMPT_INDEX_NAME = "active_prompt_index.jsonl"
 VERSION_MANIFEST_NAME = "manifest.json"
 ACTIVE_VERSION_NAME = "active_version.json"
 DEFAULT_ALIGN_BYTES = 4096
@@ -68,6 +69,24 @@ def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
                 tmp.unlink()
         except OSError:
             logger.debug("Failed to remove temporary HSpec table manifest %s",
+                         tmp,
+                         exc_info=True)
+
+
+def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            logger.debug("Failed to remove temporary HSpec active index %s",
                          tmp,
                          exc_info=True)
 
@@ -467,6 +486,137 @@ def coerce_prompt_table_desc(obj: Any) -> HSpecPromptTableDesc:
     )
 
 
+@dataclass(frozen=True)
+class HSpecActivePromptRecord:
+    """Prompt-level active table metadata wrapping a table descriptor.
+
+    The descriptor stays proposer-facing and immutable. Runtime lifecycle
+    fields live here so active sets may reference multiple table-store
+    versions without polluting ``HSpecPromptTableDesc``.
+    """
+
+    desc: HSpecPromptTableDesc
+    active_epoch: int
+    source_epoch: int
+    complete: bool
+    live_bytes: int
+    last_access_step: int = 0
+    access_count: int = 0
+    hit_count: int = 0
+    reward_mean: float = 0.0
+    reward_max: float = 0.0
+    eviction_score: float = 0.0
+
+    def __post_init__(self) -> None:
+        desc = coerce_prompt_table_desc(self.desc)
+        object.__setattr__(self, "desc", desc)
+        object.__setattr__(self, "active_epoch", max(int(self.active_epoch), 0))
+        source_epoch = int(self.source_epoch)
+        if source_epoch < 0:
+            source_epoch = int(desc.version)
+        object.__setattr__(self, "source_epoch", source_epoch)
+        object.__setattr__(self, "complete", bool(self.complete))
+        live_bytes = int(self.live_bytes)
+        if live_bytes <= 0:
+            live_bytes = int(estimate_prompt_table_desc_nbytes(desc)["total"])
+        object.__setattr__(self, "live_bytes", max(live_bytes, 0))
+        object.__setattr__(self, "last_access_step", max(int(self.last_access_step), 0))
+        object.__setattr__(self, "access_count", max(int(self.access_count), 0))
+        object.__setattr__(self, "hit_count", max(int(self.hit_count), 0))
+        object.__setattr__(self, "reward_mean", float(self.reward_mean))
+        object.__setattr__(self, "reward_max", float(self.reward_max))
+        object.__setattr__(self, "eviction_score", float(self.eviction_score))
+
+    @property
+    def prompt_id(self) -> str:
+        return str(self.desc.prompt_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        return active_prompt_record_to_dict(self)
+
+    @classmethod
+    def from_dict(cls, obj: dict[str, Any]) -> "HSpecActivePromptRecord":
+        return coerce_active_prompt_record(obj)
+
+    @classmethod
+    def from_desc(
+        cls,
+        desc_obj: HSpecPromptTableDesc | dict[str, Any],
+        *,
+        active_epoch: int,
+        source_epoch: int | None = None,
+        complete: bool = True,
+        last_access_step: int = 0,
+        access_count: int = 0,
+        hit_count: int = 0,
+        reward_mean: float = 0.0,
+        reward_max: float = 0.0,
+        eviction_score: float = 0.0,
+    ) -> "HSpecActivePromptRecord":
+        desc = coerce_prompt_table_desc(desc_obj)
+        return cls(
+            desc=desc,
+            active_epoch=int(active_epoch),
+            source_epoch=int(desc.version if source_epoch is None else source_epoch),
+            complete=bool(complete),
+            live_bytes=int(estimate_prompt_table_desc_nbytes(desc)["total"]),
+            last_access_step=int(last_access_step),
+            access_count=int(access_count),
+            hit_count=int(hit_count),
+            reward_mean=float(reward_mean),
+            reward_max=float(reward_max),
+            eviction_score=float(eviction_score),
+        )
+
+
+def active_prompt_record_to_dict(record: HSpecActivePromptRecord | dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(record, HSpecActivePromptRecord):
+        record = coerce_active_prompt_record(record)
+    return {
+        "schema_version": TABLE_STORE_SCHEMA_VERSION,
+        "prompt_id": str(record.prompt_id),
+        "active_epoch": int(record.active_epoch),
+        "source_epoch": int(record.source_epoch),
+        "complete": bool(record.complete),
+        "live_bytes": int(record.live_bytes),
+        "last_access_step": int(record.last_access_step),
+        "access_count": int(record.access_count),
+        "hit_count": int(record.hit_count),
+        "reward_mean": float(record.reward_mean),
+        "reward_max": float(record.reward_max),
+        "eviction_score": float(record.eviction_score),
+        "desc": prompt_table_desc_to_dict(record.desc),
+    }
+
+
+def coerce_active_prompt_record(obj: Any) -> HSpecActivePromptRecord:
+    if isinstance(obj, HSpecActivePromptRecord):
+        return obj
+    if not isinstance(obj, dict):
+        raise TypeError(
+            f"Expected HSpecActivePromptRecord or dict, got {type(obj)!r}")
+    desc_payload = obj.get("desc")
+    if desc_payload is None:
+        raise ValueError("HSpecActivePromptRecord missing desc")
+    desc = coerce_prompt_table_desc(desc_payload)
+    live_bytes = obj.get("live_bytes")
+    if live_bytes is None:
+        live_bytes = estimate_prompt_table_desc_nbytes(desc)["total"]
+    return HSpecActivePromptRecord(
+        desc=desc,
+        active_epoch=int(obj.get("active_epoch", obj.get("active_version", desc.version))),
+        source_epoch=int(obj.get("source_epoch", desc.version)),
+        complete=bool(obj.get("complete", True)),
+        live_bytes=int(live_bytes),
+        last_access_step=int(obj.get("last_access_step", 0)),
+        access_count=int(obj.get("access_count", 0)),
+        hit_count=int(obj.get("hit_count", 0)),
+        reward_mean=float(obj.get("reward_mean", 0.0)),
+        reward_max=float(obj.get("reward_max", 0.0)),
+        eviction_score=float(obj.get("eviction_score", 0.0)),
+    )
+
+
 def open_array(desc_obj: HSpecArrayDesc | dict[str, Any], mode: str = "r") -> np.memmap:
     desc = coerce_array_desc(desc_obj)
     if mode not in {"r", "r+", "w+"}:
@@ -824,11 +974,32 @@ class HSpecTableStoreReader:
             raise
         return result
 
-    def load_active_index(self) -> dict[str, HSpecPromptTableDesc]:
+    def load_active_records(self) -> dict[str, HSpecActivePromptRecord]:
         active = self.read_active_manifest()
         if active is None:
             return {}
-        return self.load_prompt_index(int(active["active_version"]))
+        active_index_path = active.get("active_prompt_index_path")
+        if active_index_path:
+            return read_active_prompt_index(active_index_path)
+
+        descs = self.load_prompt_index(int(active["active_version"]))
+        active_epoch = int(active.get("active_epoch", active.get("active_version", 0)))
+        return {
+            prompt_id: HSpecActivePromptRecord.from_desc(
+                desc,
+                active_epoch=active_epoch,
+                source_epoch=int(desc.version),
+                complete=True,
+            )
+            for prompt_id, desc in descs.items()
+        }
+
+    def load_active_index(self) -> dict[str, HSpecPromptTableDesc]:
+        return {
+            prompt_id: record.desc
+            for prompt_id, record in self.load_active_records().items()
+            if bool(record.complete)
+        }
 
     def get_prompt(self, prompt_id: str) -> HSpecPromptTableDesc | None:
         return self.load_active_index().get(str(prompt_id))
@@ -849,23 +1020,84 @@ def write_active_version_manifest(
     manifest_path: str | Path,
     prompt_count: int,
     entry_count: int,
+    active_epoch: int | None = None,
+    active_prompt_index_path: str | Path | None = None,
+    referenced_versions: list[int] | tuple[int, ...] | set[int] | None = None,
+    active_bytes: int = 0,
+    partial: bool = False,
 ) -> dict[str, Any]:
+    refs = sorted({int(v) for v in (referenced_versions or []) if int(v) >= 0})
+    if int(active_version) >= 0:
+        refs = sorted(set(refs) | {int(active_version)})
     payload = {
         "schema_version": TABLE_STORE_SCHEMA_VERSION,
         "active_version": int(active_version),
+        "active_epoch": int(active_version if active_epoch is None else active_epoch),
         "shard_id": int(shard_id),
         "version_dir": str(version_dir),
         "manifest_path": str(manifest_path),
         "prompt_count": int(prompt_count),
         "entry_count": int(entry_count),
+        "active_bytes": int(active_bytes),
+        "partial": bool(partial),
+        "referenced_versions": refs,
         "updated_time_ns": time.time_ns(),
     }
+    if active_prompt_index_path is not None:
+        payload["active_prompt_index_path"] = str(active_prompt_index_path)
     try:
         _write_json_atomic(Path(shard_root) / ACTIVE_VERSION_NAME, payload)
     except Exception:
         hspec_record_store_metric("table_store_active_manifest_write_error", 1)
         raise
+    hspec_record_store_metric_max("table_store_referenced_versions", len(refs))
     return payload
+
+
+def write_active_prompt_index(
+    shard_root: str | Path,
+    records: Dict[str, HSpecActivePromptRecord] | list[HSpecActivePromptRecord],
+    *,
+    index_dir: str | Path | None = None,
+) -> str:
+    if isinstance(records, dict):
+        values = list(records.values())
+    else:
+        values = list(records)
+    coerced = [coerce_active_prompt_record(record) for record in values]
+    rows = [
+        active_prompt_record_to_dict(record)
+        for record in sorted(coerced, key=lambda item: item.prompt_id)
+    ]
+    path = Path(index_dir or shard_root) / ACTIVE_PROMPT_INDEX_NAME
+    try:
+        _write_jsonl_atomic(path, rows)
+    except Exception:
+        hspec_record_store_metric("table_store_active_prompt_index_write_error", 1)
+        raise
+    hspec_record_store_metric("table_store_active_prompt_index_prompts", len(rows))
+    return str(path)
+
+
+def read_active_prompt_index(
+    path: str | Path,
+) -> dict[str, HSpecActivePromptRecord]:
+    index_path = Path(path)
+    result: dict[str, HSpecActivePromptRecord] = {}
+    if not index_path.exists():
+        return result
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = coerce_active_prompt_record(json.loads(line))
+                result[record.prompt_id] = record
+    except Exception:
+        hspec_record_store_metric("table_store_reader_load_error", 1)
+        raise
+    return result
 
 
 def list_table_store_versions(
@@ -917,6 +1149,7 @@ def gc_table_store_versions(
     *,
     active_version: int,
     retain_versions: int,
+    referenced_versions: list[int] | tuple[int, ...] | set[int] | None = None,
 ) -> dict[str, Any]:
     """Best-effort GC for old table-store versions.
 
@@ -930,7 +1163,15 @@ def gc_table_store_versions(
     retain_versions_i = max(int(retain_versions), 1)
     shard_root = base_root / f"shard_{shard_id_i:03d}"
     versions = list_table_store_versions(base_root, shard_id_i)
+    referenced = {
+        int(version)
+        for version in (referenced_versions or [])
+        if int(version) >= 0
+    }
+    if active_version_i >= 0:
+        referenced.add(active_version_i)
     hspec_record_store_metric("table_store_gc_scanned_versions", len(versions))
+    hspec_record_store_metric_max("table_store_referenced_versions", len(referenced))
     if not versions:
         return {
             "scanned_versions": 0,
@@ -939,6 +1180,7 @@ def gc_table_store_versions(
             "delete_errors": 0,
             "kept": [],
             "deleted": [],
+            "referenced_versions": sorted(referenced),
         }
 
     statuses: dict[int, str] = {
@@ -956,7 +1198,7 @@ def gc_table_store_versions(
     for version in versions:
         version_dir = shard_root / f"version_{version:06d}"
         status = statuses.get(version, "")
-        if active_version_i > 0 and version == active_version_i:
+        if version in referenced:
             continue
         if status != "gc_deletable" and (
             version in recent or version > active_version_i
@@ -984,19 +1226,35 @@ def gc_table_store_versions(
         "delete_errors": delete_errors,
         "kept": sorted(version for version in versions if version not in deleted),
         "deleted": deleted,
+        "referenced_versions": sorted(referenced),
     }
 
 
 def clear_active_version_manifest(shard_root: str | Path) -> None:
-    """Remove active_version.json if present.
+    """Remove active_version.json and its active prompt index if present.
 
     Clear is a management/debug operation. Failure should not leave the actor
     unusable, but it is observable through metrics.
     """
-    active_path = Path(shard_root) / ACTIVE_VERSION_NAME
+    shard_path = Path(shard_root)
+    active_path = shard_path / ACTIVE_VERSION_NAME
+    active_prompt_index_paths = {shard_path / ACTIVE_PROMPT_INDEX_NAME}
+    if active_path.exists():
+        try:
+            with open(active_path, "r", encoding="utf-8") as f:
+                active = json.load(f)
+            active_prompt_index_path = active.get("active_prompt_index_path")
+            if active_prompt_index_path:
+                active_prompt_index_paths.add(Path(active_prompt_index_path))
+        except Exception:
+            hspec_record_store_metric("table_store_reader_load_error", 1)
+            logger.debug("Failed to read HSpec active manifest before clear %s",
+                         active_path,
+                         exc_info=True)
     try:
-        if active_path.exists():
-            active_path.unlink()
+        for path in (active_path, *active_prompt_index_paths):
+            if path.exists():
+                path.unlink()
     except Exception:
         hspec_record_store_metric("table_store_active_manifest_clear_error", 1)
         logger.debug("Failed to clear HSpec active version manifest %s",
