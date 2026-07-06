@@ -63,6 +63,14 @@ _hspec_runtime_metrics: Dict[str, int] = {
     "copy_backpressure_drop": 0,
     "copy_backpressure_drop_rows": 0,
     "copy_backpressure_drop_reqs": 0,
+    "collect_budget_drop": 0,
+    "collect_budget_drop_bytes": 0,
+    "collect_budget_drop_reqs": 0,
+    "collect_budget_over_worker_bytes": 0,
+    "collect_budget_over_epoch_bytes": 0,
+    "backpressure_active": 0,
+    "backpressure_collect_skip": 0,
+    "pinned_fallback_ratio_skip": 0,
     "copy_worker_error": 0,
     "copy_submit_error": 0,
     "copy_worker_pair_write_error": 0,
@@ -71,6 +79,51 @@ _hspec_runtime_metrics: Dict[str, int] = {
     "flush_wait_ms_max": 0,
     "flush_wait_count": 0,
 }
+
+
+def _get_env_int(name: str, default: int = 0, minimum: int = 0) -> int:
+    value = os.getenv(name, str(default))
+    try:
+        return max(int(value), int(minimum))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s=%s", name, value)
+        return max(int(default), int(minimum))
+
+
+def _get_env_float(name: str, default: float = 0.0, minimum: float = 0.0) -> float:
+    value = os.getenv(name, str(default))
+    try:
+        return max(float(value), float(minimum))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s=%s", name, value)
+        return max(float(default), float(minimum))
+
+
+def get_hspec_collect_max_bytes_per_worker() -> int:
+    """Return the Phase-4 per-worker collect byte budget.
+
+    Step 1 only exposes the contract; Step 2 wires it into collection gates.
+    A value of 0 keeps Phase-3 behaviour.
+    """
+    return _get_env_int("HSPEC_COLLECT_MAX_BYTES_PER_WORKER", 0, 0)
+
+
+def get_hspec_collect_skip_on_pinned_fallback_ratio() -> float:
+    """Return the optional pageable-fallback ratio threshold.
+
+    A value of 0 disables this soft backpressure trigger.
+    """
+    return _get_env_float("HSPEC_COLLECT_SKIP_ON_PINNED_FALLBACK_RATIO", 0.0, 0.0)
+
+
+def get_hspec_phase4_metrics_every_steps() -> int:
+    """Return the low-frequency Phase-4 metrics cadence."""
+    return _get_env_int("HSPEC_PHASE4_METRICS_EVERY_STEPS", 1, 1)
+
+
+def hspec_profile_build_cpu_enabled() -> bool:
+    """Whether build actors may collect additional CPU profiling samples."""
+    return os.getenv("HSPEC_PROFILE_BUILD_CPU", "0") != "0"
 
 
 def _parse_profile_steps(value: str) -> set[int]:

@@ -78,6 +78,42 @@ def _maybe_get_ray_object_store_used_mb() -> float:
     return -1.0
 
 
+def _hspec_get_env_int(name: str, default: int = 0, minimum: int = 0) -> int:
+    value = os.getenv(name, str(default))
+    try:
+        return max(int(value), int(minimum))
+    except (TypeError, ValueError):
+        return max(int(default), int(minimum))
+
+
+def _hspec_get_env_float(name: str, default: float = 0.0, minimum: float = 0.0) -> float:
+    value = os.getenv(name, str(default))
+    try:
+        return max(float(value), float(minimum))
+    except (TypeError, ValueError):
+        return max(float(default), float(minimum))
+
+
+def _hspec_build_max_pending_epochs() -> int:
+    return _hspec_get_env_int("HSPEC_BUILD_MAX_PENDING_EPOCHS", 0, 0)
+
+
+def _hspec_build_queue_max_lag_s() -> float:
+    return _hspec_get_env_float("HSPEC_BUILD_QUEUE_MAX_LAG_S", 0.0, 0.0)
+
+
+def _hspec_epoch_build_barrier_timeout_s() -> float:
+    return _hspec_get_env_float("HSPEC_EPOCH_BUILD_BARRIER_TIMEOUT_S", 0.0, 0.0)
+
+
+def _hspec_swap_partial_on_timeout_enabled() -> bool:
+    return os.getenv("HSPEC_SWAP_PARTIAL_ON_TIMEOUT", "0") != "0"
+
+
+def _hspec_build_timeout_discard_unfinished_enabled() -> bool:
+    return os.getenv("HSPEC_BUILD_TIMEOUT_DISCARD_UNFINISHED", "1") != "0"
+
+
 def _extract_and_sum_hspec_rollout_metrics(meta_info: dict | None) -> dict[str, float]:
     if not isinstance(meta_info, dict):
         return {}
@@ -106,6 +142,23 @@ def _extract_and_sum_hspec_rollout_metrics(meta_info: dict | None) -> dict[str, 
         "hspec/copy_backpressure_drop",
         "hspec/copy_backpressure_drop_rows",
         "hspec/copy_backpressure_drop_reqs",
+        "hspec/collect_budget_drop",
+        "hspec/collect_budget_drop_bytes",
+        "hspec/collect_budget_drop_reqs",
+        "hspec/collect_budget_over_worker_bytes",
+        "hspec/collect_budget_over_epoch_bytes",
+        "hspec/backpressure_active",
+        "hspec/backpressure_collect_skip",
+        "hspec/pinned_fallback_ratio_skip",
+        "hspec/raw_store_epoch_bytes",
+        "hspec/raw_store_epoch_budget_bytes",
+        "hspec/raw_store_collect_budget_blocked",
+        "hspec/raw_store_collect_budget_unblocked",
+        "hspec/raw_store_collect_drop_bytes",
+        "hspec/raw_store_budget_active",
+        "hspec/collect_dropped_budget_worker_bytes",
+        "hspec/collect_dropped_budget_epoch_bytes",
+        "hspec/collect_dropped_raw_store_over_budget",
         "hspec/copy_worker_error",
         "hspec/copy_submit_error",
         "hspec/copy_worker_pair_write_error",
@@ -160,8 +213,11 @@ class HSpecPendingBuild:
     shard_id: int
     segments: frozenset[object] = field(default_factory=frozenset)
     prompt_ids: tuple[str, ...] = field(default_factory=tuple)
+    submitted_time_ns: int = 0
+    deadline_ns: int = 0
     legacy: bool = False
     done: bool = False
+    timed_out: bool = False
     result_metrics: dict[str, float] = field(default_factory=dict)
 
 
@@ -783,6 +839,16 @@ class RayPPOTrainer:
                 metrics["hspec/build_done_refs"] = 0
                 metrics["hspec/build_pending_records"] = 0
                 metrics["hspec/build_pending_segments"] = 0
+                metrics["hspec/build_pending_epochs"] = 0
+                metrics["hspec/build_pending_epoch_backpressure"] = 0
+                metrics["hspec/build_submission_skipped_pending_epochs"] = 0
+                metrics["hspec/epoch_build_barrier_timeout_count"] = 0
+                metrics["hspec/epoch_build_barrier_wait_ms"] = 0
+                metrics["hspec/build_timeout_discard"] = 0
+                metrics["hspec/build_timeout_unfinished_prompts"] = 0
+                metrics["hspec/partial_swap_count"] = 0
+                metrics["hspec/partial_swap_completed_prompts"] = 0
+                metrics["hspec/partial_swap_reused_old_prompts"] = 0
             return
 
         active_records = [record for record in records if not record.done]
@@ -807,6 +873,18 @@ class RayPPOTrainer:
             metrics["hspec/build_done_refs"] = sum(record.done for record in records)
             metrics["hspec/build_pending_records"] = len(records)
             metrics["hspec/build_pending_segments"] = self._hspec_pending_segment_count(records)
+            metrics["hspec/build_pending_epochs"] = len({
+                int(record.epoch) for record in records if not record.done
+            })
+            metrics.setdefault("hspec/build_pending_epoch_backpressure", 0)
+            metrics.setdefault("hspec/build_submission_skipped_pending_epochs", 0)
+            metrics.setdefault("hspec/epoch_build_barrier_timeout_count", 0)
+            metrics.setdefault("hspec/epoch_build_barrier_wait_ms", 0)
+            metrics.setdefault("hspec/build_timeout_discard", 0)
+            metrics.setdefault("hspec/build_timeout_unfinished_prompts", 0)
+            metrics.setdefault("hspec/partial_swap_count", 0)
+            metrics.setdefault("hspec/partial_swap_completed_prompts", 0)
+            metrics.setdefault("hspec/partial_swap_reused_old_prompts", 0)
 
     @staticmethod
     def _hspec_dump_object_array(items):

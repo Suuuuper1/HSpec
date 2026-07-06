@@ -39,6 +39,7 @@ from vllm_ascend.spec_decode.hspec_table_store import (
     HSpecPromptTableDesc,
     HSpecTableStoreWriter,
     clear_active_version_manifest,
+    estimate_prompt_table_desc_nbytes,
     gc_table_store_versions,
     get_hspec_table_prefetch_mode,
     get_hspec_table_store_retain_versions,
@@ -63,6 +64,7 @@ from vllm_ascend.spec_decode.hspec_store import (
     get_hspec_build_actor_name_prefix,
     get_hspec_build_actor_num_cpus,
     get_hspec_build_blas_threads,
+    get_hspec_build_queue_max_lag_s,
     get_hspec_build_max_prompt_descs,
     get_hspec_build_max_prompt_raw_bytes,
     get_hspec_build_max_prompt_rows,
@@ -148,6 +150,68 @@ _DRIVER_LOCAL_NONZERO_METRIC_KEYS = frozenset({
 _ACTOR_DRIVER_ADDITIVE_METRIC_KEYS = frozenset({
     "strict_descriptor_violation",
 })
+
+
+def _get_env_int(name: str, default: int = 0, minimum: int = 0) -> int:
+    value = os.getenv(name, str(default))
+    try:
+        return max(int(value), int(minimum))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s=%s; using %s", name, value, default)
+        return max(int(default), int(minimum))
+
+
+def _get_env_float(name: str, default: float = 0.0, minimum: float = 0.0) -> float:
+    value = os.getenv(name, str(default))
+    try:
+        return max(float(value), float(minimum))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s=%s; using %s", name, value, default)
+        return max(float(default), float(minimum))
+
+
+def get_hspec_table_max_bytes_per_shard() -> int:
+    """Phase-4 active table byte budget per shard, 0 means unlimited."""
+    return _get_env_int("HSPEC_TABLE_MAX_BYTES_PER_SHARD", 0, 0)
+
+
+def get_hspec_table_max_prompts_per_shard() -> int:
+    """Phase-4 active prompt budget per shard, 0 means unlimited."""
+    return _get_env_int("HSPEC_TABLE_MAX_PROMPTS_PER_SHARD", 0, 0)
+
+
+def get_hspec_table_max_entries_per_shard() -> int:
+    """Phase-4 active entry budget per shard, 0 means unlimited."""
+    return _get_env_int("HSPEC_TABLE_MAX_ENTRIES_PER_SHARD", 0, 0)
+
+
+def get_hspec_table_eviction_policy() -> str:
+    value = os.getenv("HSPEC_TABLE_EVICTION_POLICY", "lru_reward_hit_entries").strip().lower()
+    return value or "lru_reward_hit_entries"
+
+
+def get_hspec_table_evict_min_keep_prompts() -> int:
+    return _get_env_int("HSPEC_TABLE_EVICT_MIN_KEEP_PROMPTS", 0, 0)
+
+
+def get_hspec_table_evict_recency_weight() -> float:
+    return _get_env_float("HSPEC_TABLE_EVICT_RECENCY_WEIGHT", 1.0, 0.0)
+
+
+def get_hspec_table_evict_entry_weight() -> float:
+    return _get_env_float("HSPEC_TABLE_EVICT_ENTRY_WEIGHT", 0.3, 0.0)
+
+
+def get_hspec_table_evict_reward_weight() -> float:
+    return _get_env_float("HSPEC_TABLE_EVICT_REWARD_WEIGHT", 0.5, 0.0)
+
+
+def get_hspec_table_evict_hit_weight() -> float:
+    return _get_env_float("HSPEC_TABLE_EVICT_HIT_WEIGHT", 0.5, 0.0)
+
+
+def get_hspec_table_access_report_interval_steps() -> int:
+    return _get_env_int("HSPEC_TABLE_ACCESS_REPORT_INTERVAL_STEPS", 16, 1)
 
 
 @dataclass(frozen=True)
@@ -859,6 +923,17 @@ class HSpecTableGroup:
         self.build_max_prompt_raw_bytes = get_hspec_build_max_prompt_raw_bytes()
         self.build_max_prompt_descs = get_hspec_build_max_prompt_descs()
         self.build_max_rss_mb = get_hspec_build_max_rss_mb()
+        self.build_queue_max_lag_s = get_hspec_build_queue_max_lag_s()
+        self.table_max_bytes_per_shard = get_hspec_table_max_bytes_per_shard()
+        self.table_max_prompts_per_shard = get_hspec_table_max_prompts_per_shard()
+        self.table_max_entries_per_shard = get_hspec_table_max_entries_per_shard()
+        self.table_eviction_policy = get_hspec_table_eviction_policy()
+        self.table_evict_min_keep_prompts = get_hspec_table_evict_min_keep_prompts()
+        self.table_evict_recency_weight = get_hspec_table_evict_recency_weight()
+        self.table_evict_entry_weight = get_hspec_table_evict_entry_weight()
+        self.table_evict_reward_weight = get_hspec_table_evict_reward_weight()
+        self.table_evict_hit_weight = get_hspec_table_evict_hit_weight()
+        self.table_access_report_interval_steps = get_hspec_table_access_report_interval_steps()
         self._pca_config = HSpecPCAConfig.from_env(self.n_components)
         self.actor_name = _build_actor_name(self.shard_id)
         try:
@@ -881,6 +956,12 @@ class HSpecTableGroup:
         )
         self._build_pending_descs = 0
         self._build_pending_bytes = 0
+        self._build_queue_lag_ms_max = 0.0
+        self._build_queue_lag_ms_total = 0.0
+        self._build_queue_lag_count = 0
+        self._build_queue_reject_count = 0
+        self._build_queue_reject_descs = 0
+        self._build_queue_reject_bytes = 0
 
         # Metrics (track queries on active tables)
         self._query_count = 0
@@ -924,6 +1005,13 @@ class HSpecTableGroup:
         self._build_rss_after_materialize_peak_bytes = 0
         self._build_rss_after_pca_peak_bytes = 0
         self._build_rss_delta_peak_bytes = 0
+        self._table_eviction_count = 0
+        self._table_eviction_bytes = 0
+        self._table_eviction_entries = 0
+        self._table_partial_swap_count = 0
+        self._table_partial_swap_overlay_prompts = 0
+        self._table_partial_swap_reuse_old_prompts = 0
+        self._table_partial_swap_missing_prompts = 0
         # Verification metrics (post rejection-sampling)
         # verify_times: number of requests that entered verification with a
         # non-empty draft (i.e., spec decode attempted).
@@ -991,6 +1079,14 @@ class HSpecTableGroup:
         self._proposer_batch_cache_event_record_error_count = 0
         self._proposer_batch_cache_hot_build_count = 0
         self._proposer_batch_cache_hot_build_ms = 0.0
+        self._proposer_prompt_access_report_count = 0
+        self._proposer_prompt_access_report_prompts = 0
+        self._proposer_prompt_hit_count = 0
+        self._proposer_prompt_query_count = 0
+        self._proposer_cache_load_ms_max = 0.0
+        self._proposer_cache_load_ms_total = 0.0
+        self._proposer_cache_load_count = 0
+        self._proposer_cache_load_bytes = 0
 
         # ZMQ state
         self.running = False
@@ -2341,6 +2437,17 @@ class HSpecTableGroup:
 
     # Metrics
 
+    def _active_table_desc_bytes(self) -> int:
+        total = 0
+        for table in self._active.values():
+            if not isinstance(table, HSpecPromptTableDesc):
+                continue
+            try:
+                total += int(estimate_prompt_table_desc_nbytes(table))
+            except Exception:
+                hspec_record_store_metric("table_store_reader_load_error", 1)
+        return total
+
     def compute_metrics(self) -> Dict[str, float]:
         metrics: Dict[str, float] = {
             "query_times": self._query_count,
@@ -2389,9 +2496,27 @@ class HSpecTableGroup:
             "build_rss_after_materialize_peak_bytes": self._build_rss_after_materialize_peak_bytes,
             "build_rss_after_pca_peak_bytes": self._build_rss_after_pca_peak_bytes,
             "build_rss_delta_peak_bytes": self._build_rss_delta_peak_bytes,
+            "build_queue_pending_descs": self._build_pending_descs,
+            "build_queue_pending_bytes": self._build_pending_bytes,
+            "build_queue_lag_ms_max": self._build_queue_lag_ms_max,
+            "build_queue_lag_ms_total": self._build_queue_lag_ms_total,
+            "build_queue_lag_count": self._build_queue_lag_count,
+            "build_queue_reject_count": self._build_queue_reject_count,
+            "build_queue_reject_descs": self._build_queue_reject_descs,
+            "build_queue_reject_bytes": self._build_queue_reject_bytes,
             "active_version": self._active_version,
             "num_prompts": len(self._active),
             "total_entries": self.total_entries(),
+            "table_active_bytes": self._active_table_desc_bytes(),
+            "table_active_prompts": len(self._active),
+            "table_active_entries": self.total_entries(),
+            "table_eviction_count": self._table_eviction_count,
+            "table_eviction_bytes": self._table_eviction_bytes,
+            "table_eviction_entries": self._table_eviction_entries,
+            "table_partial_swap_count": self._table_partial_swap_count,
+            "table_partial_swap_overlay_prompts": self._table_partial_swap_overlay_prompts,
+            "table_partial_swap_reuse_old_prompts": self._table_partial_swap_reuse_old_prompts,
+            "table_partial_swap_missing_prompts": self._table_partial_swap_missing_prompts,
             "entry_match_count": self._entry_match_count,
             "entry_delta_sum": self._entry_delta_sum,
             "entry_abs_delta_sum": self._entry_abs_delta_sum,
@@ -2444,6 +2569,14 @@ class HSpecTableGroup:
             "proposer_batch_cache_event_record_error_count": self._proposer_batch_cache_event_record_error_count,
             "proposer_batch_cache_hot_build_count": self._proposer_batch_cache_hot_build_count,
             "proposer_batch_cache_hot_build_ms": self._proposer_batch_cache_hot_build_ms,
+            "proposer_prompt_access_report_count": self._proposer_prompt_access_report_count,
+            "proposer_prompt_access_report_prompts": self._proposer_prompt_access_report_prompts,
+            "proposer_prompt_hit_count": self._proposer_prompt_hit_count,
+            "proposer_prompt_query_count": self._proposer_prompt_query_count,
+            "proposer_cache_load_ms_max": self._proposer_cache_load_ms_max,
+            "proposer_cache_load_ms_total": self._proposer_cache_load_ms_total,
+            "proposer_cache_load_count": self._proposer_cache_load_count,
+            "proposer_cache_load_bytes": self._proposer_cache_load_bytes,
         }
         for abs_delta, count in self._entry_abs_delta_verify.items():
             metrics[f"entry_abs_delta_verify_{abs_delta}"] = float(count)
@@ -2502,6 +2635,19 @@ class HSpecTableGroup:
         self._build_rss_after_materialize_peak_bytes = 0
         self._build_rss_after_pca_peak_bytes = 0
         self._build_rss_delta_peak_bytes = 0
+        self._build_queue_lag_ms_max = 0.0
+        self._build_queue_lag_ms_total = 0.0
+        self._build_queue_lag_count = 0
+        self._build_queue_reject_count = 0
+        self._build_queue_reject_descs = 0
+        self._build_queue_reject_bytes = 0
+        self._table_eviction_count = 0
+        self._table_eviction_bytes = 0
+        self._table_eviction_entries = 0
+        self._table_partial_swap_count = 0
+        self._table_partial_swap_overlay_prompts = 0
+        self._table_partial_swap_reuse_old_prompts = 0
+        self._table_partial_swap_missing_prompts = 0
         self._verify_count = 0
         self._accept_count = 0
         self._accept_len_sum = 0
@@ -2562,6 +2708,14 @@ class HSpecTableGroup:
         self._proposer_batch_cache_event_record_error_count = 0
         self._proposer_batch_cache_hot_build_count = 0
         self._proposer_batch_cache_hot_build_ms = 0.0
+        self._proposer_prompt_access_report_count = 0
+        self._proposer_prompt_access_report_prompts = 0
+        self._proposer_prompt_hit_count = 0
+        self._proposer_prompt_query_count = 0
+        self._proposer_cache_load_ms_max = 0.0
+        self._proposer_cache_load_ms_total = 0.0
+        self._proposer_cache_load_count = 0
+        self._proposer_cache_load_bytes = 0
 
     # Online metrics reporting (from worker-local proposer)
 
@@ -2694,6 +2848,13 @@ class HSpecTableGroup:
             "batch_cache_event_record_error_count": "_proposer_batch_cache_event_record_error_count",
             "batch_cache_hot_build_count": "_proposer_batch_cache_hot_build_count",
             "batch_cache_hot_build_ms": "_proposer_batch_cache_hot_build_ms",
+            "prompt_access_report_count": "_proposer_prompt_access_report_count",
+            "prompt_access_report_prompts": "_proposer_prompt_access_report_prompts",
+            "prompt_hit_count": "_proposer_prompt_hit_count",
+            "prompt_query_count": "_proposer_prompt_query_count",
+            "cache_load_ms_total": "_proposer_cache_load_ms_total",
+            "cache_load_count": "_proposer_cache_load_count",
+            "cache_load_bytes": "_proposer_cache_load_bytes",
         }
         max_map = {
             "cache_live_cpu_bytes": "_proposer_cache_live_cpu_bytes",
@@ -2701,6 +2862,7 @@ class HSpecTableGroup:
             "cache_live_entries": "_proposer_cache_live_entries",
             "cache_live_prompts": "_proposer_cache_live_prompts",
             "batch_cache_npu_bytes": "_proposer_batch_cache_npu_bytes",
+            "cache_load_ms_max": "_proposer_cache_load_ms_max",
         }
         try:
             for key, attr in additive_map.items():
@@ -3513,6 +3675,27 @@ class GlobalHSpecTableGroup:
                 "hspec/proposer_batch_cache_event_record_error_count": 0,
                 "hspec/proposer_batch_cache_hot_build_count": 0,
                 "hspec/proposer_batch_cache_hot_build_ms": 0.0,
+                "hspec/collect_budget_drop": 0,
+                "hspec/backpressure_active": 0,
+                "hspec/raw_store_epoch_bytes": 0,
+                "hspec/build_queue_pending_descs": 0,
+                "hspec/build_queue_pending_bytes": 0,
+                "hspec/build_queue_lag_ms_max": 0.0,
+                "hspec/table_active_bytes": 0,
+                "hspec/table_active_prompts": 0,
+                "hspec/table_active_entries": 0,
+                "hspec/table_eviction_count": 0,
+                "hspec/table_partial_swap_count": 0,
+                "hspec/proposer_prompt_access_report_count": 0,
+                "hspec/proposer_prompt_access_report_prompts": 0,
+                "hspec/proposer_prompt_hit_count": 0,
+                "hspec/proposer_prompt_query_count": 0,
+                "hspec/proposer_cache_load_ms_max": 0.0,
+                "hspec/proposer_cache_load_ms_total": 0.0,
+                "hspec/proposer_cache_load_ms_avg": 0.0,
+                "hspec/proposer_cache_load_count": 0,
+                "hspec/proposer_cache_load_bytes": 0,
+                "hspec/proposer_cache_load_mb": 0.0,
             }
         tasks = [g.compute_metrics.remote() for g in self.groups]
         metrics_list = ray.get(tasks)
@@ -3532,6 +3715,8 @@ class GlobalHSpecTableGroup:
             "proposer_cache_live_entries",
             "proposer_cache_live_prompts",
             "proposer_batch_cache_npu_bytes",
+            "build_queue_lag_ms_max",
+            "proposer_cache_load_ms_max",
         }
         for metrics in metrics_list:
             for key, value in metrics.items():
@@ -3633,9 +3818,31 @@ class GlobalHSpecTableGroup:
                 agg.get("build_rss_after_pca_peak_bytes", 0) / (1024 * 1024)
             ),
             "hspec/build_actor_rss_delta_mb_max": agg.get("build_rss_delta_peak_bytes", 0) / (1024 * 1024),
+            "hspec/build_queue_pending_descs": agg.get("build_queue_pending_descs", 0),
+            "hspec/build_queue_pending_bytes": agg.get("build_queue_pending_bytes", 0),
+            "hspec/build_queue_pending_mb": agg.get("build_queue_pending_bytes", 0) / (1024 * 1024),
+            "hspec/build_queue_lag_ms_max": agg.get("build_queue_lag_ms_max", 0),
+            "hspec/build_queue_lag_ms_total": agg.get("build_queue_lag_ms_total", 0),
+            "hspec/build_queue_lag_count": agg.get("build_queue_lag_count", 0),
+            "hspec/build_queue_reject_count": agg.get("build_queue_reject_count", 0),
+            "hspec/build_queue_reject_descs": agg.get("build_queue_reject_descs", 0),
+            "hspec/build_queue_reject_bytes": agg.get("build_queue_reject_bytes", 0),
+            "hspec/build_queue_reject_mb": agg.get("build_queue_reject_bytes", 0) / (1024 * 1024),
             "hspec/active_version": agg.get("active_version", 0),
             "hspec/num_prompts": agg.get("num_prompts", 0),
             "hspec/total_entries": agg.get("total_entries", 0),
+            "hspec/table_active_bytes": agg.get("table_active_bytes", 0),
+            "hspec/table_active_mb": agg.get("table_active_bytes", 0) / (1024 * 1024),
+            "hspec/table_active_prompts": agg.get("table_active_prompts", 0),
+            "hspec/table_active_entries": agg.get("table_active_entries", 0),
+            "hspec/table_eviction_count": agg.get("table_eviction_count", 0),
+            "hspec/table_eviction_bytes": agg.get("table_eviction_bytes", 0),
+            "hspec/table_eviction_mb": agg.get("table_eviction_bytes", 0) / (1024 * 1024),
+            "hspec/table_eviction_entries": agg.get("table_eviction_entries", 0),
+            "hspec/table_partial_swap_count": agg.get("table_partial_swap_count", 0),
+            "hspec/table_partial_swap_overlay_prompts": agg.get("table_partial_swap_overlay_prompts", 0),
+            "hspec/table_partial_swap_reuse_old_prompts": agg.get("table_partial_swap_reuse_old_prompts", 0),
+            "hspec/table_partial_swap_missing_prompts": agg.get("table_partial_swap_missing_prompts", 0),
             "hspec/accept_times_advan": accept_times_advan,
             "hspec/accept_times_advan_ratio": accept_times_advan / accept_times if accept_times > 0 else 0.0,
             "hspec/reject_times_advan": reject_times_advan,
@@ -3651,6 +3858,15 @@ class GlobalHSpecTableGroup:
         }
 
         driver_store_metrics = collect_hspec_store_metrics(reset=True)
+        result["hspec/collect_budget_drop"] = float(
+            driver_store_metrics.get("collect_budget_drop", 0))
+        result["hspec/backpressure_active"] = float(
+            driver_store_metrics.get("backpressure_active", 0))
+        result["hspec/raw_store_epoch_bytes"] = float(
+            driver_store_metrics.get("raw_store_epoch_bytes", 0))
+        result["hspec/raw_store_epoch_mb"] = (
+            float(driver_store_metrics.get("raw_store_epoch_bytes", 0)) / (1024 * 1024)
+        )
         for key in _DRIVER_LOCAL_NONZERO_METRIC_KEYS:
             value = float(driver_store_metrics.get(key, 0))
             if value != 0.0:
@@ -3735,8 +3951,26 @@ class GlobalHSpecTableGroup:
             "batch_cache_event_record_error_count",
             "batch_cache_hot_build_count",
             "batch_cache_hot_build_ms",
+            "prompt_access_report_count",
+            "prompt_access_report_prompts",
+            "prompt_hit_count",
+            "prompt_query_count",
+            "cache_load_ms_total",
+            "cache_load_count",
+            "cache_load_bytes",
         ):
             result[f"hspec/proposer_{key}"] = float(agg.get(f"proposer_{key}", 0))
+        result["hspec/proposer_cache_load_ms_max"] = float(
+            agg.get("proposer_cache_load_ms_max", 0))
+        result["hspec/proposer_cache_load_ms_avg"] = (
+            float(agg.get("proposer_cache_load_ms_total", 0))
+            / float(agg.get("proposer_cache_load_count", 0))
+            if float(agg.get("proposer_cache_load_count", 0)) > 0
+            else 0.0
+        )
+        result["hspec/proposer_cache_load_mb"] = (
+            float(agg.get("proposer_cache_load_bytes", 0)) / (1024 * 1024)
+        )
         result["hspec/proposer_batch_cache_npu_bytes"] = float(
             agg.get("proposer_batch_cache_npu_bytes", 0))
         result["hspec/proposer_batch_cache_npu_mb"] = (

@@ -74,6 +74,15 @@ _store_metrics: Dict[str, int] = {
     "raw_store_budget_over_files": 0,
     "raw_store_budget_gc_skipped": 0,
     "raw_store_budget_gc_deleted": 0,
+    "raw_store_epoch_bytes": 0,
+    "raw_store_epoch_budget_bytes": 0,
+    "raw_store_collect_budget_blocked": 0,
+    "raw_store_collect_budget_unblocked": 0,
+    "raw_store_collect_drop_bytes": 0,
+    "raw_store_budget_active": 0,
+    "collect_dropped_budget_worker_bytes": 0,
+    "collect_dropped_budget_epoch_bytes": 0,
+    "collect_dropped_raw_store_over_budget": 0,
     "unsafe_descriptor_cleanup_suppressed": 0,
     "segment_delete_count": 0,
     "segment_delete_bytes": 0,
@@ -313,6 +322,31 @@ def get_hspec_build_max_rss_mb() -> float:
     return _parse_nonnegative_float_env("HSPEC_BUILD_MAX_RSS_MB", 0.0)
 
 
+def get_hspec_build_max_pending_epochs() -> int:
+    """Maximum pending HSpec build epochs on the trainer, 0 means unlimited."""
+    return _parse_nonnegative_int_env("HSPEC_BUILD_MAX_PENDING_EPOCHS", 0)
+
+
+def get_hspec_build_queue_max_lag_s() -> float:
+    """Soft build-queue lag threshold in seconds, 0 means disabled."""
+    return _parse_nonnegative_float_env("HSPEC_BUILD_QUEUE_MAX_LAG_S", 0.0)
+
+
+def get_hspec_epoch_build_barrier_timeout_s() -> float:
+    """Epoch-boundary HSpec build wait timeout, 0 preserves Phase-3 wait-all."""
+    return _parse_nonnegative_float_env("HSPEC_EPOCH_BUILD_BARRIER_TIMEOUT_S", 0.0)
+
+
+def hspec_swap_partial_on_timeout_enabled() -> bool:
+    """Whether Phase-4 timeout may publish a prompt-level partial swap."""
+    return os.getenv("HSPEC_SWAP_PARTIAL_ON_TIMEOUT", "0") != "0"
+
+
+def hspec_build_timeout_discard_unfinished_enabled() -> bool:
+    """Whether unfinished descs are discarded after a build-barrier timeout."""
+    return os.getenv("HSPEC_BUILD_TIMEOUT_DISCARD_UNFINISHED", "1") != "0"
+
+
 def get_hspec_build_actor_name_prefix() -> str:
     return os.getenv("HSPEC_BUILD_ACTOR_NAME_PREFIX", "hspec_build_shard").strip() or "hspec_build_shard"
 
@@ -421,6 +455,26 @@ def get_hspec_raw_store_max_files() -> int:
     except ValueError:
         logger.warning("Ignoring invalid HSPEC_RAW_STORE_MAX_FILES=%s", value)
         return 0
+
+
+def get_hspec_raw_store_max_bytes_per_epoch() -> int:
+    """Return the Phase-4 per-epoch raw-store byte budget.
+
+    Step 1 only centralizes the env contract. Step 2 wires this into
+    collection-time backpressure. A value of 0 disables the budget.
+    """
+    value = os.getenv("HSPEC_RAW_STORE_MAX_BYTES_PER_EPOCH", "0")
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid HSPEC_RAW_STORE_MAX_BYTES_PER_EPOCH=%s", value)
+        return 0
+
+
+def hspec_raw_store_stop_collect_on_budget_enabled() -> bool:
+    """Whether raw-store budget pressure should stop new collection."""
+    return os.getenv("HSPEC_RAW_STORE_STOP_COLLECT_ON_BUDGET", "1") != "0"
 
 
 def get_hspec_store_retain_batches() -> int:

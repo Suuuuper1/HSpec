@@ -998,6 +998,24 @@ class vLLMRollout(BaseRollout):
                         store_metrics.get("segment_manifest_write_error", 0)),
                     "hspec/raw_store_budget_gc_skipped": float(
                         store_metrics.get("raw_store_budget_gc_skipped", 0)),
+                    "hspec/raw_store_epoch_bytes": float(
+                        store_metrics.get("raw_store_epoch_bytes", 0)),
+                    "hspec/raw_store_epoch_budget_bytes": float(
+                        store_metrics.get("raw_store_epoch_budget_bytes", 0)),
+                    "hspec/raw_store_collect_budget_blocked": float(
+                        store_metrics.get("raw_store_collect_budget_blocked", 0)),
+                    "hspec/raw_store_collect_budget_unblocked": float(
+                        store_metrics.get("raw_store_collect_budget_unblocked", 0)),
+                    "hspec/raw_store_collect_drop_bytes": float(
+                        store_metrics.get("raw_store_collect_drop_bytes", 0)),
+                    "hspec/raw_store_budget_active": float(
+                        store_metrics.get("raw_store_budget_active", 0)),
+                    "hspec/collect_dropped_budget_worker_bytes": float(
+                        store_metrics.get("collect_dropped_budget_worker_bytes", 0)),
+                    "hspec/collect_dropped_budget_epoch_bytes": float(
+                        store_metrics.get("collect_dropped_budget_epoch_bytes", 0)),
+                    "hspec/collect_dropped_raw_store_over_budget": float(
+                        store_metrics.get("collect_dropped_raw_store_over_budget", 0)),
                     "hspec/unsafe_descriptor_cleanup_suppressed": float(
                         store_metrics.get("unsafe_descriptor_cleanup_suppressed", 0)),
                     "hspec/pinned_pool_miss": float(runtime_metrics.get("pinned_pool_miss", 0)),
@@ -1034,6 +1052,22 @@ class vLLMRollout(BaseRollout):
                         runtime_metrics.get("copy_backpressure_drop_rows", 0)),
                     "hspec/copy_backpressure_drop_reqs": float(
                         runtime_metrics.get("copy_backpressure_drop_reqs", 0)),
+                    "hspec/collect_budget_drop": float(
+                        runtime_metrics.get("collect_budget_drop", 0)),
+                    "hspec/collect_budget_drop_bytes": float(
+                        runtime_metrics.get("collect_budget_drop_bytes", 0)),
+                    "hspec/collect_budget_drop_reqs": float(
+                        runtime_metrics.get("collect_budget_drop_reqs", 0)),
+                    "hspec/collect_budget_over_worker_bytes": float(
+                        runtime_metrics.get("collect_budget_over_worker_bytes", 0)),
+                    "hspec/collect_budget_over_epoch_bytes": float(
+                        runtime_metrics.get("collect_budget_over_epoch_bytes", 0)),
+                    "hspec/backpressure_active": float(
+                        runtime_metrics.get("backpressure_active", 0)),
+                    "hspec/backpressure_collect_skip": float(
+                        runtime_metrics.get("backpressure_collect_skip", 0)),
+                    "hspec/pinned_fallback_ratio_skip": float(
+                        runtime_metrics.get("pinned_fallback_ratio_skip", 0)),
                     "hspec/copy_worker_error": float(
                         runtime_metrics.get("copy_worker_error", 0)),
                     "hspec/copy_submit_error": float(
