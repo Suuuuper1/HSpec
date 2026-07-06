@@ -220,18 +220,6 @@ class HSpecPendingBuild:
     done: bool = False
     timed_out: bool = False
     result_metrics: dict[str, float] = field(default_factory=dict)
-    result_payload: dict = field(default_factory=dict)
-
-
-@dataclass
-class HSpecEpochBuildBarrierResult:
-    epoch: int
-    metrics: dict[str, float] = field(default_factory=dict)
-    completed_prompt_ids: tuple[str, ...] = field(default_factory=tuple)
-    timed_out_prompt_ids: tuple[str, ...] = field(default_factory=tuple)
-    ready_shard_ids: tuple[int, ...] = field(default_factory=tuple)
-    timed_out_shard_ids: tuple[int, ...] = field(default_factory=tuple)
-    timed_out: bool = False
 
 
 @dataclass
@@ -510,7 +498,6 @@ class RayPPOTrainer:
         self._hspec_align_debug_max_logs = int(os.getenv("HSPEC_ALIGN_DEBUG_MAX_LOGS", "24"))
         # HSpec build records retain segment keys until epoch-level GC.
         self._hspec_pending_build_refs: list[HSpecPendingBuild] = []
-        self._hspec_last_epoch_build_barrier = HSpecEpochBuildBarrierResult(epoch=-1)
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -740,11 +727,6 @@ class RayPPOTrainer:
             "build_queue_reject_count",
             "build_queue_reject_descs",
             "build_queue_reject_bytes",
-            "completed_prompt_count",
-            "unfinished_prompt_count",
-            "build_deadline_hit_count",
-            "build_timeout_discard",
-            "build_timeout_unfinished_prompts",
         )
         for key in additive_keys:
             value = result.get(key)
@@ -780,64 +762,6 @@ class RayPPOTrainer:
             metrics["hspec/build_result_build_queue_lag_ms_avg"] = (
                 metrics.get("hspec/build_result_build_queue_lag_ms_total", 0.0) / lag_count
             )
-
-    @staticmethod
-    def _hspec_result_prompt_ids(result: object, key: str) -> tuple[str, ...]:
-        if not isinstance(result, dict):
-            return ()
-        value = result.get(key)
-        if not isinstance(value, (list, tuple, set)):
-            return ()
-        return tuple(str(prompt_id) for prompt_id in value if str(prompt_id))
-
-    def _hspec_record_completed_prompt_ids(self, record: HSpecPendingBuild) -> tuple[str, ...]:
-        result = getattr(record, "result_payload", {}) or {}
-        completed = self._hspec_result_prompt_ids(result, "completed_prompt_ids")
-        if completed:
-            return completed
-        unfinished = set(self._hspec_result_prompt_ids(result, "unfinished_prompt_ids"))
-        return tuple(str(prompt_id) for prompt_id in record.prompt_ids if str(prompt_id) not in unfinished)
-
-    def _hspec_record_unfinished_prompt_ids(self, record: HSpecPendingBuild) -> tuple[str, ...]:
-        result = getattr(record, "result_payload", {}) or {}
-        unfinished = self._hspec_result_prompt_ids(result, "unfinished_prompt_ids")
-        if unfinished:
-            return unfinished
-        if bool(record.timed_out) and not bool(record.done):
-            return tuple(str(prompt_id) for prompt_id in record.prompt_ids if str(prompt_id))
-        return ()
-
-    def _discard_hspec_building_for_records(
-        self,
-        records: list[HSpecPendingBuild],
-        *,
-        epoch: int,
-        metrics: dict | None = None,
-        reason: str = "build_timeout_discard",
-    ) -> None:
-        if not records or not hasattr(self, "hspec_tables"):
-            return
-        shard_ids = sorted({int(record.shard_id) for record in records})
-        try:
-            discard_metrics = self.hspec_tables.discard_building_for_shards(
-                shard_ids,
-                epoch=int(epoch),
-                reason=reason,
-            )
-        except Exception:
-            if metrics is not None:
-                metrics["hspec/build_timeout_discard_error"] = (
-                    metrics.get("hspec/build_timeout_discard_error", 0.0) + 1.0
-                )
-            print(
-                "HSpec: failed to discard timed-out building tables; "
-                "continuing training with previous active tables."
-            )
-            return
-        if metrics is not None and isinstance(discard_metrics, dict):
-            for key, value in discard_metrics.items():
-                if isinstance(value, (int, float)):
-                    metrics[key] = metrics.get(key, 0.0) + float(value)
 
     @staticmethod
     def _hspec_pending_segment_count(records: list[HSpecPendingBuild]) -> int:
@@ -926,126 +850,32 @@ class RayPPOTrainer:
     def _wait_hspec_epoch_builds(self, epoch: int, timing_raw: dict | None = None) -> dict[str, float]:
         records: list[HSpecPendingBuild] = getattr(self, "_hspec_pending_build_refs", [])
         if not records:
-            self._hspec_last_epoch_build_barrier = HSpecEpochBuildBarrierResult(epoch=int(epoch))
             return {}
 
         epoch_records = [record for record in records if record.epoch == epoch]
         if not epoch_records:
-            unresolved_timed_out = [
-                record for record in records
-                if bool(record.timed_out) and not bool(record.done)
-            ]
-            if unresolved_timed_out:
-                timed_out_prompt_ids = sorted({
-                    str(prompt_id)
-                    for record in unresolved_timed_out
-                    for prompt_id in record.prompt_ids
-                    if str(prompt_id)
-                })
-                metrics = {
-                    "hspec/epoch_build_barrier_timeout_count": 1.0,
-                    "hspec/epoch_build_barrier_wait_ms": 0.0,
-                    "hspec/build_timeout_unfinished_prompts": float(len(timed_out_prompt_ids)),
-                    "hspec/build_timeout_discard": (
-                        float(len(timed_out_prompt_ids))
-                        if _hspec_build_timeout_discard_unfinished_enabled()
-                        else 0.0
-                    ),
-                    "hspec/partial_swap_count": 0.0,
-                    "hspec/partial_swap_completed_prompts": 0.0,
-                    "hspec/partial_swap_reused_old_prompts": 0.0,
-                }
-                self._hspec_last_epoch_build_barrier = HSpecEpochBuildBarrierResult(
-                    epoch=int(epoch),
-                    metrics=dict(metrics),
-                    timed_out_prompt_ids=tuple(timed_out_prompt_ids),
-                    timed_out_shard_ids=tuple(sorted({
-                        int(record.shard_id) for record in unresolved_timed_out
-                    })),
-                    timed_out=True,
-                )
-                return metrics
-            self._hspec_last_epoch_build_barrier = HSpecEpochBuildBarrierResult(epoch=int(epoch))
             return {}
 
         build_result_metrics: dict[str, float] = {}
-        timeout_s = _hspec_epoch_build_barrier_timeout_s()
-        wait_started = time.perf_counter()
 
-        def _mark_done(record: HSpecPendingBuild, result: object) -> None:
-            record.done = True
-            record.result_payload = result if isinstance(result, dict) else {}
-            record.result_metrics = self._coerce_hspec_result_metrics(result)
-            self._merge_hspec_build_result_metrics(build_result_metrics, result)
-
-        def _wait_for_epoch() -> None:
-            pending = [record for record in epoch_records if not record.done]
-            if not pending:
-                return
-            if timeout_s <= 0:
-                for record in pending:
-                    _mark_done(record, ray.get(record.ref))
-                return
-            ref_to_record = {record.ref: record for record in pending}
-            ready_refs, _ = ray.wait(
-                list(ref_to_record.keys()),
-                num_returns=len(ref_to_record),
-                timeout=float(timeout_s),
-            )
-            for ref in ready_refs:
-                _mark_done(ref_to_record[ref], ray.get(ref))
+        def _wait_not_done() -> None:
+            for record in epoch_records:
+                if record.done:
+                    continue
+                result = ray.get(record.ref)
+                record.done = True
+                record.result_metrics = self._coerce_hspec_result_metrics(result)
+                self._merge_hspec_build_result_metrics(build_result_metrics, result)
 
         if timing_raw is None:
-            _wait_for_epoch()
+            _wait_not_done()
         else:
             with marked_timer("hspec_epoch_build_wait", timing_raw, color="teal"):
-                _wait_for_epoch()
-
-        wait_ms = float((time.perf_counter() - wait_started) * 1000.0)
-        pending_after_wait = [record for record in epoch_records if not record.done]
-        for record in pending_after_wait:
-            record.timed_out = timeout_s > 0
-
-        completed_prompt_ids: list[str] = []
-        timed_out_prompt_ids: list[str] = []
-        done_records = [record for record in epoch_records if record.done]
-        for record in done_records:
-            completed_prompt_ids.extend(self._hspec_record_completed_prompt_ids(record))
-            timed_out_prompt_ids.extend(self._hspec_record_unfinished_prompt_ids(record))
-        for record in pending_after_wait:
-            timed_out_prompt_ids.extend(str(prompt_id) for prompt_id in record.prompt_ids if str(prompt_id))
-
-        completed_prompt_ids = sorted(set(completed_prompt_ids))
-        timed_out_prompt_ids = sorted(set(timed_out_prompt_ids))
-        timed_out = bool(timed_out_prompt_ids or pending_after_wait)
-        ready_shard_ids = tuple(sorted({int(record.shard_id) for record in done_records}))
-        timed_out_shard_ids = tuple(sorted({int(record.shard_id) for record in pending_after_wait}))
-
-        build_result_metrics["hspec/epoch_build_barrier_wait_ms"] = wait_ms
-        build_result_metrics["hspec/epoch_build_barrier_timeout_count"] = 1.0 if timed_out else 0.0
-        build_result_metrics["hspec/build_timeout_unfinished_prompts"] = float(len(timed_out_prompt_ids))
-        build_result_metrics["hspec/build_timeout_discard"] = (
-            float(len(timed_out_prompt_ids))
-            if timed_out and _hspec_build_timeout_discard_unfinished_enabled()
-            else 0.0
-        )
-        build_result_metrics.setdefault("hspec/partial_swap_count", 0.0)
-        build_result_metrics.setdefault("hspec/partial_swap_completed_prompts", 0.0)
-        build_result_metrics.setdefault("hspec/partial_swap_reused_old_prompts", 0.0)
-
-        self._hspec_last_epoch_build_barrier = HSpecEpochBuildBarrierResult(
-            epoch=int(epoch),
-            metrics=dict(build_result_metrics),
-            completed_prompt_ids=tuple(completed_prompt_ids),
-            timed_out_prompt_ids=tuple(timed_out_prompt_ids),
-            ready_shard_ids=ready_shard_ids,
-            timed_out_shard_ids=timed_out_shard_ids,
-            timed_out=timed_out,
-        )
+                _wait_not_done()
 
         segments = {
             segment
-            for record in done_records
+            for record in epoch_records
             for segment in record.segments
         }
         from vllm_ascend.spec_decode.hspec_store import (
@@ -1055,11 +885,7 @@ class RayPPOTrainer:
             update_hspec_segment_manifest_status,
         )
 
-        should_gc_done_segments = (
-            bool(segments)
-            and (not timed_out or _hspec_build_timeout_discard_unfinished_enabled())
-        )
-        if should_gc_done_segments and hspec_raw_store_gc_after_epoch_enabled():
+        if segments and hspec_raw_store_gc_after_epoch_enabled():
             deleted = 0
 
             def _gc_segments() -> None:
@@ -1094,72 +920,9 @@ class RayPPOTrainer:
         self._hspec_pending_build_refs = [
             record
             for record in records
-            # Phase 0/1 static compatibility: the old full-wait predicate was
-            # record.epoch != epoch. Step 5 keeps timed-out unfinished records
-            # until their actor result is ready and safely discarded.
-            if not (record.epoch == epoch and record.done)
+            if record.epoch != epoch
         ]
         return build_result_metrics
-
-    def _publish_hspec_epoch_tables_after_barrier(self, epoch: int) -> dict[str, float]:
-        barrier = getattr(
-            self,
-            "_hspec_last_epoch_build_barrier",
-            HSpecEpochBuildBarrierResult(epoch=int(epoch)),
-        )
-        if not bool(barrier.timed_out):
-            print(f"HSpec: swap at epoch={epoch} (promote building -> active)")
-            return self.hspec_tables.swap(epoch=epoch)
-
-        if _hspec_swap_partial_on_timeout_enabled():
-            completed_prompt_ids = list(barrier.completed_prompt_ids)
-            if completed_prompt_ids:
-                print(
-                    "HSpec: partial swap after build timeout "
-                    f"epoch={epoch} completed_prompts={len(completed_prompt_ids)} "
-                    f"timed_out_prompts={len(barrier.timed_out_prompt_ids)}"
-                )
-                return self.hspec_tables.swap(
-                    epoch=epoch,
-                    partial=True,
-                    completed_prompt_ids=completed_prompt_ids,
-                    timed_out_prompt_ids=list(barrier.timed_out_prompt_ids),
-                )
-            print(
-                "HSpec: partial swap skipped after build timeout "
-                f"epoch={epoch}; no completed prompts, keeping previous active."
-            )
-            return {
-                "hspec/partial_swap_count": 0.0,
-                "hspec/partial_swap_completed_prompts": 0.0,
-                "hspec/partial_swap_reused_old_prompts": 0.0,
-            }
-
-        print(
-            "HSpec: build timeout without partial swap "
-            f"epoch={epoch}; discarding ready building tables and keeping previous active."
-        )
-        metrics: dict[str, float] = {
-            "hspec/partial_swap_count": 0.0,
-            "hspec/partial_swap_completed_prompts": 0.0,
-            "hspec/partial_swap_reused_old_prompts": 0.0,
-        }
-        ready_shard_ids = list(barrier.ready_shard_ids)
-        if ready_shard_ids:
-            self._discard_hspec_building_for_records(
-                [
-                    HSpecPendingBuild(
-                        epoch=int(epoch),
-                        ref=None,
-                        shard_id=int(shard_id),
-                    )
-                    for shard_id in ready_shard_ids
-                ],
-                epoch=int(epoch),
-                metrics=metrics,
-                reason="build_timeout_partial_disabled_discard",
-            )
-        return metrics
 
     def _poll_hspec_builds_nonblocking(self, metrics: dict | None = None) -> None:
         records: list[HSpecPendingBuild] = getattr(self, "_hspec_pending_build_refs", [])
@@ -1173,7 +936,6 @@ class RayPPOTrainer:
                 metrics["hspec/build_pending_epochs"] = 0
                 metrics["hspec/build_pending_epoch_backpressure"] = 0
                 metrics["hspec/build_submission_skipped_pending_epochs"] = 0
-                metrics["hspec/build_submission_skipped_timeout_cleanup"] = 0
                 metrics["hspec/epoch_build_barrier_timeout_count"] = 0
                 metrics["hspec/epoch_build_barrier_wait_ms"] = 0
                 metrics["hspec/build_timeout_discard"] = 0
@@ -1185,7 +947,6 @@ class RayPPOTrainer:
 
         active_records = [record for record in records if not record.done]
         ready_refs = []
-        timed_out_ready_records: list[HSpecPendingBuild] = []
         if active_records:
             ref_to_record = {record.ref: record for record in active_records}
             ready_refs, _ = ray.wait(
@@ -1197,36 +958,8 @@ class RayPPOTrainer:
                 record = ref_to_record[ref]
                 result = ray.get(ref)
                 record.done = True
-                record.result_payload = result if isinstance(result, dict) else {}
                 record.result_metrics = self._coerce_hspec_result_metrics(result)
                 self._merge_hspec_build_result_metrics(metrics, result)
-                if record.timed_out:
-                    timed_out_ready_records.append(record)
-
-        if timed_out_ready_records:
-            self._discard_hspec_building_for_records(
-                timed_out_ready_records,
-                epoch=int(timed_out_ready_records[0].epoch),
-                metrics=metrics,
-                reason="build_timeout_late_result_discard",
-            )
-            if _hspec_build_timeout_discard_unfinished_enabled():
-                timed_out_segments = {
-                    segment
-                    for record in timed_out_ready_records
-                    for segment in record.segments
-                }
-                self._mark_hspec_segments_gc_deletable(
-                    timed_out_segments,
-                    epoch=int(timed_out_ready_records[0].epoch),
-                    reason="build_timeout_late_result_discard",
-                )
-            self._hspec_pending_build_refs = [
-                record
-                for record in records
-                if not (record.timed_out and record.done)
-            ]
-            records = self._hspec_pending_build_refs
 
         if metrics is not None:
             metrics["hspec/build_pending_refs"] = sum(not record.done for record in records)
@@ -1239,7 +972,6 @@ class RayPPOTrainer:
             })
             metrics.setdefault("hspec/build_pending_epoch_backpressure", 0)
             metrics.setdefault("hspec/build_submission_skipped_pending_epochs", 0)
-            metrics.setdefault("hspec/build_submission_skipped_timeout_cleanup", 0)
             metrics.setdefault("hspec/epoch_build_barrier_timeout_count", 0)
             metrics.setdefault("hspec/epoch_build_barrier_wait_ms", 0)
             metrics.setdefault("hspec/build_timeout_discard", 0)
@@ -2354,28 +2086,17 @@ class RayPPOTrainer:
                                         dict(prompt_build_data),
                                     )
                             if prompt_build_data:
-                                pending_build_records = [
-                                    record
-                                    for record in getattr(self, "_hspec_pending_build_refs", [])
-                                    if not record.done
-                                ]
-                                unresolved_timeout = any(
-                                    bool(record.timed_out)
-                                    for record in pending_build_records
-                                )
                                 pending_epochs = {
                                     int(record.epoch)
-                                    for record in pending_build_records
+                                    for record in getattr(self, "_hspec_pending_build_refs", [])
+                                    if not record.done
                                 }
                                 max_pending_epochs = _hspec_build_max_pending_epochs()
                                 would_pending_epochs = set(pending_epochs)
                                 would_pending_epochs.add(int(epoch))
                                 skip_hspec_build = (
-                                    unresolved_timeout
-                                    or (
-                                        max_pending_epochs > 0
-                                        and len(would_pending_epochs) > max_pending_epochs
-                                    )
+                                    max_pending_epochs > 0
+                                    and len(would_pending_epochs) > max_pending_epochs
                                 )
                                 if skip_hspec_build:
                                     metrics["hspec/build_pending_epoch_backpressure"] = (
@@ -2384,13 +2105,6 @@ class RayPPOTrainer:
                                     metrics["hspec/build_submission_skipped_pending_epochs"] = (
                                         metrics.get("hspec/build_submission_skipped_pending_epochs", 0.0) + 1.0
                                     )
-                                    if unresolved_timeout:
-                                        metrics["hspec/build_submission_skipped_timeout_cleanup"] = (
-                                            metrics.get(
-                                                "hspec/build_submission_skipped_timeout_cleanup",
-                                                0.0,
-                                            ) + 1.0
-                                        )
                                     if not legacy_hspec_dataproto_hs:
                                         skipped_segments = self._hspec_segments_from_prompt_build_data(
                                             dict(prompt_build_data)
@@ -2404,33 +2118,21 @@ class RayPPOTrainer:
                                     metrics["hspec/build_submitted_refs"] = 0
                                     metrics["hspec/build_submitted_segments"] = 0
                                 else:
-                                    barrier_timeout_s = _hspec_epoch_build_barrier_timeout_s()
-                                    submitted_time_ns = time.time_ns()
-                                    deadline_ns = (
-                                        submitted_time_ns + int(barrier_timeout_s * 1_000_000_000)
-                                        if barrier_timeout_s > 0 else 0
-                                    )
                                     if legacy_hspec_dataproto_hs:
                                         ray_hspec_tasks = self.hspec_tables.build_tables_async_legacy(
-                                            dict(prompt_build_data),
-                                            epoch=epoch,
-                                            submitted_time_ns=submitted_time_ns,
-                                            deadline_ns=deadline_ns,
+                                            dict(prompt_build_data)
                                         )
                                     else:
-                                        ray_hspec_tasks = self.hspec_tables.build_tables_async(
-                                            dict(prompt_build_data),
-                                            epoch=epoch,
-                                            submitted_time_ns=submitted_time_ns,
-                                            deadline_ns=deadline_ns,
-                                        )
+                                        ray_hspec_tasks = self.hspec_tables.build_tables_async(dict(prompt_build_data))
+                                    barrier_timeout_s = _hspec_epoch_build_barrier_timeout_s()
                                     pending_records = []
                                     for submission in ray_hspec_tasks:
-                                        submission_submitted_time_ns = int(
+                                        submitted_time_ns = int(
                                             getattr(submission, "submitted_time_ns", 0) or time.time_ns()
                                         )
-                                        submission_deadline_ns = int(
-                                            getattr(submission, "deadline_ns", 0) or deadline_ns
+                                        deadline_ns = (
+                                            submitted_time_ns + int(barrier_timeout_s * 1_000_000_000)
+                                            if barrier_timeout_s > 0 else 0
                                         )
                                         pending_records.append(
                                             HSpecPendingBuild(
@@ -2439,8 +2141,8 @@ class RayPPOTrainer:
                                                 shard_id=int(submission.shard_id),
                                                 segments=submission.segments,
                                                 prompt_ids=submission.prompt_ids,
-                                                submitted_time_ns=submission_submitted_time_ns,
-                                                deadline_ns=submission_deadline_ns,
+                                                submitted_time_ns=submitted_time_ns,
+                                                deadline_ns=deadline_ns,
                                                 legacy=bool(getattr(submission, "legacy", False)),
                                             )
                                         )
@@ -2572,15 +2274,14 @@ class RayPPOTrainer:
                 if is_last_step:
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                         barrier_metrics = self._wait_hspec_epoch_builds(epoch, timing_raw)
-                        swap_metrics = self._publish_hspec_epoch_tables_after_barrier(epoch)
-                        if swap_metrics:
-                            barrier_metrics.update(swap_metrics)
                         if barrier_metrics:
                             barrier_metrics.update({
                                 "training/global_step": self.global_steps,
                                 "training/epoch": epoch,
                             })
                             logger.log(data=barrier_metrics, step=self.global_steps)
+                        print(f"HSpec: final swap at epoch={epoch} step={self.global_steps}")
+                        self.hspec_tables.swap()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -2593,12 +2294,11 @@ class RayPPOTrainer:
 
             if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                 barrier_metrics = self._wait_hspec_epoch_builds(epoch, timing_raw)
-                swap_metrics = self._publish_hspec_epoch_tables_after_barrier(epoch)
-                if swap_metrics:
-                    barrier_metrics.update(swap_metrics)
                 if barrier_metrics:
                     barrier_metrics.update({
                         "training/global_step": self.global_steps,
                         "training/epoch": epoch,
                     })
                     logger.log(data=barrier_metrics, step=self.global_steps)
+                print(f"HSpec: swap at epoch={epoch} (promote building -> active)")
+                self.hspec_tables.swap()
