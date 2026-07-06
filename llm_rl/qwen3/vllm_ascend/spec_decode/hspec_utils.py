@@ -1007,6 +1007,7 @@ _hspec_token_buffers: Dict[str, List[int]] = {}
 
 # Whether collection is enabled (set by model_runner at init)
 _hspec_collection_enabled: bool = False
+_hspec_collection_epoch: int = -1
 
 
 class _HSpecAsyncCopyTask:
@@ -1019,6 +1020,7 @@ class _HSpecAsyncCopyTask:
         "device_tensor_ref",
         "pool_handle",
         "num_rows",
+        "epoch",
     )
 
     def __init__(
@@ -1030,6 +1032,7 @@ class _HSpecAsyncCopyTask:
         device_tensor_ref: Optional[torch.Tensor],
         pool_handle: Any = None,
         num_rows: int = 0,
+        epoch: int = -1,
     ) -> None:
         self.req_slices = req_slices
         self.token_slices = token_slices
@@ -1039,6 +1042,7 @@ class _HSpecAsyncCopyTask:
         self.device_tensor_ref = device_tensor_ref
         self.pool_handle = pool_handle
         self.num_rows = int(num_rows)
+        self.epoch = int(epoch)
 
 
 class _HSpecAsyncAccumulateTask:
@@ -1055,6 +1059,7 @@ class _HSpecAsyncAccumulateTask:
         "spec_decode_metadata",
         "accepted_prefix_lengths",
         "producer_event",
+        "epoch",
     )
 
     def __init__(
@@ -1070,6 +1075,7 @@ class _HSpecAsyncAccumulateTask:
         spec_decode_metadata: Any,
         accepted_prefix_lengths: Optional[List[int]],
         producer_event: Any,
+        epoch: int = -1,
     ) -> None:
         self.req_ids = req_ids
         self.req_slices = req_slices
@@ -1082,6 +1088,7 @@ class _HSpecAsyncAccumulateTask:
         self.spec_decode_metadata = spec_decode_metadata
         self.accepted_prefix_lengths = accepted_prefix_lengths
         self.producer_event = producer_event
+        self.epoch = int(epoch)
 
 
 _hspec_copy_queue: "queue.SimpleQueue[_HSpecAsyncCopyTask | None]" = queue.SimpleQueue()
@@ -1260,32 +1267,86 @@ def _hspec_drop_on_backpressure_enabled() -> bool:
 def hspec_should_collect_step(
     estimated_rows: int = 0,
     estimated_reqs: int = 0,
+    estimated_bytes: int = 0,
+    epoch: Optional[int] = None,
 ) -> bool:
     if not _hspec_collection_enabled:
         return False
 
     max_tasks = _get_hspec_copy_max_pending_tasks()
     max_rows = _get_hspec_copy_max_pending_rows()
-    if max_tasks <= 0 and max_rows <= 0:
-        return True
-
     rows = max(int(estimated_rows), 0)
     reqs = max(int(estimated_reqs), 0)
-    with _hspec_store_cond:
-        would_exceed_tasks = (
-            max_tasks > 0 and _hspec_async_pending_tasks >= max_tasks
-        )
-        would_exceed_rows = (
-            max_rows > 0 and _hspec_async_pending_rows + rows > max_rows
-        )
+    bytes_est = max(int(estimated_bytes), 0)
+    collect_epoch = _hspec_collection_epoch if epoch is None else int(epoch)
 
-    if not (would_exceed_tasks or would_exceed_rows):
-        return True
-    if _hspec_drop_on_backpressure_enabled():
-        _hspec_metric_add("copy_backpressure_drop")
-        _hspec_metric_add("copy_backpressure_drop_rows", rows)
-        _hspec_metric_add("copy_backpressure_drop_reqs", reqs)
-        return False
+    if max_tasks > 0 or max_rows > 0:
+        with _hspec_store_cond:
+            would_exceed_tasks = (
+                max_tasks > 0 and _hspec_async_pending_tasks >= max_tasks
+            )
+            would_exceed_rows = (
+                max_rows > 0 and _hspec_async_pending_rows + rows > max_rows
+            )
+
+        if would_exceed_tasks or would_exceed_rows:
+            _hspec_metric_add("backpressure_active")
+            if _hspec_drop_on_backpressure_enabled():
+                _hspec_metric_add("copy_backpressure_drop")
+                _hspec_metric_add("copy_backpressure_drop_rows", rows)
+                _hspec_metric_add("copy_backpressure_drop_reqs", reqs)
+                return False
+
+    if bytes_est > 0:
+        try:
+            from vllm_ascend.spec_decode.hspec_store import (
+                hspec_collect_budget_decision,
+                hspec_record_collect_budget_reject,
+            )
+
+            decision = hspec_collect_budget_decision(
+                estimated_bytes=bytes_est,
+                epoch=collect_epoch,
+            )
+        except Exception:
+            logger.debug("HSpec collect budget precheck failed open", exc_info=True)
+            decision = {"allow": True}
+        if not bool(decision.get("allow", True)):
+            reason = str(decision.get("reason", "collect_budget"))
+            _hspec_metric_add("collect_budget_drop")
+            _hspec_metric_add("collect_budget_drop_bytes", bytes_est)
+            _hspec_metric_add("collect_budget_drop_reqs", reqs)
+            _hspec_metric_add("backpressure_active")
+            _hspec_metric_add("backpressure_collect_skip")
+            if reason == "budget_worker_bytes":
+                over = int(decision.get("over_bytes", bytes_est))
+                _hspec_metric_add("collect_budget_over_worker_bytes", max(over, 0))
+            elif reason == "budget_epoch_bytes":
+                over = int(decision.get("over_bytes", bytes_est))
+                _hspec_metric_add("collect_budget_over_epoch_bytes", max(over, 0))
+            try:
+                hspec_record_collect_budget_reject(
+                    decision,
+                    estimated_bytes=bytes_est,
+                    reqs=reqs,
+                )
+            except Exception:
+                logger.debug("HSpec collect budget reject metric failed", exc_info=True)
+            return False
+
+    fallback_ratio_threshold = get_hspec_collect_skip_on_pinned_fallback_ratio()
+    if fallback_ratio_threshold > 0:
+        with _hspec_runtime_metric_lock:
+            checkout_count = int(_hspec_runtime_metrics.get("pinned_checkout_count", 0))
+            fallback_count = int(_hspec_runtime_metrics.get("pinned_pageable_fallback", 0))
+        if checkout_count > 0 and (fallback_count / checkout_count) >= fallback_ratio_threshold:
+            _hspec_metric_add("pinned_fallback_ratio_skip")
+            _hspec_metric_add("collect_budget_drop")
+            _hspec_metric_add("collect_budget_drop_bytes", bytes_est)
+            _hspec_metric_add("collect_budget_drop_reqs", reqs)
+            _hspec_metric_add("backpressure_active")
+            _hspec_metric_add("backpressure_collect_skip")
+            return False
     return True
 
 
@@ -1522,10 +1583,10 @@ def _hspec_copy_worker() -> None:
                         continue
                     try:
                         if hasattr(collector, "append_hidden_and_tokens"):
-                            collector.append_hidden_and_tokens(req_id, rows, tokens)
+                            collector.append_hidden_and_tokens(req_id, rows, tokens, epoch=task.epoch)
                         else:
-                            collector.append_hidden_rows(req_id, rows)
-                            collector.extend_tokens(req_id, tokens)
+                            collector.append_hidden_rows(req_id, rows, epoch=task.epoch)
+                            collector.extend_tokens(req_id, tokens, epoch=task.epoch)
                     except Exception:
                         _hspec_metric_add("copy_worker_pair_write_error")
                         logger.exception(
@@ -1591,6 +1652,7 @@ def _hspec_accumulate_worker() -> None:
                     device_tensor_ref=selected_rows if copy_event is not None else None,
                     pool_handle=pool_handle,
                     num_rows=task.num_rows,
+                    epoch=task.epoch,
                 )
             )
         except Exception:
@@ -1673,6 +1735,22 @@ def hspec_set_collection_enabled(enabled: bool):
     """Enable or disable hidden state collection globally."""
     global _hspec_collection_enabled
     _hspec_collection_enabled = enabled
+
+
+def hspec_set_collection_context(epoch: Optional[int] = None) -> bool:
+    """Set lightweight rollout context used by collect-time budget gates."""
+    global _hspec_collection_epoch
+    try:
+        _hspec_collection_epoch = -1 if epoch is None else int(epoch)
+        return True
+    except Exception:
+        _hspec_collection_epoch = -1
+        return False
+
+
+def hspec_collection_context_epoch() -> int:
+    """Return the process-local epoch currently associated with collection."""
+    return int(_hspec_collection_epoch)
 
 
 def hspec_is_collection_enabled() -> bool:
@@ -1767,7 +1845,19 @@ def hspec_submit_accumulate_task(
         return False
 
     num_rows = len(flat_indices)
-    if not hspec_should_collect_step(num_rows, len(pending_req_ids)):
+    collect_epoch = hspec_collection_context_epoch()
+    hidden_dim = int(sample_hidden_states.shape[-1]) if sample_hidden_states.ndim >= 2 else 1
+    token_count = sum(len(tokens) for tokens in token_slices.values())
+    estimated_bytes = (
+        int(num_rows) * int(hidden_dim) * torch.empty((), dtype=torch.float16).element_size()
+        + int(token_count) * np.dtype(np.int32).itemsize
+    )
+    if not hspec_should_collect_step(
+        estimated_rows=num_rows,
+        estimated_reqs=len(pending_req_ids),
+        estimated_bytes=estimated_bytes,
+        epoch=collect_epoch,
+    ):
         return False
 
     legacy_async = _hspec_use_legacy_async_accumulate()
@@ -1819,6 +1909,7 @@ def hspec_submit_accumulate_task(
                     device_tensor_ref=selected_rows if copy_event is not None else None,
                     pool_handle=pool_handle,
                     num_rows=num_rows,
+                    epoch=collect_epoch,
                 )
             )
             _hspec_metric_add("copy_submitted_tasks")
@@ -1851,6 +1942,7 @@ def hspec_submit_accumulate_task(
             spec_decode_metadata=spec_decode_metadata,
             accepted_prefix_lengths=normalized_accepts,
             producer_event=producer_event,
+            epoch=collect_epoch,
         )
     )
     _hspec_metric_add("copy_submitted_tasks")

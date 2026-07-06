@@ -639,6 +639,10 @@ class vLLMRollout(BaseRollout):
                     "hspec_set_collection_enabled",
                     args=(bool(collect_hspec),),
                 )
+                self.inference_engine.llm_engine.collective_rpc(
+                    "hspec_set_collection_context",
+                    args=(int(hspec_epoch) if hspec_epoch is not None else -1,),
+                )
             except Exception:
                 logger.debug("HSpec collection mode update failed", exc_info=True)
 

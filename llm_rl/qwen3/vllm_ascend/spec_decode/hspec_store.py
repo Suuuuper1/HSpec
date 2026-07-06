@@ -448,6 +448,11 @@ def get_hspec_raw_store_max_bytes() -> int:
         return 0
 
 
+def get_hspec_collect_max_bytes_per_worker() -> int:
+    """Maximum descriptor-mode collect bytes reserved by one rollout worker."""
+    return _parse_nonnegative_int_env("HSPEC_COLLECT_MAX_BYTES_PER_WORKER", 0)
+
+
 def get_hspec_raw_store_max_files() -> int:
     value = os.getenv("HSPEC_RAW_STORE_MAX_FILES", "0")
     try:
@@ -518,6 +523,11 @@ def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
 def _metric_add(name: str, value: int) -> None:
     with _store_metrics_lock:
         _store_metrics[name] = _store_metrics.get(name, 0) + int(value)
+
+
+def _metric_set(name: str, value: int) -> None:
+    with _store_metrics_lock:
+        _store_metrics[name] = int(value)
 
 
 def _record_collect_drop(reason: str, count: int = 1) -> None:
@@ -647,6 +657,11 @@ class HSpecLocalCollector:
         self._segment_token_fh = None
         self._segment_hs_rows = 0
         self._segment_token_len = 0
+        self._epoch_bytes: Dict[int, int] = {}
+        self._worker_collect_bytes = 0
+        self._current_collect_epoch = -1
+        self._budget_blocked_epoch: set[int] = set()
+        self._raw_store_budget_blocked = False
 
     def _batch_dir(self) -> Path:
         path = (
@@ -678,10 +693,150 @@ class HSpecLocalCollector:
                 continue
         return total
 
+    @staticmethod
+    def _resolve_collect_epoch(epoch: int | None) -> int:
+        if epoch is not None:
+            return int(epoch)
+        try:
+            from vllm_ascend.spec_decode.hspec_utils import hspec_collection_context_epoch
+
+            return int(hspec_collection_context_epoch())
+        except Exception:
+            return -1
+
+    @staticmethod
+    def _estimate_payload_bytes(rows_count: int, hidden_dim: int, token_count: int = 0) -> int:
+        hidden_bytes = max(int(rows_count), 0) * max(int(hidden_dim), 0) * np.dtype(np.float16).itemsize
+        token_bytes = max(int(token_count), 0) * np.dtype(np.int32).itemsize
+        return int(hidden_bytes + token_bytes)
+
+    def _maybe_rotate_collect_epoch_locked(self, collect_epoch: int) -> None:
+        if collect_epoch < 0 or int(collect_epoch) == int(self._current_collect_epoch):
+            return
+        self._current_collect_epoch = int(collect_epoch)
+        self._worker_collect_bytes = 0
+        self._epoch_bytes = {
+            int(collect_epoch): int(self._epoch_bytes.get(int(collect_epoch), 0))
+        }
+        self._budget_blocked_epoch = {
+            int(collect_epoch)
+        } if int(collect_epoch) in self._budget_blocked_epoch else set()
+
+    def _collect_budget_decision_locked(
+        self,
+        estimated_bytes: int,
+        epoch: int | None = None,
+    ) -> Dict[str, Any]:
+        bytes_est = max(int(estimated_bytes), 0)
+        collect_epoch = self._resolve_collect_epoch(epoch)
+        self._maybe_rotate_collect_epoch_locked(collect_epoch)
+
+        if hspec_raw_store_stop_collect_on_budget_enabled() and self._raw_store_budget_blocked:
+            _metric_set("raw_store_budget_active", 1)
+            return {
+                "allow": False,
+                "reason": "raw_store_over_budget",
+                "epoch": int(collect_epoch),
+                "estimated_bytes": int(bytes_est),
+                "worker_bytes": int(self._worker_collect_bytes),
+                "epoch_bytes": int(self._epoch_bytes.get(collect_epoch, 0)),
+            }
+
+        worker_limit = get_hspec_collect_max_bytes_per_worker()
+        if worker_limit > 0 and self._worker_collect_bytes + bytes_est > worker_limit:
+            return {
+                "allow": False,
+                "reason": "budget_worker_bytes",
+                "epoch": int(collect_epoch),
+                "estimated_bytes": int(bytes_est),
+                "limit_bytes": int(worker_limit),
+                "current_bytes": int(self._worker_collect_bytes),
+                "over_bytes": int(self._worker_collect_bytes + bytes_est - worker_limit),
+            }
+
+        epoch_limit = get_hspec_raw_store_max_bytes_per_epoch()
+        if epoch_limit > 0:
+            _metric_set("raw_store_epoch_budget_bytes", epoch_limit)
+            epoch_bytes = int(self._epoch_bytes.get(collect_epoch, 0))
+            if collect_epoch in self._budget_blocked_epoch or epoch_bytes + bytes_est > epoch_limit:
+                if collect_epoch not in self._budget_blocked_epoch:
+                    self._budget_blocked_epoch.add(collect_epoch)
+                    _metric_add("raw_store_collect_budget_blocked", 1)
+                return {
+                    "allow": False,
+                    "reason": "budget_epoch_bytes",
+                    "epoch": int(collect_epoch),
+                    "estimated_bytes": int(bytes_est),
+                    "limit_bytes": int(epoch_limit),
+                    "current_bytes": int(epoch_bytes),
+                    "over_bytes": int(epoch_bytes + bytes_est - epoch_limit),
+                }
+
+        return {
+            "allow": True,
+            "reason": "",
+            "epoch": int(collect_epoch),
+            "estimated_bytes": int(bytes_est),
+            "worker_bytes": int(self._worker_collect_bytes),
+            "epoch_bytes": int(self._epoch_bytes.get(collect_epoch, 0)),
+        }
+
+    def collect_budget_decision(
+        self,
+        estimated_bytes: int,
+        epoch: int | None = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._collect_budget_decision_locked(estimated_bytes, epoch))
+
+    def _record_budget_reject_locked(
+        self,
+        decision: Dict[str, Any],
+        *,
+        estimated_bytes: int,
+        reqs: int = 1,
+    ) -> None:
+        reason = str(decision.get("reason", "collect_budget"))
+        bytes_est = max(int(estimated_bytes), 0)
+        _record_collect_drop(reason, max(int(reqs), 1))
+        _metric_add("raw_store_collect_drop_bytes", bytes_est)
+        if reason == "budget_worker_bytes":
+            _metric_add("collect_dropped_budget_worker_bytes", bytes_est)
+        elif reason == "budget_epoch_bytes":
+            _metric_add("collect_dropped_budget_epoch_bytes", bytes_est)
+        elif reason == "raw_store_over_budget":
+            _metric_add("collect_dropped_raw_store_over_budget", bytes_est)
+
+    def try_reserve_collect_budget(
+        self,
+        estimated_bytes: int,
+        epoch: int | None = None,
+        reqs: int = 1,
+    ) -> bool:
+        bytes_est = max(int(estimated_bytes), 0)
+        with self._lock:
+            decision = self._collect_budget_decision_locked(bytes_est, epoch)
+            if not bool(decision.get("allow", True)):
+                self._record_budget_reject_locked(
+                    decision,
+                    estimated_bytes=bytes_est,
+                    reqs=reqs,
+                )
+                return False
+            collect_epoch = int(decision.get("epoch", self._resolve_collect_epoch(epoch)))
+            self._worker_collect_bytes += bytes_est
+            self._epoch_bytes[collect_epoch] = int(self._epoch_bytes.get(collect_epoch, 0)) + bytes_est
+            _metric_add("raw_store_epoch_bytes", bytes_est)
+            return True
+
     def _enforce_store_budget(self) -> None:
         max_bytes = get_hspec_raw_store_max_bytes()
         max_files = get_hspec_raw_store_max_files()
         if max_bytes <= 0 and max_files <= 0:
+            if self._raw_store_budget_blocked:
+                self._raw_store_budget_blocked = False
+                _metric_add("raw_store_collect_budget_unblocked", 1)
+            _metric_set("raw_store_budget_active", 0)
             return
 
         try:
@@ -716,8 +871,16 @@ class HSpecLocalCollector:
         over_bytes = max(total_bytes - max_bytes, 0) if max_bytes > 0 else 0
         over_files = max(total_files - max_files, 0) if max_files > 0 else 0
         if over_bytes <= 0 and over_files <= 0:
+            if self._raw_store_budget_blocked:
+                self._raw_store_budget_blocked = False
+                _metric_add("raw_store_collect_budget_unblocked", 1)
+            _metric_set("raw_store_budget_active", 0)
             return
 
+        _metric_set("raw_store_budget_active", 1)
+        if hspec_raw_store_stop_collect_on_budget_enabled() and not self._raw_store_budget_blocked:
+            self._raw_store_budget_blocked = True
+            _metric_add("raw_store_collect_budget_blocked", 1)
         _metric_add("raw_store_budget_over_bytes", over_bytes)
         _metric_add("raw_store_budget_over_files", over_files)
         if not hspec_raw_store_budget_delete_enabled():
@@ -741,6 +904,11 @@ class HSpecLocalCollector:
                 _metric_add("raw_store_budget_gc_deleted", 1)
                 total_bytes = max(total_bytes - before_bytes, 0)
                 total_files = max(total_files - before_files, 0)
+        if (max_bytes <= 0 or total_bytes <= max_bytes) and (max_files <= 0 or total_files <= max_files):
+            if self._raw_store_budget_blocked:
+                self._raw_store_budget_blocked = False
+                _metric_add("raw_store_collect_budget_unblocked", 1)
+            _metric_set("raw_store_budget_active", 0)
 
     @staticmethod
     def _safe_request_key(req_id: str) -> str:
@@ -866,11 +1034,21 @@ class HSpecLocalCollector:
             _metric_add("segment_aborted", 1)
             self._rotate_to_next_segment_locked()
 
-    def append_hidden_rows(self, req_id: str, rows: torch.Tensor) -> None:
+    def append_hidden_rows(
+        self,
+        req_id: str,
+        rows: torch.Tensor,
+        epoch: int | None = None,
+    ) -> None:
         if rows is None or rows.numel() == 0:
             return
         if rows.ndim != 2:
             raise ValueError(f"HSpec hidden rows must be 2-D, got {tuple(rows.shape)}")
+        rows_count = int(rows.shape[0])
+        hidden_dim = int(rows.shape[1])
+        estimated_bytes = self._estimate_payload_bytes(rows_count, hidden_dim, 0)
+        if not self.try_reserve_collect_budget(estimated_bytes, epoch=epoch, reqs=1):
+            return
 
         store_dtype = get_hspec_store_dtype()
         if store_dtype == "float16":
@@ -891,9 +1069,17 @@ class HSpecLocalCollector:
                 source_dtype,
             )
 
-    def extend_tokens(self, req_id: str, token_ids: Iterable[int]) -> None:
+    def extend_tokens(
+        self,
+        req_id: str,
+        token_ids: Iterable[int],
+        epoch: int | None = None,
+    ) -> None:
         token_list = [int(t) for t in token_ids]
         if not token_list:
+            return
+        estimated_bytes = self._estimate_payload_bytes(0, 0, len(token_list))
+        if not self.try_reserve_collect_budget(estimated_bytes, epoch=epoch, reqs=1):
             return
         token_np = np.ascontiguousarray(token_list, dtype=np.int32)
 
@@ -906,6 +1092,7 @@ class HSpecLocalCollector:
         req_id: str,
         rows: torch.Tensor,
         token_ids: Iterable[int],
+        epoch: int | None = None,
     ) -> None:
         token_list = [int(t) for t in token_ids]
         if (rows is None or rows.numel() == 0) and not token_list:
@@ -914,6 +1101,16 @@ class HSpecLocalCollector:
             raise ValueError("HSpec token payload cannot be written without hidden rows")
         if rows.ndim != 2:
             raise ValueError(f"HSpec hidden rows must be 2-D, got {tuple(rows.shape)}")
+        rows_count = int(rows.shape[0])
+        hidden_dim = int(rows.shape[1])
+        if rows_count != len(token_list):
+            raise ValueError(
+                f"HSpec token/hidden length mismatch for {req_id}: "
+                f"hidden_rows={rows_count} token_len={len(token_list)}"
+            )
+        estimated_bytes = self._estimate_payload_bytes(rows_count, hidden_dim, len(token_list))
+        if not self.try_reserve_collect_budget(estimated_bytes, epoch=epoch, reqs=1):
+            return
 
         store_dtype = get_hspec_store_dtype()
         if store_dtype == "float16":
@@ -922,12 +1119,6 @@ class HSpecLocalCollector:
         else:
             raise AssertionError(f"Unsupported HSpec store dtype after validation: {store_dtype}")
         rows_np = rows_cpu.numpy()
-        rows_count = int(rows_np.shape[0])
-        if rows_count != len(token_list):
-            raise ValueError(
-                f"HSpec token/hidden length mismatch for {req_id}: "
-                f"hidden_rows={rows_count} token_len={len(token_list)}"
-            )
         token_np = np.ascontiguousarray(token_list, dtype=np.int32)
         source_dtype = str(getattr(rows, "dtype", ""))
 
@@ -1118,6 +1309,59 @@ def get_hspec_local_collector() -> HSpecLocalCollector:
         if _collector is None:
             _collector = HSpecLocalCollector()
     return _collector
+
+
+def hspec_collect_budget_decision(
+    estimated_bytes: int = 0,
+    epoch: int | None = None,
+) -> Dict[str, Any]:
+    """Cheap collect-budget precheck for rollout workers.
+
+    This function never scans the raw-store directory. Directory-derived raw
+    store pressure is reflected through the collector's sticky flag, which is
+    updated only by low-frequency budget enforcement after segment flushes.
+    """
+    bytes_est = max(int(estimated_bytes), 0)
+    if bytes_est <= 0:
+        return {"allow": True, "reason": "", "estimated_bytes": 0}
+    if (
+        get_hspec_collect_max_bytes_per_worker() <= 0
+        and get_hspec_raw_store_max_bytes_per_epoch() <= 0
+        and not (
+            hspec_raw_store_stop_collect_on_budget_enabled()
+            and (get_hspec_raw_store_max_bytes() > 0 or get_hspec_raw_store_max_files() > 0)
+            and _collector is not None
+        )
+    ):
+        return {"allow": True, "reason": "", "estimated_bytes": int(bytes_est)}
+    return get_hspec_local_collector().collect_budget_decision(bytes_est, epoch)
+
+
+def hspec_record_collect_budget_reject(
+    decision: Dict[str, Any],
+    *,
+    estimated_bytes: int = 0,
+    reqs: int = 1,
+) -> None:
+    """Record store-side metrics for a collect-budget precheck rejection."""
+    if _collector is None:
+        reason = str(decision.get("reason", "collect_budget"))
+        bytes_est = max(int(estimated_bytes), 0)
+        _record_collect_drop(reason, max(int(reqs), 1))
+        _metric_add("raw_store_collect_drop_bytes", bytes_est)
+        if reason == "budget_worker_bytes":
+            _metric_add("collect_dropped_budget_worker_bytes", bytes_est)
+        elif reason == "budget_epoch_bytes":
+            _metric_add("collect_dropped_budget_epoch_bytes", bytes_est)
+        elif reason == "raw_store_over_budget":
+            _metric_add("collect_dropped_raw_store_over_budget", bytes_est)
+        return
+    with _collector._lock:
+        _collector._record_budget_reject_locked(
+            dict(decision),
+            estimated_bytes=max(int(estimated_bytes), 0),
+            reqs=max(int(reqs), 1),
+        )
 
 
 def load_hspec_trajectory(

@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -721,6 +722,11 @@ class RayPPOTrainer:
             "build_projection_processed_fp32_tile_bytes",
             "build_processed_fp32_tile_bytes",
             "build_projection_tile_count",
+            "build_queue_lag_ms_total",
+            "build_queue_lag_count",
+            "build_queue_reject_count",
+            "build_queue_reject_descs",
+            "build_queue_reject_bytes",
         )
         for key in additive_keys:
             value = result.get(key)
@@ -737,6 +743,9 @@ class RayPPOTrainer:
             "build_actor_rss_after_pca_mb_max",
             "build_actor_rss_peak_mb",
             "build_actor_rss_delta_mb_max",
+            "build_queue_pending_descs",
+            "build_queue_pending_bytes",
+            "build_queue_lag_ms_max",
         )
         for key in max_keys:
             value = result.get(key)
@@ -748,10 +757,95 @@ class RayPPOTrainer:
                         float(metrics.get("hspec/build_actor_rss_mb_max", 0.0)),
                         float(value),
                     )
+        lag_count = metrics.get("hspec/build_result_build_queue_lag_count", 0.0)
+        if lag_count:
+            metrics["hspec/build_result_build_queue_lag_ms_avg"] = (
+                metrics.get("hspec/build_result_build_queue_lag_ms_total", 0.0) / lag_count
+            )
 
     @staticmethod
     def _hspec_pending_segment_count(records: list[HSpecPendingBuild]) -> int:
         return len({segment for record in records for segment in record.segments})
+
+    @staticmethod
+    def _hspec_segments_from_prompt_build_data(prompt_build_data: dict) -> set[object]:
+        segments: set[object] = set()
+        if not isinstance(prompt_build_data, dict):
+            return segments
+        try:
+            from vllm_ascend.spec_decode.hspec_store import (
+                coerce_hspec_desc,
+                hspec_segment_key_from_desc,
+            )
+        except Exception:
+            return segments
+        for data in prompt_build_data.values():
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                if item is None:
+                    continue
+                try:
+                    segments.add(hspec_segment_key_from_desc(coerce_hspec_desc(item)))
+                except Exception:
+                    continue
+        return segments
+
+    def _mark_hspec_segments_gc_deletable(
+        self,
+        segments: set[object],
+        *,
+        epoch: int,
+        reason: str,
+        timing_raw: dict | None = None,
+    ) -> None:
+        if not segments:
+            return
+        from vllm_ascend.spec_decode.hspec_store import (
+            delete_hspec_segment,
+            hspec_raw_store_gc_after_epoch_enabled,
+            hspec_record_store_metric,
+            update_hspec_segment_manifest_status,
+        )
+
+        deleted = 0
+
+        def _mark_and_maybe_delete() -> None:
+            nonlocal deleted
+            for segment in sorted(segments, key=lambda item: str(getattr(item, "segment_dir", item))):
+                try:
+                    segment_dir = getattr(segment, "segment_dir", segment)
+                    update_hspec_segment_manifest_status(
+                        segment_dir,
+                        "gc_deletable",
+                        extra={
+                            "epoch": int(epoch),
+                            "gc_reason": str(reason),
+                            "build_status": str(reason),
+                        },
+                    )
+                    if hspec_raw_store_gc_after_epoch_enabled():
+                        if delete_hspec_segment(segment, caller_confirmed_safe=False):
+                            deleted += 1
+                except Exception:
+                    hspec_record_store_metric("raw_store_epoch_gc_error", 1)
+                    print(
+                        "HSpec: failed to mark/delete skipped raw segment "
+                        f"for reason={reason}; continuing training."
+                    )
+                    continue
+
+        if timing_raw is None:
+            _mark_and_maybe_delete()
+        else:
+            with marked_timer("hspec_backpressure_raw_store_gc", timing_raw, color="teal"):
+                _mark_and_maybe_delete()
+
+        hspec_record_store_metric("raw_store_epoch_gc_segments", len(segments))
+        if hspec_raw_store_gc_after_epoch_enabled():
+            hspec_record_store_metric("raw_store_epoch_gc_deleted", deleted)
+        else:
+            hspec_record_store_metric("raw_store_epoch_gc_skipped", len(segments))
 
     def _wait_hspec_epoch_builds(self, epoch: int, timing_raw: dict | None = None) -> dict[str, float]:
         records: list[HSpecPendingBuild] = getattr(self, "_hspec_pending_build_refs", [])
@@ -1992,27 +2086,71 @@ class RayPPOTrainer:
                                         dict(prompt_build_data),
                                     )
                             if prompt_build_data:
-                                if legacy_hspec_dataproto_hs:
-                                    ray_hspec_tasks = self.hspec_tables.build_tables_async_legacy(
-                                        dict(prompt_build_data)
+                                pending_epochs = {
+                                    int(record.epoch)
+                                    for record in getattr(self, "_hspec_pending_build_refs", [])
+                                    if not record.done
+                                }
+                                max_pending_epochs = _hspec_build_max_pending_epochs()
+                                would_pending_epochs = set(pending_epochs)
+                                would_pending_epochs.add(int(epoch))
+                                skip_hspec_build = (
+                                    max_pending_epochs > 0
+                                    and len(would_pending_epochs) > max_pending_epochs
+                                )
+                                if skip_hspec_build:
+                                    metrics["hspec/build_pending_epoch_backpressure"] = (
+                                        metrics.get("hspec/build_pending_epoch_backpressure", 0.0) + 1.0
                                     )
+                                    metrics["hspec/build_submission_skipped_pending_epochs"] = (
+                                        metrics.get("hspec/build_submission_skipped_pending_epochs", 0.0) + 1.0
+                                    )
+                                    if not legacy_hspec_dataproto_hs:
+                                        skipped_segments = self._hspec_segments_from_prompt_build_data(
+                                            dict(prompt_build_data)
+                                        )
+                                        self._mark_hspec_segments_gc_deletable(
+                                            skipped_segments,
+                                            epoch=int(epoch),
+                                            reason="build_skipped_backpressure",
+                                            timing_raw=timing_raw,
+                                        )
+                                    metrics["hspec/build_submitted_refs"] = 0
+                                    metrics["hspec/build_submitted_segments"] = 0
                                 else:
-                                    ray_hspec_tasks = self.hspec_tables.build_tables_async(dict(prompt_build_data))
-                                self._hspec_pending_build_refs.extend(
-                                    HSpecPendingBuild(
-                                        epoch=epoch,
-                                        ref=submission.ref,
-                                        shard_id=int(submission.shard_id),
-                                        segments=submission.segments,
-                                        prompt_ids=submission.prompt_ids,
-                                        legacy=bool(getattr(submission, "legacy", False)),
+                                    if legacy_hspec_dataproto_hs:
+                                        ray_hspec_tasks = self.hspec_tables.build_tables_async_legacy(
+                                            dict(prompt_build_data)
+                                        )
+                                    else:
+                                        ray_hspec_tasks = self.hspec_tables.build_tables_async(dict(prompt_build_data))
+                                    barrier_timeout_s = _hspec_epoch_build_barrier_timeout_s()
+                                    pending_records = []
+                                    for submission in ray_hspec_tasks:
+                                        submitted_time_ns = int(
+                                            getattr(submission, "submitted_time_ns", 0) or time.time_ns()
+                                        )
+                                        deadline_ns = (
+                                            submitted_time_ns + int(barrier_timeout_s * 1_000_000_000)
+                                            if barrier_timeout_s > 0 else 0
+                                        )
+                                        pending_records.append(
+                                            HSpecPendingBuild(
+                                                epoch=epoch,
+                                                ref=submission.ref,
+                                                shard_id=int(submission.shard_id),
+                                                segments=submission.segments,
+                                                prompt_ids=submission.prompt_ids,
+                                                submitted_time_ns=submitted_time_ns,
+                                                deadline_ns=deadline_ns,
+                                                legacy=bool(getattr(submission, "legacy", False)),
+                                            )
+                                        )
+                                    self._hspec_pending_build_refs.extend(pending_records)
+                                    metrics["hspec/build_submitted_refs"] = len(ray_hspec_tasks)
+                                    metrics["hspec/build_submitted_segments"] = len(
+                                        {segment for submission in ray_hspec_tasks for segment in submission.segments}
                                     )
-                                    for submission in ray_hspec_tasks
-                                )
-                                metrics["hspec/build_submitted_refs"] = len(ray_hspec_tasks)
-                                metrics["hspec/build_submitted_segments"] = len(
-                                    {segment for submission in ray_hspec_tasks for segment in submission.segments}
-                                )
                             self._drop_hspec_non_tensor_fields(batch)
                             if step0_runtime_asserts:
                                 forbidden_after_drop = (

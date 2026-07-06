@@ -532,6 +532,18 @@ class NPUModelRunner(GPUModelRunner):
             logger.debug("HSpec: failed to update collection mode", exc_info=True)
             return False
 
+    def hspec_set_collection_context(self, epoch: int | None = None) -> bool:
+        """Update lightweight HSpec collection context for budget gates."""
+        if not self._hspec_collect:
+            return False
+        try:
+            from vllm_ascend.spec_decode.hspec_utils import hspec_set_collection_context
+
+            return bool(hspec_set_collection_context(epoch=epoch))
+        except Exception:
+            logger.debug("HSpec: failed to update collection context", exc_info=True)
+            return False
+
     def hspec_prefetch_prompt_ids_batch(self, prompt_ids: list[str]) -> int:
         """Warm HSpec proposer cache from stable prompt ids."""
         if (not self._hspec_collect or self.drafter is None

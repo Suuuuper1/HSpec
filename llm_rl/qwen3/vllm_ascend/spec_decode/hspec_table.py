@@ -221,6 +221,17 @@ class HSpecBuildSubmission:
     segments: frozenset[HSpecSegmentKey]
     prompt_ids: tuple[str, ...]
     legacy: bool = False
+    submitted_time_ns: int = 0
+
+
+@dataclass(frozen=True)
+class _BuildQueueDecision:
+    allow: bool
+    reason: str = ""
+    pending_descs: int = 0
+    pending_bytes: int = 0
+    incoming_descs: int = 0
+    incoming_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -1174,24 +1185,99 @@ class HSpecTableGroup:
             "build_max_rss_mb": float(self.build_max_rss_mb),
         }
 
-    def _can_accept_descriptor_batch(self, descs: List[HSpecTrajectoryDesc]) -> bool:
-        pending_descs = self._build_pending_descs + len(descs)
-        pending_bytes = self._build_pending_bytes + sum(estimate_hspec_trajectory_bytes(desc) for desc in descs)
+    @staticmethod
+    def _descriptor_batch_bytes(descs: List[HSpecTrajectoryDesc]) -> int:
+        return sum(max(int(estimate_hspec_trajectory_bytes(desc)), 0) for desc in descs)
+
+    def _can_accept_descriptor_batch(
+        self,
+        descs: List[HSpecTrajectoryDesc],
+    ) -> _BuildQueueDecision:
+        incoming_descs = len(descs)
+        incoming_bytes = self._descriptor_batch_bytes(descs)
+        pending_descs = self._build_pending_descs + incoming_descs
+        pending_bytes = self._build_pending_bytes + incoming_bytes
         if self._build_queue_max_descs > 0 and pending_descs > self._build_queue_max_descs:
-            return False
+            return _BuildQueueDecision(
+                allow=False,
+                reason="max_descs",
+                pending_descs=pending_descs,
+                pending_bytes=pending_bytes,
+                incoming_descs=incoming_descs,
+                incoming_bytes=incoming_bytes,
+            )
         if self._build_queue_max_bytes > 0 and pending_bytes > self._build_queue_max_bytes:
-            return False
-        return True
+            return _BuildQueueDecision(
+                allow=False,
+                reason="max_bytes",
+                pending_descs=pending_descs,
+                pending_bytes=pending_bytes,
+                incoming_descs=incoming_descs,
+                incoming_bytes=incoming_bytes,
+            )
+        return _BuildQueueDecision(
+            allow=True,
+            pending_descs=pending_descs,
+            pending_bytes=pending_bytes,
+            incoming_descs=incoming_descs,
+            incoming_bytes=incoming_bytes,
+        )
 
-    def _mark_descriptor_batch_pending(self, descs: List[HSpecTrajectoryDesc]) -> None:
+    def _mark_descriptor_batch_pending(
+        self,
+        descs: List[HSpecTrajectoryDesc],
+        incoming_bytes: Optional[int] = None,
+    ) -> None:
         self._build_pending_descs += len(descs)
-        self._build_pending_bytes += sum(estimate_hspec_trajectory_bytes(desc) for desc in descs)
+        self._build_pending_bytes += (
+            int(incoming_bytes)
+            if incoming_bytes is not None
+            else self._descriptor_batch_bytes(descs)
+        )
 
-    def _mark_descriptor_batch_finished(self, descs: List[HSpecTrajectoryDesc]) -> None:
+    def _mark_descriptor_batch_finished(
+        self,
+        descs: List[HSpecTrajectoryDesc],
+        incoming_bytes: Optional[int] = None,
+    ) -> None:
         self._build_pending_descs = max(self._build_pending_descs - len(descs), 0)
         self._build_pending_bytes = max(
-            self._build_pending_bytes - sum(estimate_hspec_trajectory_bytes(desc) for desc in descs),
+            self._build_pending_bytes - (
+                int(incoming_bytes)
+                if incoming_bytes is not None
+                else self._descriptor_batch_bytes(descs)
+            ),
             0,
+        )
+
+    def _record_build_queue_lag(self, submitted_time_ns: int) -> float:
+        if submitted_time_ns <= 0:
+            return 0.0
+        lag_ms = max((time.time_ns() - int(submitted_time_ns)) / 1_000_000.0, 0.0)
+        self._build_queue_lag_ms_max = max(self._build_queue_lag_ms_max, lag_ms)
+        self._build_queue_lag_ms_total += lag_ms
+        self._build_queue_lag_count += 1
+        return lag_ms
+
+    def _record_build_queue_reject(
+        self,
+        decision: _BuildQueueDecision,
+        reason: str | None = None,
+    ) -> None:
+        self._build_queue_reject_count += 1
+        self._build_queue_reject_descs += int(decision.incoming_descs)
+        self._build_queue_reject_bytes += int(decision.incoming_bytes)
+        self._discard_count += int(decision.incoming_descs)
+        logger.warning(
+            "HSpec build queue rejected descriptor batch on shard=%s: "
+            "reason=%s incoming_descs=%s incoming_bytes=%s "
+            "pending_descs=%s pending_bytes=%s",
+            self.shard_id,
+            reason or decision.reason,
+            decision.incoming_descs,
+            decision.incoming_bytes,
+            decision.pending_descs,
+            decision.pending_bytes,
         )
 
     def _rss_cap_exceeded(self, rss_bytes: int) -> bool:
@@ -1702,6 +1788,11 @@ class HSpecTableGroup:
         build_pca_method_fallback_count: int = 0,
         build_pca_cov_bytes_max: int = 0,
         build_pca_randomized_rank_max: int = 0,
+        build_queue_reject_count_before: int = 0,
+        build_queue_reject_descs_before: int = 0,
+        build_queue_reject_bytes_before: int = 0,
+        build_queue_lag_ms_total_before: float = 0.0,
+        build_queue_lag_count_before: int = 0,
     ) -> Dict[str, float]:
         rss_now = _get_process_rss_bytes()
         rss_peak_bytes = max(int(rss_peak_bytes), int(rss_now))
@@ -1758,6 +1849,24 @@ class HSpecTableGroup:
             ),
             "build_actor_rss_peak_mb": _bytes_to_mb(rss_peak_bytes) if rss_peak_bytes > 0 else -1.0,
             "build_actor_rss_delta_mb_max": _bytes_to_mb(rss_delta_peak_bytes) if rss_delta_peak_bytes > 0 else 0.0,
+            "build_queue_pending_descs": float(self._build_pending_descs),
+            "build_queue_pending_bytes": float(self._build_pending_bytes),
+            "build_queue_lag_ms_max": float(self._build_queue_lag_ms_max),
+            "build_queue_lag_ms_total": float(
+                self._build_queue_lag_ms_total - build_queue_lag_ms_total_before
+            ),
+            "build_queue_lag_count": float(
+                self._build_queue_lag_count - build_queue_lag_count_before
+            ),
+            "build_queue_reject_count": float(
+                self._build_queue_reject_count - build_queue_reject_count_before
+            ),
+            "build_queue_reject_descs": float(
+                self._build_queue_reject_descs - build_queue_reject_descs_before
+            ),
+            "build_queue_reject_bytes": float(
+                self._build_queue_reject_bytes - build_queue_reject_bytes_before
+            ),
         }
 
     def build_tables_batch(
@@ -1774,6 +1883,11 @@ class HSpecTableGroup:
         desc_count = 0
         build_count_before = self._build_count
         discard_count_before = self._discard_count
+        build_queue_reject_count_before = self._build_queue_reject_count
+        build_queue_reject_descs_before = self._build_queue_reject_descs
+        build_queue_reject_bytes_before = self._build_queue_reject_bytes
+        build_queue_lag_ms_total_before = self._build_queue_lag_ms_total
+        build_queue_lag_count_before = self._build_queue_lag_count
         selected_desc_count = 0
         build_input_rows = 0
         build_selected_rows = 0
@@ -1810,6 +1924,16 @@ class HSpecTableGroup:
         rss_after_materialize_peak_bytes = 0
         rss_after_pca_peak_bytes = 0
         rss_delta_peak_bytes = 0
+        submitted_time_ns = 0
+
+        if (
+            isinstance(prompt_data_dict, dict)
+            and "_hspec_prompt_data" in prompt_data_dict
+        ):
+            submitted_time_ns = int(prompt_data_dict.get("_hspec_submitted_time_ns", 0) or 0)
+            prompt_data_dict = prompt_data_dict.get("_hspec_prompt_data", {})
+
+        queue_lag_ms = self._record_build_queue_lag(submitted_time_ns)
 
         def _observe_rss(rss_bytes: int) -> None:
             nonlocal rss_peak_bytes, rss_delta_peak_bytes
@@ -1830,16 +1954,24 @@ class HSpecTableGroup:
             prompt_count += 1
             desc_count += len(descs)
             hspec_record_store_metric("descriptor_payload_count", len(descs))
-            if not self._can_accept_descriptor_batch(descs):
-                logger.warning(
-                    "HSpec build queue budget exceeded on shard=%s, dropping %s descriptors for prompt_id=%s",
-                    self.shard_id,
-                    len(descs),
-                    prompt_id,
-                )
-                self._discard_count += len(descs)
+            decision = self._can_accept_descriptor_batch(descs)
+            lag_over_limit = (
+                self.build_queue_max_lag_s > 0
+                and queue_lag_ms > self.build_queue_max_lag_s * 1000.0
+            )
+            if not decision.allow or lag_over_limit:
+                if lag_over_limit:
+                    decision = _BuildQueueDecision(
+                        allow=False,
+                        reason="max_lag_s",
+                        pending_descs=decision.pending_descs,
+                        pending_bytes=decision.pending_bytes,
+                        incoming_descs=decision.incoming_descs,
+                        incoming_bytes=decision.incoming_bytes,
+                    )
+                self._record_build_queue_reject(decision)
                 continue
-            self._mark_descriptor_batch_pending(descs)
+            self._mark_descriptor_batch_pending(descs, decision.incoming_bytes)
             try:
                 pre_build_rss = _get_process_rss_bytes()
                 _observe_rss(pre_build_rss)
@@ -1905,7 +2037,7 @@ class HSpecTableGroup:
                 _observe_rss(table_metrics.rss_after_pca_bytes)
             finally:
                 self._cleanup_trajectory_descs(descs)
-                self._mark_descriptor_batch_finished(descs)
+                self._mark_descriptor_batch_finished(descs, decision.incoming_bytes)
 
         build_total_ms = float((time.perf_counter() - t0) * 1000.0)
         self._build_selected_desc_count += selected_desc_count
@@ -2002,6 +2134,11 @@ class HSpecTableGroup:
             build_pca_method_fallback_count=build_pca_method_fallback_count,
             build_pca_cov_bytes_max=build_pca_cov_bytes_max,
             build_pca_randomized_rank_max=build_pca_randomized_rank_max,
+            build_queue_reject_count_before=build_queue_reject_count_before,
+            build_queue_reject_descs_before=build_queue_reject_descs_before,
+            build_queue_reject_bytes_before=build_queue_reject_bytes_before,
+            build_queue_lag_ms_total_before=build_queue_lag_ms_total_before,
+            build_queue_lag_count_before=build_queue_lag_count_before,
         )
 
     def build_tables_batch_legacy(self, prompt_data_dict: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
@@ -3330,6 +3467,11 @@ class GlobalHSpecTableGroup:
                     "HSpec build routing points to missing actor: "
                     f"pid={pid}, actor_count={len(self.groups)}, num_groups={self.num_groups}"
                 )
+            submitted_time_ns = time.time_ns()
+            payload = {
+                "_hspec_prompt_data": payload,
+                "_hspec_submitted_time_ns": int(submitted_time_ns),
+            }
             ref = self.groups[pid].build_tables_batch.remote(payload)
             submissions.append(
                 HSpecBuildSubmission(
@@ -3338,6 +3480,7 @@ class GlobalHSpecTableGroup:
                     segments=frozenset(partition_segments[pid]),
                     prompt_ids=tuple(partition_prompt_ids[pid]),
                     legacy=False,
+                    submitted_time_ns=int(submitted_time_ns),
                 )
             )
         if submissions:
@@ -3681,6 +3824,13 @@ class GlobalHSpecTableGroup:
                 "hspec/build_queue_pending_descs": 0,
                 "hspec/build_queue_pending_bytes": 0,
                 "hspec/build_queue_lag_ms_max": 0.0,
+                "hspec/build_queue_lag_ms_total": 0.0,
+                "hspec/build_queue_lag_count": 0,
+                "hspec/build_queue_lag_ms_avg": 0.0,
+                "hspec/build_queue_reject_count": 0,
+                "hspec/build_queue_reject_descs": 0,
+                "hspec/build_queue_reject_bytes": 0,
+                "hspec/build_queue_reject_mb": 0.0,
                 "hspec/table_active_bytes": 0,
                 "hspec/table_active_prompts": 0,
                 "hspec/table_active_entries": 0,
@@ -3824,6 +3974,10 @@ class GlobalHSpecTableGroup:
             "hspec/build_queue_lag_ms_max": agg.get("build_queue_lag_ms_max", 0),
             "hspec/build_queue_lag_ms_total": agg.get("build_queue_lag_ms_total", 0),
             "hspec/build_queue_lag_count": agg.get("build_queue_lag_count", 0),
+            "hspec/build_queue_lag_ms_avg": (
+                agg.get("build_queue_lag_ms_total", 0) / agg.get("build_queue_lag_count", 0)
+                if agg.get("build_queue_lag_count", 0) > 0 else 0.0
+            ),
             "hspec/build_queue_reject_count": agg.get("build_queue_reject_count", 0),
             "hspec/build_queue_reject_descs": agg.get("build_queue_reject_descs", 0),
             "hspec/build_queue_reject_bytes": agg.get("build_queue_reject_bytes", 0),
