@@ -20,7 +20,7 @@ import os
 import socket
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import msgpack
@@ -925,6 +925,7 @@ class HSpecTableGroup:
         self._building: Dict[str, HSpecPromptTableDesc] = {}
         self._building_records_by_epoch: Dict[int, Dict[str, HSpecActivePromptRecord]] = {}
         self._active_version: int = 0
+        self._active_access_step: int = 0
         self._table_writer: Optional[HSpecTableStoreWriter] = None
         self._building_version: Optional[int] = None
 
@@ -1026,6 +1027,8 @@ class HSpecTableGroup:
         self._table_eviction_count = 0
         self._table_eviction_bytes = 0
         self._table_eviction_entries = 0
+        self._table_access_hit_count = 0
+        self._table_access_miss_count = 0
         self._table_partial_swap_count = 0
         self._table_partial_swap_overlay_prompts = 0
         self._table_partial_swap_reuse_old_prompts = 0
@@ -1559,14 +1562,28 @@ class HSpecTableGroup:
             referenced.add(int(self._active_version))
         return referenced
 
+    def _next_active_access_step(self) -> int:
+        self._active_access_step = max(int(self._active_access_step) + 1, 1)
+        return int(self._active_access_step)
+
     def _record_from_desc(
         self,
         desc: HSpecPromptTableDesc,
         *,
         active_epoch: int,
         complete: bool = True,
+        reward_mean: float | None = None,
+        reward_max: float | None = None,
     ) -> HSpecActivePromptRecord:
         previous = self._active_records.get(str(desc.prompt_id))
+        reward_mean_value = (
+            float(getattr(previous, "reward_mean", 0.0) if previous else 0.0)
+            if reward_mean is None else float(reward_mean)
+        )
+        reward_max_value = (
+            float(getattr(previous, "reward_max", 0.0) if previous else 0.0)
+            if reward_max is None else float(reward_max)
+        )
         return HSpecActivePromptRecord.from_desc(
             desc,
             active_epoch=int(active_epoch),
@@ -1575,10 +1592,137 @@ class HSpecTableGroup:
             last_access_step=int(getattr(previous, "last_access_step", 0) if previous else 0),
             access_count=int(getattr(previous, "access_count", 0) if previous else 0),
             hit_count=int(getattr(previous, "hit_count", 0) if previous else 0),
-            reward_mean=float(getattr(previous, "reward_mean", 0.0) if previous else 0.0),
-            reward_max=float(getattr(previous, "reward_max", 0.0) if previous else 0.0),
+            reward_mean=reward_mean_value,
+            reward_max=reward_max_value,
             eviction_score=float(getattr(previous, "eviction_score", 0.0) if previous else 0.0),
         )
+
+    def _active_budget_totals(
+        self,
+        records: Dict[str, HSpecActivePromptRecord],
+    ) -> tuple[int, int, int]:
+        prompts = len(records)
+        entries = sum(int(record.desc.n_entries) for record in records.values())
+        bytes_total = sum(int(record.live_bytes) for record in records.values())
+        return bytes_total, prompts, entries
+
+    def _active_budget_enabled(self) -> bool:
+        if str(self.table_eviction_policy).strip().lower() in {
+            "none", "off", "disabled", "disable",
+        }:
+            return False
+        return (
+            int(self.table_max_bytes_per_shard) > 0
+            or int(self.table_max_prompts_per_shard) > 0
+            or int(self.table_max_entries_per_shard) > 0
+        )
+
+    def _active_over_budget(
+        self,
+        records: Dict[str, HSpecActivePromptRecord],
+    ) -> bool:
+        bytes_total, prompts, entries = self._active_budget_totals(records)
+        return (
+            (int(self.table_max_bytes_per_shard) > 0
+             and bytes_total > int(self.table_max_bytes_per_shard))
+            or (int(self.table_max_prompts_per_shard) > 0
+                and prompts > int(self.table_max_prompts_per_shard))
+            or (int(self.table_max_entries_per_shard) > 0
+                and entries > int(self.table_max_entries_per_shard))
+        )
+
+    def _refresh_eviction_scores(
+        self,
+        records: Dict[str, HSpecActivePromptRecord],
+    ) -> Dict[str, HSpecActivePromptRecord]:
+        if not records:
+            return {}
+        now_step = max(
+            [int(self._active_access_step)]
+            + [int(record.last_access_step) for record in records.values()]
+        )
+        max_age = max(
+            (max(now_step - int(record.last_access_step), 0)
+             for record in records.values()),
+            default=0,
+        )
+        max_bytes = max((int(record.live_bytes) for record in records.values()), default=0)
+        max_entries = max((int(record.desc.n_entries) for record in records.values()), default=0)
+        max_reward = max(
+            (max(float(record.reward_mean), float(record.reward_max), 0.0)
+             for record in records.values()),
+            default=0.0,
+        )
+        scored: Dict[str, HSpecActivePromptRecord] = {}
+        for prompt_id, record in records.items():
+            age = max(now_step - int(record.last_access_step), 0)
+            age_norm = (float(age) / float(max_age)) if max_age > 0 else 0.0
+            bytes_norm = (
+                float(record.live_bytes) / float(max_bytes)
+                if max_bytes > 0 else 0.0
+            )
+            entries_norm = (
+                float(record.desc.n_entries) / float(max_entries)
+                if max_entries > 0 else 0.0
+            )
+            size_norm = 0.5 * bytes_norm + 0.5 * entries_norm
+            reward_value = max(float(record.reward_mean), float(record.reward_max), 0.0)
+            reward_norm = (
+                float(reward_value) / float(max_reward)
+                if max_reward > 0.0 else 0.0
+            )
+            access_count = max(int(record.access_count), 0)
+            hit_norm = (
+                min(max(float(record.hit_count) / float(access_count), 0.0), 1.0)
+                if access_count > 0 else 0.0
+            )
+            score = (
+                float(self.table_evict_recency_weight) * age_norm
+                + float(self.table_evict_entry_weight) * size_norm
+                - float(self.table_evict_reward_weight) * reward_norm
+                - float(self.table_evict_hit_weight) * hit_norm
+            )
+            scored[str(prompt_id)] = replace(record, eviction_score=float(score))
+        return scored
+
+    def _select_active_records_under_budget(
+        self,
+        records: Dict[str, HSpecActivePromptRecord],
+    ) -> Dict[str, HSpecActivePromptRecord]:
+        selected = {
+            str(prompt_id): record
+            for prompt_id, record in records.items()
+            if bool(record.complete)
+        }
+        if not selected or not self._active_budget_enabled():
+            return selected
+        selected = self._refresh_eviction_scores(selected)
+        if not self._active_over_budget(selected):
+            return selected
+
+        min_keep = max(int(self.table_evict_min_keep_prompts), 0)
+        victims = sorted(
+            selected.values(),
+            key=lambda record: (
+                float(record.eviction_score),
+                int(record.live_bytes),
+                int(record.desc.n_entries),
+                str(record.prompt_id),
+            ),
+            reverse=True,
+        )
+        for victim in victims:
+            if not self._active_over_budget(selected):
+                break
+            if len(selected) <= min_keep:
+                break
+            removed = selected.pop(str(victim.prompt_id), None)
+            if removed is None:
+                continue
+            self._table_eviction_count += 1
+            self._table_eviction_bytes += int(removed.live_bytes)
+            self._table_eviction_entries += int(removed.desc.n_entries)
+        return selected
 
     def _maybe_gc_table_store_versions(self) -> None:
         if not hspec_table_store_gc_after_swap_enabled():
@@ -1702,12 +1846,24 @@ class HSpecTableGroup:
         metrics.table_rollout_count = int(build_metrics.n_rollouts)
         metrics.table_token_count = int(build_metrics.token_count)
         self._building[prompt_id] = table_desc
+        selected_rewards = [
+            float(desc.reward)
+            for desc in budget.selected
+            if desc.reward is not None
+        ]
+        reward_mean = (
+            float(sum(selected_rewards) / len(selected_rewards))
+            if selected_rewards else None
+        )
+        reward_max = max(selected_rewards) if selected_rewards else None
         self._building_records_by_epoch.setdefault(
             int(table_desc.version), {}
         )[str(prompt_id)] = self._record_from_desc(
             table_desc,
             active_epoch=int(table_desc.version),
             complete=True,
+            reward_mean=reward_mean,
+            reward_max=reward_max,
         )
         self._build_count += 1
         metrics.built = True
@@ -2449,6 +2605,7 @@ class HSpecTableGroup:
         self._active_records.clear()
         self._building.clear()
         self._building_records_by_epoch.clear()
+        self._active_access_step = 0
         self._table_writer = None
         self._building_version = None
         self._active_version = 0
@@ -2575,6 +2732,14 @@ class HSpecTableGroup:
                 )
             new_records[str(pid)] = record
 
+        eviction_count_before = int(self._table_eviction_count)
+        eviction_bytes_before = int(self._table_eviction_bytes)
+        eviction_entries_before = int(self._table_eviction_entries)
+        new_records = self._select_active_records_under_budget(new_records)
+        eviction_count_delta = int(self._table_eviction_count) - eviction_count_before
+        eviction_bytes_delta = int(self._table_eviction_bytes) - eviction_bytes_before
+        eviction_entries_delta = int(self._table_eviction_entries) - eviction_entries_before
+
         manifest = writer.seal({
             "step": "phase4_step3_full_swap",
             "active_publish_pending": True,
@@ -2619,6 +2784,9 @@ class HSpecTableGroup:
         self._building_version = None
         self._maybe_gc_table_store_versions()
         self._reset_metrics()
+        self._table_eviction_count += int(eviction_count_delta)
+        self._table_eviction_bytes += int(eviction_bytes_delta)
+        self._table_eviction_entries += int(eviction_entries_delta)
         logger.info(
             "HSpec swap: active_version=%d, prompts=%d, entries=%d",
             self._active_version,
@@ -2637,16 +2805,28 @@ class HSpecTableGroup:
         """Batch fetch active table descriptors without materializing arrays."""
         result: Dict[str, Optional[HSpecPromptTableDesc]] = {}
         hit_count = 0
+        miss_count = 0
         for pid in prompt_ids:
-            table = self._active.get(pid)
+            prompt_id = str(pid)
+            table = self._active.get(prompt_id)
             if isinstance(table, HSpecPromptTableDesc):
-                result[pid] = table
+                result[prompt_id] = table
                 hit_count += 1
+                record = self._active_records.get(prompt_id)
+                if record is not None:
+                    self._active_records[prompt_id] = replace(
+                        record,
+                        last_access_step=self._next_active_access_step(),
+                        access_count=int(record.access_count) + 1,
+                    )
             else:
+                miss_count += 1
                 if table is not None:
                     hspec_record_store_metric(
                         "table_prefetch_descriptor_miss_legacy_active", 1)
-                result[pid] = None
+                result[prompt_id] = None
+        self._table_access_hit_count += int(hit_count)
+        self._table_access_miss_count += int(miss_count)
         hspec_record_store_metric("table_prefetch_descriptor_count", hit_count)
         return (self._active_version, result)
 
@@ -2770,6 +2950,8 @@ class HSpecTableGroup:
             "table_eviction_count": self._table_eviction_count,
             "table_eviction_bytes": self._table_eviction_bytes,
             "table_eviction_entries": self._table_eviction_entries,
+            "table_access_hit_count": self._table_access_hit_count,
+            "table_access_miss_count": self._table_access_miss_count,
             "table_partial_swap_count": self._table_partial_swap_count,
             "table_partial_swap_overlay_prompts": self._table_partial_swap_overlay_prompts,
             "table_partial_swap_reuse_old_prompts": self._table_partial_swap_reuse_old_prompts,
@@ -2901,6 +3083,8 @@ class HSpecTableGroup:
         self._table_eviction_count = 0
         self._table_eviction_bytes = 0
         self._table_eviction_entries = 0
+        self._table_access_hit_count = 0
+        self._table_access_miss_count = 0
         self._table_partial_swap_count = 0
         self._table_partial_swap_overlay_prompts = 0
         self._table_partial_swap_reuse_old_prompts = 0
@@ -3136,6 +3320,52 @@ class HSpecTableGroup:
                 setattr(self, attr, max(current, value))
         except Exception:
             pass
+
+    def report_prompt_access_metrics(
+        self,
+        prompt_stats: Optional[Dict[str, Dict[str, int]]] = None,
+    ) -> None:
+        """Update active-record query/hit metadata from worker-local proposers.
+
+        The payload is intentionally tiny and aggregated per reporting interval:
+        ``{prompt_id: {"query": int, "hit": int}}``. This never materializes
+        tables or touches mmap files.
+        """
+        if not isinstance(prompt_stats, dict) or not prompt_stats:
+            return
+        prompt_count = 0
+        query_count = 0
+        hit_count = 0
+        try:
+            for prompt_id_obj, stats in prompt_stats.items():
+                prompt_id = str(prompt_id_obj)
+                if not prompt_id or not isinstance(stats, dict):
+                    continue
+                q = max(int(stats.get("query", stats.get("queries", 0)) or 0), 0)
+                h = max(int(stats.get("hit", stats.get("hits", 0)) or 0), 0)
+                if q <= 0 and h <= 0:
+                    continue
+                prompt_count += 1
+                query_count += q
+                hit_count += h
+                record = self._active_records.get(prompt_id)
+                if record is None:
+                    continue
+                access_delta = q if q > 0 else h
+                self._active_records[prompt_id] = replace(
+                    record,
+                    last_access_step=self._next_active_access_step(),
+                    access_count=int(record.access_count) + int(access_delta),
+                    hit_count=int(record.hit_count) + int(h),
+                )
+        except Exception:
+            logger.debug("Failed to apply HSpec prompt access metrics",
+                         exc_info=True)
+            return
+        self._proposer_prompt_access_report_count += 1
+        self._proposer_prompt_access_report_prompts += int(prompt_count)
+        self._proposer_prompt_query_count += int(query_count)
+        self._proposer_prompt_hit_count += int(hit_count)
 
     # Debug
 
@@ -3529,6 +3759,39 @@ class GlobalHSpecTableGroup:
             return self.groups[0].report_proposer_cache_metrics.remote(metrics)
         except Exception:
             return None
+
+    def report_prompt_access_metrics_async(
+        self,
+        prompt_stats: Dict[str, Dict[str, int]],
+    ) -> List[ray.ObjectRef]:
+        """Fire-and-forget per-prompt query/hit feedback partitioned by shard."""
+        if not self.groups or not isinstance(prompt_stats, dict):
+            return []
+        partition_payloads: Dict[int, Dict[str, Dict[str, int]]] = {
+            i: {} for i in range(self.num_groups)
+        }
+        for prompt_id_obj, stats in prompt_stats.items():
+            prompt_id = str(prompt_id_obj)
+            if not prompt_id or not isinstance(stats, dict):
+                continue
+            try:
+                part = self._get_partition_id(prompt_id)
+            except Exception:
+                part = stable_partition_id(prompt_id, self.num_groups)
+            partition_payloads[part][prompt_id] = {
+                "query": int(stats.get("query", stats.get("queries", 0)) or 0),
+                "hit": int(stats.get("hit", stats.get("hits", 0)) or 0),
+            }
+        refs: List[ray.ObjectRef] = []
+        for part, payload in partition_payloads.items():
+            if not payload:
+                continue
+            try:
+                refs.append(
+                    self.groups[part].report_prompt_access_metrics.remote(payload))
+            except Exception:
+                continue
+        return refs
 
     # Build  (async, non-blocking)
     def build_tables_async(
@@ -3956,6 +4219,8 @@ class GlobalHSpecTableGroup:
                 "hspec/table_active_entries": 0,
                 "hspec/table_store_referenced_versions": 0,
                 "hspec/table_eviction_count": 0,
+                "hspec/table_access_hit_count": 0,
+                "hspec/table_access_miss_count": 0,
                 "hspec/table_partial_swap_count": 0,
                 "hspec/proposer_prompt_access_report_count": 0,
                 "hspec/proposer_prompt_access_report_prompts": 0,
@@ -4116,6 +4381,8 @@ class GlobalHSpecTableGroup:
             "hspec/table_eviction_bytes": agg.get("table_eviction_bytes", 0),
             "hspec/table_eviction_mb": agg.get("table_eviction_bytes", 0) / (1024 * 1024),
             "hspec/table_eviction_entries": agg.get("table_eviction_entries", 0),
+            "hspec/table_access_hit_count": agg.get("table_access_hit_count", 0),
+            "hspec/table_access_miss_count": agg.get("table_access_miss_count", 0),
             "hspec/table_partial_swap_count": agg.get("table_partial_swap_count", 0),
             "hspec/table_partial_swap_overlay_prompts": agg.get("table_partial_swap_overlay_prompts", 0),
             "hspec/table_partial_swap_reuse_old_prompts": agg.get("table_partial_swap_reuse_old_prompts", 0),

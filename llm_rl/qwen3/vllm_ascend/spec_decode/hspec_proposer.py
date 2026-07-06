@@ -650,6 +650,12 @@ class HSpecProposer(Proposer):
         self._reported_queries = 0
         self._reported_hits = 0
         self._reported_total_draft_len = 0
+        self._prompt_access_pending = defaultdict(lambda: {"query": 0, "hit": 0})
+        self._prompt_access_report_every_calls = max(
+            int(os.environ.get("HSPEC_TABLE_ACCESS_REPORT_INTERVAL_STEPS", "16")),
+            1,
+        )
+        self._last_prompt_access_report_calls = 0
 
         # Entry-position study buffers. These are flushed asynchronously to the
         # global HSpec table actors at low frequency.
@@ -1312,12 +1318,21 @@ class HSpecProposer(Proposer):
         proposer_metrics = dict(getattr(self, "_proposer_metric_deltas", {}))
         proposer_metrics.update(getattr(self, "_proposer_metric_gauges", {}))
         has_proposer_metrics = bool(proposer_metrics)
+        prompt_access_pending = getattr(self, "_prompt_access_pending", {})
+        has_prompt_access_pending = bool(prompt_access_pending)
+        prompt_access_due = (
+            has_prompt_access_pending
+            and self._stat_calls - int(getattr(
+                self, "_last_prompt_access_report_calls", 0)
+            ) >= int(getattr(self, "_prompt_access_report_every_calls", 16))
+        )
         if (
             not force_proposer_metrics
+            and not prompt_access_due
             and self._stat_calls - self._last_report_calls < self._report_every_calls
         ):
             return
-        if force_proposer_metrics and not has_proposer_metrics:
+        if force_proposer_metrics and not has_proposer_metrics and not prompt_access_due:
             return
         self._last_report_calls = self._stat_calls
 
@@ -1338,6 +1353,7 @@ class HSpecProposer(Proposer):
             and ddl <= 0
             and not has_entry_pending
             and not has_proposer_metrics
+            and not prompt_access_due
         ):
             return
 
@@ -1388,9 +1404,44 @@ class HSpecProposer(Proposer):
             except Exception:
                 pass
 
+        if prompt_access_due:
+            prompt_stats: Dict[str, Dict[str, int]] = {}
+            try:
+                for prompt_id, stats in list(prompt_access_pending.items()):
+                    if not isinstance(stats, dict):
+                        continue
+                    q = max(int(stats.get("query", 0) or 0), 0)
+                    h = max(int(stats.get("hit", 0) or 0), 0)
+                    if q <= 0 and h <= 0:
+                        continue
+                    prompt_stats[str(prompt_id)] = {"query": q, "hit": h}
+                if prompt_stats and hasattr(
+                        self.hspec_tables, "report_prompt_access_metrics_async"):
+                    self.hspec_tables.report_prompt_access_metrics_async(prompt_stats)
+                    prompt_access_pending.clear()
+                    self._last_prompt_access_report_calls = int(self._stat_calls)
+            except Exception:
+                pass
+
     def _record_proposer_metric(self, key: str, value: float = 1.0) -> None:
         try:
             self._proposer_metric_deltas[str(key)] += float(value)
+        except Exception:
+            pass
+
+    def _record_prompt_access(
+        self,
+        prompt_id: str,
+        *,
+        query: int = 0,
+        hit: int = 0,
+    ) -> None:
+        try:
+            if not prompt_id:
+                return
+            stats = self._prompt_access_pending[str(prompt_id)]
+            stats["query"] = int(stats.get("query", 0)) + max(int(query), 0)
+            stats["hit"] = int(stats.get("hit", 0)) + max(int(hit), 0)
         except Exception:
             pass
 
@@ -2416,6 +2467,9 @@ class HSpecProposer(Proposer):
 
         if active_batch_indices and batch_table_cache is not None:
             self._stat_queries += len(active_batch_indices)
+            for batch_idx in active_batch_indices:
+                if batch_idx < len(prompt_ids):
+                    self._record_prompt_access(prompt_ids[batch_idx], query=1)
             t0_cast = _now_ns() if gen_enabled else 0
             with (hspec_record_function("hspec/proposal/anchor_gather", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
@@ -2643,6 +2697,8 @@ class HSpecProposer(Proposer):
             results[i] = draft
             self._stat_hits += 1
             self._stat_total_draft_len += len(draft)
+            if i < len(prompt_ids):
+                self._record_prompt_access(prompt_ids[i], hit=1)
             pending.append((i, sims_cpu[j], idxs_cpu[j], cached, base_pos, effective_wnd))
 
             if draft:
