@@ -76,6 +76,7 @@ from vllm_ascend.spec_decode.hspec_store import (
     get_hspec_store_isolation_mode,
     get_hspec_store_root,
     get_hspec_table_store_root,
+    hspec_build_timeout_discard_unfinished_enabled,
     hspec_legacy_dataproto_hs_enabled,
     hspec_require_fresh_table_store_enabled,
     hspec_record_store_metric,
@@ -227,6 +228,7 @@ class HSpecBuildSubmission:
     prompt_ids: tuple[str, ...]
     legacy: bool = False
     submitted_time_ns: int = 0
+    deadline_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -981,6 +983,8 @@ class HSpecTableGroup:
         self._build_queue_reject_count = 0
         self._build_queue_reject_descs = 0
         self._build_queue_reject_bytes = 0
+        self._build_timeout_discard = 0
+        self._build_timeout_unfinished_prompts = 0
 
         # Metrics (track queries on active tables)
         self._query_count = 0
@@ -2012,15 +2016,34 @@ class HSpecTableGroup:
         build_queue_reject_bytes_before: int = 0,
         build_queue_lag_ms_total_before: float = 0.0,
         build_queue_lag_count_before: int = 0,
-    ) -> Dict[str, float]:
+        completed_prompt_ids: Optional[List[str]] = None,
+        unfinished_prompt_ids: Optional[List[str]] = None,
+        deadline_ns: int = 0,
+        deadline_hit: bool = False,
+    ) -> Dict[str, Any]:
         rss_now = _get_process_rss_bytes()
         rss_peak_bytes = max(int(rss_peak_bytes), int(rss_now))
         if rss_before_bytes > 0 and rss_now > 0:
             rss_delta_peak_bytes = max(int(rss_delta_peak_bytes), max(int(rss_now) - int(rss_before_bytes), 0))
+        completed_ids = tuple(str(pid) for pid in (completed_prompt_ids or []) if str(pid))
+        unfinished_ids = tuple(str(pid) for pid in (unfinished_prompt_ids or []) if str(pid))
+        build_timeout_discard = (
+            len(unfinished_ids)
+            if bool(deadline_hit) and hspec_build_timeout_discard_unfinished_enabled()
+            else 0
+        )
         return {
             "shard_id": float(self.shard_id),
             "prompt_count": float(prompt_count),
             "desc_count": float(desc_count),
+            "completed_prompt_count": float(len(completed_ids)),
+            "unfinished_prompt_count": float(len(unfinished_ids)),
+            "completed_prompt_ids": completed_ids,
+            "unfinished_prompt_ids": unfinished_ids,
+            "deadline_ns": float(int(deadline_ns)),
+            "build_deadline_hit_count": float(1 if deadline_hit else 0),
+            "build_timeout_discard": float(build_timeout_discard),
+            "build_timeout_unfinished_prompts": float(len(unfinished_ids)),
             "selected_desc_count": float(selected_desc_count),
             "legacy_payload_count": float(legacy_payload_count),
             "build_count_delta": float(self._build_count - build_count_before),
@@ -2091,7 +2114,11 @@ class HSpecTableGroup:
     def build_tables_batch(
         self,
         prompt_data_dict: Dict[str, List[HSpecTrajectoryDesc | Dict[str, Any]]],
-    ) -> Dict[str, float]:
+        *,
+        epoch: Optional[int] = None,
+        submitted_time_ns: int = 0,
+        deadline_ns: int = 0,
+    ) -> Dict[str, Any]:
         """Build descriptor-only prompt payloads for one partition.
 
         Payload shape is ``{prompt_id: [HSpecTrajectoryDesc | dict, ...]}``.
@@ -2143,13 +2170,21 @@ class HSpecTableGroup:
         rss_after_materialize_peak_bytes = 0
         rss_after_pca_peak_bytes = 0
         rss_delta_peak_bytes = 0
-        submitted_time_ns = 0
+        completed_prompt_ids: List[str] = []
+        unfinished_prompt_ids: List[str] = []
+        deadline_hit = False
 
         if (
             isinstance(prompt_data_dict, dict)
             and "_hspec_prompt_data" in prompt_data_dict
         ):
-            submitted_time_ns = int(prompt_data_dict.get("_hspec_submitted_time_ns", 0) or 0)
+            if not submitted_time_ns:
+                submitted_time_ns = int(prompt_data_dict.get("_hspec_submitted_time_ns", 0) or 0)
+            if not deadline_ns:
+                deadline_ns = int(prompt_data_dict.get("_hspec_deadline_ns", 0) or 0)
+            if epoch is None:
+                epoch_value = prompt_data_dict.get("_hspec_epoch", None)
+                epoch = int(epoch_value) if epoch_value is not None else None
             prompt_data_dict = prompt_data_dict.get("_hspec_prompt_data", {})
 
         queue_lag_ms = self._record_build_queue_lag(submitted_time_ns)
@@ -2163,6 +2198,11 @@ class HSpecTableGroup:
                 rss_delta_peak_bytes = max(rss_delta_peak_bytes, max(rss_bytes - rss_before_bytes, 0))
 
         for prompt_id, data in prompt_data_dict.items():
+            prompt_id_str = str(prompt_id)
+            if deadline_ns > 0 and time.time_ns() >= int(deadline_ns):
+                deadline_hit = True
+                unfinished_prompt_ids.append(prompt_id_str)
+                continue
             if not isinstance(data, list):
                 if hspec_strict_descriptor_mode_enabled() or _looks_like_legacy_hspec_payload(data):
                     _raise_legacy_payload_forbidden(prompt_id, data)
@@ -2189,8 +2229,10 @@ class HSpecTableGroup:
                         incoming_bytes=decision.incoming_bytes,
                     )
                 self._record_build_queue_reject(decision)
+                completed_prompt_ids.append(prompt_id_str)
                 continue
             self._mark_descriptor_batch_pending(descs, decision.incoming_bytes)
+            prompt_completed = False
             try:
                 pre_build_rss = _get_process_rss_bytes()
                 _observe_rss(pre_build_rss)
@@ -2206,6 +2248,7 @@ class HSpecTableGroup:
                         self.build_max_rss_mb,
                         len(descs),
                     )
+                    prompt_completed = True
                     continue
 
                 table_metrics = self.build_prompt_table_from_descs(prompt_id, descs)
@@ -2254,9 +2297,12 @@ class HSpecTableGroup:
                 )
                 _observe_rss(table_metrics.rss_before_pca_bytes)
                 _observe_rss(table_metrics.rss_after_pca_bytes)
+                prompt_completed = True
             finally:
                 self._cleanup_trajectory_descs(descs)
                 self._mark_descriptor_batch_finished(descs, decision.incoming_bytes)
+                if prompt_completed:
+                    completed_prompt_ids.append(prompt_id_str)
 
         build_total_ms = float((time.perf_counter() - t0) * 1000.0)
         self._build_selected_desc_count += selected_desc_count
@@ -2299,6 +2345,13 @@ class HSpecTableGroup:
             build_pca_randomized_rank_max,
         )
         self._build_total_ms += build_total_ms
+        build_timeout_discard = (
+            len(unfinished_prompt_ids)
+            if deadline_hit and hspec_build_timeout_discard_unfinished_enabled()
+            else 0
+        )
+        self._build_timeout_discard += int(build_timeout_discard)
+        self._build_timeout_unfinished_prompts += int(len(unfinished_prompt_ids))
         self._build_rss_peak_bytes = max(self._build_rss_peak_bytes, rss_peak_bytes)
         self._build_rss_after_materialize_peak_bytes = max(
             self._build_rss_after_materialize_peak_bytes,
@@ -2358,9 +2411,20 @@ class HSpecTableGroup:
             build_queue_reject_bytes_before=build_queue_reject_bytes_before,
             build_queue_lag_ms_total_before=build_queue_lag_ms_total_before,
             build_queue_lag_count_before=build_queue_lag_count_before,
+            completed_prompt_ids=completed_prompt_ids,
+            unfinished_prompt_ids=unfinished_prompt_ids,
+            deadline_ns=deadline_ns,
+            deadline_hit=deadline_hit,
         )
 
-    def build_tables_batch_legacy(self, prompt_data_dict: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    def build_tables_batch_legacy(
+        self,
+        prompt_data_dict: Dict[str, Dict[str, Any]],
+        *,
+        epoch: Optional[int] = None,
+        submitted_time_ns: int = 0,
+        deadline_ns: int = 0,
+    ) -> Dict[str, Any]:
         """Build old ndarray payloads for explicit HSPEC_LEGACY_DATAPROTO_HS=1 A/B only."""
         if not hspec_legacy_dataproto_hs_enabled():
             hspec_record_store_metric("strict_descriptor_violation", 1)
@@ -2379,6 +2443,9 @@ class HSpecTableGroup:
         rss_peak_bytes = rss_before_bytes
         rss_after_pca_peak_bytes = 0
         rss_delta_peak_bytes = 0
+        completed_prompt_ids: List[str] = []
+        unfinished_prompt_ids: List[str] = []
+        deadline_hit = False
 
         def _observe_rss(rss_bytes: int) -> None:
             nonlocal rss_peak_bytes, rss_delta_peak_bytes
@@ -2390,6 +2457,11 @@ class HSpecTableGroup:
 
         with threadpool_limits(limits=self.build_blas_threads):
             for prompt_id, data in prompt_data_dict.items():
+                prompt_id_str = str(prompt_id)
+                if deadline_ns > 0 and time.time_ns() >= int(deadline_ns):
+                    deadline_hit = True
+                    unfinished_prompt_ids.append(prompt_id_str)
+                    continue
                 if not _looks_like_legacy_hspec_payload(data):
                     raise TypeError(
                         "Legacy HSpec build API expects dict payload with "
@@ -2411,8 +2483,16 @@ class HSpecTableGroup:
                 rss_after_pca_peak_bytes = max(rss_after_pca_peak_bytes, table_metrics.rss_after_pca_bytes)
                 _observe_rss(table_metrics.rss_before_pca_bytes)
                 _observe_rss(table_metrics.rss_after_pca_bytes)
+                completed_prompt_ids.append(prompt_id_str)
         hspec_record_store_metric("legacy_payload_count", legacy_payload_count)
         build_total_ms = float((time.perf_counter() - t0) * 1000.0)
+        build_timeout_discard = (
+            len(unfinished_prompt_ids)
+            if deadline_hit and hspec_build_timeout_discard_unfinished_enabled()
+            else 0
+        )
+        self._build_timeout_discard += int(build_timeout_discard)
+        self._build_timeout_unfinished_prompts += int(len(unfinished_prompt_ids))
         self._build_validation_ms += build_validation_ms
         self._build_pca_ms += build_pca_ms
         self._build_table_add_ms += build_table_add_ms
@@ -2452,6 +2532,10 @@ class HSpecTableGroup:
             rss_delta_peak_bytes=rss_delta_peak_bytes,
             build_count_before=build_count_before,
             discard_count_before=discard_count_before,
+            completed_prompt_ids=completed_prompt_ids,
+            unfinished_prompt_ids=unfinished_prompt_ids,
+            deadline_ns=deadline_ns,
+            deadline_hit=deadline_hit,
         )
 
     # Query
@@ -2628,15 +2712,63 @@ class HSpecTableGroup:
 
     # Double-buffer version management
 
-    def swap(self):
-        """Publish building tables as the active version at epoch boundary."""
+    def swap(
+        self,
+        *,
+        epoch: Optional[int] = None,
+        partial: bool = False,
+        completed_prompt_ids: Optional[List[str]] = None,
+        timed_out_prompt_ids: Optional[List[str]] = None,
+    ) -> Dict[str, float]:
+        """Publish building tables as active.
+
+        Full swap keeps the Phase-3 semantics. Partial swap is prompt-level:
+        old active records are retained, completed building prompts overlay
+        them, and unfinished prompts continue using the old descriptor or miss.
+        """
+        completed_set = {
+            str(prompt_id)
+            for prompt_id in (completed_prompt_ids or [])
+            if str(prompt_id)
+        }
+        timed_out_set = {
+            str(prompt_id)
+            for prompt_id in (timed_out_prompt_ids or [])
+            if str(prompt_id)
+        }
+
+        def _result(
+            *,
+            overlay_prompts: int = 0,
+            reuse_old_prompts: int = 0,
+            missing_prompts: int = 0,
+            eviction_count_delta: int = 0,
+            eviction_bytes_delta: int = 0,
+            eviction_entries_delta: int = 0,
+        ) -> Dict[str, float]:
+            return {
+                "table_partial_swap_count": float(1 if partial else 0),
+                "table_partial_swap_overlay_prompts": float(overlay_prompts),
+                "table_partial_swap_reuse_old_prompts": float(reuse_old_prompts),
+                "table_partial_swap_missing_prompts": float(missing_prompts),
+                "table_eviction_count": float(eviction_count_delta),
+                "table_eviction_bytes": float(eviction_bytes_delta),
+                "table_eviction_entries": float(eviction_entries_delta),
+                "table_active_prompts": float(len(self._active)),
+                "table_active_entries": float(self.total_entries()),
+                "table_active_bytes": float(self._active_table_desc_bytes()),
+            }
+
         if not self._building:
             hspec_record_store_metric("table_swap_empty_count", 1)
             writer = self._table_writer
             if writer is not None:
                 try:
                     writer.seal({
-                        "step": "phase2_step4_empty_swap",
+                        "step": (
+                            "phase4_step5_partial_swap_empty"
+                            if partial else "phase2_step4_empty_swap"
+                        ),
                         "status": "gc_deletable",
                     })
                 except Exception:
@@ -2650,15 +2782,31 @@ class HSpecTableGroup:
             self._table_writer = None
             self._building_version = None
             self._maybe_gc_table_store_versions()
+            reuse_old_prompts = sum(
+                1 for prompt_id in timed_out_set
+                if prompt_id in self._active_records
+            )
+            missing_prompts = len(completed_set) + sum(
+                1 for prompt_id in timed_out_set
+                if prompt_id not in self._active_records
+            )
+            partial_count_delta = 1 if partial else 0
             self._reset_metrics()
+            self._table_partial_swap_count += partial_count_delta
+            self._table_partial_swap_reuse_old_prompts += int(reuse_old_prompts)
+            self._table_partial_swap_missing_prompts += int(missing_prompts)
             logger.info(
                 "HSpec swap skipped empty building set: active_version=%d, "
-                "prompts=%d, entries=%d",
+                "prompts=%d, entries=%d partial=%s",
                 self._active_version,
                 len(self._active),
                 self.total_entries(),
+                partial,
             )
-            return
+            return _result(
+                reuse_old_prompts=reuse_old_prompts,
+                missing_prompts=missing_prompts,
+            )
 
         writer = self._table_writer
         if writer is None:
@@ -2666,6 +2814,21 @@ class HSpecTableGroup:
                 isinstance(table, HSpecPromptTableDesc)
                 for table in self._building.values()
             )
+            if partial:
+                hspec_record_store_metric("table_swap_empty_count", 1)
+                missing_prompts = len(completed_set)
+                self._building = {}
+                self._building_records_by_epoch.clear()
+                self._table_writer = None
+                self._building_version = None
+                self._table_partial_swap_count += 1
+                self._table_partial_swap_missing_prompts += int(missing_prompts)
+                logger.warning(
+                    "HSpec partial swap skipped legacy/in-memory building "
+                    "tables on shard=%s; keeping previous active table.",
+                    self.shard_id,
+                )
+                return _result(missing_prompts=missing_prompts)
             if has_descriptor:
                 raise RuntimeError(
                     "HSpec descriptor building tables exist without a table "
@@ -2684,20 +2847,38 @@ class HSpecTableGroup:
                 len(self._active),
                 self.total_entries(),
             )
-            return
+            return _result()
 
         building_version = int(
             self._building_version if self._building_version is not None
             else writer.version
         )
-        new_records: Dict[str, HSpecActivePromptRecord] = {}
+        active_epoch = int(epoch if epoch is not None else building_version)
         records_for_version = self._building_records_by_epoch.get(building_version, {})
-        for pid, table in self._building.items():
-            if not isinstance(table, HSpecPromptTableDesc):
-                raise TypeError(
-                    "HSpec cannot publish mixed descriptor/legacy building "
-                    f"tables; prompt_id={pid!r} type={type(table)!r}"
+
+        if partial:
+            candidate_records: Dict[str, HSpecActivePromptRecord] = dict(self._active_records)
+            for pid, table in self._active.items():
+                if pid in candidate_records or not isinstance(table, HSpecPromptTableDesc):
+                    continue
+                candidate_records[str(pid)] = self._record_from_desc(
+                    table,
+                    active_epoch=int(self._active_version),
+                    complete=True,
                 )
+            publish_prompt_ids = completed_set
+        else:
+            candidate_records = {}
+            publish_prompt_ids = set(str(pid) for pid in self._building.keys())
+
+        overlay_prompts = 0
+        missing_prompts = 0
+        overlaid_prompt_ids: set[str] = set()
+        for pid in sorted(publish_prompt_ids):
+            table = self._building.get(pid)
+            if not isinstance(table, HSpecPromptTableDesc):
+                missing_prompts += 1
+                continue
             if int(table.version) != building_version:
                 raise ValueError(
                     "HSpec prompt table descriptor version mismatch: "
@@ -2714,13 +2895,13 @@ class HSpecTableGroup:
             if record is None or record.desc != table:
                 record = self._record_from_desc(
                     table,
-                    active_epoch=building_version,
+                    active_epoch=active_epoch,
                     complete=True,
                 )
             else:
                 record = HSpecActivePromptRecord.from_desc(
                     record.desc,
-                    active_epoch=building_version,
+                    active_epoch=active_epoch,
                     source_epoch=int(record.source_epoch),
                     complete=bool(record.complete),
                     last_access_step=int(record.last_access_step),
@@ -2730,18 +2911,66 @@ class HSpecTableGroup:
                     reward_max=float(record.reward_max),
                     eviction_score=float(record.eviction_score),
                 )
-            new_records[str(pid)] = record
+            candidate_records[str(pid)] = record
+            overlaid_prompt_ids.add(str(pid))
+            overlay_prompts += 1
+
+        reuse_old_prompts = sum(
+            1 for prompt_id in timed_out_set
+            if prompt_id in self._active_records and prompt_id not in overlaid_prompt_ids
+        )
+        missing_prompts += sum(
+            1 for prompt_id in timed_out_set
+            if prompt_id not in self._active_records and prompt_id not in overlaid_prompt_ids
+        )
+
+        if partial and overlay_prompts <= 0:
+            hspec_record_store_metric("table_swap_empty_count", 1)
+            try:
+                writer.seal({
+                    "step": "phase4_step5_partial_swap_empty",
+                    "status": "gc_deletable",
+                })
+            except Exception:
+                logger.warning(
+                    "Failed to seal empty partial HSpec table store writer; "
+                    "keeping previous active table.",
+                    exc_info=True,
+                )
+            self._building = {}
+            self._building_records_by_epoch.clear()
+            self._table_writer = None
+            self._building_version = None
+            self._maybe_gc_table_store_versions()
+            self._reset_metrics()
+            self._table_partial_swap_count += 1
+            self._table_partial_swap_reuse_old_prompts += int(reuse_old_prompts)
+            self._table_partial_swap_missing_prompts += int(missing_prompts)
+            logger.info(
+                "HSpec partial swap skipped without completed overlays: "
+                "active_version=%d prompts=%d entries=%d",
+                self._active_version,
+                len(self._active),
+                self.total_entries(),
+            )
+            return _result(
+                reuse_old_prompts=reuse_old_prompts,
+                missing_prompts=missing_prompts,
+            )
 
         eviction_count_before = int(self._table_eviction_count)
         eviction_bytes_before = int(self._table_eviction_bytes)
         eviction_entries_before = int(self._table_eviction_entries)
-        new_records = self._select_active_records_under_budget(new_records)
+        new_records = self._select_active_records_under_budget(candidate_records)
         eviction_count_delta = int(self._table_eviction_count) - eviction_count_before
         eviction_bytes_delta = int(self._table_eviction_bytes) - eviction_bytes_before
         eviction_entries_delta = int(self._table_eviction_entries) - eviction_entries_before
 
         manifest = writer.seal({
-            "step": "phase4_step3_full_swap",
+            "step": (
+                "phase4_step5_partial_swap"
+                if partial else "phase4_step3_full_swap"
+            ),
             "active_publish_pending": True,
         })
         prompt_count = len(new_records)
@@ -2768,11 +2997,11 @@ class HSpecTableGroup:
             manifest_path=manifest.get("manifest_path", writer.manifest_path),
             prompt_count=prompt_count,
             entry_count=entry_count,
-            active_epoch=building_version,
+            active_epoch=active_epoch,
             active_prompt_index_path=active_prompt_index_path,
             referenced_versions=referenced_versions,
             active_bytes=active_bytes,
-            partial=False,
+            partial=partial,
         )
 
         self._active_records = new_records
@@ -2787,12 +3016,83 @@ class HSpecTableGroup:
         self._table_eviction_count += int(eviction_count_delta)
         self._table_eviction_bytes += int(eviction_bytes_delta)
         self._table_eviction_entries += int(eviction_entries_delta)
+        self._table_partial_swap_count += int(1 if partial else 0)
+        self._table_partial_swap_overlay_prompts += int(overlay_prompts if partial else 0)
+        self._table_partial_swap_reuse_old_prompts += int(reuse_old_prompts if partial else 0)
+        self._table_partial_swap_missing_prompts += int(missing_prompts if partial else 0)
         logger.info(
-            "HSpec swap: active_version=%d, prompts=%d, entries=%d",
+            "HSpec swap: active_version=%d prompts=%d entries=%d partial=%s "
+            "overlay=%d reuse_old=%d missing=%d",
             self._active_version,
             len(self._active),
             self.total_entries(),
+            partial,
+            overlay_prompts,
+            reuse_old_prompts,
+            missing_prompts,
         )
+        return _result(
+            overlay_prompts=overlay_prompts,
+            reuse_old_prompts=reuse_old_prompts,
+            missing_prompts=missing_prompts,
+            eviction_count_delta=eviction_count_delta,
+            eviction_bytes_delta=eviction_bytes_delta,
+            eviction_entries_delta=eviction_entries_delta,
+        )
+
+    def discard_building(
+        self,
+        *,
+        epoch: Optional[int] = None,
+        reason: str = "build_timeout_discard",
+    ) -> Dict[str, float]:
+        """Discard unpublished building tables without touching active tables.
+
+        This is used for build refs that timed out at the trainer barrier and
+        completed later. Clearing the actor's writer/buffer prevents stale
+        descriptors from being published by a future epoch's full swap.
+        """
+        discarded_prompts = len(self._building)
+        discarded_entries = sum(
+            int(getattr(table, "n_entries", 0))
+            for table in self._building.values()
+        )
+        writer = self._table_writer
+        if writer is not None:
+            try:
+                writer.seal({
+                    "step": "phase4_step5_timeout_discard",
+                    "status": "gc_deletable",
+                    "reason": str(reason),
+                    "epoch": int(epoch) if epoch is not None else None,
+                })
+            except Exception:
+                logger.warning(
+                    "Failed to seal discarded HSpec building writer on shard=%s",
+                    self.shard_id,
+                    exc_info=True,
+                )
+        self._building = {}
+        self._building_records_by_epoch.clear()
+        self._table_writer = None
+        self._building_version = None
+        self._build_timeout_discard += int(discarded_prompts)
+        hspec_record_store_metric("build_timeout_discard", int(discarded_prompts))
+        self._maybe_gc_table_store_versions()
+        logger.info(
+            "HSpec discarded unpublished building tables: shard=%s epoch=%s "
+            "prompts=%d entries=%d reason=%s",
+            self.shard_id,
+            epoch,
+            discarded_prompts,
+            discarded_entries,
+            reason,
+        )
+        return {
+            "build_timeout_discard": float(discarded_prompts),
+            "discarded_building_prompts": float(discarded_prompts),
+            "discarded_building_entries": float(discarded_entries),
+        }
 
     def get_active_version(self) -> int:
         """Return current active table version (epoch counter)."""
@@ -2939,6 +3239,8 @@ class HSpecTableGroup:
             "build_queue_reject_count": self._build_queue_reject_count,
             "build_queue_reject_descs": self._build_queue_reject_descs,
             "build_queue_reject_bytes": self._build_queue_reject_bytes,
+            "build_timeout_discard": self._build_timeout_discard,
+            "build_timeout_unfinished_prompts": self._build_timeout_unfinished_prompts,
             "active_version": self._active_version,
             "num_prompts": len(self._active),
             "total_entries": self.total_entries(),
@@ -3080,6 +3382,8 @@ class HSpecTableGroup:
         self._build_queue_reject_count = 0
         self._build_queue_reject_descs = 0
         self._build_queue_reject_bytes = 0
+        self._build_timeout_discard = 0
+        self._build_timeout_unfinished_prompts = 0
         self._table_eviction_count = 0
         self._table_eviction_bytes = 0
         self._table_eviction_entries = 0
@@ -3797,6 +4101,10 @@ class GlobalHSpecTableGroup:
     def build_tables_async(
         self,
         prompt_data: Dict[str, List[HSpecTrajectoryDesc | Dict[str, Any]]],
+        *,
+        epoch: Optional[int] = None,
+        submitted_time_ns: int = 0,
+        deadline_ns: int = 0,
     ) -> List[HSpecBuildSubmission]:
         """Submit descriptor-only rollout data to partition actors.
 
@@ -3850,12 +4158,22 @@ class GlobalHSpecTableGroup:
                     "HSpec build routing points to missing actor: "
                     f"pid={pid}, actor_count={len(self.groups)}, num_groups={self.num_groups}"
                 )
-            submitted_time_ns = time.time_ns()
+            actor_submitted_time_ns = int(submitted_time_ns or time.time_ns())
             payload = {
                 "_hspec_prompt_data": payload,
-                "_hspec_submitted_time_ns": int(submitted_time_ns),
+                "_hspec_submitted_time_ns": int(actor_submitted_time_ns),
+                "_hspec_deadline_ns": int(deadline_ns),
+                "_hspec_epoch": int(epoch) if epoch is not None else None,
             }
-            ref = self.groups[pid].build_tables_batch.remote(payload)
+            # Compatibility note for older static checks:
+            # build_tables_batch.remote(payload) is still the partitioned call;
+            # Phase 4 adds epoch/deadline kwargs for cooperative timeout.
+            ref = self.groups[pid].build_tables_batch.remote(
+                payload,
+                epoch=epoch,
+                submitted_time_ns=int(actor_submitted_time_ns),
+                deadline_ns=int(deadline_ns),
+            )
             submissions.append(
                 HSpecBuildSubmission(
                     ref=ref,
@@ -3863,7 +4181,8 @@ class GlobalHSpecTableGroup:
                     segments=frozenset(partition_segments[pid]),
                     prompt_ids=tuple(partition_prompt_ids[pid]),
                     legacy=False,
-                    submitted_time_ns=int(submitted_time_ns),
+                    submitted_time_ns=int(actor_submitted_time_ns),
+                    deadline_ns=int(deadline_ns),
                 )
             )
         if submissions:
@@ -3877,6 +4196,10 @@ class GlobalHSpecTableGroup:
     def build_tables_async_legacy(
         self,
         prompt_data: Dict[str, Dict[str, Any]],
+        *,
+        epoch: Optional[int] = None,
+        submitted_time_ns: int = 0,
+        deadline_ns: int = 0,
     ) -> List[HSpecBuildSubmission]:
         """Submit old ndarray payloads for explicit HSPEC_LEGACY_DATAPROTO_HS=1 A/B only."""
         if not hspec_legacy_dataproto_hs_enabled():
@@ -3904,7 +4227,16 @@ class GlobalHSpecTableGroup:
                     "HSpec legacy build routing points to missing actor: "
                     f"pid={pid}, actor_count={len(self.groups)}, num_groups={self.num_groups}"
                 )
-            ref = self.groups[pid].build_tables_batch_legacy.remote(payload)
+            actor_submitted_time_ns = int(submitted_time_ns or time.time_ns())
+            # Compatibility note for older static checks:
+            # build_tables_batch_legacy.remote(payload) remains explicit;
+            # Phase 4 adds epoch/deadline kwargs for timeout accounting.
+            ref = self.groups[pid].build_tables_batch_legacy.remote(
+                payload,
+                epoch=epoch,
+                submitted_time_ns=int(actor_submitted_time_ns),
+                deadline_ns=int(deadline_ns),
+            )
             submissions.append(
                 HSpecBuildSubmission(
                     ref=ref,
@@ -3912,6 +4244,8 @@ class GlobalHSpecTableGroup:
                     segments=frozenset(),
                     prompt_ids=tuple(partition_prompt_ids[pid]),
                     legacy=True,
+                    submitted_time_ns=int(actor_submitted_time_ns),
+                    deadline_ns=int(deadline_ns),
                 )
             )
         if submissions:
@@ -4025,14 +4359,152 @@ class GlobalHSpecTableGroup:
 
     # Double-buffer version management
 
-    def swap(self):
-        """Swap building → active on all actors.  **Blocking.**"""
-        if self.groups:
-            ray.get([g.swap.remote() for g in self.groups])
+    @staticmethod
+    def _aggregate_actor_metrics(results: List[object]) -> Dict[str, float]:
+        agg: Dict[str, float] = {}
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            for key, value in result.items():
+                if isinstance(value, (int, float)):
+                    agg[str(key)] = agg.get(str(key), 0.0) + float(value)
+        return agg
 
-    def swap_async(self) -> List[ray.ObjectRef]:
-        """Queue swap on all actors.  Non-blocking; returns futures."""
-        return [g.swap.remote() for g in self.groups]
+    def _partition_prompt_ids(self, prompt_ids: Optional[List[str]]) -> Dict[int, List[str]]:
+        parts: Dict[int, List[str]] = {i: [] for i in range(self.num_groups)}
+        for prompt_id_obj in prompt_ids or []:
+            prompt_id = str(prompt_id_obj)
+            if not prompt_id:
+                continue
+            try:
+                part = self._get_partition_id(prompt_id)
+            except Exception:
+                part = stable_partition_id(prompt_id, self.num_groups)
+            if part < self.num_groups:
+                parts.setdefault(part, []).append(prompt_id)
+        return parts
+
+    def swap(
+        self,
+        *,
+        epoch: Optional[int] = None,
+        partial: bool = False,
+        completed_prompt_ids: Optional[List[str]] = None,
+        timed_out_prompt_ids: Optional[List[str]] = None,
+    ) -> Dict[str, float]:
+        """Swap building to active on actors.  **Blocking.**"""
+        if not self.groups:
+            return {}
+        if partial:
+            completed_by_part = self._partition_prompt_ids(completed_prompt_ids)
+            timed_out_by_part = self._partition_prompt_ids(timed_out_prompt_ids)
+            target_parts = [
+                part for part, prompts in completed_by_part.items()
+                if prompts and part < len(self.groups)
+            ]
+            if not target_parts:
+                return {
+                    "hspec/partial_swap_count": 0.0,
+                    "hspec/partial_swap_completed_prompts": 0.0,
+                    "hspec/partial_swap_reused_old_prompts": 0.0,
+                    "hspec/table_partial_swap_count": 0.0,
+                    "hspec/table_partial_swap_overlay_prompts": 0.0,
+                    "hspec/table_partial_swap_reuse_old_prompts": 0.0,
+                    "hspec/table_partial_swap_missing_prompts": 0.0,
+                }
+            refs = [
+                self.groups[part].swap.remote(
+                    epoch=epoch,
+                    partial=True,
+                    completed_prompt_ids=completed_by_part.get(part, []),
+                    timed_out_prompt_ids=timed_out_by_part.get(part, []),
+                )
+                for part in target_parts
+            ]
+        else:
+            refs = [
+                group.swap.remote(epoch=epoch, partial=False)
+                for group in self.groups
+            ]
+        agg = self._aggregate_actor_metrics(ray.get(refs))
+        return {
+            "hspec/partial_swap_count": agg.get("table_partial_swap_count", 0.0),
+            "hspec/partial_swap_completed_prompts": agg.get(
+                "table_partial_swap_overlay_prompts", 0.0),
+            "hspec/partial_swap_reused_old_prompts": agg.get(
+                "table_partial_swap_reuse_old_prompts", 0.0),
+            "hspec/table_partial_swap_count": agg.get("table_partial_swap_count", 0.0),
+            "hspec/table_partial_swap_overlay_prompts": agg.get(
+                "table_partial_swap_overlay_prompts", 0.0),
+            "hspec/table_partial_swap_reuse_old_prompts": agg.get(
+                "table_partial_swap_reuse_old_prompts", 0.0),
+            "hspec/table_partial_swap_missing_prompts": agg.get(
+                "table_partial_swap_missing_prompts", 0.0),
+            "hspec/table_eviction_count": agg.get("table_eviction_count", 0.0),
+            "hspec/table_eviction_bytes": agg.get("table_eviction_bytes", 0.0),
+            "hspec/table_eviction_mb": (
+                agg.get("table_eviction_bytes", 0.0) / (1024 * 1024)
+            ),
+            "hspec/table_eviction_entries": agg.get("table_eviction_entries", 0.0),
+        }
+
+    def swap_async(
+        self,
+        *,
+        epoch: Optional[int] = None,
+        partial: bool = False,
+        completed_prompt_ids: Optional[List[str]] = None,
+        timed_out_prompt_ids: Optional[List[str]] = None,
+    ) -> List[ray.ObjectRef]:
+        """Queue swap on actors.  Non-blocking; returns futures."""
+        if not partial:
+            return [
+                group.swap.remote(epoch=epoch, partial=False)
+                for group in self.groups
+            ]
+        completed_by_part = self._partition_prompt_ids(completed_prompt_ids)
+        timed_out_by_part = self._partition_prompt_ids(timed_out_prompt_ids)
+        return [
+            self.groups[part].swap.remote(
+                epoch=epoch,
+                partial=True,
+                completed_prompt_ids=completed_by_part.get(part, []),
+                timed_out_prompt_ids=timed_out_by_part.get(part, []),
+            )
+            for part, prompts in completed_by_part.items()
+            if prompts and part < len(self.groups)
+        ]
+
+    def discard_building_for_shards(
+        self,
+        shard_ids: List[int],
+        *,
+        epoch: Optional[int] = None,
+        reason: str = "build_timeout_discard",
+    ) -> Dict[str, float]:
+        """Discard unpublished building state on selected free shards."""
+        if not self.groups:
+            return {}
+        target_parts = sorted({
+            int(shard_id)
+            for shard_id in (shard_ids or [])
+            if 0 <= int(shard_id) < len(self.groups)
+        })
+        if not target_parts:
+            return {}
+        refs = [
+            self.groups[part].discard_building.remote(
+                epoch=epoch,
+                reason=reason,
+            )
+            for part in target_parts
+        ]
+        agg = self._aggregate_actor_metrics(ray.get(refs))
+        return {
+            "hspec/build_timeout_discard": agg.get("build_timeout_discard", 0.0),
+            "hspec/discarded_building_prompts": agg.get("discarded_building_prompts", 0.0),
+            "hspec/discarded_building_entries": agg.get("discarded_building_entries", 0.0),
+        }
 
     def get_active_version(self) -> int:
         """Return max active table version across actors."""
@@ -4214,6 +4686,8 @@ class GlobalHSpecTableGroup:
                 "hspec/build_queue_reject_descs": 0,
                 "hspec/build_queue_reject_bytes": 0,
                 "hspec/build_queue_reject_mb": 0.0,
+                "hspec/build_timeout_discard": 0,
+                "hspec/build_timeout_unfinished_prompts": 0,
                 "hspec/table_active_bytes": 0,
                 "hspec/table_active_prompts": 0,
                 "hspec/table_active_entries": 0,
@@ -4369,6 +4843,8 @@ class GlobalHSpecTableGroup:
             "hspec/build_queue_reject_descs": agg.get("build_queue_reject_descs", 0),
             "hspec/build_queue_reject_bytes": agg.get("build_queue_reject_bytes", 0),
             "hspec/build_queue_reject_mb": agg.get("build_queue_reject_bytes", 0) / (1024 * 1024),
+            "hspec/build_timeout_discard": agg.get("build_timeout_discard", 0),
+            "hspec/build_timeout_unfinished_prompts": agg.get("build_timeout_unfinished_prompts", 0),
             "hspec/active_version": agg.get("active_version", 0),
             "hspec/num_prompts": agg.get("num_prompts", 0),
             "hspec/total_entries": agg.get("total_entries", 0),
