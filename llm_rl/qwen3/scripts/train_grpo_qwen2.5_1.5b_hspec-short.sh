@@ -143,6 +143,14 @@ export HSPEC_PROFILE_WITH_STACK="${HSPEC_PROFILE_WITH_STACK:-0}"
 export HSPEC_PROFILE_MEMORY="${HSPEC_PROFILE_MEMORY:-0}"
 export HSPEC_PHASE4_METRICS_EVERY_STEPS="${HSPEC_PHASE4_METRICS_EVERY_STEPS:-1}"
 export HSPEC_PROFILE_BUILD_CPU="${HSPEC_PROFILE_BUILD_CPU:-0}"
+export HSPEC_PROFILE_BUILD_CPU_OUTPUT_DIR="${HSPEC_PROFILE_BUILD_CPU_OUTPUT_DIR:-}"
+export HSPEC_PROFILE_BUILD_CPU_SORT="${HSPEC_PROFILE_BUILD_CPU_SORT:-cumtime}"
+export HSPEC_PROFILE_BUILD_CPU_TOPK="${HSPEC_PROFILE_BUILD_CPU_TOPK:-30}"
+export HSPEC_PROFILE_BUILD_CPU_WRITE_PROF="${HSPEC_PROFILE_BUILD_CPU_WRITE_PROF:-0}"
+export HSPEC_PROFILE_BUILD_CPU_MAX_BATCHES_PER_ACTOR="${HSPEC_PROFILE_BUILD_CPU_MAX_BATCHES_PER_ACTOR:-1}"
+export HSPEC_PROFILE_BUILD_CPU_MAX_PROMPTS_PER_BATCH="${HSPEC_PROFILE_BUILD_CPU_MAX_PROMPTS_PER_BATCH:-0}"
+export HSPEC_PROFILE_BUILD_CPU_MIN_BATCH_MS="${HSPEC_PROFILE_BUILD_CPU_MIN_BATCH_MS:-0}"
+export HSPEC_PROFILE_BUILD_CPU_EVERY_EPOCHS="${HSPEC_PROFILE_BUILD_CPU_EVERY_EPOCHS:-0}"
 
 # rollout strictly sync; HSpec path assumes sync vLLM rollout.
 export USE_HSPEC_DECODE="${USE_HSPEC_DECODE:-1}"
@@ -284,6 +292,14 @@ hspec_maybe_clean_store_dirs
     echo "hspec_profile=${HSPEC_PROFILE}"
     echo "hspec_phase4_metrics_every_steps=${HSPEC_PHASE4_METRICS_EVERY_STEPS}"
     echo "hspec_profile_build_cpu=${HSPEC_PROFILE_BUILD_CPU}"
+    echo "hspec_profile_build_cpu_output_dir=${HSPEC_PROFILE_BUILD_CPU_OUTPUT_DIR}"
+    echo "hspec_profile_build_cpu_sort=${HSPEC_PROFILE_BUILD_CPU_SORT}"
+    echo "hspec_profile_build_cpu_topk=${HSPEC_PROFILE_BUILD_CPU_TOPK}"
+    echo "hspec_profile_build_cpu_write_prof=${HSPEC_PROFILE_BUILD_CPU_WRITE_PROF}"
+    echo "hspec_profile_build_cpu_max_batches_per_actor=${HSPEC_PROFILE_BUILD_CPU_MAX_BATCHES_PER_ACTOR}"
+    echo "hspec_profile_build_cpu_max_prompts_per_batch=${HSPEC_PROFILE_BUILD_CPU_MAX_PROMPTS_PER_BATCH}"
+    echo "hspec_profile_build_cpu_min_batch_ms=${HSPEC_PROFILE_BUILD_CPU_MIN_BATCH_MS}"
+    echo "hspec_profile_build_cpu_every_epochs=${HSPEC_PROFILE_BUILD_CPU_EVERY_EPOCHS}"
     echo "hspec_dump=${HSPEC_DUMP}"
     echo "hspec_async_hs_accumulate=${HSPEC_ASYNC_HS_ACCUMULATE}"
     echo "hspec_async_hs_copy_stream=${HSPEC_ASYNC_HS_COPY_STREAM}"
@@ -404,6 +420,14 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_MEMORY='"'"${HSPEC_PROFILE_MEMORY}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PHASE4_METRICS_EVERY_STEPS='"'"${HSPEC_PHASE4_METRICS_EVERY_STEPS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_BUILD_CPU='"'"${HSPEC_PROFILE_BUILD_CPU}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_BUILD_CPU_OUTPUT_DIR='"'"${HSPEC_PROFILE_BUILD_CPU_OUTPUT_DIR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_BUILD_CPU_SORT='"'"${HSPEC_PROFILE_BUILD_CPU_SORT}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_BUILD_CPU_TOPK='"'"${HSPEC_PROFILE_BUILD_CPU_TOPK}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_BUILD_CPU_WRITE_PROF='"'"${HSPEC_PROFILE_BUILD_CPU_WRITE_PROF}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_BUILD_CPU_MAX_BATCHES_PER_ACTOR='"'"${HSPEC_PROFILE_BUILD_CPU_MAX_BATCHES_PER_ACTOR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_BUILD_CPU_MAX_PROMPTS_PER_BATCH='"'"${HSPEC_PROFILE_BUILD_CPU_MAX_PROMPTS_PER_BATCH}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_BUILD_CPU_MIN_BATCH_MS='"'"${HSPEC_PROFILE_BUILD_CPU_MIN_BATCH_MS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_BUILD_CPU_EVERY_EPOCHS='"'"${HSPEC_PROFILE_BUILD_CPU_EVERY_EPOCHS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LOG_LEVEL='"'"${HSPEC_LOG_LEVEL}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGGING_LEVEL='"'"${VERL_LOGGING_LEVEL}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DISABLE_NUMBA_REBUILD='"'"${HSPEC_DISABLE_NUMBA_REBUILD}"'"' \

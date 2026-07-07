@@ -115,6 +115,33 @@ def _hspec_build_timeout_discard_unfinished_enabled() -> bool:
     return os.getenv("HSPEC_BUILD_TIMEOUT_DISCARD_UNFINISHED", "1") != "0"
 
 
+def _hspec_phase4_metrics_every_steps() -> int:
+    try:
+        from vllm_ascend.spec_decode.hspec_utils import get_hspec_phase4_metrics_every_steps
+
+        return get_hspec_phase4_metrics_every_steps()
+    except Exception:
+        return _hspec_get_env_int("HSPEC_PHASE4_METRICS_EVERY_STEPS", 1, 1)
+
+
+_HSPEC_PHASE4_GAUGE_CACHE_KEYS = (
+    "hspec/active_version",
+    "hspec/num_prompts",
+    "hspec/total_entries",
+    "hspec/table_active_bytes",
+    "hspec/table_active_mb",
+    "hspec/table_active_prompts",
+    "hspec/table_active_entries",
+    "hspec/table_store_referenced_versions",
+    "hspec/proposer_cache_live_cpu_bytes",
+    "hspec/proposer_cache_live_cpu_mb",
+    "hspec/proposer_cache_live_npu_bytes",
+    "hspec/proposer_cache_live_npu_mb",
+    "hspec/proposer_cache_live_entries",
+    "hspec/proposer_cache_live_prompts",
+)
+
+
 def _extract_and_sum_hspec_rollout_metrics(meta_info: dict | None) -> dict[str, float]:
     if not isinstance(meta_info, dict):
         return {}
@@ -511,6 +538,15 @@ class RayPPOTrainer:
         # HSpec build records retain segment keys until epoch-level GC.
         self._hspec_pending_build_refs: list[HSpecPendingBuild] = []
         self._hspec_last_epoch_build_barrier = HSpecEpochBuildBarrierResult(epoch=-1)
+        self._hspec_phase4_metrics_every_steps = _hspec_phase4_metrics_every_steps()
+        self._hspec_last_phase4_metrics_step = -1
+        self._hspec_last_phase4_metrics_wall_ns = 0
+        self._hspec_phase4_metrics_sample_count = 0
+        self._hspec_phase4_metrics_skip_cadence_count = 0
+        self._hspec_phase4_metrics_skip_inflight_count = 0
+        self._hspec_phase4_metrics_error_count = 0
+        self._hspec_cached_phase4_gauges: dict[str, float] = {}
+        self._hspec_force_phase4_metrics_next = True
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -693,6 +729,119 @@ class RayPPOTrainer:
             for record in getattr(self, "_hspec_pending_build_refs", [])
         )
 
+    def _hspec_phase4_metrics_due(self, *, force: bool = False) -> tuple[bool, str]:
+        if force:
+            return True, "force"
+        every = max(int(getattr(self, "_hspec_phase4_metrics_every_steps", 1)), 1)
+        step = int(getattr(self, "global_steps", 0))
+        last = int(getattr(self, "_hspec_last_phase4_metrics_step", -1))
+        if last < 0:
+            return True, "first"
+        if every <= 1 or step - last >= every:
+            return True, "cadence"
+        return False, "cadence_skip"
+
+    def _emit_cached_hspec_phase4_gauges(self, metrics: dict) -> None:
+        cached = getattr(self, "_hspec_cached_phase4_gauges", {})
+        if not cached:
+            metrics["hspec/phase4_metrics_cached_gauge_count"] = 0.0
+            metrics["hspec/phase4_metrics_cached_age_steps"] = -1.0
+            return
+        step = int(getattr(self, "global_steps", 0))
+        last = int(getattr(self, "_hspec_last_phase4_metrics_step", -1))
+        for key, value in cached.items():
+            short_key = key[len("hspec/"):] if key.startswith("hspec/") else key
+            metrics[f"hspec/phase4_cached/{short_key}"] = float(value)
+        metrics["hspec/phase4_metrics_cached_gauge_count"] = float(len(cached))
+        metrics["hspec/phase4_metrics_cached_age_steps"] = float(max(step - last, 0))
+
+    def _update_cached_hspec_phase4_gauges(self, table_metrics: dict) -> None:
+        cached: dict[str, float] = {}
+        for key in _HSPEC_PHASE4_GAUGE_CACHE_KEYS:
+            value = table_metrics.get(key)
+            if isinstance(value, (int, float)):
+                cached[key] = float(value)
+        self._hspec_cached_phase4_gauges = cached
+
+    def _maybe_collect_hspec_phase4_metrics(self, metrics: dict, *, force: bool = False) -> bool:
+        due, reason = self._hspec_phase4_metrics_due(force=force)
+        every = max(int(getattr(self, "_hspec_phase4_metrics_every_steps", 1)), 1)
+        metrics["hspec/phase4_metrics_every_steps"] = float(every)
+        metrics["hspec/phase4_metrics_due"] = 1.0 if due else 0.0
+        metrics["hspec/phase4_metrics_sampled"] = 0.0
+        metrics["hspec/phase4_metrics_compute_ms"] = 0.0
+        metrics["hspec/phase4_metrics_interval_steps"] = 0.0
+        metrics["hspec/phase4_metrics_skip_cadence"] = 0.0
+        metrics["hspec/phase4_metrics_skip_inflight"] = 0.0
+        metrics["hspec/phase4_metrics_reason_first"] = 1.0 if reason == "first" else 0.0
+        metrics["hspec/phase4_metrics_reason_cadence"] = 1.0 if reason == "cadence" else 0.0
+        metrics["hspec/phase4_metrics_reason_force"] = 1.0 if reason == "force" else 0.0
+        metrics["hspec/phase4_metrics_sample_count"] = float(
+            getattr(self, "_hspec_phase4_metrics_sample_count", 0)
+        )
+
+        if self._hspec_has_inflight_builds():
+            if due:
+                self._hspec_phase4_metrics_skip_inflight_count += 1
+                metrics["hspec/phase4_metrics_skip_inflight"] = 1.0
+            metrics["hspec/phase4_metrics_skip_inflight_count"] = float(
+                self._hspec_phase4_metrics_skip_inflight_count
+            )
+            metrics["hspec/phase4_metrics_skip_cadence_count"] = float(
+                self._hspec_phase4_metrics_skip_cadence_count
+            )
+            self._emit_cached_hspec_phase4_gauges(metrics)
+            return False
+
+        if not due:
+            self._hspec_phase4_metrics_skip_cadence_count += 1
+            metrics["hspec/phase4_metrics_skip_cadence"] = 1.0
+            metrics["hspec/phase4_metrics_skip_cadence_count"] = float(
+                self._hspec_phase4_metrics_skip_cadence_count
+            )
+            metrics["hspec/phase4_metrics_skip_inflight_count"] = float(
+                self._hspec_phase4_metrics_skip_inflight_count
+            )
+            self._emit_cached_hspec_phase4_gauges(metrics)
+            return False
+
+        t0 = time.perf_counter_ns()
+        try:
+            table_metrics = self.hspec_tables.compute_metrics()
+        except Exception:
+            self._hspec_phase4_metrics_error_count += 1
+            metrics["hspec/phase4_metrics_error_count"] = float(
+                self._hspec_phase4_metrics_error_count
+            )
+            self._emit_cached_hspec_phase4_gauges(metrics)
+            return False
+        elapsed_ms = float((time.perf_counter_ns() - t0) / 1_000_000.0)
+        step = int(getattr(self, "global_steps", 0))
+        last = int(getattr(self, "_hspec_last_phase4_metrics_step", -1))
+        interval_steps = 1 if last < 0 else max(step - last, 1)
+        metrics.update(table_metrics)
+        metrics["hspec/phase4_metrics_sampled"] = 1.0
+        metrics["hspec/phase4_metrics_compute_ms"] = elapsed_ms
+        metrics["hspec/phase4_metrics_interval_steps"] = float(interval_steps)
+        self._hspec_last_phase4_metrics_step = step
+        self._hspec_last_phase4_metrics_wall_ns = time.time_ns()
+        self._hspec_phase4_metrics_sample_count += 1
+        metrics["hspec/phase4_metrics_sample_count"] = float(
+            self._hspec_phase4_metrics_sample_count
+        )
+        metrics["hspec/phase4_metrics_skip_cadence_count"] = float(
+            self._hspec_phase4_metrics_skip_cadence_count
+        )
+        metrics["hspec/phase4_metrics_skip_inflight_count"] = float(
+            self._hspec_phase4_metrics_skip_inflight_count
+        )
+        metrics["hspec/phase4_metrics_error_count"] = float(
+            self._hspec_phase4_metrics_error_count
+        )
+        self._update_cached_hspec_phase4_gauges(table_metrics)
+        self._emit_cached_hspec_phase4_gauges(metrics)
+        return True
+
     @staticmethod
     def _coerce_hspec_result_metrics(result: object) -> dict[str, float]:
         if not isinstance(result, dict):
@@ -745,6 +894,12 @@ class RayPPOTrainer:
             "build_deadline_hit_count",
             "build_timeout_discard",
             "build_timeout_unfinished_prompts",
+            "build_cpu_profile_count",
+            "build_cpu_profile_ms",
+            "build_cpu_profile_dump_ms",
+            "build_cpu_profile_error_count",
+            "build_cpu_profile_skipped_count",
+            "build_cpu_profile_batches",
         )
         for key in additive_keys:
             value = result.get(key)
@@ -764,6 +919,8 @@ class RayPPOTrainer:
             "build_queue_pending_descs",
             "build_queue_pending_bytes",
             "build_queue_lag_ms_max",
+            "build_cpu_profile_enabled",
+            "build_cpu_profile_top_cumtime_ms_max",
         )
         for key in max_keys:
             value = result.get(key)
@@ -1109,7 +1266,9 @@ class RayPPOTrainer:
         )
         if not bool(barrier.timed_out):
             print(f"HSpec: swap at epoch={epoch} (promote building -> active)")
-            return self.hspec_tables.swap(epoch=epoch)
+            metrics = self.hspec_tables.swap(epoch=epoch)
+            self._hspec_force_phase4_metrics_next = True
+            return metrics
 
         if _hspec_swap_partial_on_timeout_enabled():
             completed_prompt_ids = list(barrier.completed_prompt_ids)
@@ -1119,12 +1278,14 @@ class RayPPOTrainer:
                     f"epoch={epoch} completed_prompts={len(completed_prompt_ids)} "
                     f"timed_out_prompts={len(barrier.timed_out_prompt_ids)}"
                 )
-                return self.hspec_tables.swap(
+                metrics = self.hspec_tables.swap(
                     epoch=epoch,
                     partial=True,
                     completed_prompt_ids=completed_prompt_ids,
                     timed_out_prompt_ids=list(barrier.timed_out_prompt_ids),
                 )
+                self._hspec_force_phase4_metrics_next = True
+                return metrics
             print(
                 "HSpec: partial swap skipped after build timeout "
                 f"epoch={epoch}; no completed prompts, keeping previous active."
@@ -1159,6 +1320,7 @@ class RayPPOTrainer:
                 metrics=metrics,
                 reason="build_timeout_partial_disabled_discard",
             )
+            self._hspec_force_phase4_metrics_next = True
         return metrics
 
     def _poll_hspec_builds_nonblocking(self, metrics: dict | None = None) -> None:
@@ -2126,8 +2288,18 @@ class RayPPOTrainer:
                     if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
                         with marked_timer("update_hspec_tables", timing_raw, color="teal"):
                             self._poll_hspec_builds_nonblocking(metrics)
-                            if not self._hspec_has_inflight_builds():
-                                metrics.update(self.hspec_tables.compute_metrics())
+                            force_hspec_phase4_metrics = bool(
+                                getattr(self, "_hspec_force_phase4_metrics_next", False)
+                            )
+                            sampled_hspec_phase4_metrics = self._maybe_collect_hspec_phase4_metrics(
+                                metrics,
+                                force=force_hspec_phase4_metrics,
+                            )
+                            self._hspec_force_phase4_metrics_next = bool(
+                                force_hspec_phase4_metrics
+                                and not sampled_hspec_phase4_metrics
+                                and self._hspec_has_inflight_builds()
+                            )
                             from vllm_ascend.spec_decode.hspec_store import (
                                 coerce_hspec_desc,
                                 get_hspec_num_shards,

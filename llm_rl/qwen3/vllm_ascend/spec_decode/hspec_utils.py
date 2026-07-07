@@ -126,8 +126,53 @@ def hspec_profile_build_cpu_enabled() -> bool:
     return os.getenv("HSPEC_PROFILE_BUILD_CPU", "0") != "0"
 
 
-def _parse_profile_steps(value: str) -> set[int]:
+def hspec_profile_build_cpu_output_dir() -> str:
+    """Return the output directory for build-actor CPU profile summaries."""
+    root = os.getenv("HSPEC_PROFILE_BUILD_CPU_OUTPUT_DIR", "").strip()
+    if root:
+        return root
+    return os.path.join(hspec_profile_output_dir(), "build_cpu")
+
+
+def hspec_profile_build_cpu_sort() -> str:
+    """Return the pstats sort key for build-actor CPU profiling."""
+    return os.getenv("HSPEC_PROFILE_BUILD_CPU_SORT", "cumtime").strip() or "cumtime"
+
+
+def hspec_profile_build_cpu_topk() -> int:
+    """Return the number of top pstats entries to write in summary JSON."""
+    return _get_env_int("HSPEC_PROFILE_BUILD_CPU_TOPK", 30, 1)
+
+
+def hspec_profile_build_cpu_write_prof() -> bool:
+    """Whether to also dump the raw cProfile .prof file."""
+    return os.getenv("HSPEC_PROFILE_BUILD_CPU_WRITE_PROF", "0") != "0"
+
+
+def hspec_profile_build_cpu_max_batches_per_actor() -> int:
+    """Return max build CPU profile samples per actor when no step list is set."""
+    return _get_env_int("HSPEC_PROFILE_BUILD_CPU_MAX_BATCHES_PER_ACTOR", 1, 0)
+
+
+def hspec_profile_build_cpu_max_prompts_per_batch() -> int:
+    """Return max prompt-scoped build CPU profile samples per batch; 0 means no prompt cap."""
+    return _get_env_int("HSPEC_PROFILE_BUILD_CPU_MAX_PROMPTS_PER_BATCH", 0, 0)
+
+
+def hspec_profile_build_cpu_min_batch_ms() -> float:
+    """Return min profiled build duration required before writing a summary."""
+    return _get_env_float("HSPEC_PROFILE_BUILD_CPU_MIN_BATCH_MS", 0.0, 0.0)
+
+
+def hspec_profile_build_cpu_every_epochs() -> int:
+    """Return optional epoch cadence for build CPU profiling; 0 disables it."""
+    return _get_env_int("HSPEC_PROFILE_BUILD_CPU_EVERY_EPOCHS", 0, 0)
+
+
+def _parse_profile_steps(value: Optional[str]) -> set[int]:
     steps: set[int] = set()
+    if value is None:
+        return steps
     for item in value.split(","):
         item = item.strip()
         if not item:
@@ -137,6 +182,11 @@ def _parse_profile_steps(value: str) -> set[int]:
         except ValueError:
             logger.warning("Ignoring invalid HSPEC_PROFILE_STEPS item: %s", item)
     return steps
+
+
+def hspec_profile_steps() -> set[int]:
+    """Return the optional global-step profile allowlist shared by HSpec profilers."""
+    return _parse_profile_steps(os.getenv("HSPEC_PROFILE_STEPS", None))
 
 
 def hspec_profile_enabled_for_step(global_step: Optional[int]) -> bool:

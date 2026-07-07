@@ -670,7 +670,8 @@ class HSpecProposer(Proposer):
         self._entry_pending_abs_delta_accept_len_sum = defaultdict(int)
 
         logger.info(
-            "HSpec proposer initialised: threshold=%.3f, max_draft=%d, cache_cap=%d, "
+            "HSpec proposer initialised: threshold=%.3f, max_draft=%d, "
+            "n_components=%d, max_entries_per_prompt=%d, cache_cap=%d, "
             "fully_batched_match=1, numba_rebuild=%s, entry_blend_horizon=%d, entry_bias_cap=%d, "
             "abs_delta_cap=%s safe<=%d mid<=%d mid_cap=%d far_cap=%d hot_path_strict=%s "
             "cache_max_cpu_bytes=%d cache_max_npu_bytes=%d cache_max_entries=%d "
@@ -679,6 +680,8 @@ class HSpecProposer(Proposer):
             "prefix_cache=%s store_per_prompt_npu=%s keys_cpu_dtype=%s keys_device_dtype=%s",
             self.similarity_threshold,
             self.max_draft_tokens,
+            self.n_components,
+            self.max_entries_per_prompt,
             self._max_cache_size,
             str(bool(self._use_numba_rebuild)),
             int(self._entry_blend_horizon),

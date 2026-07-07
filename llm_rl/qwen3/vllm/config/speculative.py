@@ -79,6 +79,8 @@ class SpeculativeConfig:
     # accepts these fields when method="hspec".
     hspec_similarity_threshold: float | None = None
     hspec_min_match_len: int | None = None
+    hspec_n_components: int | None = Field(default=None, ge=1)
+    hspec_max_entries_per_prompt: int | None = Field(default=None, ge=1)
     draft_tensor_parallel_size: int | None = Field(default=None, ge=1)
     """The degree of the tensor parallelism for the draft model. Can only be 1
     or the same as the target model's tensor parallel size."""

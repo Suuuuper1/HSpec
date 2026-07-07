@@ -55,6 +55,16 @@ from vllm_ascend.spec_decode.hspec_utils import (
     PromptPCAParams,
     fit_pca_multi_sequence,
     fit_pca_single_sequence,
+    hspec_profile_build_cpu_enabled,
+    hspec_profile_build_cpu_every_epochs,
+    hspec_profile_build_cpu_max_batches_per_actor,
+    hspec_profile_build_cpu_max_prompts_per_batch,
+    hspec_profile_build_cpu_min_batch_ms,
+    hspec_profile_build_cpu_output_dir,
+    hspec_profile_build_cpu_sort,
+    hspec_profile_build_cpu_topk,
+    hspec_profile_build_cpu_write_prof,
+    hspec_profile_steps,
     stable_partition_id,
 )
 from vllm_ascend.spec_decode.hspec_store import (
@@ -1028,6 +1038,15 @@ class HSpecTableGroup:
         self._build_rss_after_materialize_peak_bytes = 0
         self._build_rss_after_pca_peak_bytes = 0
         self._build_rss_delta_peak_bytes = 0
+        self._build_cpu_profile_batches_seen = 0
+        self._build_cpu_profile_count = 0
+        self._build_cpu_profile_ms = 0.0
+        self._build_cpu_profile_dump_ms = 0.0
+        self._build_cpu_profile_error_count = 0
+        self._build_cpu_profile_skipped_count = 0
+        self._build_cpu_profile_top_cumtime_ms_max = 0.0
+        self._build_cpu_profile_batches = 0
+        self._build_cpu_profile_last_path = ""
         self._table_eviction_count = 0
         self._table_eviction_bytes = 0
         self._table_eviction_entries = 0
@@ -1965,6 +1984,257 @@ class HSpecTableGroup:
         metrics.built = True
         return metrics
 
+    @staticmethod
+    def _safe_profile_path_part(value: object) -> str:
+        text = str(value) if value is not None else "unknown"
+        safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text)
+        return safe[:96] or "unknown"
+
+    @staticmethod
+    def _build_cpu_profile_step_from_descs(descs: List[HSpecTrajectoryDesc]) -> Optional[int]:
+        for desc in descs:
+            try:
+                step = int(getattr(desc, "global_step", -1))
+            except Exception:
+                continue
+            if step >= 0:
+                return step
+        return None
+
+    def _should_profile_build_cpu(
+        self,
+        *,
+        step: Optional[int],
+        epoch: Optional[int],
+    ) -> bool:
+        if not hspec_profile_build_cpu_enabled():
+            return False
+        steps = hspec_profile_steps()
+        max_batches = hspec_profile_build_cpu_max_batches_per_actor()
+        if max_batches > 0 and self._build_cpu_profile_batches_seen >= max_batches:
+            return False
+        if steps:
+            return step is not None and int(step) in steps
+        every_epochs = hspec_profile_build_cpu_every_epochs()
+        if every_epochs > 0:
+            if epoch is None or int(epoch) % every_epochs != 0:
+                return False
+        return every_epochs > 0 or max_batches != 0
+
+    def _begin_build_cpu_profile(
+        self,
+        *,
+        step: Optional[int],
+        epoch: Optional[int],
+        scope_name: str,
+        metadata: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not hspec_profile_build_cpu_enabled():
+            return None
+        if not self._should_profile_build_cpu(step=step, epoch=epoch):
+            self._build_cpu_profile_skipped_count += 1
+            return None
+        try:
+            import cProfile
+        except Exception:
+            self._build_cpu_profile_error_count += 1
+            logger.debug("Failed to import cProfile for HSpec build CPU profiling", exc_info=True)
+            return None
+        try:
+            profiler = cProfile.Profile()
+            token = {
+                "profiler": profiler,
+                "t0": time.perf_counter(),
+                "step": step,
+                "epoch": epoch,
+                "scope_name": scope_name,
+                "metadata": dict(metadata or {}),
+            }
+            self._build_cpu_profile_batches_seen += 1
+            self._build_cpu_profile_batches += 1
+            profiler.enable()
+            return token
+        except Exception:
+            self._build_cpu_profile_error_count += 1
+            logger.debug("Failed to start HSpec build CPU profiler", exc_info=True)
+            return None
+
+    def _finish_build_cpu_profile(
+        self,
+        token: Optional[Dict[str, Any]],
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not token:
+            return
+        profiler = token.get("profiler")
+        try:
+            profiler.disable()
+        except Exception:
+            self._build_cpu_profile_error_count += 1
+            logger.debug("Failed to stop HSpec build CPU profiler", exc_info=True)
+            return
+        profile_ms = float((time.perf_counter() - float(token.get("t0", time.perf_counter()))) * 1000.0)
+        min_ms = hspec_profile_build_cpu_min_batch_ms()
+        if min_ms > 0.0 and profile_ms < min_ms:
+            self._build_cpu_profile_skipped_count += 1
+            return
+        dump_t0 = time.perf_counter()
+        try:
+            import hashlib
+            import io
+            import json
+            import pstats
+
+            sort_key = hspec_profile_build_cpu_sort()
+            topk = hspec_profile_build_cpu_topk()
+            stream = io.StringIO()
+            stats = pstats.Stats(profiler, stream=stream).sort_stats(sort_key)
+            functions = getattr(stats, "fcn_list", None) or list(stats.stats.keys())
+            top_functions = []
+            top_cumtime_ms = 0.0
+            for func in functions[:topk]:
+                cc, nc, tt, ct, _callers = stats.stats[func]
+                filename, line, name = func
+                cumtime_ms = float(ct * 1000.0)
+                top_cumtime_ms = max(top_cumtime_ms, cumtime_ms)
+                top_functions.append({
+                    "file": str(filename),
+                    "line": int(line),
+                    "function": str(name),
+                    "primitive_calls": int(cc),
+                    "calls": int(nc),
+                    "tottime_ms": float(tt * 1000.0),
+                    "cumtime_ms": cumtime_ms,
+                })
+
+            merged_metadata = dict(token.get("metadata") or {})
+            if metadata:
+                merged_metadata.update(metadata)
+            prompt_id = merged_metadata.pop("prompt_id", "")
+            if prompt_id:
+                merged_metadata["prompt_id_hash"] = hashlib.sha1(
+                    str(prompt_id).encode("utf-8", errors="ignore")
+                ).hexdigest()[:16]
+            merged_metadata.update({
+                "scope_name": str(token.get("scope_name", "")),
+                "epoch": token.get("epoch"),
+                "step": token.get("step"),
+                "shard_id": int(self.shard_id),
+                "actor_name": str(self.actor_name),
+                "logical_node_id": str(self.logical_node_id),
+                "ray_node_id": str(self.ray_node_id),
+                "pid": int(os.getpid()),
+                "hostname": socket.gethostname(),
+                "profile_ms": profile_ms,
+                "sort": sort_key,
+                "topk": int(topk),
+            })
+
+            root = hspec_profile_build_cpu_output_dir()
+            node_part = self._safe_profile_path_part(self.logical_node_id or self.ray_node_id or "node")
+            epoch_part = self._safe_profile_path_part(token.get("epoch", "na"))
+            out_dir = os.path.join(
+                root,
+                f"node_{node_part}",
+                f"shard_{int(self.shard_id):03d}",
+                f"epoch_{epoch_part}",
+            )
+            os.makedirs(out_dir, exist_ok=True)
+            seq = int(self._build_cpu_profile_count) + 1
+            step_part = self._safe_profile_path_part(token.get("step", "na"))
+            base_name = (
+                f"build_cpu_step_{step_part}_shard_{int(self.shard_id):03d}_"
+                f"sample_{seq:06d}_{time.time_ns()}"
+            )
+            json_path = os.path.join(out_dir, f"{base_name}.json")
+            summary = {
+                "metadata": merged_metadata,
+                "total_calls": int(getattr(stats, "total_calls", 0)),
+                "primitive_calls": int(getattr(stats, "prim_calls", 0)),
+                "total_time_ms": float(getattr(stats, "total_tt", 0.0) * 1000.0),
+                "top_cumtime_ms": float(top_cumtime_ms),
+                "top_functions": top_functions,
+            }
+            prof_path = ""
+            if hspec_profile_build_cpu_write_prof():
+                prof_path = os.path.join(out_dir, f"{base_name}.prof")
+                profiler.dump_stats(prof_path)
+                summary["prof_path"] = prof_path
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, separators=(",", ":"))
+
+            dump_ms = float((time.perf_counter() - dump_t0) * 1000.0)
+            self._build_cpu_profile_count += 1
+            self._build_cpu_profile_ms += profile_ms
+            self._build_cpu_profile_dump_ms += dump_ms
+            self._build_cpu_profile_top_cumtime_ms_max = max(
+                self._build_cpu_profile_top_cumtime_ms_max,
+                top_cumtime_ms,
+            )
+            self._build_cpu_profile_last_path = json_path
+        except Exception:
+            self._build_cpu_profile_error_count += 1
+            logger.debug("Failed to finalize HSpec build CPU profile", exc_info=True)
+
+    def _profiled_build_prompt_table_from_descs(
+        self,
+        prompt_id: str,
+        descs: List[HSpecTrajectoryDesc],
+        *,
+        epoch: Optional[int],
+        submitted_time_ns: int,
+        deadline_ns: int,
+        queue_lag_ms: float,
+    ) -> _PromptTableBuildMetrics:
+        profile_step = self._build_cpu_profile_step_from_descs(descs)
+        token = self._begin_build_cpu_profile(
+            step=profile_step,
+            epoch=epoch,
+            scope_name="build_prompt_table_from_descs",
+            metadata={
+                "prompt_id": prompt_id,
+                "prompt_desc_count": len(descs),
+                "submitted_time_ns": int(submitted_time_ns),
+                "deadline_ns": int(deadline_ns),
+                "queue_lag_ms": float(queue_lag_ms),
+            },
+        )
+        try:
+            return self.build_prompt_table_from_descs(prompt_id, descs)
+        finally:
+            self._finish_build_cpu_profile(
+                token,
+                metadata={"prompt_desc_count": len(descs)},
+            )
+
+    def _profiled_build_prompt_table_legacy(
+        self,
+        prompt_id: str,
+        hidden_states: Any,
+        tokens: Any,
+        rewards: Any,
+        *,
+        epoch: Optional[int],
+        submitted_time_ns: int,
+        deadline_ns: int,
+    ) -> _PromptTableBuildMetrics:
+        token = self._begin_build_cpu_profile(
+            step=None,
+            epoch=epoch,
+            scope_name="build_prompt_table_legacy",
+            metadata={
+                "prompt_id": prompt_id,
+                "submitted_time_ns": int(submitted_time_ns),
+                "deadline_ns": int(deadline_ns),
+                "legacy_payload": True,
+            },
+        )
+        try:
+            return self.build_prompt_table(prompt_id, hidden_states, tokens, rewards)
+        finally:
+            self._finish_build_cpu_profile(token, metadata={"legacy_payload": True})
+
     def _build_result_metrics(
         self,
         *,
@@ -2016,6 +2286,13 @@ class HSpecTableGroup:
         build_queue_reject_bytes_before: int = 0,
         build_queue_lag_ms_total_before: float = 0.0,
         build_queue_lag_count_before: int = 0,
+        build_cpu_profile_count_before: int = 0,
+        build_cpu_profile_ms_before: float = 0.0,
+        build_cpu_profile_dump_ms_before: float = 0.0,
+        build_cpu_profile_error_count_before: int = 0,
+        build_cpu_profile_skipped_count_before: int = 0,
+        build_cpu_profile_batches_before: int = 0,
+        build_cpu_profile_top_cumtime_ms_max_before: float = 0.0,
         completed_prompt_ids: Optional[List[str]] = None,
         unfinished_prompt_ids: Optional[List[str]] = None,
         deadline_ns: int = 0,
@@ -2031,6 +2308,17 @@ class HSpecTableGroup:
             len(unfinished_ids)
             if bool(deadline_hit) and hspec_build_timeout_discard_unfinished_enabled()
             else 0
+        )
+        build_cpu_profile_count_delta = int(self._build_cpu_profile_count) - int(
+            build_cpu_profile_count_before)
+        build_cpu_profile_top_cumtime_ms = (
+            float(self._build_cpu_profile_top_cumtime_ms_max)
+            if build_cpu_profile_count_delta > 0
+            else max(
+                float(self._build_cpu_profile_top_cumtime_ms_max)
+                - float(build_cpu_profile_top_cumtime_ms_max_before),
+                0.0,
+            )
         )
         return {
             "shard_id": float(self.shard_id),
@@ -2109,6 +2397,24 @@ class HSpecTableGroup:
             "build_queue_reject_bytes": float(
                 self._build_queue_reject_bytes - build_queue_reject_bytes_before
             ),
+            "build_cpu_profile_enabled": float(1 if hspec_profile_build_cpu_enabled() else 0),
+            "build_cpu_profile_count": float(build_cpu_profile_count_delta),
+            "build_cpu_profile_ms": float(
+                self._build_cpu_profile_ms - build_cpu_profile_ms_before
+            ),
+            "build_cpu_profile_dump_ms": float(
+                self._build_cpu_profile_dump_ms - build_cpu_profile_dump_ms_before
+            ),
+            "build_cpu_profile_error_count": float(
+                self._build_cpu_profile_error_count - build_cpu_profile_error_count_before
+            ),
+            "build_cpu_profile_skipped_count": float(
+                self._build_cpu_profile_skipped_count - build_cpu_profile_skipped_count_before
+            ),
+            "build_cpu_profile_batches": float(
+                self._build_cpu_profile_batches - build_cpu_profile_batches_before
+            ),
+            "build_cpu_profile_top_cumtime_ms_max": float(build_cpu_profile_top_cumtime_ms),
         }
 
     def build_tables_batch(
@@ -2134,6 +2440,13 @@ class HSpecTableGroup:
         build_queue_reject_bytes_before = self._build_queue_reject_bytes
         build_queue_lag_ms_total_before = self._build_queue_lag_ms_total
         build_queue_lag_count_before = self._build_queue_lag_count
+        build_cpu_profile_count_before = self._build_cpu_profile_count
+        build_cpu_profile_ms_before = self._build_cpu_profile_ms
+        build_cpu_profile_dump_ms_before = self._build_cpu_profile_dump_ms
+        build_cpu_profile_error_count_before = self._build_cpu_profile_error_count
+        build_cpu_profile_skipped_count_before = self._build_cpu_profile_skipped_count
+        build_cpu_profile_batches_before = self._build_cpu_profile_batches
+        build_cpu_profile_top_cumtime_ms_max_before = self._build_cpu_profile_top_cumtime_ms_max
         selected_desc_count = 0
         build_input_rows = 0
         build_selected_rows = 0
@@ -2188,6 +2501,12 @@ class HSpecTableGroup:
             prompt_data_dict = prompt_data_dict.get("_hspec_prompt_data", {})
 
         queue_lag_ms = self._record_build_queue_lag(submitted_time_ns)
+        profile_build_cpu = hspec_profile_build_cpu_enabled()
+        profile_prompt_cap = (
+            hspec_profile_build_cpu_max_prompts_per_batch()
+            if profile_build_cpu else 0
+        )
+        profile_prompt_scope_count = 0
 
         def _observe_rss(rss_bytes: int) -> None:
             nonlocal rss_peak_bytes, rss_delta_peak_bytes
@@ -2251,7 +2570,21 @@ class HSpecTableGroup:
                     prompt_completed = True
                     continue
 
-                table_metrics = self.build_prompt_table_from_descs(prompt_id, descs)
+                if (
+                    profile_build_cpu
+                    and (profile_prompt_cap <= 0 or profile_prompt_scope_count < profile_prompt_cap)
+                ):
+                    profile_prompt_scope_count += 1
+                    table_metrics = self._profiled_build_prompt_table_from_descs(
+                        prompt_id,
+                        descs,
+                        epoch=epoch,
+                        submitted_time_ns=submitted_time_ns,
+                        deadline_ns=deadline_ns,
+                        queue_lag_ms=queue_lag_ms,
+                    )
+                else:
+                    table_metrics = self.build_prompt_table_from_descs(prompt_id, descs)
                 selected_desc_count += table_metrics.selected_desc_count
                 build_input_rows += table_metrics.input_rows
                 build_selected_rows += table_metrics.selected_rows
@@ -2411,6 +2744,13 @@ class HSpecTableGroup:
             build_queue_reject_bytes_before=build_queue_reject_bytes_before,
             build_queue_lag_ms_total_before=build_queue_lag_ms_total_before,
             build_queue_lag_count_before=build_queue_lag_count_before,
+            build_cpu_profile_count_before=build_cpu_profile_count_before,
+            build_cpu_profile_ms_before=build_cpu_profile_ms_before,
+            build_cpu_profile_dump_ms_before=build_cpu_profile_dump_ms_before,
+            build_cpu_profile_error_count_before=build_cpu_profile_error_count_before,
+            build_cpu_profile_skipped_count_before=build_cpu_profile_skipped_count_before,
+            build_cpu_profile_batches_before=build_cpu_profile_batches_before,
+            build_cpu_profile_top_cumtime_ms_max_before=build_cpu_profile_top_cumtime_ms_max_before,
             completed_prompt_ids=completed_prompt_ids,
             unfinished_prompt_ids=unfinished_prompt_ids,
             deadline_ns=deadline_ns,
@@ -2435,6 +2775,13 @@ class HSpecTableGroup:
         legacy_payload_count = 0
         build_count_before = self._build_count
         discard_count_before = self._discard_count
+        build_cpu_profile_count_before = self._build_cpu_profile_count
+        build_cpu_profile_ms_before = self._build_cpu_profile_ms
+        build_cpu_profile_dump_ms_before = self._build_cpu_profile_dump_ms
+        build_cpu_profile_error_count_before = self._build_cpu_profile_error_count
+        build_cpu_profile_skipped_count_before = self._build_cpu_profile_skipped_count
+        build_cpu_profile_batches_before = self._build_cpu_profile_batches
+        build_cpu_profile_top_cumtime_ms_max_before = self._build_cpu_profile_top_cumtime_ms_max
         build_validation_ms = 0.0
         build_pca_ms = 0.0
         build_table_add_ms = 0.0
@@ -2446,6 +2793,12 @@ class HSpecTableGroup:
         completed_prompt_ids: List[str] = []
         unfinished_prompt_ids: List[str] = []
         deadline_hit = False
+        profile_build_cpu = hspec_profile_build_cpu_enabled()
+        profile_prompt_cap = (
+            hspec_profile_build_cpu_max_prompts_per_batch()
+            if profile_build_cpu else 0
+        )
+        profile_prompt_scope_count = 0
 
         def _observe_rss(rss_bytes: int) -> None:
             nonlocal rss_peak_bytes, rss_delta_peak_bytes
@@ -2470,12 +2823,27 @@ class HSpecTableGroup:
                 prompt_count += 1
                 hidden_states = data["hidden_states"]
                 legacy_payload_count += len(hidden_states) if hasattr(hidden_states, "__len__") else 1
-                table_metrics = self.build_prompt_table(
-                    prompt_id,
-                    hidden_states,
-                    data["tokens"],
-                    data["rewards"],
-                )
+                if (
+                    profile_build_cpu
+                    and (profile_prompt_cap <= 0 or profile_prompt_scope_count < profile_prompt_cap)
+                ):
+                    profile_prompt_scope_count += 1
+                    table_metrics = self._profiled_build_prompt_table_legacy(
+                        prompt_id,
+                        hidden_states,
+                        data["tokens"],
+                        data["rewards"],
+                        epoch=epoch,
+                        submitted_time_ns=submitted_time_ns,
+                        deadline_ns=deadline_ns,
+                    )
+                else:
+                    table_metrics = self.build_prompt_table(
+                        prompt_id,
+                        hidden_states,
+                        data["tokens"],
+                        data["rewards"],
+                    )
                 build_validation_ms += table_metrics.validation_ms
                 build_pca_ms += table_metrics.pca_ms
                 build_table_add_ms += table_metrics.table_add_ms
@@ -2532,6 +2900,13 @@ class HSpecTableGroup:
             rss_delta_peak_bytes=rss_delta_peak_bytes,
             build_count_before=build_count_before,
             discard_count_before=discard_count_before,
+            build_cpu_profile_count_before=build_cpu_profile_count_before,
+            build_cpu_profile_ms_before=build_cpu_profile_ms_before,
+            build_cpu_profile_dump_ms_before=build_cpu_profile_dump_ms_before,
+            build_cpu_profile_error_count_before=build_cpu_profile_error_count_before,
+            build_cpu_profile_skipped_count_before=build_cpu_profile_skipped_count_before,
+            build_cpu_profile_batches_before=build_cpu_profile_batches_before,
+            build_cpu_profile_top_cumtime_ms_max_before=build_cpu_profile_top_cumtime_ms_max_before,
             completed_prompt_ids=completed_prompt_ids,
             unfinished_prompt_ids=unfinished_prompt_ids,
             deadline_ns=deadline_ns,
@@ -3241,6 +3616,14 @@ class HSpecTableGroup:
             "build_queue_reject_bytes": self._build_queue_reject_bytes,
             "build_timeout_discard": self._build_timeout_discard,
             "build_timeout_unfinished_prompts": self._build_timeout_unfinished_prompts,
+            "build_cpu_profile_enabled": 1 if hspec_profile_build_cpu_enabled() else 0,
+            "build_cpu_profile_count": self._build_cpu_profile_count,
+            "build_cpu_profile_ms": self._build_cpu_profile_ms,
+            "build_cpu_profile_dump_ms": self._build_cpu_profile_dump_ms,
+            "build_cpu_profile_error_count": self._build_cpu_profile_error_count,
+            "build_cpu_profile_skipped_count": self._build_cpu_profile_skipped_count,
+            "build_cpu_profile_top_cumtime_ms_max": self._build_cpu_profile_top_cumtime_ms_max,
+            "build_cpu_profile_batches": self._build_cpu_profile_batches,
             "active_version": self._active_version,
             "num_prompts": len(self._active),
             "total_entries": self.total_entries(),
@@ -3384,6 +3767,14 @@ class HSpecTableGroup:
         self._build_queue_reject_bytes = 0
         self._build_timeout_discard = 0
         self._build_timeout_unfinished_prompts = 0
+        self._build_cpu_profile_count = 0
+        self._build_cpu_profile_ms = 0.0
+        self._build_cpu_profile_dump_ms = 0.0
+        self._build_cpu_profile_error_count = 0
+        self._build_cpu_profile_skipped_count = 0
+        self._build_cpu_profile_top_cumtime_ms_max = 0.0
+        self._build_cpu_profile_batches = 0
+        self._build_cpu_profile_last_path = ""
         self._table_eviction_count = 0
         self._table_eviction_bytes = 0
         self._table_eviction_entries = 0
@@ -4688,6 +5079,14 @@ class GlobalHSpecTableGroup:
                 "hspec/build_queue_reject_mb": 0.0,
                 "hspec/build_timeout_discard": 0,
                 "hspec/build_timeout_unfinished_prompts": 0,
+                "hspec/build_cpu_profile_enabled": 0,
+                "hspec/build_cpu_profile_count": 0,
+                "hspec/build_cpu_profile_ms": 0.0,
+                "hspec/build_cpu_profile_dump_ms": 0.0,
+                "hspec/build_cpu_profile_error_count": 0,
+                "hspec/build_cpu_profile_skipped_count": 0,
+                "hspec/build_cpu_profile_top_cumtime_ms_max": 0.0,
+                "hspec/build_cpu_profile_batches": 0,
                 "hspec/table_active_bytes": 0,
                 "hspec/table_active_prompts": 0,
                 "hspec/table_active_entries": 0,
@@ -4728,6 +5127,8 @@ class GlobalHSpecTableGroup:
             "proposer_batch_cache_npu_bytes",
             "build_queue_lag_ms_max",
             "proposer_cache_load_ms_max",
+            "build_cpu_profile_enabled",
+            "build_cpu_profile_top_cumtime_ms_max",
         }
         for metrics in metrics_list:
             for key, value in metrics.items():
@@ -4845,6 +5246,15 @@ class GlobalHSpecTableGroup:
             "hspec/build_queue_reject_mb": agg.get("build_queue_reject_bytes", 0) / (1024 * 1024),
             "hspec/build_timeout_discard": agg.get("build_timeout_discard", 0),
             "hspec/build_timeout_unfinished_prompts": agg.get("build_timeout_unfinished_prompts", 0),
+            "hspec/build_cpu_profile_enabled": agg.get("build_cpu_profile_enabled", 0),
+            "hspec/build_cpu_profile_count": agg.get("build_cpu_profile_count", 0),
+            "hspec/build_cpu_profile_ms": agg.get("build_cpu_profile_ms", 0),
+            "hspec/build_cpu_profile_dump_ms": agg.get("build_cpu_profile_dump_ms", 0),
+            "hspec/build_cpu_profile_error_count": agg.get("build_cpu_profile_error_count", 0),
+            "hspec/build_cpu_profile_skipped_count": agg.get("build_cpu_profile_skipped_count", 0),
+            "hspec/build_cpu_profile_top_cumtime_ms_max": agg.get(
+                "build_cpu_profile_top_cumtime_ms_max", 0),
+            "hspec/build_cpu_profile_batches": agg.get("build_cpu_profile_batches", 0),
             "hspec/active_version": agg.get("active_version", 0),
             "hspec/num_prompts": agg.get("num_prompts", 0),
             "hspec/total_entries": agg.get("total_entries", 0),

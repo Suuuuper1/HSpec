@@ -384,6 +384,8 @@ class vLLMRollout(BaseRollout):
                 "num_speculative_tokens": self.config.get("hspec_num_speculative_tokens", 5),
                 "hspec_similarity_threshold": self.config.get("hspec_similarity_threshold", 0.9),
                 "hspec_min_match_len": self.config.get("hspec_min_match_len", 1),
+                "hspec_n_components": self.config.get("hspec_n_components", 64),
+                "hspec_max_entries_per_prompt": self.config.get("hspec_max_entries_per_prompt", 10000),
             }
         else:
             speculative_config = None
