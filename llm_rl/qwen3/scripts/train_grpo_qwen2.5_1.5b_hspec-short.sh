@@ -26,6 +26,10 @@ export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 
 # HSpec_system optim switches.
+export HSPEC_RUN_UID="$(date -u '+%Y%m%dT%H%M%SZ')_$$"
+export HSPEC_STORE_DIR="/home/sharedata/xy_hspec/hspec_store/${RUN_NAME}/${HSPEC_RUN_UID}"
+export HSPEC_TABLE_STORE_DIR="/home/sharedata/xy_hspec/hspec_table_store/${RUN_NAME}/${HSPEC_RUN_UID}"
+mkdir -p "$HSPEC_STORE_DIR" "$HSPEC_TABLE_STORE_DIR"
 export HSPEC_LEGACY_DATAPROTO_HS="${HSPEC_LEGACY_DATAPROTO_HS:-0}"
 export HSPEC_STRICT_DESCRIPTOR_MODE="${HSPEC_STRICT_DESCRIPTOR_MODE:-1}"
 export HSPEC_STORE_DTYPE="${HSPEC_STORE_DTYPE:-float16}"
