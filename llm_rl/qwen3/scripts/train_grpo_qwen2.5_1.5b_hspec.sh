@@ -192,7 +192,7 @@ fi
 # Log/output path conventions.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/rl}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/logs}"
-export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-1.5b-64.txt}"
+export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-1.5b-64-debug2.txt}"
 mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
 hspec_maybe_clean_store_dirs
 

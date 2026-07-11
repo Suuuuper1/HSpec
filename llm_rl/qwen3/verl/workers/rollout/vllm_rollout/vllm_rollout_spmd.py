@@ -982,6 +982,12 @@ class vLLMRollout(BaseRollout):
                 meta_info["metrics"] = {
                     "hspec/raw_store_bytes": float(store_metrics.get("raw_store_bytes", 0)),
                     "hspec/desc_count": float(store_metrics.get("desc_count", 0)),
+                    "hspec/desc_multiextent_count": float(
+                        store_metrics.get("desc_multiextent_count", 0)),
+                    "hspec/desc_extent_total": float(
+                        store_metrics.get("desc_extent_total", 0)),
+                    "hspec/desc_extent_max": float(
+                        store_metrics.get("desc_extent_max", 0)),
                     "hspec/collect_dropped": float(store_metrics.get("collect_dropped", 0)),
                     "hspec/collect_dropped_empty": float(
                         store_metrics.get("collect_dropped_empty", 0)),
@@ -991,6 +997,8 @@ class vLLMRollout(BaseRollout):
                         store_metrics.get("collect_dropped_missing_offset", 0)),
                     "hspec/collect_dropped_align_mismatch": float(
                         store_metrics.get("collect_dropped_align_mismatch", 0)),
+                    "hspec/collect_dropped_unpaired_extent": float(
+                        store_metrics.get("collect_dropped_unpaired_extent", 0)),
                     "hspec/strict_descriptor_violation": float(
                         store_metrics.get("strict_descriptor_violation", 0)),
                     "hspec/legacy_payload_count": float(store_metrics.get("legacy_payload_count", 0)),

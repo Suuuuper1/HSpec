@@ -41,7 +41,8 @@ from vllm_ascend.spec_decode.hspec_store import (
     estimate_hspec_trajectory_bytes,
     hspec_record_store_metric,
     hspec_record_store_metric_max,
-    load_hspec_trajectory,
+    iter_hspec_hidden_tiles as iter_desc_hidden_tiles,
+    iter_hspec_token_chunks,
 )
 from vllm_ascend.spec_decode.hspec_table_store import (
     HSpecPromptTableDesc,
@@ -469,22 +470,12 @@ def iter_prompt_hidden_tiles(
         desc = coerce_hspec_desc(desc_obj)
         if int(desc.length) <= 0:
             continue
-        hs = None
-        tokens = None
-        try:
-            hs, tokens = load_hspec_trajectory(desc)
-            _close_memmap(tokens)
-            tokens = None
-            length = int(desc.length)
-            for start in range(0, length, int(tile_rows)):
-                stop = min(start + int(tile_rows), length)
-                tile = np.asarray(hs[start:stop], dtype=dtype_np, order="C")
-                yield desc, start, np.ascontiguousarray(tile)
-        finally:
-            if tokens is not None:
-                _close_memmap(tokens)
-            if hs is not None:
-                _close_memmap(hs)
+        for start, tile in iter_desc_hidden_tiles(
+            desc,
+            int(tile_rows),
+            dtype=dtype_np,
+        ):
+            yield desc, start, tile
 
 
 def compute_streaming_mean(
@@ -1027,56 +1018,76 @@ def build_prompt_table_to_store(
             token_cursor = 0
             with _threadpool_context(blas_threads):
                 for item in plan.items:
-                    raw_hs = None
-                    raw_tokens = None
-                    try:
-                        raw_hs, raw_tokens = load_hspec_trajectory(item.desc)
-                        length = int(item.length)
-                        n_add = int(item.n_entries)
-                        rollout_idx = int(item.rollout_idx)
-                        token_slice = np.asarray(raw_tokens[:length], dtype=np.int32)
-                        arrays["token_buffer"][token_cursor:token_cursor + length] = token_slice
-                        arrays["rollout_offset"][rollout_idx] = int(token_cursor)
-                        arrays["rollout_len"][rollout_idx] = int(length)
+                    length = int(item.length)
+                    n_add = int(item.n_entries)
+                    rollout_idx = int(item.rollout_idx)
+                    arrays["rollout_offset"][rollout_idx] = int(token_cursor)
+                    arrays["rollout_len"][rollout_idx] = int(length)
 
-                        row_end = row_cursor + n_add
-                        arrays["entry_rollout_idx"][row_cursor:row_end] = rollout_idx
-                        arrays["entry_offset"][row_cursor:row_end] = np.arange(
-                            1,
-                            n_add + 1,
-                            dtype=np.int32,
+                    token_written = 0
+                    for logical_start, token_chunk in iter_hspec_token_chunks(
+                        item.desc,
+                        dtype=np.int32,
+                    ):
+                        logical_start = int(logical_start)
+                        logical_stop = logical_start + int(token_chunk.shape[0])
+                        arrays["token_buffer"][
+                            token_cursor + logical_start:token_cursor + logical_stop
+                        ] = token_chunk
+                        token_written += int(token_chunk.shape[0])
+                    if token_written != length:
+                        raise RuntimeError(
+                            "HSpec token materialization length mismatch for prompt_id="
+                            f"{prompt_id} request_id={item.desc.request_id!r}: "
+                            f"token_written={token_written} length={length}"
                         )
-                        arrays["rewards"][row_cursor:row_end] = float(item.reward)
 
-                        for tile_start in range(0, n_add, int(config.tile_rows)):
-                            tile_stop = min(tile_start + int(config.tile_rows), n_add)
-                            t_projection = time.perf_counter()
-                            h_tile = np.asarray(
-                                raw_hs[tile_start:tile_stop],
-                                dtype=np.float32,
-                                order="C",
-                            )
-                            h_tile = np.ascontiguousarray(h_tile)
-                            z = (h_tile - mean_fp32) @ components_t
-                            metrics.projection_ms += float(
-                                (time.perf_counter() - t_projection) * 1000.0)
-                            keys_start = row_cursor + tile_start
-                            keys_stop = row_cursor + tile_stop
-                            arrays["keys"][keys_start:keys_stop] = z.astype(
-                                keys_dtype,
-                                copy=False,
-                            )
-                            metrics.projection_tile_count += 1
-                            tile_bytes = int(h_tile.nbytes)
-                            metrics.projection_processed_fp32_tile_bytes += tile_bytes
-                            metrics.processed_fp32_tile_bytes += tile_bytes
-                        row_cursor = row_end
-                        token_cursor += length
-                    finally:
-                        if raw_tokens is not None:
-                            _close_memmap(raw_tokens)
-                        if raw_hs is not None:
-                            _close_memmap(raw_hs)
+                    row_end = row_cursor + n_add
+                    arrays["entry_rollout_idx"][row_cursor:row_end] = rollout_idx
+                    arrays["entry_offset"][row_cursor:row_end] = np.arange(
+                        1,
+                        n_add + 1,
+                        dtype=np.int32,
+                    )
+                    arrays["rewards"][row_cursor:row_end] = float(item.reward)
+
+                    hidden_written = 0
+                    for tile_start, h_tile in iter_desc_hidden_tiles(
+                        item.desc,
+                        int(config.tile_rows),
+                        dtype=np.float32,
+                    ):
+                        tile_start = int(tile_start)
+                        if tile_start >= n_add:
+                            break
+                        valid_rows = min(int(h_tile.shape[0]), n_add - tile_start)
+                        if valid_rows <= 0:
+                            continue
+                        if valid_rows != int(h_tile.shape[0]):
+                            h_tile = np.ascontiguousarray(h_tile[:valid_rows], dtype=np.float32)
+                        t_projection = time.perf_counter()
+                        z = (h_tile - mean_fp32) @ components_t
+                        metrics.projection_ms += float(
+                            (time.perf_counter() - t_projection) * 1000.0)
+                        keys_start = row_cursor + tile_start
+                        keys_stop = keys_start + valid_rows
+                        arrays["keys"][keys_start:keys_stop] = z.astype(
+                            keys_dtype,
+                            copy=False,
+                        )
+                        metrics.projection_tile_count += 1
+                        tile_bytes = int(h_tile.nbytes)
+                        metrics.projection_processed_fp32_tile_bytes += tile_bytes
+                        metrics.processed_fp32_tile_bytes += tile_bytes
+                        hidden_written += valid_rows
+                    if hidden_written != n_add:
+                        raise RuntimeError(
+                            "HSpec hidden projection length mismatch for prompt_id="
+                            f"{prompt_id} request_id={item.desc.request_id!r}: "
+                            f"hidden_written={hidden_written} n_add={n_add}"
+                        )
+                    row_cursor = row_end
+                    token_cursor += length
             if row_cursor != int(plan.entry_count):
                 raise RuntimeError(
                     f"HSpec table row cursor mismatch for prompt_id={prompt_id}: "

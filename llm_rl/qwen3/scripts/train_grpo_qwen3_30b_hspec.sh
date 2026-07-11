@@ -203,7 +203,7 @@ TB_ROOT="${TB_ROOT:-${OUTPUT_ROOT}/tensorboard}"
 ROLLOUT_LENGTH_DIR="${ROLLOUT_LENGTH_DIR:-${ROLL_LEN_ROOT}/${RUN_NAME}}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${TB_ROOT}/${RUN_NAME}}"
 ROLLOUT_LOG_PATH="${ROLLOUT_LOG_PATH:-${LOG_DIR}/${RUN_NAME}.log}"
-OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b-test.txt}"
+OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-30b-test3.txt}"
 
 mkdir -p "${LOG_DIR}" "${ROLL_LEN_ROOT}" "${TB_ROOT}" "${ROLLOUT_LENGTH_DIR}" "$(dirname "${OUT}")"
 hspec_maybe_clean_store_dirs

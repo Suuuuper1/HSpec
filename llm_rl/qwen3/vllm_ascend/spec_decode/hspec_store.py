@@ -31,7 +31,7 @@ import socket
 import tempfile
 import threading
 import time
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Iterator, Optional
 
 import numpy as np
 import torch
@@ -57,6 +57,7 @@ _store_metrics: Dict[str, int] = {
     "collect_dropped_invalid_dim": 0,
     "collect_dropped_missing_offset": 0,
     "collect_dropped_align_mismatch": 0,
+    "collect_dropped_unpaired_extent": 0,
     "store_fp16_rows": 0,
     "source_dtype_fp16_rows": 0,
     "source_dtype_bf16_rows": 0,
@@ -157,6 +158,10 @@ _store_metrics: Dict[str, int] = {
     "table_build_projection_processed_fp32_tile_bytes": 0,
     "table_build_processed_fp32_tile_bytes": 0,
     "table_build_error_count": 0,
+    "desc_multiextent_count": 0,
+    "desc_extent_total": 0,
+    "desc_extent_max": 0,
+    "desc_extent_coalesced_count": 0,
 }
 
 
@@ -548,6 +553,47 @@ def collect_hspec_store_metrics(reset: bool = True) -> Dict[str, int]:
 
 
 @dataclass(frozen=True)
+class HSpecTrajectoryExtent:
+    hs_offset_rows: int
+    token_offset: int
+    length: int
+
+    def __post_init__(self) -> None:
+        hs_offset_rows = int(self.hs_offset_rows)
+        token_offset = int(self.token_offset)
+        length = int(self.length)
+        if hs_offset_rows < 0:
+            raise ValueError(
+                f"HSpecTrajectoryExtent.hs_offset_rows must be >= 0, got {hs_offset_rows}"
+            )
+        if token_offset < 0:
+            raise ValueError(
+                f"HSpecTrajectoryExtent.token_offset must be >= 0, got {token_offset}"
+            )
+        if length <= 0:
+            raise ValueError(
+                f"HSpecTrajectoryExtent.length must be > 0, got {length}"
+            )
+        object.__setattr__(self, "hs_offset_rows", hs_offset_rows)
+        object.__setattr__(self, "token_offset", token_offset)
+        object.__setattr__(self, "length", length)
+
+    @classmethod
+    def from_obj(cls, obj: Any) -> "HSpecTrajectoryExtent":
+        if isinstance(obj, cls):
+            return obj
+        if isinstance(obj, dict):
+            return cls(
+                hs_offset_rows=int(obj["hs_offset_rows"]),
+                token_offset=int(obj["token_offset"]),
+                length=int(obj["length"]),
+            )
+        raise TypeError(
+            f"Expected HSpecTrajectoryExtent or dict, got {type(obj)!r}"
+        )
+
+
+@dataclass(frozen=True)
 class HSpecTrajectoryDesc:
     epoch: int
     global_step: int
@@ -558,14 +604,64 @@ class HSpecTrajectoryDesc:
     request_id: str
     prompt_id: str
     hs_path: str
-    hs_offset_rows: int
     token_path: str
-    token_offset: int
     length: int
     hidden_dim: int
     hs_dtype: str
     token_dtype: str
+    chunk_count: int = 1
+    extents: tuple[HSpecTrajectoryExtent, ...] | None = None
+    hs_offset_rows: int = 0
+    token_offset: int = 0
     reward: float | None = None
+
+    def __post_init__(self) -> None:
+        length = int(self.length)
+        if length < 0:
+            raise ValueError(
+                f"HSpecTrajectoryDesc.length must be >= 0, got {length}"
+            )
+        hidden_dim = int(self.hidden_dim)
+        if hidden_dim < 0:
+            raise ValueError(
+                f"HSpecTrajectoryDesc.hidden_dim must be >= 0, got {hidden_dim}"
+            )
+        hs_offset_rows = int(self.hs_offset_rows)
+        token_offset = int(self.token_offset)
+        chunk_count = int(self.chunk_count)
+        if hs_offset_rows < 0:
+            raise ValueError(
+                f"HSpecTrajectoryDesc.hs_offset_rows must be >= 0, got {hs_offset_rows}"
+            )
+        if token_offset < 0:
+            raise ValueError(
+                f"HSpecTrajectoryDesc.token_offset must be >= 0, got {token_offset}"
+            )
+        norm_extents: tuple[HSpecTrajectoryExtent, ...] | None = None
+        if self.extents:
+            norm_extents = tuple(
+                HSpecTrajectoryExtent.from_obj(item) for item in self.extents
+            )
+            if norm_extents:
+                total_len = sum(int(ext.length) for ext in norm_extents)
+                if length not in (0, total_len):
+                    raise ValueError(
+                        "HSpecTrajectoryDesc.length/extents mismatch: "
+                        f"length={length} ext_total={total_len}"
+                    )
+                first = norm_extents[0]
+                hs_offset_rows = int(first.hs_offset_rows)
+                token_offset = int(first.token_offset)
+                length = total_len
+                chunk_count = len(norm_extents)
+        if norm_extents is None:
+            chunk_count = max(chunk_count, 1)
+        object.__setattr__(self, "length", length)
+        object.__setattr__(self, "hidden_dim", hidden_dim)
+        object.__setattr__(self, "hs_offset_rows", hs_offset_rows)
+        object.__setattr__(self, "token_offset", token_offset)
+        object.__setattr__(self, "chunk_count", chunk_count)
+        object.__setattr__(self, "extents", norm_extents)
 
     def with_updates(self, **kwargs: Any) -> "HSpecTrajectoryDesc":
         return replace(self, **kwargs)
@@ -577,6 +673,31 @@ def coerce_hspec_desc(obj: Any) -> HSpecTrajectoryDesc:
     if isinstance(obj, dict):
         return HSpecTrajectoryDesc(**obj)
     raise TypeError(f"Expected HSpecTrajectoryDesc or dict, got {type(obj)!r}")
+
+
+def hspec_desc_extents(
+    desc_obj: HSpecTrajectoryDesc | Dict[str, Any],
+) -> tuple[HSpecTrajectoryExtent, ...]:
+    desc = coerce_hspec_desc(desc_obj)
+    if desc.extents:
+        extents = tuple(desc.extents)
+    else:
+        if int(desc.length) <= 0:
+            return ()
+        extents = (
+            HSpecTrajectoryExtent(
+                hs_offset_rows=int(desc.hs_offset_rows),
+                token_offset=int(desc.token_offset),
+                length=int(desc.length),
+            ),
+        )
+    total_len = sum(int(ext.length) for ext in extents)
+    if total_len != int(desc.length):
+        raise ValueError(
+            "HSpec descriptor extents do not sum to length: "
+            f"request_id={desc.request_id!r} length={desc.length} ext_total={total_len}"
+        )
+    return extents
 
 
 @dataclass(frozen=True)
@@ -633,7 +754,7 @@ class HSpecLocalCollector:
 
     Hidden states are written as fp16 rows. Tokens are written as int32.
     Storage is per-worker append-only segment per batch, while each request
-    keeps a contiguous row/token slice via offsets in the descriptor.
+    records one or more logical extents into the shared segment files.
     """
 
     def __init__(self) -> None:
@@ -934,6 +1055,9 @@ class HSpecLocalCollector:
             "token_len": 0,
             "hs_offset_rows": None,
             "token_offset": None,
+            "extents": [],
+            "pending_hidden_segments": [],
+            "pending_token_segments": [],
         }
         self._req_states[req_id] = state
         return state
@@ -1160,13 +1284,17 @@ class HSpecLocalCollector:
                 f"HSpec hidden dtype mismatch for {req_id}: "
                 f"{state['hs_dtype']} vs {hs_dtype}"
             )
+        segment_hs_offset_rows = int(self._segment_hs_rows)
         if state["hs_offset_rows"] is None:
-            state["hs_offset_rows"] = int(self._segment_hs_rows)
+            state["hs_offset_rows"] = segment_hs_offset_rows
         if self._segment_hs_fh is None:
             self._segment_hs_fh = open(self._segment_hs_path, "ab")
         self._segment_hs_fh.write(rows_np.tobytes(order="C"))
         state["hs_rows"] += rows_count
         self._segment_hs_rows += rows_count
+        pending_hidden = state.setdefault("pending_hidden_segments", [])
+        pending_hidden.append((segment_hs_offset_rows, rows_count))
+        self._pair_pending_segments_locked(state)
         _metric_add("raw_store_bytes", int(rows_np.nbytes))
         _metric_add("store_fp16_rows", rows_count)
         if "bfloat16" in source_dtype:
@@ -1181,14 +1309,86 @@ class HSpecLocalCollector:
         state: Dict[str, Any],
         token_np: np.ndarray,
     ) -> None:
+        segment_token_offset = int(self._segment_token_len)
         if state["token_offset"] is None:
-            state["token_offset"] = int(self._segment_token_len)
+            state["token_offset"] = segment_token_offset
         if self._segment_token_fh is None:
             self._segment_token_fh = open(self._segment_token_path, "ab")
         self._segment_token_fh.write(token_np.tobytes(order="C"))
         state["token_len"] += int(token_np.shape[0])
         self._segment_token_len += int(token_np.shape[0])
+        pending_token = state.setdefault("pending_token_segments", [])
+        pending_token.append((segment_token_offset, int(token_np.shape[0])))
+        self._pair_pending_segments_locked(state)
         _metric_add("raw_store_bytes", int(token_np.nbytes))
+
+    @staticmethod
+    def _append_extent_locked(
+        state: Dict[str, Any],
+        hs_offset_rows: int,
+        token_offset: int,
+        length: int,
+    ) -> None:
+        if int(length) <= 0:
+            return
+        extents: list[HSpecTrajectoryExtent] = state.setdefault("extents", [])
+        new_extent = HSpecTrajectoryExtent(
+            hs_offset_rows=int(hs_offset_rows),
+            token_offset=int(token_offset),
+            length=int(length),
+        )
+        if extents:
+            prev = extents[-1]
+            if (
+                int(prev.hs_offset_rows) + int(prev.length) == int(new_extent.hs_offset_rows)
+                and int(prev.token_offset) + int(prev.length) == int(new_extent.token_offset)
+            ):
+                extents[-1] = HSpecTrajectoryExtent(
+                    hs_offset_rows=int(prev.hs_offset_rows),
+                    token_offset=int(prev.token_offset),
+                    length=int(prev.length) + int(new_extent.length),
+                )
+                _metric_add("desc_extent_coalesced_count", 1)
+                return
+        extents.append(new_extent)
+
+    def _pair_pending_segments_locked(self, state: Dict[str, Any]) -> None:
+        pending_hidden: list[tuple[int, int]] = state.setdefault(
+            "pending_hidden_segments", []
+        )
+        pending_token: list[tuple[int, int]] = state.setdefault(
+            "pending_token_segments", []
+        )
+        while pending_hidden and pending_token:
+            hs_offset_rows, hs_len = pending_hidden[0]
+            token_offset, tok_len = pending_token[0]
+            take = min(int(hs_len), int(tok_len))
+            if take <= 0:
+                if int(hs_len) <= 0:
+                    pending_hidden.pop(0)
+                if int(tok_len) <= 0:
+                    pending_token.pop(0)
+                continue
+            self._append_extent_locked(
+                state,
+                hs_offset_rows=hs_offset_rows,
+                token_offset=token_offset,
+                length=take,
+            )
+            if int(hs_len) == take:
+                pending_hidden.pop(0)
+            else:
+                pending_hidden[0] = (
+                    int(hs_offset_rows) + take,
+                    int(hs_len) - take,
+                )
+            if int(tok_len) == take:
+                pending_token.pop(0)
+            else:
+                pending_token[0] = (
+                    int(token_offset) + take,
+                    int(tok_len) - take,
+                )
 
     def flush_descriptors(
         self,
@@ -1214,6 +1414,9 @@ class HSpecLocalCollector:
                 hs_dtype = str(state.get("hs_dtype") or get_hspec_store_dtype())
                 hs_offset_rows = state.get("hs_offset_rows")
                 token_offset = state.get("token_offset")
+                extents = tuple(state.get("extents", ()))
+                pending_hidden = list(state.get("pending_hidden_segments", ()))
+                pending_token = list(state.get("pending_token_segments", ()))
                 if hs_rows <= 0 or token_len <= 0:
                     _record_collect_drop("empty")
                     dropped_count += 1
@@ -1237,6 +1440,17 @@ class HSpecLocalCollector:
                     _record_collect_drop("missing_offset")
                     dropped_count += 1
                     continue
+                if pending_hidden or pending_token:
+                    logger.warning(
+                        "HSpec descriptor has unpaired extents: req_id=%s "
+                        "pending_hidden=%s pending_token=%s; dropping",
+                        req_id,
+                        pending_hidden,
+                        pending_token,
+                    )
+                    _record_collect_drop("unpaired_extent")
+                    dropped_count += 1
+                    continue
                 if hs_rows != token_len:
                     logger.warning(
                         "HSpec descriptor alignment mismatch: req_id=%s hs_rows=%d token_len=%d; dropping",
@@ -1247,6 +1461,29 @@ class HSpecLocalCollector:
                     _record_collect_drop("align_mismatch")
                     dropped_count += 1
                     continue
+                if not extents:
+                    logger.warning(
+                        "HSpec descriptor missing extents after paired writes: req_id=%s hs_rows=%d token_len=%d; dropping",
+                        req_id,
+                        hs_rows,
+                        token_len,
+                    )
+                    _record_collect_drop("missing_offset")
+                    dropped_count += 1
+                    continue
+                ext_total = sum(int(ext.length) for ext in extents)
+                if ext_total != hs_rows:
+                    logger.warning(
+                        "HSpec descriptor extent total mismatch: req_id=%s ext_total=%d hs_rows=%d token_len=%d; dropping",
+                        req_id,
+                        ext_total,
+                        hs_rows,
+                        token_len,
+                    )
+                    _record_collect_drop("align_mismatch")
+                    dropped_count += 1
+                    continue
+                first_extent = extents[0]
 
                 prompt_id = str(request_id_to_prompt_id.get(req_id, ""))
                 shard_id = _stable_partition_id(prompt_id or req_id, get_hspec_num_shards())
@@ -1260,17 +1497,23 @@ class HSpecLocalCollector:
                     request_id=str(req_id),
                     prompt_id=prompt_id,
                     hs_path=str(state["hs_path"]),
-                    hs_offset_rows=int(hs_offset_rows),
                     token_path=str(state["token_path"]),
-                    token_offset=int(token_offset),
                     length=hs_rows,
                     hidden_dim=hidden_dim,
                     hs_dtype=hs_dtype,
                     token_dtype="int32",
+                    chunk_count=len(extents),
+                    extents=extents,
+                    hs_offset_rows=int(first_extent.hs_offset_rows),
+                    token_offset=int(first_extent.token_offset),
                     reward=None,
                 )
                 descs[req_id] = desc
                 self._append_manifest(desc)
+                _metric_add("desc_extent_total", len(extents))
+                hspec_record_store_metric_max("desc_extent_max", len(extents))
+                if len(extents) > 1:
+                    _metric_add("desc_multiextent_count", 1)
 
             self._flush_and_close_segment_files_locked()
             segment_status = "sealed" if descs else "gc_deletable"
@@ -1367,30 +1610,215 @@ def hspec_record_collect_budget_reject(
         )
 
 
-def load_hspec_trajectory(
+def _open_hidden_memmap_for_desc(desc: HSpecTrajectoryDesc) -> np.memmap:
+    hs_dtype = np.dtype(desc.hs_dtype)
+    row_bytes = int(desc.hidden_dim) * hs_dtype.itemsize
+    if row_bytes <= 0:
+        raise ValueError(
+            f"HSpec descriptor has invalid hidden row bytes: hidden_dim={desc.hidden_dim} hs_dtype={desc.hs_dtype}"
+        )
+    hs_file_size = os.path.getsize(desc.hs_path)
+    if hs_file_size % row_bytes != 0:
+        raise ValueError(
+            f"HSpec hs file size is not aligned to hidden rows: path={desc.hs_path} "
+            f"size={hs_file_size} row_bytes={row_bytes}"
+        )
+    total_rows = hs_file_size // row_bytes
+    return np.memmap(
+        desc.hs_path,
+        dtype=hs_dtype,
+        mode="r",
+        shape=(int(total_rows), int(desc.hidden_dim)),
+        order="C",
+    )
+
+
+def _open_token_memmap_for_desc(desc: HSpecTrajectoryDesc) -> np.memmap:
+    token_dtype = np.dtype(desc.token_dtype)
+    token_itemsize = token_dtype.itemsize
+    if token_itemsize <= 0:
+        raise ValueError(
+            f"HSpec descriptor has invalid token dtype itemsize: token_dtype={desc.token_dtype}"
+        )
+    token_file_size = os.path.getsize(desc.token_path)
+    if token_file_size % token_itemsize != 0:
+        raise ValueError(
+            f"HSpec token file size is not aligned to token dtype: path={desc.token_path} "
+            f"size={token_file_size} itemsize={token_itemsize}"
+        )
+    total_tokens = token_file_size // token_itemsize
+    return np.memmap(
+        desc.token_path,
+        dtype=token_dtype,
+        mode="r",
+        shape=(int(total_tokens),),
+        order="C",
+    )
+
+
+def iter_hspec_hidden_tiles(
     desc_obj: HSpecTrajectoryDesc | Dict[str, Any],
+    tile_rows: int,
+    *,
+    dtype: np.dtype | str = np.float32,
+) -> Iterator[tuple[int, np.ndarray]]:
+    """Yield logical hidden-state tiles for a descriptor in trajectory order."""
+    desc = coerce_hspec_desc(desc_obj)
+    if int(tile_rows) <= 0:
+        raise ValueError(f"tile_rows must be > 0, got {tile_rows}")
+    if desc.length <= 0:
+        return
+    extents = hspec_desc_extents(desc)
+    dtype_np = np.dtype(dtype)
+    hs_mm = None
+    logical_start = 0
+    try:
+        hs_mm = _open_hidden_memmap_for_desc(desc)
+        total_rows = int(hs_mm.shape[0])
+        for ext in extents:
+            hs_start = int(ext.hs_offset_rows)
+            hs_stop = hs_start + int(ext.length)
+            if hs_stop > total_rows:
+                raise ValueError(
+                    "HSpec extent exceeds hidden-state file bounds: "
+                    f"request_id={desc.request_id!r} hs_stop={hs_stop} total_rows={total_rows}"
+                )
+            for local_start in range(0, int(ext.length), int(tile_rows)):
+                local_stop = min(local_start + int(tile_rows), int(ext.length))
+                tile = np.asarray(
+                    hs_mm[hs_start + local_start:hs_start + local_stop],
+                    dtype=dtype_np,
+                    order="C",
+                )
+                yield logical_start + local_start, np.ascontiguousarray(tile)
+            logical_start += int(ext.length)
+    finally:
+        if hs_mm is not None:
+            mmap_obj = getattr(hs_mm, "_mmap", None)
+            if mmap_obj is not None:
+                mmap_obj.close()
+
+
+def iter_hspec_token_chunks(
+    desc_obj: HSpecTrajectoryDesc | Dict[str, Any],
+    *,
+    dtype: np.dtype | str = np.int32,
+) -> Iterator[tuple[int, np.ndarray]]:
+    """Yield logical token chunks for a descriptor in trajectory order."""
+    desc = coerce_hspec_desc(desc_obj)
+    if desc.length <= 0:
+        return
+    extents = hspec_desc_extents(desc)
+    dtype_np = np.dtype(dtype)
+    token_mm = None
+    logical_start = 0
+    try:
+        token_mm = _open_token_memmap_for_desc(desc)
+        total_tokens = int(token_mm.shape[0])
+        for ext in extents:
+            token_start = int(ext.token_offset)
+            token_stop = token_start + int(ext.length)
+            if token_stop > total_tokens:
+                raise ValueError(
+                    "HSpec extent exceeds token file bounds: "
+                    f"request_id={desc.request_id!r} token_stop={token_stop} total_tokens={total_tokens}"
+                )
+            chunk = np.asarray(
+                token_mm[token_start:token_stop],
+                dtype=dtype_np,
+                order="C",
+            )
+            yield logical_start, np.ascontiguousarray(chunk)
+            logical_start += int(ext.length)
+    finally:
+        if token_mm is not None:
+            mmap_obj = getattr(token_mm, "_mmap", None)
+            if mmap_obj is not None:
+                mmap_obj.close()
+
+
+def materialize_hspec_trajectory(
+    desc_obj: HSpecTrajectoryDesc | Dict[str, Any],
+    *,
+    hidden_dtype: np.dtype | str = np.float16,
+    token_dtype: np.dtype | str = np.int32,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return mmap-backed hidden states and token ids for a descriptor."""
+    """Materialize a descriptor into contiguous hidden/token arrays.
+
+    This helper is intended for debug/validation or compatibility paths.
+    Production build paths should prefer the extent-aware iterators to avoid
+    extra copies.
+    """
     desc = coerce_hspec_desc(desc_obj)
     if desc.length <= 0:
         raise ValueError(f"HSpec descriptor has non-positive length: {desc.length}")
     if desc.hidden_dim <= 0:
         raise ValueError(f"HSpec descriptor has invalid hidden_dim: {desc.hidden_dim}")
+    hs_dtype = np.dtype(hidden_dtype)
+    tok_dtype = np.dtype(token_dtype)
+    hs_out = np.empty((int(desc.length), int(desc.hidden_dim)), dtype=hs_dtype)
+    tok_out = np.empty((int(desc.length),), dtype=tok_dtype)
+    tile_rows = max(1, min(int(desc.length), 4096))
+    hs_written = 0
+    for logical_start, tile in iter_hspec_hidden_tiles(desc, tile_rows, dtype=hs_dtype):
+        logical_stop = int(logical_start) + int(tile.shape[0])
+        hs_out[logical_start:logical_stop] = tile
+        hs_written += int(tile.shape[0])
+    tok_written = 0
+    for logical_start, chunk in iter_hspec_token_chunks(desc, dtype=tok_dtype):
+        logical_stop = int(logical_start) + int(chunk.shape[0])
+        tok_out[logical_start:logical_stop] = chunk
+        tok_written += int(chunk.shape[0])
+    if hs_written != int(desc.length) or tok_written != int(desc.length):
+        raise RuntimeError(
+            "HSpec materialized trajectory length mismatch: "
+            f"request_id={desc.request_id!r} hs_written={hs_written} tok_written={tok_written} "
+            f"expected={desc.length}"
+        )
+    return hs_out, tok_out
+
+
+def load_hspec_trajectory(
+    desc_obj: HSpecTrajectoryDesc | Dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return hidden states and token ids for a descriptor.
+
+    Single-extent descriptors use zero-copy memmap slices. Multi-extent
+    descriptors are materialized into contiguous arrays for compatibility.
+    Production build paths should prefer the extent-aware iterators.
+    """
+    desc = coerce_hspec_desc(desc_obj)
+    if desc.length <= 0:
+        raise ValueError(f"HSpec descriptor has non-positive length: {desc.length}")
+    if desc.hidden_dim <= 0:
+        raise ValueError(f"HSpec descriptor has invalid hidden_dim: {desc.hidden_dim}")
+    extents = hspec_desc_extents(desc)
+    if not extents:
+        raise ValueError(
+            f"HSpec descriptor has no extents: request_id={desc.request_id!r}"
+        )
     if int(desc.hs_offset_rows) < 0:
         raise ValueError(f"HSpec descriptor has negative hs_offset_rows: {desc.hs_offset_rows}")
     if int(desc.token_offset) < 0:
         raise ValueError(f"HSpec descriptor has negative token_offset: {desc.token_offset}")
-
-    hs_dtype = np.dtype(desc.hs_dtype)
-    token_dtype = np.dtype(desc.token_dtype)
-    hs_offset = int(desc.hs_offset_rows) * int(desc.hidden_dim) * hs_dtype.itemsize
-    token_offset = int(desc.token_offset) * token_dtype.itemsize
-    hs_bytes = int(desc.length) * int(desc.hidden_dim) * hs_dtype.itemsize
-    token_bytes = int(desc.length) * token_dtype.itemsize
     if not os.path.exists(desc.hs_path):
         raise FileNotFoundError(desc.hs_path)
     if not os.path.exists(desc.token_path):
         raise FileNotFoundError(desc.token_path)
+    if len(extents) > 1:
+        return materialize_hspec_trajectory(
+            desc,
+            hidden_dtype=desc.hs_dtype,
+            token_dtype=desc.token_dtype,
+        )
+
+    extent = extents[0]
+    hs_dtype = np.dtype(desc.hs_dtype)
+    token_dtype = np.dtype(desc.token_dtype)
+    hs_offset = int(extent.hs_offset_rows) * int(desc.hidden_dim) * hs_dtype.itemsize
+    token_offset = int(extent.token_offset) * token_dtype.itemsize
+    hs_bytes = int(extent.length) * int(desc.hidden_dim) * hs_dtype.itemsize
+    token_bytes = int(extent.length) * token_dtype.itemsize
     if os.path.getsize(desc.hs_path) < hs_offset + hs_bytes:
         raise ValueError(
             f"HSpec hs file too small: path={desc.hs_path} "
@@ -1406,7 +1834,7 @@ def load_hspec_trajectory(
         dtype=hs_dtype,
         mode="r",
         offset=hs_offset,
-        shape=(int(desc.length), int(desc.hidden_dim)),
+        shape=(int(extent.length), int(desc.hidden_dim)),
         order="C",
     )
     tokens = np.memmap(
@@ -1414,7 +1842,7 @@ def load_hspec_trajectory(
         dtype=token_dtype,
         mode="r",
         offset=token_offset,
-        shape=(int(desc.length),),
+        shape=(int(extent.length),),
         order="C",
     )
     return hs, tokens
