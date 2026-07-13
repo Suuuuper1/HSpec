@@ -252,6 +252,8 @@ def _lookup_hspec_store_payload(
 def _hspec_prefetch_rollout_prompts(
     inference_engine: LLM,
     vllm_inputs: list[dict[str, Any]],
+    *,
+    max_num_seqs: int,
 ) -> None:
     """Warm worker-local HSpec proposer caches before scheduling starts.
 
@@ -263,11 +265,23 @@ def _hspec_prefetch_rollout_prompts(
     if os.getenv("HSPEC_FULL_BATCH_PREFETCH", "1") == "0":
         return
 
-    prompt_ids = [
-        prompt_id_from_token_ids(list(input_data.get("prompt_token_ids", [])))
-        for input_data in vllm_inputs
-        if input_data.get("prompt_token_ids")
-    ]
+    waves_ahead = max(int(os.getenv("HSPEC_PREFETCH_WAVES_AHEAD", "1")), 1)
+    hard_cap = max(int(os.getenv("HSPEC_PREFETCH_MAX_PROMPTS", "0")), 0)
+    prefetch_limit = max(int(max_num_seqs), 1) * waves_ahead
+    if hard_cap > 0:
+        prefetch_limit = min(prefetch_limit, hard_cap)
+
+    prompt_ids: list[str] = []
+    seen_prompt_ids: set[str] = set()
+    for input_data in vllm_inputs[:prefetch_limit]:
+        prompt_token_ids = input_data.get("prompt_token_ids", [])
+        if not prompt_token_ids:
+            continue
+        prompt_id = prompt_id_from_token_ids(list(prompt_token_ids))
+        if not prompt_id or prompt_id in seen_prompt_ids:
+            continue
+        seen_prompt_ids.add(prompt_id)
+        prompt_ids.append(prompt_id)
     if not prompt_ids:
         return
 
@@ -691,10 +705,18 @@ class vLLMRollout(BaseRollout):
         try:
             with self.update_sampling_params(**kwargs):
                 if use_hspec:
+                    try:
+                        self.inference_engine.llm_engine.collective_rpc(
+                            "hspec_begin_prefetch_window",
+                            args=(),
+                        )
+                    except Exception:
+                        logger.debug("HSpec prefetch window reset failed", exc_info=True)
                     with hspec_record_function("hspec/rollout/full_batch_prefetch"):
                         _hspec_prefetch_rollout_prompts(
                             self.inference_engine,
                             vllm_inputs,
+                            max_num_seqs=int(self.config.max_num_seqs),
                         )
                 with hspec_record_function("hspec/rollout/engine_generate", use_npu_stream=True):
                     outputs = self.inference_engine.generate(

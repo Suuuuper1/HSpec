@@ -20,6 +20,7 @@ import os
 import time
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
@@ -132,6 +133,16 @@ def _now_ns() -> int:
 
 def _ns_to_ms(ns: int) -> float:
     return float(ns) / 1_000_000.0
+
+
+@dataclass(frozen=True)
+class HSpecPrefetchDecision:
+    allow: bool
+    reason: str
+    estimated_cpu_bytes: int
+    estimated_entries: int
+    estimated_token_bytes: int
+    estimated_match_cost: int = 0
 
 
 def _close_hspec_memmap(array: np.ndarray | None) -> None:
@@ -527,6 +538,20 @@ class HSpecProposer(Proposer):
             "HSPEC_MAX_READY_PREFETCH_MATERIALIZE", 0, 0)
         self._max_ready_prefetch_bytes: int = _get_env_int(
             "HSPEC_MAX_READY_PREFETCH_BYTES", 0, 0)
+        self._prefetch_window_max_bytes: int = _get_env_int(
+            "HSPEC_PROPOSER_PREFETCH_WINDOW_MAX_BYTES",
+            (
+                int(self._max_ready_prefetch_bytes) * 4
+                if int(self._max_ready_prefetch_bytes) > 0 else 0
+            ),
+            0,
+        )
+        self._max_prompt_cpu_bytes: int = _get_env_int(
+            "HSPEC_PROPOSER_MAX_PROMPT_CPU_BYTES", 64 * 1024 * 1024, 0)
+        self._max_prompt_entries: int = _get_env_int(
+            "HSPEC_PROPOSER_MAX_PROMPT_ENTRIES", 32768, 0)
+        self._max_prompt_token_bytes: int = _get_env_int(
+            "HSPEC_PROPOSER_MAX_PROMPT_TOKEN_BYTES", 0, 0)
         self._batch_cache_prebuild: bool = (
             os.environ.get("HSPEC_PROPOSER_BATCH_CACHE_PREBUILD", "1") != "0"
         )
@@ -535,6 +560,10 @@ class HSpecProposer(Proposer):
         )
         self._batch_cache_max_npu_bytes: int = _get_env_int(
             "HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES", 0, 0)
+        self._batch_cache_max_total_entries: int = _get_env_int(
+            "HSPEC_PROPOSER_BATCH_CACHE_MAX_TOTAL_ENTRIES", 131072, 0)
+        self._batch_cache_max_bmm_elems: int = _get_env_int(
+            "HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS", 134217728, 0)
         self._batch_cache_copy_stream: Optional[Any] = None
         self._batch_cache_copy_stream_disabled: bool = False
         self._prefix_cache_enabled: bool = (
@@ -573,6 +602,11 @@ class HSpecProposer(Proposer):
         # resolves to (version, {pid: table_data | None}).
         self._pending_fetches: List[tuple] = []
         self._pending_pids: Set[str] = set()
+        self._online_disabled: Dict[str, tuple[int, str]] = {}
+        self._prefetch_window_active: bool = False
+        self._prefetch_window_materialized_bytes: int = 0
+        self._prefetch_window_generation: int = 0
+        self._prefetch_window_deferred: Set[str] = set()
         # Worker-local prompt baseline window priors. These survive cache
         # invalidation / epoch swap and are re-applied when the next version of
         # the same prompt is prefetched into the local cache.
@@ -676,7 +710,10 @@ class HSpecProposer(Proposer):
             "abs_delta_cap=%s safe<=%d mid<=%d mid_cap=%d far_cap=%d hot_path_strict=%s "
             "cache_max_cpu_bytes=%d cache_max_npu_bytes=%d cache_max_entries=%d "
             "max_ready_prefetch_materialize=%d max_ready_prefetch_bytes=%d "
+            "prefetch_window_max_bytes=%d max_prompt_cpu_bytes=%d max_prompt_entries=%d "
+            "max_prompt_token_bytes=%d "
             "batch_cache_prebuild=%s allow_hot_batch_cache_build=%s batch_cache_max_npu_bytes=%d "
+            "batch_cache_max_total_entries=%d batch_cache_max_bmm_elems=%d "
             "prefix_cache=%s store_per_prompt_npu=%s keys_cpu_dtype=%s keys_device_dtype=%s",
             self.similarity_threshold,
             self.max_draft_tokens,
@@ -697,9 +734,15 @@ class HSpecProposer(Proposer):
             int(self._cache_max_entries),
             int(self._max_ready_prefetch_materialize),
             int(self._max_ready_prefetch_bytes),
+            int(self._prefetch_window_max_bytes),
+            int(self._max_prompt_cpu_bytes),
+            int(self._max_prompt_entries),
+            int(self._max_prompt_token_bytes),
             str(bool(self._batch_cache_prebuild)),
             str(bool(self._allow_hot_batch_cache_build)),
             int(self._batch_cache_max_npu_bytes),
+            int(self._batch_cache_max_total_entries),
+            int(self._batch_cache_max_bmm_elems),
             str(bool(self._prefix_cache_enabled)),
             str(bool(self._store_per_prompt_npu)),
             str(self._keys_cpu_dtype_mode),
@@ -729,12 +772,13 @@ class HSpecProposer(Proposer):
         fetch_prompt_ids = [pid for pid in prompt_ids if pid]
         if not fetch_prompt_ids:
             return
+        self._ensure_prefetch_window()
 
         # Consume any futures that became ready since last call. This happens
         # before the model forward, so descriptor mmap/H2D work stays outside
         # the proposal hot path.
-        self._poll_pending(materialize_ready=True,
-                           priority_prompt_ids=fetch_prompt_ids)
+        self._poll_pending_governed(materialize_ready=True,
+                                    priority_prompt_ids=fetch_prompt_ids)
         if self._batch_cache_prebuild:
             self._prepare_batched_table_cache(
                 req_ids,
@@ -773,9 +817,10 @@ class HSpecProposer(Proposer):
                              exc_info=True)
         if not prompt_ids:
             return 0
+        self._ensure_prefetch_window()
 
-        self._poll_pending(materialize_ready=True,
-                           priority_prompt_ids=prompt_ids)
+        self._poll_pending_governed(materialize_ready=True,
+                                    priority_prompt_ids=prompt_ids)
         for pid in set(prompt_ids):
             self._not_in_table.discard(pid)
         before = len(self._pending_pids)
@@ -793,15 +838,172 @@ class HSpecProposer(Proposer):
         prompt_ids = [str(pid) for pid in prompt_ids if pid]
         if not prompt_ids:
             return 0
+        self._ensure_prefetch_window()
 
-        self._poll_pending(materialize_ready=True,
-                           priority_prompt_ids=prompt_ids)
+        self._poll_pending_governed(materialize_ready=True,
+                                    priority_prompt_ids=prompt_ids)
         for pid in set(prompt_ids):
             self._not_in_table.discard(pid)
         before = len(self._pending_pids)
         self._fire_prefetch_async(prompt_ids, include_absent=True)
         self._maybe_report_metrics(force_proposer_metrics=True)
         return max(len(self._pending_pids) - before, 0)
+
+    def begin_prefetch_window(self) -> None:
+        """Reset per-rollout prefetch materialization state."""
+        self._prefetch_window_active = True
+        self._prefetch_window_materialized_bytes = 0
+        self._prefetch_window_generation += 1
+        self._prefetch_window_deferred.clear()
+
+    def _ensure_prefetch_window(self) -> None:
+        if not self._prefetch_window_active:
+            self.begin_prefetch_window()
+
+    def _is_online_disabled(self, prompt_id: str) -> bool:
+        state = self._online_disabled.get(str(prompt_id))
+        if state is None:
+            return False
+        version, _ = state
+        return int(version) == int(self._cache_version)
+
+    def _estimate_descriptor_online_cpu_bytes(
+        self,
+        desc_obj: HSpecPromptTableDesc | Dict[str, Any],
+    ) -> int:
+        desc = (
+            desc_obj
+            if isinstance(desc_obj, HSpecPromptTableDesc)
+            else HSpecPromptTableDesc.from_dict(desc_obj)
+        )
+        parts = estimate_prompt_table_desc_nbytes(desc)
+        total = int(parts.get("total", 0))
+        if self._keys_cpu_dtype_mode == "float32":
+            key_count = 1
+            for dim in tuple(desc.keys.shape):
+                key_count *= int(dim)
+            table_key_bytes = int(parts.get("keys", 0))
+            fp32_key_bytes = int(key_count) * np.dtype(np.float32).itemsize
+            total += max(0, fp32_key_bytes - table_key_bytes)
+        return max(total, 0)
+
+    def _estimate_descriptor_online_entries(
+        self,
+        desc_obj: HSpecPromptTableDesc | Dict[str, Any],
+    ) -> int:
+        desc = (
+            desc_obj
+            if isinstance(desc_obj, HSpecPromptTableDesc)
+            else HSpecPromptTableDesc.from_dict(desc_obj)
+        )
+        return max(int(desc.n_entries), 0)
+
+    def _estimate_descriptor_online_token_bytes(
+        self,
+        desc_obj: HSpecPromptTableDesc | Dict[str, Any],
+    ) -> int:
+        desc = (
+            desc_obj
+            if isinstance(desc_obj, HSpecPromptTableDesc)
+            else HSpecPromptTableDesc.from_dict(desc_obj)
+        )
+        parts = estimate_prompt_table_desc_nbytes(desc)
+        return max(int(parts.get("token_buffer", 0)), 0)
+
+    def _estimate_descriptor_batch_match_cost(
+        self,
+        desc_obj: HSpecPromptTableDesc | Dict[str, Any],
+    ) -> int:
+        desc = (
+            desc_obj
+            if isinstance(desc_obj, HSpecPromptTableDesc)
+            else HSpecPromptTableDesc.from_dict(desc_obj)
+        )
+        return max(int(desc.n_entries), 0) * max(int(desc.n_components), 0)
+
+    def _classify_descriptor_for_online_prefetch(
+        self,
+        desc_obj: HSpecPromptTableDesc | Dict[str, Any],
+    ) -> HSpecPrefetchDecision:
+        cpu_bytes = self._estimate_descriptor_online_cpu_bytes(desc_obj)
+        entries = self._estimate_descriptor_online_entries(desc_obj)
+        token_bytes = self._estimate_descriptor_online_token_bytes(desc_obj)
+        match_cost = self._estimate_descriptor_batch_match_cost(desc_obj)
+        if entries <= 0:
+            return HSpecPrefetchDecision(
+                allow=False,
+                reason="empty_entries",
+                estimated_cpu_bytes=cpu_bytes,
+                estimated_entries=entries,
+                estimated_token_bytes=token_bytes,
+                estimated_match_cost=match_cost,
+            )
+        if self._max_prompt_cpu_bytes > 0 and cpu_bytes > self._max_prompt_cpu_bytes:
+            return HSpecPrefetchDecision(
+                allow=False,
+                reason="prompt_cpu_bytes",
+                estimated_cpu_bytes=cpu_bytes,
+                estimated_entries=entries,
+                estimated_token_bytes=token_bytes,
+                estimated_match_cost=match_cost,
+            )
+        if self._max_prompt_entries > 0 and entries > self._max_prompt_entries:
+            return HSpecPrefetchDecision(
+                allow=False,
+                reason="prompt_entries",
+                estimated_cpu_bytes=cpu_bytes,
+                estimated_entries=entries,
+                estimated_token_bytes=token_bytes,
+                estimated_match_cost=match_cost,
+            )
+        if self._max_prompt_token_bytes > 0 and token_bytes > self._max_prompt_token_bytes:
+            return HSpecPrefetchDecision(
+                allow=False,
+                reason="prompt_token_bytes",
+                estimated_cpu_bytes=cpu_bytes,
+                estimated_entries=entries,
+                estimated_token_bytes=token_bytes,
+                estimated_match_cost=match_cost,
+            )
+        if self._batch_cache_max_bmm_elems > 0 and match_cost > self._batch_cache_max_bmm_elems:
+            return HSpecPrefetchDecision(
+                allow=False,
+                reason="prompt_match_cost",
+                estimated_cpu_bytes=cpu_bytes,
+                estimated_entries=entries,
+                estimated_token_bytes=token_bytes,
+                estimated_match_cost=match_cost,
+            )
+        return HSpecPrefetchDecision(
+            allow=True,
+            reason="",
+            estimated_cpu_bytes=cpu_bytes,
+            estimated_entries=entries,
+            estimated_token_bytes=token_bytes,
+            estimated_match_cost=match_cost,
+        )
+
+    def _mark_online_disabled(
+        self,
+        prompt_id: str,
+        *,
+        version: int,
+        reason: str,
+        estimated_cpu_bytes: int = 0,
+        estimated_entries: int = 0,
+    ) -> None:
+        self._online_disabled[str(prompt_id)] = (int(version), str(reason))
+        self._record_proposer_metric("prefetch_online_disabled_prompt_count", 1)
+        if str(reason).startswith("prompt_"):
+            self._record_proposer_metric("prefetch_prompt_oversize_skip_count", 1)
+            self._record_proposer_metric(
+                "prefetch_prompt_oversize_skip_bytes",
+                max(int(estimated_cpu_bytes), 0),
+            )
+            self._record_proposer_metric(
+                "prefetch_prompt_oversize_skip_entries",
+                max(int(estimated_entries), 0),
+            )
 
     def _poll_pending(
         self,
@@ -810,14 +1012,8 @@ class HSpecProposer(Proposer):
         max_ready_refs: Optional[int] = None,
         priority_prompt_ids: Optional[List[str]] = None,
     ) -> None:
-        """Non-blocking: consume any ready prefetch futures.
-
-        Uses ``ray.wait(timeout=0)`` which returns immediately with
-        whatever futures are already completed.
-        """
-        if not self._pending_fetches:
-            return
-        if not materialize_ready:
+        """Non-blocking: consume any ready prefetch futures."""
+        if not self._pending_fetches or not materialize_ready:
             return
 
         import ray as _ray
@@ -828,7 +1024,11 @@ class HSpecProposer(Proposer):
         if not ready_refs:
             return
         ready_set_all = set(ready_refs)
-        priority_set = {str(pid) for pid in (priority_prompt_ids or []) if pid}
+        priority_order = {
+            str(pid): idx
+            for idx, pid in enumerate(priority_prompt_ids or [])
+            if pid
+        }
         ready_entries = [
             (idx, future, pids)
             for idx, (future, pids) in enumerate(self._pending_fetches)
@@ -836,7 +1036,10 @@ class HSpecProposer(Proposer):
         ]
         ready_entries.sort(
             key=lambda item: (
-                0 if priority_set.intersection(str(pid) for pid in item[2]) else 1,
+                min(
+                    (priority_order.get(str(pid), len(priority_order)) for pid in item[2]),
+                    default=len(priority_order),
+                ),
                 item[0],
             )
         )
@@ -972,6 +1175,242 @@ class HSpecProposer(Proposer):
             self._cache_generation += 1
             self._batched_table_cache = None
 
+    def _poll_pending_governed(
+        self,
+        *,
+        materialize_ready: bool = True,
+        max_ready_refs: Optional[int] = None,
+        priority_prompt_ids: Optional[List[str]] = None,
+    ) -> None:
+        """Governed prompt-level ready-future consumption.
+
+        This keeps descriptor materialization out of the proposal hot path and
+        enforces prompt-level online-serving admission before materialization.
+        """
+        if not self._pending_fetches or not materialize_ready:
+            return
+
+        import ray as _ray
+
+        cache_mutated = False
+        all_futures = [future for future, _ in self._pending_fetches]
+        ready_refs, _ = _ray.wait(all_futures, num_returns=len(all_futures), timeout=0)
+        if not ready_refs:
+            return
+
+        priority_order = {
+            str(pid): idx
+            for idx, pid in enumerate(priority_prompt_ids or [])
+            if pid
+        }
+        ready_set_all = set(ready_refs)
+        ready_entries = [
+            (idx, future, pids)
+            for idx, (future, pids) in enumerate(self._pending_fetches)
+            if future in ready_set_all
+        ]
+        ready_entries.sort(
+            key=lambda item: (
+                min(
+                    (priority_order.get(str(pid), len(priority_order)) for pid in item[2]),
+                    default=len(priority_order),
+                ),
+                item[0],
+            )
+        )
+        ref_budget = int(max_ready_refs or self._max_ready_prefetch_materialize)
+        if ref_budget > 0 and len(ready_entries) > ref_budget:
+            self._record_proposer_metric(
+                "prefetch_ready_ref_throttle_count",
+                len(ready_entries) - ref_budget,
+            )
+            ready_entries = ready_entries[:ref_budget]
+        ready_set = {future for _, future, _ in ready_entries}
+
+        still_pending: List[tuple] = []
+        fetched_results: List[tuple[Any, List[str], int, Dict[str, Any]]] = []
+        newest_version = int(self._cache_version)
+        for future, pids in self._pending_fetches:
+            if future not in ready_set:
+                still_pending.append((future, pids))
+                continue
+            try:
+                version, table_data = _ray.get(future)
+                version_i = int(version)
+                newest_version = max(newest_version, version_i)
+                fetched_results.append((future, list(pids), version_i, table_data))
+                self._stat_prefetch_ready += 1
+            except Exception:
+                self._record_proposer_metric("cache_build_error_count", len(pids))
+                for pid in pids:
+                    self._not_in_table.add(pid)
+                cache_mutated = True
+
+        version_bumped = False
+        if newest_version > int(self._cache_version):
+            self._clear_prompt_cache()
+            self._not_in_table.clear()
+            self._online_disabled.clear()
+            self._prefetch_window_deferred.clear()
+            self._cache_version = newest_version
+            version_bumped = True
+            cache_mutated = True
+
+        candidates: List[tuple[int, int, int, int, str, Any, Any]] = []
+        deferred_by_future: Dict[Any, List[str]] = defaultdict(list)
+        for future, pids, version, table_data in fetched_results:
+            if int(version) < int(self._cache_version):
+                continue
+            for local_idx, pid in enumerate(pids):
+                data = table_data.get(pid)
+                if data is None:
+                    self._not_in_table.add(pid)
+                    self._record_proposer_metric("prefetch_absent_payload_count", 1)
+                    cache_mutated = True
+                    continue
+                self._not_in_table.discard(pid)
+                if self._is_online_disabled(pid):
+                    continue
+
+                estimated_bytes = self._estimate_pending_payload_bytes(data)
+                estimated_entries = 0
+                if isinstance(data, HSpecPromptTableDesc):
+                    if int(data.version) > int(version):
+                        self._record_proposer_metric("cache_build_error_count", 1)
+                        logger.debug(
+                            "HSpec descriptor version mismatch: prompt_id=%r desc.version=%s active_version=%s",
+                            pid,
+                            data.version,
+                            version,
+                        )
+                        self._not_in_table.add(pid)
+                        cache_mutated = True
+                        continue
+                    decision = self._classify_descriptor_for_online_prefetch(data)
+                    estimated_bytes = int(decision.estimated_cpu_bytes)
+                    estimated_entries = int(decision.estimated_entries)
+                    if not decision.allow:
+                        self._mark_online_disabled(
+                            pid,
+                            version=int(self._cache_version),
+                            reason=str(decision.reason),
+                            estimated_cpu_bytes=int(decision.estimated_cpu_bytes),
+                            estimated_entries=int(decision.estimated_entries),
+                        )
+                        cache_mutated = True
+                        continue
+                elif isinstance(data, dict):
+                    estimated_entries = max(int(data.get("n_entries", 0) or 0), 0)
+                candidates.append((
+                    priority_order.get(str(pid), len(priority_order)),
+                    max(int(estimated_bytes), 0),
+                    max(int(estimated_entries), 0),
+                    int(local_idx),
+                    str(pid),
+                    future,
+                    data,
+                ))
+
+        candidates.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2],
+                item[3],
+                item[4],
+            )
+        )
+
+        materialized_bytes_this_call = 0
+        window_used_bytes = (
+            int(self._prefetch_window_materialized_bytes)
+            if self._prefetch_window_active else 0
+        )
+        byte_budget = int(self._max_ready_prefetch_bytes)
+        window_budget = int(self._prefetch_window_max_bytes)
+        for _, estimated_bytes, _, _, pid, future, data in candidates:
+            if estimated_bytes > 0:
+                would_exceed_call = (
+                    byte_budget > 0
+                    and materialized_bytes_this_call + int(estimated_bytes) > byte_budget
+                )
+                would_exceed_window = (
+                    window_budget > 0
+                    and window_used_bytes + int(estimated_bytes) > window_budget
+                )
+                if would_exceed_call or would_exceed_window:
+                    if would_exceed_window:
+                        self._prefetch_window_deferred.add(str(pid))
+                    else:
+                        deferred_by_future[future].append(pid)
+                    self._record_proposer_metric("prefetch_ready_bytes_throttle_count", 1)
+                    self._record_proposer_metric(
+                        "prefetch_ready_bytes_deferred",
+                        int(estimated_bytes),
+                    )
+                    self._record_proposer_metric("prefetch_prompt_deferred_count", 1)
+                    self._record_proposer_metric(
+                        "prefetch_prompt_deferred_bytes",
+                        int(estimated_bytes),
+                    )
+                    continue
+            try:
+                if isinstance(data, HSpecPromptTableDesc):
+                    self._record_proposer_metric("prefetch_descriptor_payload_count", 1)
+                    cached = self._build_cached_table_from_descriptor(
+                        data, prompt_id=pid)
+                    self._record_proposer_metric("descriptor_cache_build_count", 1)
+                elif isinstance(data, dict):
+                    self._record_proposer_metric("prefetch_legacy_payload_count", 1)
+                    cached = self._build_cached_table(data, prompt_id=pid)
+                    self._record_proposer_metric("legacy_cache_build_count", 1)
+                else:
+                    raise TypeError(
+                        f"Unsupported HSpec prefetch payload type: {type(data)!r}"
+                    )
+                materialized_bytes_this_call += int(estimated_bytes)
+                if self._prefetch_window_active:
+                    window_used_bytes += int(estimated_bytes)
+                if self._admit_cached_table(pid, cached):
+                    self._not_in_table.discard(pid)
+                else:
+                    self._not_in_table.add(pid)
+                cache_mutated = True
+            except Exception:
+                self._record_proposer_metric("cache_build_error_count", 1)
+                logger.debug(
+                    "HSpec: failed to build proposer cache for prompt_id=%r",
+                    pid,
+                    exc_info=True,
+                )
+                self._not_in_table.add(pid)
+                cache_mutated = True
+
+        if self._prefetch_window_active:
+            self._prefetch_window_materialized_bytes = int(window_used_bytes)
+
+        for future, pids, version, _table_data in fetched_results:
+            if int(version) < int(self._cache_version):
+                continue
+            deferred_pids = deferred_by_future.get(future, [])
+            if deferred_pids:
+                still_pending.append((future, deferred_pids))
+
+        self._pending_fetches = still_pending
+        self._pending_pids = {
+            str(pid)
+            for _future, pids in self._pending_fetches
+            for pid in pids
+        }
+
+        if version_bumped and self._pending_fetches:
+            self._pending_fetches = []
+            self._pending_pids.clear()
+
+        if cache_mutated:
+            self._cache_generation += 1
+            self._batched_table_cache = None
+
     def _fire_prefetch_async(
         self,
         prompt_ids: List[str],
@@ -987,6 +1426,8 @@ class HSpecProposer(Proposer):
             pid for pid in set(prompt_ids)
             if pid not in self._cache
             and (include_absent or pid not in self._not_in_table)
+            and not self._is_online_disabled(pid)
+            and pid not in self._prefetch_window_deferred
             and pid not in self._pending_pids
         ]
         if not missing:
@@ -1114,6 +1555,131 @@ class HSpecProposer(Proposer):
         except Exception:
             return 0
 
+    def _estimate_batched_table_cache_nbytes_from_dims(
+        self,
+        *,
+        num_rows: int,
+        hidden_dim: int,
+        m_max: int,
+        k_max: int,
+        dtype: torch.dtype,
+    ) -> int:
+        if num_rows <= 0 or hidden_dim <= 0 or m_max <= 0 or k_max <= 0:
+            return 0
+        model_elem = self._dtype_element_size(dtype)
+        key_elem = self._dtype_element_size(self._keys_device_dtype)
+        total = (
+            int(num_rows) * int(hidden_dim) * model_elem
+            + int(num_rows) * int(hidden_dim) * int(k_max) * model_elem
+            + int(num_rows) * int(m_max) * int(k_max) * key_elem
+            + int(num_rows) * self._dtype_element_size(torch.long)
+            + int(num_rows) * int(m_max) * self._dtype_element_size(torch.bool)
+        )
+        return int(total)
+
+    @staticmethod
+    def _estimate_batched_table_cache_bmm_elems(
+        *,
+        num_rows: int,
+        m_max: int,
+        k_max: int,
+    ) -> int:
+        if num_rows <= 0 or m_max <= 0 or k_max <= 0:
+            return 0
+        return int(num_rows) * int(m_max) * int(k_max)
+
+    def _select_batch_cache_subset(
+        self,
+        batch_indices: List[int],
+        cached_tables: List[_CachedPromptTable],
+        dtype: torch.dtype,
+    ) -> tuple[List[int], List[_CachedPromptTable], int, int]:
+        if not batch_indices or not cached_tables:
+            return [], [], 0, 0
+
+        total_entry_budget = int(self._batch_cache_max_total_entries)
+        bmm_elem_budget = int(self._batch_cache_max_bmm_elems)
+        byte_budget = int(self._batch_cache_max_npu_bytes)
+        if total_entry_budget <= 0 and bmm_elem_budget <= 0 and byte_budget <= 0:
+            total_entries = sum(int(cached.n_entries) for cached in cached_tables)
+            k_max = max(int(cached.components_t_cpu.shape[1]) for cached in cached_tables)
+            m_max = max(int(cached.n_entries) for cached in cached_tables)
+            return (
+                batch_indices,
+                cached_tables,
+                int(total_entries),
+                self._estimate_batched_table_cache_bmm_elems(
+                    num_rows=len(cached_tables),
+                    m_max=m_max,
+                    k_max=k_max,
+                ),
+            )
+
+        candidates = [
+            (int(batch_idx), cached)
+            for batch_idx, cached in zip(batch_indices, cached_tables, strict=True)
+        ]
+        candidates.sort(
+            key=lambda item: (
+                int(item[1].n_entries),
+                int(item[1].components_t_cpu.shape[1]),
+                int(item[0]),
+            )
+        )
+
+        hidden_dim = int(cached_tables[0].mean_cpu.shape[0])
+        selected: List[tuple[int, _CachedPromptTable]] = []
+        selected_total_entries = 0
+        selected_m_max = 0
+        selected_k_max = 0
+        for batch_idx, cached in candidates:
+            entries = max(int(cached.n_entries), 0)
+            k_dim = max(int(cached.components_t_cpu.shape[1]), 0)
+            next_num_rows = len(selected) + 1
+            next_total_entries = selected_total_entries + entries
+            next_m_max = max(selected_m_max, entries)
+            next_k_max = max(selected_k_max, k_dim)
+            next_npu_bytes = self._estimate_batched_table_cache_nbytes_from_dims(
+                num_rows=next_num_rows,
+                hidden_dim=hidden_dim,
+                m_max=next_m_max,
+                k_max=next_k_max,
+                dtype=dtype,
+            )
+            next_bmm_elems = self._estimate_batched_table_cache_bmm_elems(
+                num_rows=next_num_rows,
+                m_max=next_m_max,
+                k_max=next_k_max,
+            )
+            if total_entry_budget > 0 and next_total_entries > total_entry_budget:
+                continue
+            if byte_budget > 0 and next_npu_bytes > byte_budget:
+                continue
+            if bmm_elem_budget > 0 and next_bmm_elems > bmm_elem_budget:
+                continue
+            selected.append((batch_idx, cached))
+            selected_total_entries = next_total_entries
+            selected_m_max = next_m_max
+            selected_k_max = next_k_max
+
+        if not selected:
+            return [], [], 0, 0
+
+        selected.sort(key=lambda item: item[0])
+        selected_batch_indices = [int(batch_idx) for batch_idx, _ in selected]
+        selected_cached_tables = [cached for _, cached in selected]
+        selected_bmm_elems = self._estimate_batched_table_cache_bmm_elems(
+            num_rows=len(selected_cached_tables),
+            m_max=selected_m_max,
+            k_max=selected_k_max,
+        )
+        return (
+            selected_batch_indices,
+            selected_cached_tables,
+            int(selected_total_entries),
+            int(selected_bmm_elems),
+        )
+
     def _get_batch_cache_stream_context(self) -> tuple[Any, bool]:
         if self._batch_cache_copy_stream_disabled:
             return nullcontext(), False
@@ -1215,8 +1781,56 @@ class HSpecProposer(Proposer):
             self._batched_table_cache = None
             return None
 
+        selected_batch_indices = list(batch_indices)
+        selected_cached_tables = list(cached_tables)
+        selected_total_entries = sum(int(cached.n_entries) for cached in cached_tables)
+        selected_bmm_elems = 0
+        if cached_tables:
+            selected_bmm_elems = self._estimate_batched_table_cache_bmm_elems(
+                num_rows=len(cached_tables),
+                m_max=max(int(cached.n_entries) for cached in cached_tables),
+                k_max=max(int(cached.components_t_cpu.shape[1]) for cached in cached_tables),
+            )
+
+        (
+            selected_batch_indices,
+            selected_cached_tables,
+            selected_total_entries,
+            selected_bmm_elems,
+        ) = self._select_batch_cache_subset(
+            batch_indices,
+            cached_tables,
+            dtype,
+        )
+        skipped_prompts = max(len(batch_indices) - len(selected_batch_indices), 0)
+        if skipped_prompts > 0:
+            self._record_proposer_metric("batch_cache_partial_build_count", 1)
+            self._record_proposer_metric(
+                "batch_cache_partial_build_prompts",
+                len(selected_batch_indices),
+            )
+            self._record_proposer_metric(
+                "batch_cache_skipped_active_prompts",
+                skipped_prompts,
+            )
+        self._record_proposer_gauge(
+            "batch_cache_total_entries",
+            float(selected_total_entries),
+        )
+        self._record_proposer_gauge(
+            "batch_cache_bmm_elems",
+            float(selected_bmm_elems),
+        )
+
+        if not selected_batch_indices:
+            self._batched_table_cache = None
+            self._record_proposer_metric("batch_cache_budget_skip_count", 1)
+            self._record_proposer_metric("batch_cache_miss_no_hot_build", 1)
+            self._record_proposer_gauge("batch_cache_npu_bytes", 0)
+            return None
+
         estimated_npu_bytes = self._estimate_batched_table_cache_nbytes(
-            cached_tables, dtype)
+            selected_cached_tables, dtype)
         if (self._batch_cache_max_npu_bytes > 0
                 and estimated_npu_bytes > self._batch_cache_max_npu_bytes):
             self._batched_table_cache = None
@@ -1230,12 +1844,12 @@ class HSpecProposer(Proposer):
         ready_event: Optional[Any] = None
         if hot_path:
             mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask = (
-                self._build_batched_table_tensors(cached_tables, dtype, device))
+                self._build_batched_table_tensors(selected_cached_tables, dtype, device))
         else:
             stream_context, used_copy_stream = self._get_batch_cache_stream_context()
             with stream_context:
                 mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask = (
-                    self._build_batched_table_tensors(cached_tables, dtype, device))
+                    self._build_batched_table_tensors(selected_cached_tables, dtype, device))
                 if used_copy_stream:
                     ready_event = self._record_batch_cache_ready_event()
             if used_copy_stream and ready_event is None:
@@ -1245,16 +1859,18 @@ class HSpecProposer(Proposer):
         build_t1 = _now_ns()
 
         with hspec_record_function("hspec/proposal/build_batch_idx_to_row"):
-            batch_idx_to_row = {batch_idx: row for row, batch_idx in enumerate(batch_indices)}
+            batch_idx_to_row = {
+                batch_idx: row for row, batch_idx in enumerate(selected_batch_indices)
+            }
 
         with hspec_record_function("hspec/proposal/build_cached"):
             cached = _BatchedPromptTableCache(
                 req_ids=req_ids_tuple,
                 prompt_ids=prompt_ids_tuple,
                 cache_generation=self._cache_generation,
-                batch_indices=batch_indices,
+                batch_indices=selected_batch_indices,
                 batch_idx_to_row=batch_idx_to_row,
-                cached_tables=cached_tables,
+                cached_tables=selected_cached_tables,
                 mean_batch=mean_batch,
                 components_t_batch=components_t_batch,
                 keys_batch=keys_batch,
@@ -2406,7 +3022,7 @@ class HSpecProposer(Proposer):
         # descriptor never gets ray.get'ed and mmap'ed in generate_token_ids().
         t0_poll = _now_ns() if gen_enabled else 0
         with hspec_record_function("hspec/proposal/poll_pending"):
-            self._poll_pending(materialize_ready=False)
+            self._poll_pending_governed(materialize_ready=False)
         t1_poll = _now_ns() if gen_enabled else 0
 
         t0_fire = _now_ns() if gen_enabled else 0

@@ -544,6 +544,19 @@ class NPUModelRunner(GPUModelRunner):
             logger.debug("HSpec: failed to update collection context", exc_info=True)
             return False
 
+    def hspec_begin_prefetch_window(self) -> bool:
+        """Reset proposer-side prefetch budget state for one rollout call."""
+        if (not self._hspec_collect or self.drafter is None
+                or getattr(self.drafter, "name", None) != SpecDcodeType.HSPEC
+                or not hasattr(self.drafter, "begin_prefetch_window")):
+            return False
+        try:
+            self.drafter.begin_prefetch_window()
+            return True
+        except Exception:
+            logger.debug("HSpec: failed to begin prefetch window", exc_info=True)
+            return False
+
     def hspec_prefetch_prompt_ids_batch(self, prompt_ids: list[str]) -> int:
         """Warm HSpec proposer cache from stable prompt ids."""
         if (not self._hspec_collect or self.drafter is None

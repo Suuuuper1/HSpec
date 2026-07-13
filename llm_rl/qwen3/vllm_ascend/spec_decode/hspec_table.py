@@ -1106,6 +1106,12 @@ class HSpecTableGroup:
         self._proposer_cache_oversize_cpu_bytes = 0
         self._proposer_cache_oversize_npu_bytes = 0
         self._proposer_cache_oversize_entries = 0
+        self._proposer_prefetch_prompt_oversize_skip_count = 0
+        self._proposer_prefetch_prompt_oversize_skip_bytes = 0
+        self._proposer_prefetch_prompt_oversize_skip_entries = 0
+        self._proposer_prefetch_prompt_deferred_count = 0
+        self._proposer_prefetch_prompt_deferred_bytes = 0
+        self._proposer_prefetch_online_disabled_prompt_count = 0
         self._proposer_prefetch_ready_ref_throttle_count = 0
         self._proposer_prefetch_ready_bytes_throttle_count = 0
         self._proposer_prefetch_ready_bytes_deferred = 0
@@ -1123,6 +1129,11 @@ class HSpecTableGroup:
         self._proposer_batch_cache_event_record_error_count = 0
         self._proposer_batch_cache_hot_build_count = 0
         self._proposer_batch_cache_hot_build_ms = 0.0
+        self._proposer_batch_cache_partial_build_count = 0
+        self._proposer_batch_cache_partial_build_prompts = 0
+        self._proposer_batch_cache_skipped_active_prompts = 0
+        self._proposer_batch_cache_total_entries = 0
+        self._proposer_batch_cache_bmm_elems = 0
         self._proposer_prompt_access_report_count = 0
         self._proposer_prompt_access_report_prompts = 0
         self._proposer_prompt_hit_count = 0
@@ -3676,6 +3687,12 @@ class HSpecTableGroup:
             "proposer_cache_oversize_cpu_bytes": self._proposer_cache_oversize_cpu_bytes,
             "proposer_cache_oversize_npu_bytes": self._proposer_cache_oversize_npu_bytes,
             "proposer_cache_oversize_entries": self._proposer_cache_oversize_entries,
+            "proposer_prefetch_prompt_oversize_skip_count": self._proposer_prefetch_prompt_oversize_skip_count,
+            "proposer_prefetch_prompt_oversize_skip_bytes": self._proposer_prefetch_prompt_oversize_skip_bytes,
+            "proposer_prefetch_prompt_oversize_skip_entries": self._proposer_prefetch_prompt_oversize_skip_entries,
+            "proposer_prefetch_prompt_deferred_count": self._proposer_prefetch_prompt_deferred_count,
+            "proposer_prefetch_prompt_deferred_bytes": self._proposer_prefetch_prompt_deferred_bytes,
+            "proposer_prefetch_online_disabled_prompt_count": self._proposer_prefetch_online_disabled_prompt_count,
             "proposer_prefetch_ready_ref_throttle_count": self._proposer_prefetch_ready_ref_throttle_count,
             "proposer_prefetch_ready_bytes_throttle_count": self._proposer_prefetch_ready_bytes_throttle_count,
             "proposer_prefetch_ready_bytes_deferred": self._proposer_prefetch_ready_bytes_deferred,
@@ -3693,6 +3710,11 @@ class HSpecTableGroup:
             "proposer_batch_cache_event_record_error_count": self._proposer_batch_cache_event_record_error_count,
             "proposer_batch_cache_hot_build_count": self._proposer_batch_cache_hot_build_count,
             "proposer_batch_cache_hot_build_ms": self._proposer_batch_cache_hot_build_ms,
+            "proposer_batch_cache_partial_build_count": self._proposer_batch_cache_partial_build_count,
+            "proposer_batch_cache_partial_build_prompts": self._proposer_batch_cache_partial_build_prompts,
+            "proposer_batch_cache_skipped_active_prompts": self._proposer_batch_cache_skipped_active_prompts,
+            "proposer_batch_cache_total_entries": self._proposer_batch_cache_total_entries,
+            "proposer_batch_cache_bmm_elems": self._proposer_batch_cache_bmm_elems,
             "proposer_prompt_access_report_count": self._proposer_prompt_access_report_count,
             "proposer_prompt_access_report_prompts": self._proposer_prompt_access_report_prompts,
             "proposer_prompt_hit_count": self._proposer_prompt_hit_count,
@@ -3827,6 +3849,12 @@ class HSpecTableGroup:
         self._proposer_cache_oversize_cpu_bytes = 0
         self._proposer_cache_oversize_npu_bytes = 0
         self._proposer_cache_oversize_entries = 0
+        self._proposer_prefetch_prompt_oversize_skip_count = 0
+        self._proposer_prefetch_prompt_oversize_skip_bytes = 0
+        self._proposer_prefetch_prompt_oversize_skip_entries = 0
+        self._proposer_prefetch_prompt_deferred_count = 0
+        self._proposer_prefetch_prompt_deferred_bytes = 0
+        self._proposer_prefetch_online_disabled_prompt_count = 0
         self._proposer_prefetch_ready_ref_throttle_count = 0
         self._proposer_prefetch_ready_bytes_throttle_count = 0
         self._proposer_prefetch_ready_bytes_deferred = 0
@@ -3844,6 +3872,11 @@ class HSpecTableGroup:
         self._proposer_batch_cache_event_record_error_count = 0
         self._proposer_batch_cache_hot_build_count = 0
         self._proposer_batch_cache_hot_build_ms = 0.0
+        self._proposer_batch_cache_partial_build_count = 0
+        self._proposer_batch_cache_partial_build_prompts = 0
+        self._proposer_batch_cache_skipped_active_prompts = 0
+        self._proposer_batch_cache_total_entries = 0
+        self._proposer_batch_cache_bmm_elems = 0
         self._proposer_prompt_access_report_count = 0
         self._proposer_prompt_access_report_prompts = 0
         self._proposer_prompt_hit_count = 0
@@ -3968,6 +4001,12 @@ class HSpecTableGroup:
             "cache_oversize_cpu_bytes": "_proposer_cache_oversize_cpu_bytes",
             "cache_oversize_npu_bytes": "_proposer_cache_oversize_npu_bytes",
             "cache_oversize_entries": "_proposer_cache_oversize_entries",
+            "prefetch_prompt_oversize_skip_count": "_proposer_prefetch_prompt_oversize_skip_count",
+            "prefetch_prompt_oversize_skip_bytes": "_proposer_prefetch_prompt_oversize_skip_bytes",
+            "prefetch_prompt_oversize_skip_entries": "_proposer_prefetch_prompt_oversize_skip_entries",
+            "prefetch_prompt_deferred_count": "_proposer_prefetch_prompt_deferred_count",
+            "prefetch_prompt_deferred_bytes": "_proposer_prefetch_prompt_deferred_bytes",
+            "prefetch_online_disabled_prompt_count": "_proposer_prefetch_online_disabled_prompt_count",
             "prefetch_ready_ref_throttle_count": "_proposer_prefetch_ready_ref_throttle_count",
             "prefetch_ready_bytes_throttle_count": "_proposer_prefetch_ready_bytes_throttle_count",
             "prefetch_ready_bytes_deferred": "_proposer_prefetch_ready_bytes_deferred",
@@ -3984,6 +4023,9 @@ class HSpecTableGroup:
             "batch_cache_event_record_error_count": "_proposer_batch_cache_event_record_error_count",
             "batch_cache_hot_build_count": "_proposer_batch_cache_hot_build_count",
             "batch_cache_hot_build_ms": "_proposer_batch_cache_hot_build_ms",
+            "batch_cache_partial_build_count": "_proposer_batch_cache_partial_build_count",
+            "batch_cache_partial_build_prompts": "_proposer_batch_cache_partial_build_prompts",
+            "batch_cache_skipped_active_prompts": "_proposer_batch_cache_skipped_active_prompts",
             "prompt_access_report_count": "_proposer_prompt_access_report_count",
             "prompt_access_report_prompts": "_proposer_prompt_access_report_prompts",
             "prompt_hit_count": "_proposer_prompt_hit_count",
@@ -3998,6 +4040,8 @@ class HSpecTableGroup:
             "cache_live_entries": "_proposer_cache_live_entries",
             "cache_live_prompts": "_proposer_cache_live_prompts",
             "batch_cache_npu_bytes": "_proposer_batch_cache_npu_bytes",
+            "batch_cache_total_entries": "_proposer_batch_cache_total_entries",
+            "batch_cache_bmm_elems": "_proposer_batch_cache_bmm_elems",
             "cache_load_ms_max": "_proposer_cache_load_ms_max",
         }
         try:
@@ -5043,6 +5087,12 @@ class GlobalHSpecTableGroup:
                 "hspec/proposer_cache_oversize_cpu_bytes": 0,
                 "hspec/proposer_cache_oversize_npu_bytes": 0,
                 "hspec/proposer_cache_oversize_entries": 0,
+                "hspec/proposer_prefetch_prompt_oversize_skip_count": 0,
+                "hspec/proposer_prefetch_prompt_oversize_skip_bytes": 0,
+                "hspec/proposer_prefetch_prompt_oversize_skip_entries": 0,
+                "hspec/proposer_prefetch_prompt_deferred_count": 0,
+                "hspec/proposer_prefetch_prompt_deferred_bytes": 0,
+                "hspec/proposer_prefetch_online_disabled_prompt_count": 0,
                 "hspec/proposer_prefetch_ready_ref_throttle_count": 0,
                 "hspec/proposer_prefetch_ready_bytes_throttle_count": 0,
                 "hspec/proposer_prefetch_ready_bytes_deferred": 0,
@@ -5064,6 +5114,11 @@ class GlobalHSpecTableGroup:
                 "hspec/proposer_batch_cache_event_record_error_count": 0,
                 "hspec/proposer_batch_cache_hot_build_count": 0,
                 "hspec/proposer_batch_cache_hot_build_ms": 0.0,
+                "hspec/proposer_batch_cache_partial_build_count": 0,
+                "hspec/proposer_batch_cache_partial_build_prompts": 0,
+                "hspec/proposer_batch_cache_skipped_active_prompts": 0,
+                "hspec/proposer_batch_cache_total_entries": 0,
+                "hspec/proposer_batch_cache_bmm_elems": 0,
                 "hspec/collect_budget_drop": 0,
                 "hspec/backpressure_active": 0,
                 "hspec/raw_store_epoch_bytes": 0,
@@ -5125,6 +5180,8 @@ class GlobalHSpecTableGroup:
             "proposer_cache_live_entries",
             "proposer_cache_live_prompts",
             "proposer_batch_cache_npu_bytes",
+            "proposer_batch_cache_total_entries",
+            "proposer_batch_cache_bmm_elems",
             "build_queue_lag_ms_max",
             "proposer_cache_load_ms_max",
             "build_cpu_profile_enabled",
@@ -5365,6 +5422,12 @@ class GlobalHSpecTableGroup:
             "cache_oversize_cpu_bytes",
             "cache_oversize_npu_bytes",
             "cache_oversize_entries",
+            "prefetch_prompt_oversize_skip_count",
+            "prefetch_prompt_oversize_skip_bytes",
+            "prefetch_prompt_oversize_skip_entries",
+            "prefetch_prompt_deferred_count",
+            "prefetch_prompt_deferred_bytes",
+            "prefetch_online_disabled_prompt_count",
             "prefetch_ready_ref_throttle_count",
             "prefetch_ready_bytes_throttle_count",
             "prefetch_ready_bytes_deferred",
@@ -5381,6 +5444,9 @@ class GlobalHSpecTableGroup:
             "batch_cache_event_record_error_count",
             "batch_cache_hot_build_count",
             "batch_cache_hot_build_ms",
+            "batch_cache_partial_build_count",
+            "batch_cache_partial_build_prompts",
+            "batch_cache_skipped_active_prompts",
             "prompt_access_report_count",
             "prompt_access_report_prompts",
             "prompt_hit_count",
@@ -5406,6 +5472,10 @@ class GlobalHSpecTableGroup:
         result["hspec/proposer_batch_cache_npu_mb"] = (
             float(agg.get("proposer_batch_cache_npu_bytes", 0)) / (1024 * 1024)
         )
+        result["hspec/proposer_batch_cache_total_entries"] = float(
+            agg.get("proposer_batch_cache_total_entries", 0))
+        result["hspec/proposer_batch_cache_bmm_elems"] = float(
+            agg.get("proposer_batch_cache_bmm_elems", 0))
         result["hspec/proposer_batch_cache_budget_skip_mb"] = (
             float(agg.get("proposer_batch_cache_budget_skip_bytes", 0)) / (1024 * 1024)
         )
