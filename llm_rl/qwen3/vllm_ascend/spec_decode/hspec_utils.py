@@ -184,9 +184,64 @@ def _parse_profile_steps(value: Optional[str]) -> set[int]:
     return steps
 
 
+def _parse_positive_index_set(
+    value: Optional[str],
+    env_name: str,
+) -> set[int]:
+    indices: set[int] = set()
+    if value is None:
+        return indices
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            parsed = int(item)
+        except ValueError:
+            logger.warning("Ignoring invalid %s item: %s", env_name, item)
+            continue
+        if parsed <= 0:
+            logger.warning("Ignoring non-positive %s item: %s", env_name, item)
+            continue
+        indices.add(parsed)
+    return indices
+
+
 def hspec_profile_steps() -> set[int]:
     """Return the optional global-step profile allowlist shared by HSpec profilers."""
     return _parse_profile_steps(os.getenv("HSPEC_PROFILE_STEPS", None))
+
+
+def hspec_profile_decode_steps() -> set[int]:
+    """Return the optional 1-based decode-step allowlist for rollout profiling."""
+    return _parse_positive_index_set(
+        os.getenv("HSPEC_PROFILE_DECODE_STEPS", None),
+        "HSPEC_PROFILE_DECODE_STEPS",
+    )
+
+
+def hspec_profile_decode_step_interval() -> int:
+    """Return the optional decode-step sampling interval; 0 keeps full-step capture."""
+    return _get_env_int("HSPEC_PROFILE_DECODE_STEP_INTERVAL", 0, 0)
+
+
+def hspec_profile_decode_step_sampling_enabled() -> bool:
+    """Whether rollout profile should sample decode steps instead of whole steps."""
+    return bool(hspec_profile_decode_steps()) or hspec_profile_decode_step_interval() > 1
+
+
+def hspec_profile_should_capture_decode_step(decode_step_idx: int) -> bool:
+    """Return whether a 1-based decode-step index should be profiled."""
+    idx = int(decode_step_idx)
+    if idx <= 0:
+        return False
+    selected_steps = hspec_profile_decode_steps()
+    if selected_steps:
+        return idx in selected_steps
+    interval = hspec_profile_decode_step_interval()
+    if interval <= 1:
+        return True
+    return ((idx - 1) % interval) == 0
 
 
 def hspec_profile_enabled_for_step(global_step: Optional[int]) -> bool:
@@ -283,6 +338,103 @@ def hspec_clear_profile_context() -> None:
     _hspec_profile_local.enabled = False
     _hspec_profile_local.step = None
     _hspec_profile_local.req_idx = -1
+
+
+def hspec_begin_decode_step_profile_session(
+    *,
+    step: Optional[int],
+    req_idx: int,
+    profile_dir: str,
+) -> None:
+    selected_steps = frozenset(hspec_profile_decode_steps())
+    interval = int(hspec_profile_decode_step_interval())
+    _hspec_profile_local.decode_step_profile_session = {
+        "step": step,
+        "req_idx": int(req_idx),
+        "profile_dir": str(profile_dir),
+        "selected_steps": selected_steps,
+        "interval": interval,
+    }
+
+
+def hspec_decode_step_profile_session_enabled() -> bool:
+    session = getattr(_hspec_profile_local, "decode_step_profile_session", None)
+    return isinstance(session, dict) and bool(session.get("profile_dir"))
+
+
+def hspec_end_decode_step_profile_session() -> None:
+    _hspec_profile_local.decode_step_profile_session = None
+
+
+@contextmanager
+def hspec_maybe_profile_decode_step(decode_step_idx: int):
+    session = getattr(_hspec_profile_local, "decode_step_profile_session", None)
+    if not isinstance(session, dict):
+        with nullcontext():
+            yield
+        return
+
+    idx = int(decode_step_idx)
+    selected_steps = session.get("selected_steps", frozenset())
+    interval = int(session.get("interval", 0))
+    if selected_steps:
+        should_profile = idx in selected_steps
+    elif interval > 1:
+        should_profile = idx > 0 and ((idx - 1) % interval) == 0
+    else:
+        should_profile = idx > 0
+    if not should_profile:
+        with nullcontext():
+            yield
+        return
+
+    step = session.get("step")
+    req_idx = int(session.get("req_idx", -1))
+    base_profile_dir = str(session.get("profile_dir", ""))
+    if not base_profile_dir:
+        with nullcontext():
+            yield
+        return
+
+    profile_dir = os.path.join(
+        base_profile_dir,
+        f"decode_step_{idx:04d}",
+    )
+    os.makedirs(profile_dir, exist_ok=True)
+    profiler = create_hspec_torch_npu_profiler(profile_dir)
+    hspec_set_profile_context(
+        enabled=True,
+        step=step,
+        req_idx=req_idx,
+    )
+    profiler.start()
+    try:
+        try:
+            profiler.add_metadata_json(
+                "hspec_profile_context",
+                (
+                    f'{{"global_step": {int(step) if step is not None else -1}, '
+                    f'"decode_step": {idx}, '
+                    f'"req_scope": "all_requests", '
+                    f'"mode": "{hspec_profile_method()}"}}'
+                ),
+            )
+        except Exception:
+            pass
+        yield
+    finally:
+        try:
+            torch.npu.synchronize()
+        except Exception:
+            pass
+        try:
+            profiler.step()
+        except Exception:
+            pass
+        try:
+            profiler.stop()
+        finally:
+            hspec_clear_profile_context()
 
 
 @contextmanager

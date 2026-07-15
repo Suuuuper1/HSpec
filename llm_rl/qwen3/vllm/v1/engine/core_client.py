@@ -1306,7 +1306,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         and reconfiguring existing ones."""
         cur_data_parallel_size = len(self.core_engines)
 
-        # Phase 1: Send reconfigure messages to all existing engines and wait
+        # Send reconfigure messages to all existing engines and wait
         # for them to be sent
         reconfig_futures = []
         self.vllm_config.parallel_config.data_parallel_master_port = get_open_port()
@@ -1325,7 +1325,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         logger.info("All reconfigure messages sent, starting engine creation")
 
-        # Phase 2: Create new engines now that reconfig messages have been sent
+        # Create new engines now that reconfig messages have been sent
         # self.resources.engine_manager is guaranteed to be
         # CoreEngineActorManager for RayDPClient
         assert isinstance(self.resources.engine_manager, CoreEngineActorManager)
@@ -1353,7 +1353,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             identity, _ = sync_input_socket.recv_multipart()
             new_engine_identities.discard(identity)
 
-        # Phase 3: Wait for all existing engines to complete reconfiguration
+        # Wait for all existing engines to complete reconfiguration
         logger.info("Waiting for existing engines to complete reconfiguration")
         await asyncio.gather(*reconfig_futures)
 

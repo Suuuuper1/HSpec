@@ -55,7 +55,10 @@ from vllm.lora.request import LoRARequest
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.spec_decode.hspec_utils import (
     create_hspec_torch_npu_profiler,
+    hspec_begin_decode_step_profile_session,
     hspec_clear_profile_context,
+    hspec_end_decode_step_profile_session,
+    hspec_profile_decode_step_sampling_enabled,
     hspec_profile_enabled_for_step,
     hspec_profile_output_dir,
     hspec_record_function,
@@ -579,6 +582,7 @@ class vLLMRollout(BaseRollout):
         collect_hspec = use_hspec and not is_validate and bool(do_sample)
         profile_this_step = hspec_profile_enabled_for_step(global_step)
         profiler = None
+        decode_step_profile_session = False
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         _maybe_log_hspec_phase3_runtime(
             use_hspec=bool(use_hspec),
@@ -682,25 +686,33 @@ class vLLMRollout(BaseRollout):
                 f"step_{int(global_step)}",
             )
             os.makedirs(profile_dir, exist_ok=True)
-            profiler = create_hspec_torch_npu_profiler(profile_dir)
-            hspec_set_profile_context(
-                enabled=True,
-                step=int(global_step),
-                req_idx=-1,
-            )
-            profiler.start()
-            try:
-                profiler.add_metadata_json(
-                    "hspec_profile_context",
-                    (
-                        f'{{"global_step": {int(global_step)}, '
-                        f'"req_scope": "all_requests", '
-                        f'"rank": {int(rank)}, '
-                        f'"mode": "{os.getenv("HSPEC_PROFILE_METHOD", "mstx")}"}}'
-                    ),
+            if hspec_profile_decode_step_sampling_enabled():
+                hspec_begin_decode_step_profile_session(
+                    step=int(global_step),
+                    req_idx=-1,
+                    profile_dir=profile_dir,
                 )
-            except Exception:
-                pass
+                decode_step_profile_session = True
+            else:
+                profiler = create_hspec_torch_npu_profiler(profile_dir)
+                hspec_set_profile_context(
+                    enabled=True,
+                    step=int(global_step),
+                    req_idx=-1,
+                )
+                profiler.start()
+                try:
+                    profiler.add_metadata_json(
+                        "hspec_profile_context",
+                        (
+                            f'{{"global_step": {int(global_step)}, '
+                            f'"req_scope": "all_requests", '
+                            f'"rank": {int(rank)}, '
+                            f'"mode": "{os.getenv("HSPEC_PROFILE_METHOD", "mstx")}"}}'
+                        ),
+                    )
+                except Exception:
+                    pass
 
         try:
             with self.update_sampling_params(**kwargs):
@@ -866,6 +878,8 @@ class vLLMRollout(BaseRollout):
 
                     seq = torch.cat([idx, response], dim=-1)
         finally:
+            if decode_step_profile_session:
+                hspec_end_decode_step_profile_session()
             if profiler is not None:
                 try:
                     torch.npu.synchronize()

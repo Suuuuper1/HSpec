@@ -139,6 +139,8 @@ export HSPEC_GEN="${HSPEC_GEN:-0}"
 export HSPEC_GEN_REQ_IDX="${HSPEC_GEN_REQ_IDX:-0}"
 export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
 export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-5,31,63,91}"
+export HSPEC_PROFILE_DECODE_STEP_INTERVAL="${HSPEC_PROFILE_DECODE_STEP_INTERVAL:-0}"
+export HSPEC_PROFILE_DECODE_STEPS="${HSPEC_PROFILE_DECODE_STEPS:-}"
 export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/xy/hspec_profile_batch-update_prefill_spec_on}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
@@ -294,6 +296,9 @@ hspec_maybe_clean_store_dirs
     echo "hspec_table_evict_hit_weight=${HSPEC_TABLE_EVICT_HIT_WEIGHT}"
     echo "hspec_table_access_report_interval_steps=${HSPEC_TABLE_ACCESS_REPORT_INTERVAL_STEPS}"
     echo "hspec_profile=${HSPEC_PROFILE}"
+    echo "hspec_profile_steps=${HSPEC_PROFILE_STEPS}"
+    echo "hspec_profile_decode_step_interval=${HSPEC_PROFILE_DECODE_STEP_INTERVAL}"
+    echo "hspec_profile_decode_steps=${HSPEC_PROFILE_DECODE_STEPS}"
     echo "hspec_phase4_metrics_every_steps=${HSPEC_PHASE4_METRICS_EVERY_STEPS}"
     echo "hspec_profile_build_cpu=${HSPEC_PROFILE_BUILD_CPU}"
     echo "hspec_profile_build_cpu_output_dir=${HSPEC_PROFILE_BUILD_CPU_OUTPUT_DIR}"
@@ -416,6 +421,8 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_MAX_CALLS='"'"${HSPEC_GEN_MAX_CALLS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE='"'"${HSPEC_PROFILE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_STEPS='"'"${HSPEC_PROFILE_STEPS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_DECODE_STEP_INTERVAL='"'"${HSPEC_PROFILE_DECODE_STEP_INTERVAL}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_DECODE_STEPS='"'"${HSPEC_PROFILE_DECODE_STEPS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_METHOD='"'"${HSPEC_PROFILE_METHOD}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_DIR='"'"${HSPEC_PROFILE_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_LEVEL='"'"${HSPEC_PROFILE_LEVEL}"'"' \

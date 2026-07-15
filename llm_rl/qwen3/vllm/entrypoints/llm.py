@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+from contextlib import nullcontext
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1746,6 +1747,13 @@ class LLM:
     def _run_engine(
         self, *, use_tqdm: bool | Callable[..., tqdm] = True
     ) -> list[RequestOutput | PoolingRequestOutput]:
+        try:
+            from vllm_ascend.spec_decode.hspec_utils import (
+                hspec_maybe_profile_decode_step,
+            )
+        except Exception:
+            hspec_maybe_profile_decode_step = None
+
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
@@ -1761,11 +1769,21 @@ class LLM:
         outputs: list[RequestOutput | PoolingRequestOutput] = []
         total_in_toks = 0
         total_out_toks = 0
+        decode_step_idx = 0
         while self.llm_engine.has_unfinished_requests():
+            decode_step_idx += 1
             original_threshold = gc.get_threshold()
             gc.set_threshold(0)
-            step_outputs = self.llm_engine.step()
-            gc.set_threshold(*original_threshold)
+            try:
+                profile_ctx = (
+                    hspec_maybe_profile_decode_step(decode_step_idx)
+                    if hspec_maybe_profile_decode_step is not None
+                    else nullcontext()
+                )
+                with profile_ctx:
+                    step_outputs = self.llm_engine.step()
+            finally:
+                gc.set_threshold(*original_threshold)
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)

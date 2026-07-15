@@ -261,7 +261,6 @@ class StatelessProcessGroup:
         except Exception as e:
             raise RuntimeError("Failed to broadcast barrier_id") from e
 
-        # Phase 1: Signal arrival at barrier
         # Wait for all processes to arrive
         # We need all ranks to confirm the arrival of all other ranks.
         # This is the key synchronization point.
@@ -302,7 +301,6 @@ class StatelessProcessGroup:
             if len(processes_arrived) < self.world_size:
                 sched_yield()
 
-        # Phase 2: Signal departure from barrier
         # We only care to block at this stage in rank 0, which runs the
         # server side of the TCPStore. We want to make sure that all
         # clients have departed the barrier before rank 0 in case the

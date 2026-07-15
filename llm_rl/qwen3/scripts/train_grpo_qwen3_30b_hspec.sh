@@ -115,7 +115,7 @@ export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export HSPEC_DEBUG="${HSPEC_DEBUG:-0}"
 export HSPEC_TRACE="${HSPEC_TRACE:-0}"
 export HSPEC_DUMP="${HSPEC_DUMP:-0}"
-export HSPEC_PROFILE="${HSPEC_PROFILE:-0}"
+export HSPEC_PROFILE="${HSPEC_PROFILE:-1}"
 export HSPEC_DUMP_DIR="${HSPEC_DUMP_DIR:-/workspace/exp/hspec_dump-rollout_1024}"
 
 # Core HSpec knobs.
@@ -136,7 +136,9 @@ export HSPEC_ASYNC_HS_COPY_STREAM="${HSPEC_ASYNC_HS_COPY_STREAM:-1}"
 export HSPEC_GEN="${HSPEC_GEN:-0}"
 export HSPEC_GEN_REQ_IDX="${HSPEC_GEN_REQ_IDX:-0}"
 export HSPEC_GEN_MAX_CALLS="${HSPEC_GEN_MAX_CALLS:-0}"
-export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-1}"
+export HSPEC_PROFILE_STEPS="${HSPEC_PROFILE_STEPS:-1,3,5}"
+export HSPEC_PROFILE_DECODE_STEP_INTERVAL="${HSPEC_PROFILE_DECODE_STEP_INTERVAL:-0}"
+export HSPEC_PROFILE_DECODE_STEPS="${HSPEC_PROFILE_DECODE_STEPS:-1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64}"
 export HSPEC_PROFILE_DIR="${HSPEC_PROFILE_DIR:-/home/sharedata/xy_profile/hspec_profile_new-30b}"
 export HSPEC_PROFILE_METHOD="${HSPEC_PROFILE_METHOD:-mstx}"
 export HSPEC_PROFILE_LEVEL="${HSPEC_PROFILE_LEVEL:-level_none}"
@@ -316,6 +318,9 @@ fi
     echo "hspec_table_evict_hit_weight=${HSPEC_TABLE_EVICT_HIT_WEIGHT}"
     echo "hspec_table_access_report_interval_steps=${HSPEC_TABLE_ACCESS_REPORT_INTERVAL_STEPS}"
     echo "hspec_profile=${HSPEC_PROFILE}"
+    echo "hspec_profile_steps=${HSPEC_PROFILE_STEPS}"
+    echo "hspec_profile_decode_step_interval=${HSPEC_PROFILE_DECODE_STEP_INTERVAL}"
+    echo "hspec_profile_decode_steps=${HSPEC_PROFILE_DECODE_STEPS}"
     echo "hspec_phase4_metrics_every_steps=${HSPEC_PHASE4_METRICS_EVERY_STEPS}"
     echo "hspec_profile_build_cpu=${HSPEC_PROFILE_BUILD_CPU}"
     echo "hspec_profile_build_cpu_output_dir=${HSPEC_PROFILE_BUILD_CPU_OUTPUT_DIR}"
@@ -533,6 +538,8 @@ env \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_GEN_MAX_CALLS='"'"${HSPEC_GEN_MAX_CALLS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE='"'"${HSPEC_PROFILE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_STEPS='"'"${HSPEC_PROFILE_STEPS}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_DECODE_STEP_INTERVAL='"'"${HSPEC_PROFILE_DECODE_STEP_INTERVAL}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_DECODE_STEPS='"'"${HSPEC_PROFILE_DECODE_STEPS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_METHOD='"'"${HSPEC_PROFILE_METHOD}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_DIR='"'"${HSPEC_PROFILE_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROFILE_LEVEL='"'"${HSPEC_PROFILE_LEVEL}"'"' \
