@@ -35,11 +35,16 @@ from typing import Any, Dict, Iterable, Iterator, Optional
 
 import numpy as np
 import torch
+from vllm_ascend.spec_decode.hspec_utils import (
+    hspec_external_request_id,
+    hspec_resolve_prompt_id_for_request,
+)
 
 logger = logging.getLogger(__name__)
 
 _SEGMENT_MANIFEST_NAME = "segment.json"
 _DESC_MANIFEST_NAME = "desc.jsonl"
+_REQ_PROMPT_MAP_NAME = "req_prompt_map.jsonl"
 _SEGMENT_SAFE_DELETE_STATES = frozenset({"gc_deletable", "aborted", "epoch_build_done"})
 _SEGMENT_CONFIRMED_DELETE_STATES = _SEGMENT_SAFE_DELETE_STATES | frozenset({"sealed", "submitted_to_build"})
 _unsafe_delete_trajectory_warned = False
@@ -162,6 +167,15 @@ _store_metrics: Dict[str, int] = {
     "desc_extent_total": 0,
     "desc_extent_max": 0,
     "desc_extent_coalesced_count": 0,
+    "prompt_id_bind_success": 0,
+    "prompt_id_bind_conflict": 0,
+    "prompt_id_bind_missing_tokens": 0,
+    "prompt_id_resolved_from_state": 0,
+    "prompt_id_resolved_from_request_mapping": 0,
+    "prompt_id_resolved_from_external_mapping": 0,
+    "prompt_id_miss": 0,
+    "prompt_id_empty_seal_rejected": 0,
+    "req_prompt_map_write_error": 0,
 }
 
 
@@ -199,6 +213,11 @@ def hspec_strict_descriptor_mode_enabled() -> bool:
 def hspec_step0_runtime_asserts_enabled() -> bool:
     """Enable cheap Step-0 key-level invariants outside decode hot paths."""
     return os.getenv("HSPEC_STEP0_RUNTIME_ASSERTS", "0") != "0"
+
+
+def hspec_strict_prompt_id_on_seal_enabled() -> bool:
+    """Whether descriptor mode should refuse sealing descriptors with empty prompt ids."""
+    return os.getenv("HSPEC_STRICT_PROMPT_ID_ON_SEAL", "1") != "0"
 
 
 def hspec_raw_store_gc_after_epoch_enabled() -> bool:
@@ -609,6 +628,7 @@ class HSpecTrajectoryDesc:
     hidden_dim: int
     hs_dtype: str
     token_dtype: str
+    external_request_id: str = ""
     chunk_count: int = 1
     extents: tuple[HSpecTrajectoryExtent, ...] | None = None
     hs_offset_rows: int = 0
@@ -1047,6 +1067,8 @@ class HSpecLocalCollector:
 
         state = {
             "request_id": req_id,
+            "external_request_id": hspec_external_request_id(req_id),
+            "prompt_id": "",
             "hs_path": self._segment_hs_path,
             "token_path": self._segment_token_path,
             "hidden_dim": 0,
@@ -1061,6 +1083,34 @@ class HSpecLocalCollector:
         }
         self._req_states[req_id] = state
         return state
+
+    def bind_prompt_id(self, req_id: str, prompt_id: str) -> None:
+        prompt_id = str(prompt_id or "")
+        if not prompt_id:
+            return
+        req_id = str(req_id)
+        with self._lock:
+            state = self._state_for_req(req_id)
+            current = str(state.get("prompt_id") or "")
+            if not current:
+                state["prompt_id"] = prompt_id
+                state["external_request_id"] = str(
+                    state.get("external_request_id") or hspec_external_request_id(req_id)
+                )
+                _metric_add("prompt_id_bind_success", 1)
+                return
+            if current != prompt_id:
+                _metric_add("prompt_id_bind_conflict", 1)
+                logger.warning(
+                    "HSpec prompt_id bind conflict for req_id=%s: current=%s incoming=%s",
+                    req_id,
+                    current,
+                    prompt_id,
+                )
+
+    def record_prompt_id_missing_tokens(self, count: int = 1) -> None:
+        with self._lock:
+            _metric_add("prompt_id_bind_missing_tokens", max(int(count), 1))
 
     @staticmethod
     def _close_state_files(state: Dict[str, Any]) -> None:
@@ -1484,9 +1534,36 @@ class HSpecLocalCollector:
                     dropped_count += 1
                     continue
                 first_extent = extents[0]
-
-                prompt_id = str(request_id_to_prompt_id.get(req_id, ""))
-                shard_id = _stable_partition_id(prompt_id or req_id, get_hspec_num_shards())
+                state_prompt_id = str(state.get("prompt_id") or "")
+                prompt_id = hspec_resolve_prompt_id_for_request(
+                    req_id,
+                    request_id_to_prompt_id,
+                    state_prompt_id=state_prompt_id,
+                )
+                if state_prompt_id:
+                    _metric_add("prompt_id_resolved_from_state", 1)
+                elif prompt_id:
+                    external_request_id = hspec_external_request_id(req_id)
+                    if external_request_id != str(req_id) and external_request_id in request_id_to_prompt_id:
+                        _metric_add("prompt_id_resolved_from_external_mapping", 1)
+                    else:
+                        _metric_add("prompt_id_resolved_from_request_mapping", 1)
+                if not prompt_id:
+                    _metric_add("prompt_id_miss", 1)
+                    _metric_add("prompt_id_empty_seal_rejected", 1)
+                    _record_collect_drop("empty_prompt_id")
+                    dropped_count += 1
+                    if hspec_strict_prompt_id_on_seal_enabled():
+                        logger.error(
+                            "HSpec descriptor seal rejected empty prompt_id: req_id=%s external_request_id=%s",
+                            req_id,
+                            hspec_external_request_id(req_id),
+                        )
+                    continue
+                shard_id = _stable_partition_id(prompt_id, get_hspec_num_shards())
+                external_request_id = str(
+                    state.get("external_request_id") or hspec_external_request_id(req_id)
+                )
                 desc = HSpecTrajectoryDesc(
                     epoch=int(epoch),
                     global_step=int(global_step),
@@ -1495,6 +1572,7 @@ class HSpecLocalCollector:
                     tp_group_id=int(self.tp_group_id),
                     shard_id=int(shard_id),
                     request_id=str(req_id),
+                    external_request_id=external_request_id,
                     prompt_id=prompt_id,
                     hs_path=str(state["hs_path"]),
                     token_path=str(state["token_path"]),
@@ -1510,6 +1588,7 @@ class HSpecLocalCollector:
                 )
                 descs[req_id] = desc
                 self._append_manifest(desc)
+                self._append_req_prompt_map(desc)
                 _metric_add("desc_extent_total", len(extents))
                 hspec_record_store_metric_max("desc_extent_max", len(extents))
                 if len(extents) > 1:
@@ -1542,6 +1621,25 @@ class HSpecLocalCollector:
         except Exception:
             logger.debug("Failed to append HSpec descriptor manifest", exc_info=True)
 
+    def _append_req_prompt_map(self, desc: HSpecTrajectoryDesc) -> None:
+        try:
+            map_path = Path(desc.hs_path).with_name(_REQ_PROMPT_MAP_NAME)
+            payload = {
+                "request_id": str(desc.request_id),
+                "external_request_id": str(desc.external_request_id),
+                "prompt_id": str(desc.prompt_id),
+                "shard_id": int(desc.shard_id),
+                "epoch": int(desc.epoch),
+                "global_step": int(desc.global_step),
+                "worker_rank": int(desc.worker_rank),
+                "tp_group_id": int(desc.tp_group_id),
+            }
+            with open(map_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception:
+            _metric_add("req_prompt_map_write_error", 1)
+            logger.debug("Failed to append HSpec req_prompt sidecar", exc_info=True)
+
 
 _collector: HSpecLocalCollector | None = None
 _collector_lock = threading.Lock()
@@ -1555,6 +1653,14 @@ def get_hspec_local_collector() -> HSpecLocalCollector:
         if _collector is None:
             _collector = HSpecLocalCollector()
     return _collector
+
+
+def bind_hspec_prompt_id(req_id: str, prompt_id: str) -> None:
+    get_hspec_local_collector().bind_prompt_id(req_id, prompt_id)
+
+
+def record_hspec_prompt_id_missing_tokens(count: int = 1) -> None:
+    get_hspec_local_collector().record_prompt_id_missing_tokens(count)
 
 
 def hspec_collect_budget_decision(

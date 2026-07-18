@@ -129,12 +129,42 @@ def _install_lightweight_package_stubs(repo_root: Path) -> None:
         spec_pkg.__path__ = [str(repo_root / "vllm_ascend/spec_decode")]  # type: ignore[attr-defined]
         sys.modules["vllm_ascend.spec_decode"] = spec_pkg
 
-    if importlib.util.find_spec("torch") is None and "torch" not in sys.modules:
+    torch_available = False
+    try:
+        torch_available = importlib.util.find_spec("torch") is not None
+    except (ImportError, ValueError):
+        torch_available = "torch" in sys.modules and getattr(sys.modules.get("torch"), "__spec__", None) is not None
+    if not torch_available and "torch" not in sys.modules:
+        def _noop_record_function(*args, **kwargs):
+            class _NoOpContext:
+                def __enter__(self):
+                    return None
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            return _NoOpContext()
+
         torch_stub = types.ModuleType("torch")
         torch_stub.Tensor = object  # type: ignore[attr-defined]
         torch_stub.dtype = object  # type: ignore[attr-defined]
         torch_stub.Size = tuple  # type: ignore[attr-defined]
+        torch_stub.device = lambda value="cpu": str(value)  # type: ignore[attr-defined]
+        torch_stub.float16 = "float16"  # type: ignore[attr-defined]
+        torch_stub.float32 = "float32"  # type: ignore[attr-defined]
+        torch_stub.long = "long"  # type: ignore[attr-defined]
+        profiler_mod = types.ModuleType("torch.profiler")
+        profiler_mod.record_function = _noop_record_function  # type: ignore[attr-defined]
+        autograd_mod = types.ModuleType("torch.autograd")
+        autograd_profiler_mod = types.ModuleType("torch.autograd.profiler")
+        autograd_profiler_mod.record_function = _noop_record_function  # type: ignore[attr-defined]
+        autograd_mod.profiler = autograd_profiler_mod  # type: ignore[attr-defined]
+        torch_stub.profiler = profiler_mod  # type: ignore[attr-defined]
+        torch_stub.autograd = autograd_mod  # type: ignore[attr-defined]
         sys.modules["torch"] = torch_stub
+        sys.modules["torch.profiler"] = profiler_mod
+        sys.modules["torch.autograd"] = autograd_mod
+        sys.modules["torch.autograd.profiler"] = autograd_profiler_mod
 
 
 def _load_local_module(module_name: str, path: Path) -> Any:
@@ -147,8 +177,12 @@ def _load_local_module(module_name: str, path: Path) -> Any:
     return module
 
 
-def _load_hspec_modules(repo_root: Path) -> tuple[Any, Any]:
+def _load_hspec_modules(repo_root: Path) -> tuple[Any, Any, Any]:
     _install_lightweight_package_stubs(repo_root)
+    hspec_utils_mod = _load_local_module(
+        "vllm_ascend.spec_decode.hspec_utils",
+        repo_root / "vllm_ascend/spec_decode/hspec_utils.py",
+    )
     hspec_store_mod = _load_local_module(
         "vllm_ascend.spec_decode.hspec_store",
         repo_root / "vllm_ascend/spec_decode/hspec_store.py",
@@ -157,7 +191,7 @@ def _load_hspec_modules(repo_root: Path) -> tuple[Any, Any]:
         "vllm_ascend.spec_decode.hspec_table_store",
         repo_root / "vllm_ascend/spec_decode/hspec_table_store.py",
     )
-    return hspec_store_mod, hspec_table_store_mod
+    return hspec_store_mod, hspec_table_store_mod, hspec_utils_mod
 
 
 def _scan_descriptors(
@@ -195,7 +229,10 @@ def _scan_descriptors(
                         "global_step": step,
                         "prompt_id": str(desc.prompt_id),
                         "request_id": str(desc.request_id),
+                        "external_request_id": str(getattr(desc, "external_request_id", "") or ""),
                         "shard_id": int(desc.shard_id),
+                        "worker_rank": int(desc.worker_rank),
+                        "tp_group_id": int(desc.tp_group_id),
                         "length": int(desc.length),
                         "hidden_dim": int(desc.hidden_dim),
                         "hs_path": str(desc.hs_path),
@@ -347,6 +384,7 @@ def _build_step_inventory(
         prompt_ids = {str(item["prompt_id"]) for item in items if str(item["prompt_id"])}
         segment_dirs = {str(item["segment_dir"]) for item in items}
         shard_ids = sorted({int(item["shard_id"]) for item in items})
+        empty_prompt_id_count = sum(1 for item in items if not str(item["prompt_id"]))
 
         raw_bytes_total = 0
         missing_files = 0
@@ -385,6 +423,11 @@ def _build_step_inventory(
                 "raw_bytes_total": int(raw_bytes_total),
                 "segment_count": len(segment_dirs),
                 "missing_segment_files": int(missing_files),
+                "empty_prompt_id_count": int(empty_prompt_id_count),
+                "empty_prompt_id_ratio": (
+                    float(empty_prompt_id_count) / float(len(items))
+                    if items else 0.0
+                ),
                 "query_epoch_usable": bool(epoch_value is not None and int(epoch_value) >= 1),
                 "analysis_ready": bool(analysis_ready),
                 "missing_table_mapping_shards": missing_shards,
@@ -422,7 +465,7 @@ def _parse_inventory_command(args: argparse.Namespace) -> int:
     hspec_store_dir = Path(hspec_store_dir_value).expanduser()
     hspec_table_store_dir = Path(hspec_table_store_dir_value).expanduser()
 
-    hspec_store_mod, hspec_table_store_mod = _load_hspec_modules(REPO_ROOT)
+    hspec_store_mod, hspec_table_store_mod, _ = _load_hspec_modules(REPO_ROOT)
     descriptors = _scan_descriptors(hspec_store_dir, hspec_store_mod)
     version_records, version_report = _scan_table_versions(hspec_table_store_dir, hspec_table_store_mod)
     step_rows, step_report = _build_step_inventory(descriptors, hspec_store_mod, version_records)
@@ -436,7 +479,10 @@ def _parse_inventory_command(args: argparse.Namespace) -> int:
             "global_step": int(item["global_step"]),
             "prompt_id": str(item["prompt_id"]),
             "request_id": str(item["request_id"]),
+            "external_request_id": str(item["external_request_id"]),
             "shard_id": int(item["shard_id"]),
+            "worker_rank": int(item["worker_rank"]),
+            "tp_group_id": int(item["tp_group_id"]),
             "length": int(item["length"]),
             "hidden_dim": int(item["hidden_dim"]),
             "hs_path": str(item["hs_path"]),
@@ -474,6 +520,44 @@ def _load_target_descriptors(
     target_steps: set[int],
 ) -> list[dict[str, Any]]:
     return _scan_descriptors(hspec_store_dir, hspec_store_mod, target_steps=target_steps)
+
+
+def _dedupe_tp_fanout_for_step(
+    items: list[dict[str, Any]],
+    hspec_utils_mod: Any,
+) -> list[dict[str, Any]]:
+    """Keep one descriptor per (tp_group_id, external_request_id) within a step."""
+    kept: dict[tuple[int, str], dict[str, Any]] = {}
+    for item in items:
+        external_request_id = str(
+            item.get("external_request_id")
+            or hspec_utils_mod.hspec_external_request_id(str(item["request_id"]))
+        )
+        key = (int(item["tp_group_id"]), external_request_id)
+        prev = kept.get(key)
+        if prev is None:
+            kept[key] = item
+            continue
+        current_order = (int(item["worker_rank"]), str(item["request_id"]))
+        prev_order = (int(prev["worker_rank"]), str(prev["request_id"]))
+        if current_order < prev_order:
+            kept[key] = item
+    return sorted(
+        kept.values(),
+        key=lambda item: (
+            int(item["tp_group_id"]),
+            str(item.get("external_request_id") or ""),
+            int(item["worker_rank"]),
+            str(item["request_id"]),
+        ),
+    )
+
+
+def _infer_num_shards(version_records: list[dict[str, Any]]) -> int:
+    shard_ids = sorted({int(record["shard_id"]) for record in version_records})
+    if not shard_ids:
+        raise RuntimeError("failed to infer num_shards from empty table version catalog")
+    return len(shard_ids)
 
 
 def _load_version_catalog_from_json(path: Path) -> list[dict[str, Any]]:
@@ -759,6 +843,11 @@ def _analyze_prompt_group(
             all_meta.append(
                 {
                     "request_id": str(desc.request_id),
+                    "external_request_id": str(
+                        getattr(desc, "external_request_id", "")
+                        or hspec_utils_mod.hspec_external_request_id(str(desc.request_id))
+                    ),
+                    "tp_group_id": int(getattr(desc, "tp_group_id", 0)),
                     "query_token_idx": int(token_idx),
                     "query_token_id": int(tokens[token_idx]),
                     "response_len": int(tokens.shape[0]),
@@ -814,9 +903,11 @@ def _analyze_prompt_group(
                     "global_step": int(step),
                     "prompt_id": str(prompt_id),
                     "request_id": str(meta["request_id"]),
+                    "external_request_id": str(meta["external_request_id"]),
                     "shard_id": int(shard_id),
                     "table_version": int(version_record["version"]),
                     "table_active_epoch": int(version_record["active_epoch"]),
+                    "tp_group_id": int(meta["tp_group_id"]),
                     "query_token_idx": int(meta["query_token_idx"]),
                     "candidate_rank_by_sim": int(rank_idx),
                     "candidate_entry_idx": entry_i,
@@ -871,9 +962,11 @@ def _analyze_prompt_group(
                 "epoch": int(epoch),
                 "global_step": int(step),
                 "prompt_id": str(prompt_id),
-                "request_id": str(meta["request_id"]),
-                "shard_id": int(shard_id),
-                "query_token_idx": int(meta["query_token_idx"]),
+                    "request_id": str(meta["request_id"]),
+                    "external_request_id": str(meta["external_request_id"]),
+                    "shard_id": int(shard_id),
+                    "tp_group_id": int(meta["tp_group_id"]),
+                    "query_token_idx": int(meta["query_token_idx"]),
                 "query_token_id": int(meta["query_token_id"]),
                 "response_len": int(meta["response_len"]),
                 "table_present": True,
@@ -915,7 +1008,7 @@ def _analyze_command(args: argparse.Namespace) -> int:
         else manifest.get("A1_HSPEC_NUM_SPECULATIVE_TOKENS", DEFAULT_DRAFT_HORIZON)
     )
 
-    hspec_store_mod, hspec_table_store_mod = _load_hspec_modules(REPO_ROOT)
+    hspec_store_mod, hspec_table_store_mod, hspec_utils_mod = _load_hspec_modules(REPO_ROOT)
     descriptors = _load_target_descriptors(
         Path(hspec_store_dir_value).expanduser(),
         hspec_store_mod,
@@ -927,6 +1020,7 @@ def _analyze_command(args: argparse.Namespace) -> int:
         else _scan_table_versions(Path(hspec_table_store_dir_value).expanduser(), hspec_table_store_mod)[0]
     )
     version_map = _version_index(version_records)
+    num_shards = _infer_num_shards(version_records)
 
     grouped_steps: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for item in descriptors:
@@ -950,17 +1044,36 @@ def _analyze_command(args: argparse.Namespace) -> int:
         epoch = int(epochs[0])
         if epoch < 1:
             raise RuntimeError(f"step={step} belongs to epoch 0 and is not eligible for A1")
+        empty_prompt_ids = sum(1 for item in items if not str(item["prompt_id"]))
+        if empty_prompt_ids:
+            raise RuntimeError(
+                f"step={step}: {empty_prompt_ids}/{len(items)} descriptors have empty prompt_id. "
+                "Raw-store seal mapping is broken; refusing silent skip. "
+                "See HSpec_reaserch_doc/optim_draft_select/exp/hspec_a1_prompt_id_disk_fix_guide.md"
+            )
+
+        deduped_items = _dedupe_tp_fanout_for_step(items, hspec_utils_mod)
+        for item in deduped_items:
+            prompt_id = str(item["prompt_id"])
+            expected_shard = int(hspec_utils_mod.stable_partition_id(prompt_id, num_shards))
+            if int(item["shard_id"]) != expected_shard:
+                raise RuntimeError(
+                    "descriptor shard mismatch after prompt_id repair: "
+                    f"step={step} request_id={item['request_id']} prompt_id={prompt_id} "
+                    f"desc.shard_id={item['shard_id']} expected_shard={expected_shard} "
+                    f"num_shards={num_shards}"
+                )
 
         target_active_epoch = epoch - 1
         by_prompt: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for item in items:
+        for item in deduped_items:
             prompt_id = str(item["prompt_id"])
-            if not prompt_id:
-                continue
             by_prompt[prompt_id].append(item)
 
         step_counters = {
-            "num_desc_analyzed": len(items),
+            "num_desc_scanned": len(items),
+            "num_desc_after_tp_dedupe": len(deduped_items),
+            "num_desc_analyzed": len(deduped_items),
             "num_prompts_analyzed": len(by_prompt),
             "num_query_points_total": 0,
             "num_query_points_usable": 0,
@@ -1029,6 +1142,10 @@ def _analyze_command(args: argparse.Namespace) -> int:
     eligible_query_rows = [row for row in usable_query_rows if bool(row["eligible_by_threshold"])]
     summary = {
         "num_steps_analyzed": len(target_steps),
+        "num_desc_scanned": int(sum(int(row["num_desc_scanned"]) for row in step_rows)),
+        "num_desc_after_tp_dedupe": int(
+            sum(int(row["num_desc_after_tp_dedupe"]) for row in step_rows)
+        ),
         "num_desc_analyzed": int(sum(int(row["num_desc_analyzed"]) for row in step_rows)),
         "num_query_points_total": int(len(query_records)),
         "num_query_points_usable": int(len(usable_query_rows)),

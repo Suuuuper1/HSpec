@@ -631,6 +631,29 @@ class NPUModelRunner(GPUModelRunner):
         spec_decode_metadata: Optional[SpecDecodeMetadata],
         accepted_prefix_lengths: Optional[list[int]] = None,
     ) -> bool:
+        try:
+            from vllm_ascend.spec_decode.hspec_store import (
+                bind_hspec_prompt_id,
+                record_hspec_prompt_id_missing_tokens,
+            )
+            from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
+
+            missing_prompt_tokens = 0
+            for req_id in list(self.input_batch.req_ids):
+                req_state = self.requests.get(req_id)
+                prompt_token_ids = getattr(req_state, "prompt_token_ids", None)
+                if prompt_token_ids:
+                    bind_hspec_prompt_id(
+                        str(req_id),
+                        prompt_id_from_token_ids(list(prompt_token_ids)),
+                    )
+                else:
+                    missing_prompt_tokens += 1
+            if missing_prompt_tokens > 0:
+                record_hspec_prompt_id_missing_tokens(missing_prompt_tokens)
+        except Exception:
+            logger.debug("HSpec: failed to bind prompt_id before accumulate", exc_info=True)
+
         from vllm_ascend.spec_decode.hspec_utils import hspec_submit_accumulate_task
 
         return hspec_submit_accumulate_task(

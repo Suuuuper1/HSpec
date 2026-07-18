@@ -2497,6 +2497,24 @@ class RayPPOTrainer:
                                     if prompt_build_data[prompt_id]["prompt_token_ids"] is None:
                                         prompt_build_data[prompt_id]["prompt_token_ids"] = list(prompt_token_ids)
                                 else:
+                                    existing_prompt_id = str(getattr(desc_obj, "prompt_id", "") or "")
+                                    if not existing_prompt_id:
+                                        hspec_record_store_metric("prompt_id_empty_from_rollout", 1)
+                                        if strict_descriptor_mode:
+                                            raise RuntimeError(
+                                                "HSpec descriptor path received an empty prompt_id "
+                                                f"before trainer build aggregation: step={self.global_steps} "
+                                                f"epoch={epoch} request_id={getattr(desc_obj, 'request_id', '<unknown>')!r}"
+                                            )
+                                    elif existing_prompt_id != prompt_id:
+                                        hspec_record_store_metric("prompt_id_conflict", 1)
+                                        if strict_descriptor_mode:
+                                            raise RuntimeError(
+                                                "HSpec descriptor prompt_id conflict before trainer build "
+                                                f"aggregation: step={self.global_steps} epoch={epoch} "
+                                                f"request_id={getattr(desc_obj, 'request_id', '<unknown>')!r} "
+                                                f"desc.prompt_id={existing_prompt_id!r} prompt_id_from_vllm_inputs={prompt_id!r}"
+                                            )
                                     desc_obj = desc_obj.with_updates(
                                         prompt_id=prompt_id,
                                         shard_id=stable_partition_id(

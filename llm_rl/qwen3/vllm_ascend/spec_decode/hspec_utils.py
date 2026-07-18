@@ -555,6 +555,52 @@ def stable_partition_id(key: str, num_partitions: int) -> int:
     return hv % num_partitions
 
 
+def hspec_external_request_id(request_id: str) -> str:
+    """Recover vLLM's external request id from an internal request id.
+
+    vLLM V1 may rewrite request ids from:
+
+    ``external`` -> ``f"{external}-{random_uuid[:8]}"``
+
+    When the incoming id is already external or does not match the internal
+    pattern, this function returns it unchanged.
+    """
+    rid = str(request_id)
+    if "-" not in rid:
+        return rid
+    return rid.rsplit("-", 1)[0]
+
+
+def hspec_resolve_prompt_id_for_request(
+    request_id: str,
+    request_id_to_prompt_id: Optional[Dict[str, str]] = None,
+    *,
+    state_prompt_id: Optional[str] = None,
+) -> str:
+    """Resolve prompt_id for a request across state-bound and mapping-bound keys.
+
+    Resolution order is intentionally symmetric with the existing fuzzy lookup
+    behaviour used when matching collector payloads back to rollout outputs:
+
+    1. A prompt_id already bound to the collector request state.
+    2. Exact request-id lookup in the provided mapping.
+    3. External request-id lookup derived from the internal request id.
+    """
+    if state_prompt_id:
+        return str(state_prompt_id)
+    mapping = request_id_to_prompt_id or {}
+    rid = str(request_id)
+    prompt_id = str(mapping.get(rid, "") or "")
+    if prompt_id:
+        return prompt_id
+    external_req_id = hspec_external_request_id(rid)
+    if external_req_id != rid:
+        prompt_id = str(mapping.get(external_req_id, "") or "")
+        if prompt_id:
+            return prompt_id
+    return ""
+
+
 class HiddenStateCollector:
     """Collector for hidden states during model inference.
     

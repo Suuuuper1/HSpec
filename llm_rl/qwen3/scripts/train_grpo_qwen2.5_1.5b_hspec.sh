@@ -32,6 +32,7 @@ export HSPEC_TABLE_STORE_DIR="/home/sharedata/xy_hspec/hspec_table_store/${RUN_N
 mkdir -p "$HSPEC_STORE_DIR" "$HSPEC_TABLE_STORE_DIR"
 export HSPEC_LEGACY_DATAPROTO_HS="${HSPEC_LEGACY_DATAPROTO_HS:-0}"
 export HSPEC_STRICT_DESCRIPTOR_MODE="${HSPEC_STRICT_DESCRIPTOR_MODE:-1}"
+export HSPEC_STRICT_PROMPT_ID_ON_SEAL="${HSPEC_STRICT_PROMPT_ID_ON_SEAL:-1}"
 export HSPEC_STORE_DTYPE="${HSPEC_STORE_DTYPE:-float16}"
 hspec_configure_store_lifecycle unique
 export HSPEC_INFER_TP="${HSPEC_INFER_TP:-2}"
@@ -211,6 +212,7 @@ hspec_maybe_clean_store_dirs
     echo "use_hspec_decode=${USE_HSPEC_DECODE}"
     echo "hspec_legacy_dataproto_hs=${HSPEC_LEGACY_DATAPROTO_HS}"
     echo "hspec_strict_descriptor_mode=${HSPEC_STRICT_DESCRIPTOR_MODE}"
+    echo "hspec_strict_prompt_id_on_seal=${HSPEC_STRICT_PROMPT_ID_ON_SEAL}"
     echo "hspec_store_dtype=${HSPEC_STORE_DTYPE}"
     echo "hspec_store_isolation_mode=${HSPEC_STORE_ISOLATION_MODE}"
     echo "hspec_run_uid=${HSPEC_RUN_UID}"
@@ -331,6 +333,7 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DUMP_DIR='"'"${HSPEC_DUMP_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LEGACY_DATAPROTO_HS='"'"${HSPEC_LEGACY_DATAPROTO_HS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STRICT_DESCRIPTOR_MODE='"'"${HSPEC_STRICT_DESCRIPTOR_MODE}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STRICT_PROMPT_ID_ON_SEAL='"'"${HSPEC_STRICT_PROMPT_ID_ON_SEAL}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DTYPE='"'"${HSPEC_STORE_DTYPE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_ISOLATION_MODE='"'"${HSPEC_STORE_ISOLATION_MODE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RUN_UID='"'"${HSPEC_RUN_UID}"'"' \
@@ -501,7 +504,7 @@ python -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
-    trainer.test_freq=-1 \
+    trainer.test_freq=2 \
     trainer.total_epochs=5 \
     > "${OUT}" 2>&1 "$@"
 

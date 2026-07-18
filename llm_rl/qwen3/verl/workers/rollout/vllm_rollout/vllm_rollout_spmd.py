@@ -818,6 +818,37 @@ class vLLMRollout(BaseRollout):
                                                 output_prompt_id,
                                                 get_hspec_num_shards(),
                                             )
+                                            existing_prompt_id = ""
+                                            if hasattr(hspec_desc, "prompt_id"):
+                                                existing_prompt_id = str(
+                                                    getattr(hspec_desc, "prompt_id", "") or ""
+                                                )
+                                            elif isinstance(hspec_desc, dict):
+                                                existing_prompt_id = str(
+                                                    hspec_desc.get("prompt_id", "") or ""
+                                                )
+                                            if (
+                                                existing_prompt_id
+                                                and existing_prompt_id != output_prompt_id
+                                            ):
+                                                try:
+                                                    from vllm_ascend.spec_decode.hspec_store import (
+                                                        hspec_record_store_metric,
+                                                    )
+
+                                                    hspec_record_store_metric("prompt_id_conflict", 1)
+                                                except Exception:
+                                                    logger.debug(
+                                                        "Failed to record HSpec prompt_id conflict metric",
+                                                        exc_info=True,
+                                                    )
+                                                logger.warning(
+                                                    "HSpec descriptor prompt_id conflict in rollout output collect: "
+                                                    "request_id=%s existing_prompt_id=%s output_prompt_id=%s",
+                                                    output.request_id,
+                                                    existing_prompt_id,
+                                                    output_prompt_id,
+                                                )
                                             if hasattr(hspec_desc, "with_updates"):
                                                 hspec_desc = hspec_desc.with_updates(
                                                     prompt_id=output_prompt_id,

@@ -170,6 +170,7 @@ def run_ppo(config) -> None:
             f"store_dir={get_hspec_store_root()}, "
             f"table_store_dir={get_hspec_table_store_root()}, "
             f"strict_descriptor_mode={hspec_strict_descriptor_mode_enabled()}, "
+            f"strict_prompt_id_on_seal={os.getenv('HSPEC_STRICT_PROMPT_ID_ON_SEAL', '1')}, "
             f"single_node_only={hspec_single_node_only}, "
             f"topology_strict={hspec_topology_strict}, "
             f"nnodes={int(config.trainer.nnodes)}, "
