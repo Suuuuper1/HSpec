@@ -194,7 +194,7 @@ fi
 # Log/output path conventions.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/rl}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/logs}"
-export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-1.5b-64-debug2.txt}"
+export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-1.5b-64-debug3.txt}"
 mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
 hspec_maybe_clean_store_dirs
 
@@ -501,7 +501,7 @@ python -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
-    trainer.test_freq=2 \
+    trainer.test_freq=-1 \
     trainer.total_epochs=5 \
     > "${OUT}" 2>&1 "$@"
 
