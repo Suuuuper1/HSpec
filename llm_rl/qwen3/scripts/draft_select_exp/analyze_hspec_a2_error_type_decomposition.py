@@ -276,6 +276,62 @@ def _summarize_decomposition(query_rows: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def _group_query_rows_by_topk(query_rows: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in query_rows:
+        grouped[int(row["topk_requested"])].append(row)
+    return grouped
+
+
+def _write_topk_plot_a2(out_dir: Path, summary_by_topk: dict[str, Any]) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    if a1.plt is None:  # pragma: no cover - optional dependency
+        outputs["warning"] = "matplotlib is unavailable; plot was skipped"
+        return outputs
+
+    topk_values = sorted(int(key) for key in summary_by_topk.keys())
+    if not topk_values:
+        outputs["warning"] = "no topk values to plot"
+        return outputs
+
+    def _series(universe: str, metric: str) -> list[float]:
+        return [
+            float(summary_by_topk[str(topk)][universe][metric])
+            for topk in topk_values
+        ]
+
+    fig, axes = a1.plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    universe_specs = [
+        ("all_query_points", "All Query Points", axes[0]),
+        ("spec_eligible_query_points", "Spec Eligible", axes[1]),
+    ]
+    for universe_key, title, row_axes in universe_specs:
+        row_axes[0].plot(topk_values, _series(universe_key, "mean_baseline_accept"), marker="o", label="baseline")
+        row_axes[0].plot(topk_values, _series(universe_key, "mean_top1_oracle_len"), marker="o", label="top1+oracle_len")
+        row_axes[0].plot(topk_values, _series(universe_key, "mean_topk_current_len"), marker="o", label="topk+current_len")
+        row_axes[0].plot(topk_values, _series(universe_key, "mean_joint_oracle"), marker="o", label="joint_oracle")
+        row_axes[0].set_title(f"{title}: Counterfactual Means")
+        row_axes[0].set_xlabel("topk")
+        row_axes[0].set_ylabel("accept len")
+        row_axes[0].grid(True, alpha=0.3)
+        row_axes[0].legend()
+
+        row_axes[1].plot(topk_values, _series(universe_key, "rank_share"), marker="o", label="rank_share")
+        row_axes[1].plot(topk_values, _series(universe_key, "len_share"), marker="o", label="len_share")
+        row_axes[1].plot(topk_values, _series(universe_key, "coupling_share"), marker="o", label="coupling_share")
+        row_axes[1].set_title(f"{title}: Error Shares")
+        row_axes[1].set_xlabel("topk")
+        row_axes[1].set_ylabel("share")
+        row_axes[1].grid(True, alpha=0.3)
+        row_axes[1].legend()
+
+    plot_path = out_dir / "topk_sweep_a2.png"
+    fig.savefig(plot_path, dpi=160)
+    a1.plt.close(fig)
+    outputs["png"] = str(plot_path)
+    return outputs
+
+
 def _mark_candidate_flags(
     candidate_records: list[dict[str, Any]],
     candidate_start: int,
@@ -327,17 +383,20 @@ def _analyze_prompt_group(
     prompt_desc_cache: dict[tuple[int, int], dict[str, Any]],
     hspec_store_mod: Any,
     hspec_table_store_mod: Any,
-    topk: int,
+    topk_values: list[int],
     horizon: int,
     threshold: float,
     query_block_size: int,
     key_block_size: int,
+    compute_backend: str,
+    torch_device: str,
     abs_delta_config: dict[str, int | bool],
     analysis_universe: str,
     query_records: list[dict[str, Any]],
     candidate_records: list[dict[str, Any]],
     step_counters: dict[str, int],
 ) -> None:
+    max_topk = max(int(value) for value in topk_values)
     trajectories: list[dict[str, Any]] = []
     total_query_points = 0
 
@@ -413,7 +472,11 @@ def _analyze_prompt_group(
                     "analysis_universe_main": False,
                     "query_target_len": int(min(horizon, tokens.shape[0] - token_idx - 1)),
                 }
-                query_records.append(query_row)
+                for topk_requested in topk_values:
+                    missing_row = dict(query_row)
+                    missing_row["topk_requested"] = int(topk_requested)
+                    missing_row["topk_effective"] = 0
+                    query_records.append(missing_row)
         step_counters["num_query_points_total"] += total_query_points
         step_counters["num_query_points_table_miss"] += total_query_points
         return
@@ -424,6 +487,7 @@ def _analyze_prompt_group(
         str(prompt_id),
         loader=lambda: hspec_table_store_mod.materialize_prompt_table(table_desc),
     )
+    table_data = a1._prepare_table_data(table_data)
 
     mean = np.ascontiguousarray(np.asarray(table_data["mean"], dtype=np.float32))
     components = np.ascontiguousarray(np.asarray(table_data["components"], dtype=np.float32))
@@ -463,9 +527,11 @@ def _analyze_prompt_group(
     topk_vals, topk_idxs = a1._exact_topk_blocked(
         z_queries,
         keys,
-        topk=topk,
+        topk=max_topk,
         query_block_size=query_block_size,
         key_block_size=key_block_size,
+        compute_backend=compute_backend,
+        torch_device=torch_device,
     )
 
     step_counters["num_query_points_total"] += len(all_meta)
@@ -481,31 +547,57 @@ def _analyze_prompt_group(
         top1_margin = top1_sim - top2_sim if top2_sim is not None else None
         eligible = bool(top1_sim >= threshold)
 
-        top1_entry_idx: int | None = None
-        top1_current_len: int | None = None
-        top1_full_match_len: int | None = None
-        top1_current_accept_len: int | None = None
-
-        best_current_entry_idx = -1
-        best_current_rank = -1
-        best_current_len = -1
-        best_current_full_match = -1
-        best_current_accept = -1
-        best_current_sim = -math.inf
-
-        best_joint_entry_idx = -1
-        best_joint_rank = -1
-        best_joint_full_match = -1
-        best_joint_current_len = -1
-        best_joint_sim = -math.inf
-
         candidate_start = len(candidate_records)
-        for rank_idx, (sim_value, entry_idx) in enumerate(zip(sims.tolist(), idxs.tolist()), start=1):
-            entry_i = int(entry_idx)
-            if entry_i < 0:
-                continue
-            draft = a1._extract_draft(table_data, entry_i, horizon)
-            full_match_len = int(a1._prefix_match_len(draft, target))
+        valid_mask = np.asarray(idxs >= 0, dtype=np.bool_)
+        candidate_entry_indices = np.ascontiguousarray(idxs[valid_mask], dtype=np.int32)
+        candidate_sims = np.ascontiguousarray(sims[valid_mask], dtype=np.float32)
+
+        if candidate_entry_indices.size == 0:
+            raise RuntimeError(
+                f"no valid A2 candidates for step={step} prompt={prompt_id} query={q_idx}"
+            )
+
+        draft_matrix, draft_lens, rollout_idx_arr, entry_offsets_arr, tail_lens_arr = a1._extract_draft_batch(
+            table_data,
+            candidate_entry_indices,
+            horizon,
+        )
+        full_match_lens = a1._prefix_match_lens_batch(draft_matrix, draft_lens, target)
+        num_candidates = int(candidate_entry_indices.shape[0])
+
+        current_len_arr = np.empty((num_candidates,), dtype=np.int32)
+        matched_pos_arr = np.empty((num_candidates,), dtype=np.int32)
+        base_pos_arr = np.empty((num_candidates,), dtype=np.int32)
+        abs_delta_arr = np.empty((num_candidates,), dtype=np.int32)
+        wnd_size_arr = np.empty((num_candidates,), dtype=np.int32)
+        wnd_after_cap_arr = np.empty((num_candidates,), dtype=np.int32)
+        current_accept_arr = np.empty((num_candidates,), dtype=np.int32)
+
+        prefix_best_current_accept = np.empty((num_candidates,), dtype=np.int32)
+        prefix_best_current_rank = np.empty((num_candidates,), dtype=np.int32)
+        prefix_best_current_entry = np.empty((num_candidates,), dtype=np.int32)
+        prefix_best_current_len = np.empty((num_candidates,), dtype=np.int32)
+        prefix_best_current_full_match = np.empty((num_candidates,), dtype=np.int32)
+        prefix_best_joint_full = np.empty((num_candidates,), dtype=np.int32)
+        prefix_best_joint_rank = np.empty((num_candidates,), dtype=np.int32)
+        prefix_best_joint_entry = np.empty((num_candidates,), dtype=np.int32)
+        prefix_best_joint_current_len = np.empty((num_candidates,), dtype=np.int32)
+
+        running_best_current_accept = -1
+        running_best_current_rank = -1
+        running_best_current_entry = -1
+        running_best_current_len = -1
+        running_best_current_full_match = -1
+        running_best_current_sim = -math.inf
+
+        running_best_joint_full = -1
+        running_best_joint_rank = -1
+        running_best_joint_entry = -1
+        running_best_joint_current_len = -1
+        running_best_joint_sim = -math.inf
+
+        for rank_idx, entry_i in enumerate(candidate_entry_indices.tolist(), start=1):
+            row_idx = rank_idx - 1
             len_info = _compute_static_current_length(
                 table_data=table_data,
                 entry_idx=entry_i,
@@ -513,14 +605,29 @@ def _analyze_prompt_group(
                 horizon=horizon,
                 abs_delta_config=abs_delta_config,
             )
-            current_len = int(len_info["current_len"])
-            current_accept_len = min(full_match_len, current_len)
-            entry_reward = float(rewards[entry_i]) if rewards is not None and entry_i < len(rewards) else math.nan
+            current_len_arr[row_idx] = int(len_info["current_len"])
+            matched_pos_arr[row_idx] = int(len_info["matched_pos"])
+            base_pos_arr[row_idx] = int(len_info["base_pos"])
+            abs_delta_arr[row_idx] = int(len_info["abs_delta"])
+            wnd_size_arr[row_idx] = int(len_info["wnd_size"])
+            wnd_after_cap_arr[row_idx] = int(len_info["wnd_after_cap"])
+            current_accept_arr[row_idx] = min(int(full_match_lens[row_idx]), int(current_len_arr[row_idx]))
+
+            sim_value = float(candidate_sims[row_idx])
+            full_match_len = int(full_match_lens[row_idx])
+            current_len = int(current_len_arr[row_idx])
+            current_accept = int(current_accept_arr[row_idx])
+            entry_reward = (
+                float(rewards[entry_i])
+                if rewards is not None and entry_i < len(rewards)
+                else math.nan
+            )
 
             candidate_records.append(
                 {
                     "epoch": int(epoch),
                     "global_step": int(step),
+                    "topk_max_requested": int(max_topk),
                     "prompt_id": str(prompt_id),
                     "request_id": str(meta["request_id"]),
                     "external_request_id": str(meta["external_request_id"]),
@@ -531,179 +638,188 @@ def _analyze_prompt_group(
                     "query_token_idx": int(meta["query_token_idx"]),
                     "candidate_rank_by_sim": int(rank_idx),
                     "candidate_entry_idx": int(entry_i),
-                    "candidate_sim": float(sim_value),
+                    "candidate_sim": sim_value,
                     "candidate_reward": None if math.isnan(entry_reward) else float(entry_reward),
-                    "candidate_rollout_idx": int(table_data["entry_rollout_idx"][entry_i]),
-                    "candidate_entry_offset": int(table_data["entry_offset"][entry_i]),
-                    "candidate_matched_pos": int(len_info["matched_pos"]),
-                    "candidate_base_pos": int(len_info["base_pos"]),
-                    "candidate_abs_delta": int(len_info["abs_delta"]),
-                    "candidate_tail_len": int(len_info["tail_len"]),
-                    "candidate_wnd_size": int(len_info["wnd_size"]),
-                    "candidate_wnd_after_cap": int(len_info["wnd_after_cap"]),
+                    "candidate_rollout_idx": int(rollout_idx_arr[row_idx]),
+                    "candidate_entry_offset": int(entry_offsets_arr[row_idx]),
+                    "candidate_matched_pos": int(matched_pos_arr[row_idx]),
+                    "candidate_base_pos": int(base_pos_arr[row_idx]),
+                    "candidate_abs_delta": int(abs_delta_arr[row_idx]),
+                    "candidate_tail_len": int(tail_lens_arr[row_idx]),
+                    "candidate_wnd_size": int(wnd_size_arr[row_idx]),
+                    "candidate_wnd_after_cap": int(wnd_after_cap_arr[row_idx]),
                     "candidate_current_len": int(current_len),
                     "candidate_full_match_len": int(full_match_len),
-                    "candidate_current_accept_len": int(current_accept_len),
+                    "candidate_current_accept_len": int(current_accept),
                     "is_top1": bool(rank_idx == 1),
                     "is_best_current": False,
                     "is_best_joint": False,
                 }
             )
 
-            if rank_idx == 1:
-                top1_entry_idx = int(entry_i)
-                top1_current_len = int(current_len)
-                top1_full_match_len = int(full_match_len)
-                top1_current_accept_len = int(current_accept_len)
+            if (
+                current_accept > running_best_current_accept
+                or (current_accept == running_best_current_accept and sim_value > running_best_current_sim)
+            ):
+                running_best_current_accept = current_accept
+                running_best_current_rank = rank_idx
+                running_best_current_entry = int(entry_i)
+                running_best_current_len = int(current_len)
+                running_best_current_full_match = int(full_match_len)
+                running_best_current_sim = sim_value
 
             if (
-                int(current_accept_len) > best_current_accept
-                or (
-                    int(current_accept_len) == best_current_accept
-                    and float(sim_value) > best_current_sim
-                )
+                full_match_len > running_best_joint_full
+                or (full_match_len == running_best_joint_full and sim_value > running_best_joint_sim)
             ):
-                best_current_entry_idx = int(entry_i)
-                best_current_rank = int(rank_idx)
-                best_current_len = int(current_len)
-                best_current_full_match = int(full_match_len)
-                best_current_accept = int(current_accept_len)
-                best_current_sim = float(sim_value)
+                running_best_joint_full = full_match_len
+                running_best_joint_rank = rank_idx
+                running_best_joint_entry = int(entry_i)
+                running_best_joint_current_len = int(current_len)
+                running_best_joint_sim = sim_value
 
-            if (
-                int(full_match_len) > best_joint_full_match
-                or (
-                    int(full_match_len) == best_joint_full_match
-                    and float(sim_value) > best_joint_sim
-                )
-            ):
-                best_joint_entry_idx = int(entry_i)
-                best_joint_rank = int(rank_idx)
-                best_joint_full_match = int(full_match_len)
-                best_joint_current_len = int(current_len)
-                best_joint_sim = float(sim_value)
+            prefix_best_current_accept[row_idx] = int(running_best_current_accept)
+            prefix_best_current_rank[row_idx] = int(running_best_current_rank)
+            prefix_best_current_entry[row_idx] = int(running_best_current_entry)
+            prefix_best_current_len[row_idx] = int(running_best_current_len)
+            prefix_best_current_full_match[row_idx] = int(running_best_current_full_match)
+            prefix_best_joint_full[row_idx] = int(running_best_joint_full)
+            prefix_best_joint_rank[row_idx] = int(running_best_joint_rank)
+            prefix_best_joint_entry[row_idx] = int(running_best_joint_entry)
+            prefix_best_joint_current_len[row_idx] = int(running_best_joint_current_len)
 
-        if (
-            top1_entry_idx is None
-            or top1_current_len is None
-            or top1_full_match_len is None
-            or top1_current_accept_len is None
-        ):
-            raise RuntimeError(
-                f"missing top-1 A2 baseline for step={step} prompt={prompt_id} query={q_idx}"
-            )
-
-        _mark_candidate_flags(
-            candidate_records,
-            candidate_start,
-            step=step,
-            prompt_id=prompt_id,
-            request_id=str(meta["request_id"]),
-            external_request_id=str(meta["external_request_id"]),
-            tp_group_id=int(meta["tp_group_id"]),
-            query_token_idx=int(meta["query_token_idx"]),
-            best_current_entry_idx=best_current_entry_idx,
-            best_current_rank=best_current_rank,
-            best_joint_entry_idx=best_joint_entry_idx,
-            best_joint_rank=best_joint_rank,
-        )
-
-        b = int(top1_current_accept_len)
-        l = int(top1_full_match_len)
-        r = int(best_current_accept)
-        j = int(best_joint_full_match)
-        if not (0 <= b <= l <= j <= horizon):
-            raise RuntimeError(
-                "A2 invariant violated for top1/joint decomposition: "
-                f"step={step} prompt={prompt_id} query={meta['query_token_idx']} "
-                f"b={b} l={l} j={j} horizon={horizon}"
-            )
-        if not (0 <= b <= r <= j <= horizon):
-            raise RuntimeError(
-                "A2 invariant violated for current-length oracle decomposition: "
-                f"step={step} prompt={prompt_id} query={meta['query_token_idx']} "
-                f"b={b} r={r} j={j} horizon={horizon}"
-            )
-
-        H_total = int(j - b)
-        H_len = int(l - b)
-        H_rank = int(r - b)
-        H_len_after_rank = int(j - r)
-        H_rank_after_len = int(j - l)
-        phi_rank = 0.5 * ((r - b) + (j - l))
-        phi_len = 0.5 * ((l - b) + (j - r))
-        H_coupled = int(j - max(l, r))
-
-        if phi_rank < -1e-6 or phi_len < -1e-6:
-            raise RuntimeError(
-                "A2 Shapley contribution became negative: "
-                f"step={step} prompt={prompt_id} query={meta['query_token_idx']} "
-                f"phi_rank={phi_rank} phi_len={phi_len}"
-            )
-        if abs((phi_rank + phi_len) - H_total) > 1e-6:
-            raise RuntimeError(
-                "A2 Shapley sum mismatch: "
-                f"step={step} prompt={prompt_id} query={meta['query_token_idx']} "
-                f"phi_rank={phi_rank} phi_len={phi_len} H_total={H_total}"
-            )
-
-        error_label = _compute_error_label(
-            H_total=H_total,
-            H_len=H_len,
-            H_rank=H_rank,
-            H_coupled=H_coupled,
-        )
+        top1_entry_idx = int(candidate_entry_indices[0])
+        top1_current_len = int(current_len_arr[0])
+        top1_full_match_len = int(full_match_lens[0])
+        top1_current_accept_len = int(current_accept_arr[0])
 
         step_counters["num_query_points_usable"] += 1
         if eligible:
             step_counters["num_query_points_spec_eligible"] += 1
 
-        query_row = {
-            "epoch": int(epoch),
-            "global_step": int(step),
-            "prompt_id": str(prompt_id),
-            "request_id": str(meta["request_id"]),
-            "external_request_id": str(meta["external_request_id"]),
-            "shard_id": int(shard_id),
-            "tp_group_id": int(meta["tp_group_id"]),
-            "query_token_idx": int(meta["query_token_idx"]),
-            "query_token_id": int(meta["query_token_id"]),
-            "response_len": int(meta["response_len"]),
-            "table_present": True,
-            "table_version": int(version_record["version"]),
-            "table_active_epoch": int(version_record["active_epoch"]),
-            "table_entry_count": int(keys.shape[0]),
-            "top1_sim": float(top1_sim),
-            "top2_sim": _float_or_none(top2_sim),
-            "top1_margin": _float_or_none(top1_margin),
-            "top1_entry_idx": int(top1_entry_idx),
-            "top1_current_len": int(top1_current_len),
-            "top1_full_match_len": int(top1_full_match_len),
-            "top1_current_accept_len": int(top1_current_accept_len),
-            "best_current_entry_idx": int(best_current_entry_idx),
-            "best_current_rank": int(best_current_rank),
-            "best_current_current_len": int(best_current_len),
-            "best_current_full_match_len": int(best_current_full_match),
-            "best_current_accept_len": int(best_current_accept),
-            "best_joint_entry_idx": int(best_joint_entry_idx),
-            "best_joint_rank": int(best_joint_rank),
-            "best_joint_current_len": int(best_joint_current_len),
-            "best_joint_full_match_len": int(best_joint_full_match),
-            "H_total": H_total,
-            "H_len": H_len,
-            "H_rank": H_rank,
-            "H_len_after_rank": H_len_after_rank,
-            "H_rank_after_len": H_rank_after_len,
-            "phi_rank": float(phi_rank),
-            "phi_len": float(phi_len),
-            "H_coupled": H_coupled,
-            "error_label": str(error_label),
-            "eligible_by_threshold": bool(eligible),
-            "analysis_universe_main": False,
-            "query_target_len": int(len(target)),
-        }
-        query_row["analysis_universe_main"] = _main_universe_membership(query_row, analysis_universe)
-        query_records.append(query_row)
+        for topk_requested in topk_values:
+            eff_k = min(int(topk_requested), num_candidates)
+            eff_idx = eff_k - 1
+            best_current_entry_idx = int(prefix_best_current_entry[eff_idx])
+            best_current_rank = int(prefix_best_current_rank[eff_idx])
+            best_current_len = int(prefix_best_current_len[eff_idx])
+            best_current_full_match = int(prefix_best_current_full_match[eff_idx])
+            best_current_accept = int(prefix_best_current_accept[eff_idx])
+            best_joint_entry_idx = int(prefix_best_joint_entry[eff_idx])
+            best_joint_rank = int(prefix_best_joint_rank[eff_idx])
+            best_joint_full_match = int(prefix_best_joint_full[eff_idx])
+            best_joint_current_len = int(prefix_best_joint_current_len[eff_idx])
+
+            if int(topk_requested) == int(max_topk):
+                _mark_candidate_flags(
+                    candidate_records,
+                    candidate_start,
+                    step=step,
+                    prompt_id=prompt_id,
+                    request_id=str(meta["request_id"]),
+                    external_request_id=str(meta["external_request_id"]),
+                    tp_group_id=int(meta["tp_group_id"]),
+                    query_token_idx=int(meta["query_token_idx"]),
+                    best_current_entry_idx=best_current_entry_idx,
+                    best_current_rank=best_current_rank,
+                    best_joint_entry_idx=best_joint_entry_idx,
+                    best_joint_rank=best_joint_rank,
+                )
+
+            b = int(top1_current_accept_len)
+            l = int(top1_full_match_len)
+            r = int(best_current_accept)
+            j = int(best_joint_full_match)
+            if not (0 <= b <= l <= j <= horizon):
+                raise RuntimeError(
+                    "A2 invariant violated for top1/joint decomposition: "
+                    f"step={step} prompt={prompt_id} query={meta['query_token_idx']} "
+                    f"topk={topk_requested} b={b} l={l} j={j} horizon={horizon}"
+                )
+            if not (0 <= b <= r <= j <= horizon):
+                raise RuntimeError(
+                    "A2 invariant violated for current-length oracle decomposition: "
+                    f"step={step} prompt={prompt_id} query={meta['query_token_idx']} "
+                    f"topk={topk_requested} b={b} r={r} j={j} horizon={horizon}"
+                )
+
+            H_total = int(j - b)
+            H_len = int(l - b)
+            H_rank = int(r - b)
+            H_len_after_rank = int(j - r)
+            H_rank_after_len = int(j - l)
+            phi_rank = 0.5 * ((r - b) + (j - l))
+            phi_len = 0.5 * ((l - b) + (j - r))
+            H_coupled = int(j - max(l, r))
+
+            if phi_rank < -1e-6 or phi_len < -1e-6:
+                raise RuntimeError(
+                    "A2 Shapley contribution became negative: "
+                    f"step={step} prompt={prompt_id} query={meta['query_token_idx']} "
+                    f"topk={topk_requested} phi_rank={phi_rank} phi_len={phi_len}"
+                )
+            if abs((phi_rank + phi_len) - H_total) > 1e-6:
+                raise RuntimeError(
+                    "A2 Shapley sum mismatch: "
+                    f"step={step} prompt={prompt_id} query={meta['query_token_idx']} "
+                    f"topk={topk_requested} phi_rank={phi_rank} phi_len={phi_len} H_total={H_total}"
+                )
+
+            error_label = _compute_error_label(
+                H_total=H_total,
+                H_len=H_len,
+                H_rank=H_rank,
+                H_coupled=H_coupled,
+            )
+
+            query_row = {
+                "epoch": int(epoch),
+                "global_step": int(step),
+                "topk_requested": int(topk_requested),
+                "topk_effective": int(eff_k),
+                "prompt_id": str(prompt_id),
+                "request_id": str(meta["request_id"]),
+                "external_request_id": str(meta["external_request_id"]),
+                "shard_id": int(shard_id),
+                "tp_group_id": int(meta["tp_group_id"]),
+                "query_token_idx": int(meta["query_token_idx"]),
+                "query_token_id": int(meta["query_token_id"]),
+                "response_len": int(meta["response_len"]),
+                "table_present": True,
+                "table_version": int(version_record["version"]),
+                "table_active_epoch": int(version_record["active_epoch"]),
+                "table_entry_count": int(keys.shape[0]),
+                "top1_sim": float(top1_sim),
+                "top2_sim": _float_or_none(top2_sim),
+                "top1_margin": _float_or_none(top1_margin),
+                "top1_entry_idx": int(top1_entry_idx),
+                "top1_current_len": int(top1_current_len),
+                "top1_full_match_len": int(top1_full_match_len),
+                "top1_current_accept_len": int(top1_current_accept_len),
+                "best_current_entry_idx": int(best_current_entry_idx),
+                "best_current_rank": int(best_current_rank),
+                "best_current_current_len": int(best_current_len),
+                "best_current_full_match_len": int(best_current_full_match),
+                "best_current_accept_len": int(best_current_accept),
+                "best_joint_entry_idx": int(best_joint_entry_idx),
+                "best_joint_rank": int(best_joint_rank),
+                "best_joint_current_len": int(best_joint_current_len),
+                "best_joint_full_match_len": int(best_joint_full_match),
+                "H_total": H_total,
+                "H_len": H_len,
+                "H_rank": H_rank,
+                "H_len_after_rank": H_len_after_rank,
+                "H_rank_after_len": H_rank_after_len,
+                "phi_rank": float(phi_rank),
+                "phi_len": float(phi_len),
+                "H_coupled": H_coupled,
+                "error_label": str(error_label),
+                "eligible_by_threshold": bool(eligible),
+                "analysis_universe_main": False,
+                "query_target_len": int(len(target)),
+            }
+            query_row["analysis_universe_main"] = _main_universe_membership(query_row, analysis_universe)
+            query_records.append(query_row)
 
 
 def _make_step_summary_row(
@@ -762,6 +878,7 @@ def _analyze_command(args: argparse.Namespace) -> int:
         raise ValueError("hspec table store dir is required")
 
     target_steps = set(a1._parse_step_spec(args.target_steps))
+    topk_values = a1._parse_positive_int_spec(args.topk)
     threshold = float(
         args.similarity_threshold
         if args.similarity_threshold is not None
@@ -888,11 +1005,13 @@ def _analyze_command(args: argparse.Namespace) -> int:
                 prompt_desc_cache=prompt_desc_cache,
                 hspec_store_mod=hspec_store_mod,
                 hspec_table_store_mod=hspec_table_store_mod,
-                topk=int(args.topk),
+                topk_values=topk_values,
                 horizon=int(horizon),
                 threshold=float(threshold),
                 query_block_size=int(args.query_block_size),
                 key_block_size=int(args.key_block_size),
+                compute_backend=str(args.compute_backend),
+                torch_device=str(args.torch_device),
                 abs_delta_config=abs_delta_config,
                 analysis_universe=str(args.analysis_universe),
                 query_records=query_records,
@@ -900,19 +1019,21 @@ def _analyze_command(args: argparse.Namespace) -> int:
                 step_counters=step_counters,
             )
 
-        step_all_rows = [
-            row for row in query_records
-            if int(row["global_step"]) == int(step) and bool(row["table_present"])
-        ]
-        step_eligible_rows = [
-            row for row in step_all_rows if bool(row["eligible_by_threshold"])
-        ]
-        step_main_rows = [
-            row for row in step_all_rows
-            if _main_universe_membership(row, str(args.analysis_universe))
-        ]
-        step_rows.append(
-            _make_step_summary_row(
+        step_query_rows = [row for row in query_records if int(row["global_step"]) == int(step)]
+        for topk_requested in topk_values:
+            step_topk_rows = [
+                row for row in step_query_rows
+                if int(row["topk_requested"]) == int(topk_requested)
+            ]
+            step_all_rows = [row for row in step_topk_rows if bool(row["table_present"])]
+            step_eligible_rows = [
+                row for row in step_all_rows if bool(row["eligible_by_threshold"])
+            ]
+            step_main_rows = [
+                row for row in step_all_rows
+                if _main_universe_membership(row, str(args.analysis_universe))
+            ]
+            row = _make_step_summary_row(
                 epoch=epoch,
                 step=step,
                 step_counters=step_counters,
@@ -921,28 +1042,52 @@ def _analyze_command(args: argparse.Namespace) -> int:
                 main_rows=step_main_rows,
                 analysis_universe=str(args.analysis_universe),
             )
-        )
+            row["topk_requested"] = int(topk_requested)
+            step_rows.append(row)
 
     all_query_rows = [row for row in query_records if bool(row["table_present"])]
     eligible_query_rows = [row for row in all_query_rows if bool(row["eligible_by_threshold"])]
-    main_query_rows = [
-        row for row in all_query_rows
-        if _main_universe_membership(row, str(args.analysis_universe))
+    summary_by_topk: dict[str, Any] = {}
+    for topk_requested in topk_values:
+        topk_all_rows = [
+            row for row in all_query_rows
+            if int(row["topk_requested"]) == int(topk_requested)
+        ]
+        topk_eligible_rows = [
+            row for row in eligible_query_rows
+            if int(row["topk_requested"]) == int(topk_requested)
+        ]
+        topk_main_rows = [
+            row for row in topk_all_rows
+            if _main_universe_membership(row, str(args.analysis_universe))
+        ]
+        summary_by_topk[str(int(topk_requested))] = {
+            "main_universe": _summarize_decomposition(topk_main_rows),
+            "all_query_points": _summarize_decomposition(topk_all_rows),
+            "spec_eligible_query_points": _summarize_decomposition(topk_eligible_rows),
+        }
+
+    unique_step_rows = [
+        row for row in step_rows
+        if int(row["topk_requested"]) == int(topk_values[0])
     ]
 
     summary = {
+        "topk_values": topk_values,
         "num_steps_analyzed": len(target_steps),
-        "num_desc_scanned": int(sum(int(row["num_desc_scanned"]) for row in step_rows)),
+        "num_desc_scanned": int(sum(int(row["num_desc_scanned"]) for row in unique_step_rows)),
         "num_desc_after_tp_dedupe": int(
-            sum(int(row["num_desc_after_tp_dedupe"]) for row in step_rows)
+            sum(int(row["num_desc_after_tp_dedupe"]) for row in unique_step_rows)
         ),
-        "num_desc_analyzed": int(sum(int(row["num_desc_analyzed"]) for row in step_rows)),
-        "num_query_points_total": int(len(query_records)),
-        "num_query_points_table_present": int(len(all_query_rows)),
-        "num_query_points_spec_eligible": int(len(eligible_query_rows)),
-        "num_query_points_main_universe": int(len(main_query_rows)),
+        "num_desc_analyzed": int(sum(int(row["num_desc_analyzed"]) for row in unique_step_rows)),
+        "num_query_points_total": int(sum(int(row["num_query_points_total"]) for row in unique_step_rows)),
+        "num_query_points_table_present": int(sum(int(row["num_query_points_with_table"]) for row in unique_step_rows)),
+        "num_query_points_spec_eligible": int(sum(int(row["num_query_points_spec_eligible"]) for row in unique_step_rows)),
+        "num_query_points_main_universe": int(
+            sum(int(row["num_query_points_main"]) for row in unique_step_rows)
+        ),
         "analysis_config": {
-            "topk": int(args.topk),
+            "topk_values": topk_values,
             "max_draft_tokens": int(horizon),
             "similarity_threshold": float(threshold),
             "analysis_universe": str(args.analysis_universe),
@@ -950,6 +1095,8 @@ def _analyze_command(args: argparse.Namespace) -> int:
             "query_block_size": int(args.query_block_size),
             "key_block_size": int(args.key_block_size),
             "table_cache_prompts": int(args.table_cache_prompts),
+            "compute_backend": str(args.compute_backend),
+            "torch_device": str(args.torch_device),
             "target_steps": sorted(target_steps),
             "abs_delta_cap_enabled": bool(abs_delta_config["enabled"]),
             "abs_delta_safe_threshold": int(abs_delta_config["safe_threshold"]),
@@ -957,24 +1104,51 @@ def _analyze_command(args: argparse.Namespace) -> int:
             "abs_delta_mid_cap": int(abs_delta_config["mid_cap"]),
             "abs_delta_far_cap": int(abs_delta_config["far_cap"]),
         },
-        "main_universe": _summarize_decomposition(main_query_rows),
-        "all_query_points": _summarize_decomposition(all_query_rows),
-        "spec_eligible_query_points": _summarize_decomposition(eligible_query_rows),
+        "by_topk": summary_by_topk,
     }
 
     out_dir = Path(args.out_dir).resolve()
     a1._ensure_dir(out_dir)
-    a1._write_json(out_dir / "summary.json", summary)
-    a1._write_csv(out_dir / "step_summary.csv", step_rows)
-    query_outputs = a1._write_records(out_dir / "query_records", query_records)
-    candidate_outputs = a1._write_records(out_dir / "candidate_records", candidate_records)
+    a1._write_json(out_dir / "summary_by_topk.json", summary)
+    a1._write_csv(out_dir / "step_summary_by_topk.csv", step_rows)
+    query_outputs = a1._write_records(out_dir / "query_records_by_topk", query_records)
+    candidate_outputs = a1._write_records(out_dir / "candidate_records_max_topk", candidate_records)
+    plot_outputs = _write_topk_plot_a2(out_dir, summary_by_topk)
     a1._write_json(
         out_dir / "artifact_paths.json",
         {
-            "query_records": query_outputs,
-            "candidate_records": candidate_outputs,
+            "query_records_by_topk": query_outputs,
+            "candidate_records_max_topk": candidate_outputs,
+            "plots": plot_outputs,
         },
     )
+
+    if len(topk_values) == 1:
+        topk_key = str(int(topk_values[0]))
+        legacy_summary = {
+            "num_steps_analyzed": int(summary["num_steps_analyzed"]),
+            "num_desc_scanned": int(summary["num_desc_scanned"]),
+            "num_desc_after_tp_dedupe": int(summary["num_desc_after_tp_dedupe"]),
+            "num_desc_analyzed": int(summary["num_desc_analyzed"]),
+            "num_query_points_total": int(summary["num_query_points_total"]),
+            "num_query_points_table_present": int(summary["num_query_points_table_present"]),
+            "num_query_points_spec_eligible": int(summary["num_query_points_spec_eligible"]),
+            "num_query_points_main_universe": int(summary["num_query_points_main_universe"]),
+            "analysis_config": summary["analysis_config"],
+            "main_universe": summary_by_topk[topk_key]["main_universe"],
+            "all_query_points": summary_by_topk[topk_key]["all_query_points"],
+            "spec_eligible_query_points": summary_by_topk[topk_key]["spec_eligible_query_points"],
+        }
+        a1._write_json(out_dir / "summary.json", legacy_summary)
+        a1._write_csv(
+            out_dir / "step_summary.csv",
+            [row for row in step_rows if int(row["topk_requested"]) == int(topk_values[0])],
+        )
+        a1._write_records(
+            out_dir / "query_records",
+            [row for row in query_records if int(row["topk_requested"]) == int(topk_values[0])],
+        )
+        a1._write_records(out_dir / "candidate_records", candidate_records)
 
     print(f"A2 analysis written to {out_dir}")
     return 0
@@ -988,7 +1162,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-inventory", type=str, default=None, help="optional A1 step_inventory.json")
     parser.add_argument("--table-version-catalog", type=str, default=None, help="optional A1 table_version_catalog.json")
     parser.add_argument("--target-steps", type=str, required=True, help="comma list or ranges, e.g. 12,13,20-25")
-    parser.add_argument("--topk", type=int, default=8, help="exact top-k to compute")
+    parser.add_argument("--topk", type=str, default="8", help="one or more positive integers, e.g. 8 or 2,4,8")
     parser.add_argument("--max-draft-tokens", type=int, default=None, help="draft horizon H; defaults from manifest or 15")
     parser.add_argument("--similarity-threshold", type=float, default=None, help="spec-eligibility threshold; defaults from manifest or 0.85")
     parser.add_argument(
@@ -1008,6 +1182,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query-block-size", type=int, default=256, help="number of query rows per blocked similarity pass")
     parser.add_argument("--key-block-size", type=int, default=8192, help="number of keys per blocked similarity pass")
     parser.add_argument("--table-cache-prompts", type=int, default=64, help="max materialized prompt tables kept in the LRU")
+    parser.add_argument(
+        "--compute-backend",
+        type=str,
+        choices=("auto", "numpy", "torch"),
+        default=a1.DEFAULT_COMPUTE_BACKEND,
+        help="backend for blocked exact top-k retrieval",
+    )
+    parser.add_argument(
+        "--torch-device",
+        type=str,
+        choices=("auto", "cpu", "cuda", "npu"),
+        default=a1.DEFAULT_TORCH_DEVICE,
+        help="device used when compute-backend=torch or auto resolves to torch",
+    )
     parser.add_argument("--abs-delta-cap-enabled", type=str, default="1", help="whether to apply the static abs-delta window cap")
     parser.add_argument("--abs-delta-safe-threshold", type=int, default=DEFAULT_ABS_DELTA_SAFE_THRESHOLD, help="safe abs-delta threshold")
     parser.add_argument("--abs-delta-mid-threshold", type=int, default=DEFAULT_ABS_DELTA_MID_THRESHOLD, help="mid abs-delta threshold")

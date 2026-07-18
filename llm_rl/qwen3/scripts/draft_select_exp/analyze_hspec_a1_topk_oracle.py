@@ -29,10 +29,22 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     pd = None
 
+try:  # pragma: no cover - optional dependency
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+try:  # pragma: no cover - optional dependency
+    import torch
+except Exception:
+    torch = None
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_THRESHOLD = 0.85
 DEFAULT_DRAFT_HORIZON = 15
+DEFAULT_COMPUTE_BACKEND = "auto"
+DEFAULT_TORCH_DEVICE = "auto"
 
 
 def _parse_step_spec(value: str) -> list[int]:
@@ -53,6 +65,35 @@ def _parse_step_spec(value: str) -> list[int]:
     if not steps:
         raise ValueError("no target steps provided")
     return sorted(steps)
+
+
+def _parse_positive_int_spec(value: str | int) -> list[int]:
+    values: set[int] = set()
+    if isinstance(value, int):
+        if int(value) <= 0:
+            raise ValueError(f"topk must be > 0, got {value}")
+        return [int(value)]
+    for raw_item in str(value).split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_s, end_s = item.split("-", 1)
+            start_i = int(start_s)
+            end_i = int(end_s)
+            if start_i <= 0 or end_i <= 0:
+                raise ValueError(f"topk range must be positive: {item!r}")
+            if end_i < start_i:
+                raise ValueError(f"invalid topk range: {item!r}")
+            values.update(range(start_i, end_i + 1))
+        else:
+            current = int(item)
+            if current <= 0:
+                raise ValueError(f"topk values must be > 0, got {current}")
+            values.add(current)
+    if not values:
+        raise ValueError("no topk values provided")
+    return sorted(values)
 
 
 def _read_env_manifest(path: Path | None) -> dict[str, str]:
@@ -616,6 +657,50 @@ class _PromptTableCache:
         return value
 
 
+def _resolve_compute_backend(
+    backend: str,
+    torch_device: str,
+) -> tuple[str, str | None]:
+    backend_norm = str(backend).strip().lower()
+    device_norm = str(torch_device).strip().lower()
+    if backend_norm not in {"auto", "numpy", "torch"}:
+        raise ValueError(f"unsupported compute backend: {backend!r}")
+    if device_norm not in {"auto", "cpu", "cuda", "npu"}:
+        raise ValueError(f"unsupported torch device: {torch_device!r}")
+
+    if backend_norm == "numpy":
+        return ("numpy", None)
+
+    torch_mod = torch
+    if torch_mod is None:
+        if backend_norm == "torch":
+            raise RuntimeError("torch backend requested but torch is not importable")
+        return ("numpy", None)
+
+    chosen_device = "cpu"
+    if device_norm == "auto":
+        has_npu = bool(hasattr(torch_mod, "npu") and getattr(torch_mod.npu, "is_available", lambda: False)())
+        has_cuda = bool(getattr(torch_mod.cuda, "is_available", lambda: False)())
+        if has_npu:
+            chosen_device = "npu"
+        elif has_cuda:
+            chosen_device = "cuda"
+        else:
+            chosen_device = "cpu"
+    elif device_norm == "cuda":
+        if not bool(getattr(torch_mod.cuda, "is_available", lambda: False)()):
+            raise RuntimeError("torch cuda device requested but not available")
+        chosen_device = "cuda"
+    elif device_norm == "npu":
+        if not bool(hasattr(torch_mod, "npu") and getattr(torch_mod.npu, "is_available", lambda: False)()):
+            raise RuntimeError("torch npu device requested but not available")
+        chosen_device = "npu"
+    else:
+        chosen_device = "cpu"
+
+    return ("torch", chosen_device)
+
+
 def _prefix_match_len(a: np.ndarray | list[int], b: np.ndarray | list[int]) -> int:
     n = min(len(a), len(b))
     for i in range(n):
@@ -632,7 +717,80 @@ def _extract_draft(table_data: dict[str, Any], entry_idx: int, horizon: int) -> 
     return np.ascontiguousarray(seq[off:end], dtype=np.int32)
 
 
-def _exact_topk_blocked(
+def _prepare_table_data(table_data: dict[str, Any]) -> dict[str, Any]:
+    if "_rollout_seq_lens" not in table_data:
+        table_data["_rollout_seq_lens"] = np.ascontiguousarray(
+            [len(seq) for seq in table_data["rollout_seqs"]],
+            dtype=np.int32,
+        )
+    if "_entry_rollout_idx_i32" not in table_data:
+        table_data["_entry_rollout_idx_i32"] = np.ascontiguousarray(
+            np.asarray(table_data["entry_rollout_idx"], dtype=np.int32)
+        )
+    if "_entry_offset_i32" not in table_data:
+        table_data["_entry_offset_i32"] = np.ascontiguousarray(
+            np.asarray(table_data["entry_offset"], dtype=np.int32)
+        )
+    return table_data
+
+
+def _extract_draft_batch(
+    table_data: dict[str, Any],
+    entry_indices: np.ndarray,
+    horizon: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    table_data = _prepare_table_data(table_data)
+    entry_idx_arr = np.ascontiguousarray(np.asarray(entry_indices, dtype=np.int32))
+    num_entries = int(entry_idx_arr.shape[0])
+    horizon_i = max(int(horizon), 0)
+    draft_matrix = np.full((num_entries, horizon_i), -1, dtype=np.int32)
+    draft_lens = np.zeros((num_entries,), dtype=np.int32)
+    rollout_idx = table_data["_entry_rollout_idx_i32"][entry_idx_arr]
+    entry_offsets = table_data["_entry_offset_i32"][entry_idx_arr]
+    rollout_lens = table_data["_rollout_seq_lens"][rollout_idx]
+    tail_lens = np.maximum(rollout_lens - entry_offsets, 0).astype(np.int32, copy=False)
+    for row, (ridx, off, tail_len) in enumerate(zip(rollout_idx.tolist(), entry_offsets.tolist(), tail_lens.tolist(), strict=True)):
+        take = min(int(tail_len), horizon_i)
+        if take <= 0:
+            continue
+        seq = table_data["rollout_seqs"][int(ridx)]
+        draft_matrix[row, :take] = np.asarray(seq[int(off):int(off) + take], dtype=np.int32)
+        draft_lens[row] = int(take)
+    return draft_matrix, draft_lens, rollout_idx, entry_offsets, tail_lens
+
+
+def _prefix_match_lens_batch(
+    draft_matrix: np.ndarray,
+    draft_lens: np.ndarray,
+    target: np.ndarray,
+) -> np.ndarray:
+    draft_mat = np.ascontiguousarray(np.asarray(draft_matrix, dtype=np.int32))
+    lens = np.ascontiguousarray(np.asarray(draft_lens, dtype=np.int32))
+    target_np = np.ascontiguousarray(np.asarray(target, dtype=np.int32))
+    if draft_mat.ndim != 2:
+        raise ValueError(f"draft_matrix must be 2-D, got {draft_mat.shape}")
+    if lens.ndim != 1 or lens.shape[0] != draft_mat.shape[0]:
+        raise ValueError(
+            f"draft_lens shape mismatch: matrix={draft_mat.shape} lens={lens.shape}"
+        )
+    if draft_mat.shape[0] == 0:
+        return np.empty((0,), dtype=np.int32)
+    horizon = int(draft_mat.shape[1])
+    target_len = min(int(target_np.shape[0]), horizon)
+    if target_len <= 0:
+        return np.zeros((draft_mat.shape[0],), dtype=np.int32)
+    target_pad = np.full((horizon,), -2, dtype=np.int32)
+    target_pad[:target_len] = target_np[:target_len]
+    compare_len = np.minimum(lens, target_len)
+    positions = np.arange(horizon, dtype=np.int32)[None, :]
+    valid_mask = positions < compare_len[:, None]
+    mismatch = valid_mask & (draft_mat != target_pad[None, :])
+    has_mismatch = mismatch.any(axis=1)
+    first_mismatch = mismatch.argmax(axis=1).astype(np.int32, copy=False)
+    return np.where(has_mismatch, first_mismatch, compare_len).astype(np.int32, copy=False)
+
+
+def _exact_topk_blocked_numpy(
     z_queries: np.ndarray,
     keys: np.ndarray,
     *,
@@ -704,6 +862,100 @@ def _exact_topk_blocked(
     return result_vals, result_idxs
 
 
+def _exact_topk_blocked_torch(
+    z_queries: np.ndarray,
+    keys: np.ndarray,
+    *,
+    topk: int,
+    query_block_size: int,
+    key_block_size: int,
+    torch_device: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if torch is None:
+        raise RuntimeError("torch backend selected but torch is unavailable")
+    if z_queries.ndim != 2:
+        raise ValueError(f"z_queries must be 2-D, got {z_queries.shape}")
+    if keys.ndim != 2:
+        raise ValueError(f"keys must be 2-D, got {keys.shape}")
+    if z_queries.shape[1] != keys.shape[1]:
+        raise ValueError(
+            f"query/key dim mismatch: queries={z_queries.shape} keys={keys.shape}"
+        )
+    if keys.shape[0] <= 0:
+        raise ValueError("keys must have at least one entry")
+
+    topk_eff = min(max(int(topk), 1), int(keys.shape[0]))
+    num_queries = int(z_queries.shape[0])
+    result_vals = np.full((num_queries, topk_eff), -np.inf, dtype=np.float32)
+    result_idxs = np.full((num_queries, topk_eff), -1, dtype=np.int32)
+
+    device = torch.device(str(torch_device))
+    keys_t = torch.as_tensor(np.ascontiguousarray(keys, dtype=np.float32), dtype=torch.float32, device=device)
+    neg_inf = torch.tensor(float("-inf"), dtype=torch.float32, device=device)
+
+    with torch.inference_mode():
+        for q_start in range(0, num_queries, max(int(query_block_size), 1)):
+            q_stop = min(q_start + max(int(query_block_size), 1), num_queries)
+            q_block_np = np.ascontiguousarray(z_queries[q_start:q_stop], dtype=np.float32)
+            q_block = torch.as_tensor(q_block_np, dtype=torch.float32, device=device)
+            block_size = q_stop - q_start
+
+            running_vals = torch.full((block_size, topk_eff), neg_inf, dtype=torch.float32, device=device)
+            running_idxs = torch.full((block_size, topk_eff), -1, dtype=torch.int64, device=device)
+
+            for k_start in range(0, int(keys_t.shape[0]), max(int(key_block_size), 1)):
+                k_stop = min(k_start + max(int(key_block_size), 1), int(keys_t.shape[0]))
+                key_block = keys_t[k_start:k_stop]
+                sims = q_block @ key_block.transpose(0, 1)
+                block_k = min(topk_eff, int(key_block.shape[0]))
+                block_vals, block_local_idxs = torch.topk(sims, k=block_k, dim=1, largest=True, sorted=True)
+                block_global_idxs = block_local_idxs.to(dtype=torch.int64) + int(k_start)
+                merged_vals = torch.cat([running_vals, block_vals], dim=1)
+                merged_idxs = torch.cat([running_idxs, block_global_idxs], dim=1)
+                running_vals, select = torch.topk(
+                    merged_vals,
+                    k=topk_eff,
+                    dim=1,
+                    largest=True,
+                    sorted=True,
+                )
+                running_idxs = torch.gather(merged_idxs, 1, select)
+
+            result_vals[q_start:q_stop] = running_vals.cpu().numpy().astype(np.float32, copy=False)
+            result_idxs[q_start:q_stop] = running_idxs.cpu().numpy().astype(np.int32, copy=False)
+
+    return result_vals, result_idxs
+
+
+def _exact_topk_blocked(
+    z_queries: np.ndarray,
+    keys: np.ndarray,
+    *,
+    topk: int,
+    query_block_size: int,
+    key_block_size: int,
+    compute_backend: str = DEFAULT_COMPUTE_BACKEND,
+    torch_device: str = DEFAULT_TORCH_DEVICE,
+) -> tuple[np.ndarray, np.ndarray]:
+    backend_mode, resolved_device = _resolve_compute_backend(compute_backend, torch_device)
+    if backend_mode == "torch":
+        return _exact_topk_blocked_torch(
+            z_queries,
+            keys,
+            topk=topk,
+            query_block_size=query_block_size,
+            key_block_size=key_block_size,
+            torch_device=str(resolved_device),
+        )
+    return _exact_topk_blocked_numpy(
+        z_queries,
+        keys,
+        topk=topk,
+        query_block_size=query_block_size,
+        key_block_size=key_block_size,
+    )
+
+
 def _target_slice(tokens: np.ndarray, token_idx: int, horizon: int) -> np.ndarray:
     start = int(token_idx) + 1
     end = min(start + int(horizon), int(tokens.shape[0]))
@@ -737,6 +989,66 @@ def _summarize_subset(query_rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _group_query_rows_by_topk(query_rows: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in query_rows:
+        grouped[int(row["topk_requested"])].append(row)
+    return grouped
+
+
+def _build_topk_sweep_summary(query_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped = _group_query_rows_by_topk(query_rows)
+    return {
+        str(topk): _summarize_subset(rows)
+        for topk, rows in sorted(grouped.items())
+    }
+
+
+def _write_topk_plot_a1(out_dir: Path, summary_by_topk: dict[str, Any]) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    if plt is None:  # pragma: no cover - optional dependency
+        outputs["warning"] = "matplotlib is unavailable; plot was skipped"
+        return outputs
+
+    topk_values = sorted(int(key) for key in summary_by_topk.keys())
+    if not topk_values:
+        outputs["warning"] = "no topk values to plot"
+        return outputs
+
+    def _series(universe: str, metric: str) -> list[float]:
+        return [
+            float(summary_by_topk[str(topk)][universe][metric])
+            for topk in topk_values
+        ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    universe_specs = [
+        ("all_query_points", "All Query Points", axes[0]),
+        ("spec_eligible_query_points", "Spec Eligible", axes[1]),
+    ]
+    for universe_key, title, row_axes in universe_specs:
+        row_axes[0].plot(topk_values, _series(universe_key, "top1_mean_accept_len"), marker="o", label="top1_mean_accept")
+        row_axes[0].plot(topk_values, _series(universe_key, "oracle_mean_accept_len"), marker="o", label="oracle_mean_accept")
+        row_axes[0].set_title(f"{title}: Accept Length")
+        row_axes[0].set_xlabel("topk")
+        row_axes[0].set_ylabel("accept len")
+        row_axes[0].grid(True, alpha=0.3)
+        row_axes[0].legend()
+
+        row_axes[1].plot(topk_values, _series(universe_key, "mean_gain"), marker="o", label="mean_gain")
+        row_axes[1].plot(topk_values, _series(universe_key, "win_rate"), marker="o", label="win_rate")
+        row_axes[1].set_title(f"{title}: Gain / Win Rate")
+        row_axes[1].set_xlabel("topk")
+        row_axes[1].grid(True, alpha=0.3)
+        row_axes[1].legend()
+
+    plot_path = out_dir / "topk_sweep_a1.png"
+    fig.savefig(plot_path, dpi=160)
+    plt.close(fig)
+    outputs["png"] = str(plot_path)
+    return outputs
+
+
 def _analyze_prompt_group(
     *,
     step: int,
@@ -750,15 +1062,18 @@ def _analyze_prompt_group(
     prompt_desc_cache: dict[tuple[int, int], dict[str, Any]],
     hspec_store_mod: Any,
     hspec_table_store_mod: Any,
-    topk: int,
+    topk_values: list[int],
     horizon: int,
     threshold: float,
     query_block_size: int,
     key_block_size: int,
+    compute_backend: str,
+    torch_device: str,
     query_records: list[dict[str, Any]],
     candidate_records: list[dict[str, Any]],
     step_counters: dict[str, int],
 ) -> None:
+    max_topk = max(int(value) for value in topk_values)
     trajectories: list[dict[str, Any]] = []
     total_query_points = 0
 
@@ -788,32 +1103,41 @@ def _analyze_prompt_group(
             tokens = traj["tokens"]
             desc = traj["desc"]
             for token_idx in range(traj["query_count"]):
-                query_records.append(
-                    {
-                        "epoch": int(epoch),
-                        "global_step": int(step),
-                        "prompt_id": str(prompt_id),
-                        "request_id": str(desc.request_id),
-                        "shard_id": int(shard_id),
-                        "query_token_idx": int(token_idx),
-                        "query_token_id": int(tokens[token_idx]),
-                        "response_len": int(tokens.shape[0]),
-                        "table_present": False,
-                        "table_version": int(version_record["version"]),
-                        "table_active_epoch": int(version_record["active_epoch"]),
-                        "table_entry_count": 0,
-                        "top1_sim": None,
-                        "top2_sim": None,
-                        "top1_margin": None,
-                        "top1_accept_len": None,
-                        "oracle_topk_accept_len": None,
-                        "oracle_gain": None,
-                        "oracle_best_rank": -1,
-                        "oracle_best_entry_idx": -1,
-                        "eligible_by_threshold": False,
-                        "query_target_len": int(min(horizon, tokens.shape[0] - token_idx - 1)),
-                    }
+                external_request_id = str(
+                    getattr(desc, "external_request_id", "")
+                    or hspec_store_mod.hspec_external_request_id(str(desc.request_id))
                 )
+                for topk_requested in topk_values:
+                    query_records.append(
+                        {
+                            "epoch": int(epoch),
+                            "global_step": int(step),
+                            "topk_requested": int(topk_requested),
+                            "prompt_id": str(prompt_id),
+                            "request_id": str(desc.request_id),
+                            "external_request_id": external_request_id,
+                            "shard_id": int(shard_id),
+                            "tp_group_id": int(getattr(desc, "tp_group_id", 0)),
+                            "query_token_idx": int(token_idx),
+                            "query_token_id": int(tokens[token_idx]),
+                            "response_len": int(tokens.shape[0]),
+                            "table_present": False,
+                            "table_version": int(version_record["version"]),
+                            "table_active_epoch": int(version_record["active_epoch"]),
+                            "table_entry_count": 0,
+                            "top1_sim": None,
+                            "top2_sim": None,
+                            "top1_margin": None,
+                            "top1_accept_len": None,
+                            "oracle_topk_accept_len": None,
+                            "oracle_gain": None,
+                            "oracle_best_rank": -1,
+                            "oracle_best_entry_idx": -1,
+                            "eligible_by_threshold": False,
+                            "analysis_universe_main": False,
+                            "query_target_len": int(min(horizon, tokens.shape[0] - token_idx - 1)),
+                        }
+                    )
         step_counters["num_query_points_total"] += total_query_points
         step_counters["num_query_points_table_miss"] += total_query_points
         return
@@ -824,6 +1148,7 @@ def _analyze_prompt_group(
         str(prompt_id),
         loader=lambda: hspec_table_store_mod.materialize_prompt_table(table_desc),
     )
+    table_data = _prepare_table_data(table_data)
 
     mean = np.ascontiguousarray(np.asarray(table_data["mean"], dtype=np.float32))
     components = np.ascontiguousarray(np.asarray(table_data["components"], dtype=np.float32))
@@ -863,9 +1188,11 @@ def _analyze_prompt_group(
     topk_vals, topk_idxs = _exact_topk_blocked(
         z_queries,
         keys,
-        topk=topk,
+        topk=max_topk,
         query_block_size=query_block_size,
         key_block_size=key_block_size,
+        compute_backend=compute_backend,
+        torch_device=torch_device,
     )
 
     step_counters["num_query_points_total"] += len(all_meta)
@@ -882,25 +1209,43 @@ def _analyze_prompt_group(
         eligible = bool(top1_sim >= threshold)
 
         top1_accept_len: int | None = None
-        oracle_best_rank = -1
-        oracle_best_entry_idx = -1
-        oracle_best_accept = -1
-        oracle_best_sim = -math.inf
         candidate_start = len(candidate_records)
+        valid_mask = np.asarray(idxs >= 0, dtype=np.bool_)
+        candidate_entry_indices = np.ascontiguousarray(idxs[valid_mask], dtype=np.int32)
+        candidate_sims = np.ascontiguousarray(sims[valid_mask], dtype=np.float32)
 
-        for rank_idx, (sim_value, entry_idx) in enumerate(zip(sims.tolist(), idxs.tolist()), start=1):
-            entry_i = int(entry_idx)
-            if entry_i < 0:
-                continue
-            draft = _extract_draft(table_data, entry_i, horizon)
-            accept_len = _prefix_match_len(draft, target)
-            entry_reward = float(rewards[entry_i]) if rewards is not None and entry_i < len(rewards) else math.nan
-            entry_rollout_idx = int(table_data["entry_rollout_idx"][entry_i])
-            entry_offset = int(table_data["entry_offset"][entry_i])
+        if candidate_entry_indices.size == 0:
+            raise RuntimeError(
+                f"no valid candidates for step={step} prompt={prompt_id} query={q_idx}"
+            )
+
+        draft_matrix, draft_lens, rollout_idx_arr, entry_offsets_arr, tail_lens_arr = _extract_draft_batch(
+            table_data,
+            candidate_entry_indices,
+            horizon,
+        )
+        candidate_accept_lens = _prefix_match_lens_batch(draft_matrix, draft_lens, target)
+        prefix_best_accept = np.empty((candidate_entry_indices.shape[0],), dtype=np.int32)
+        prefix_best_rank = np.empty((candidate_entry_indices.shape[0],), dtype=np.int32)
+        prefix_best_entry_idx = np.empty((candidate_entry_indices.shape[0],), dtype=np.int32)
+        running_best_accept = -1
+        running_best_rank = -1
+        running_best_entry = -1
+        running_best_sim = -math.inf
+
+        for rank_idx, entry_i in enumerate(candidate_entry_indices.tolist(), start=1):
+            accept_len = int(candidate_accept_lens[rank_idx - 1])
+            sim_value = float(candidate_sims[rank_idx - 1])
+            entry_reward = (
+                float(rewards[entry_i])
+                if rewards is not None and entry_i < len(rewards)
+                else math.nan
+            )
             candidate_records.append(
                 {
                     "epoch": int(epoch),
                     "global_step": int(step),
+                    "topk_max_requested": int(max_topk),
                     "prompt_id": str(prompt_id),
                     "request_id": str(meta["request_id"]),
                     "external_request_id": str(meta["external_request_id"]),
@@ -910,81 +1255,89 @@ def _analyze_prompt_group(
                     "tp_group_id": int(meta["tp_group_id"]),
                     "query_token_idx": int(meta["query_token_idx"]),
                     "candidate_rank_by_sim": int(rank_idx),
-                    "candidate_entry_idx": entry_i,
-                    "candidate_sim": float(sim_value),
-                    "candidate_accept_len": int(accept_len),
-                    "candidate_reward": None if math.isnan(entry_reward) else entry_reward,
-                    "candidate_rollout_idx": entry_rollout_idx,
-                    "candidate_entry_offset": entry_offset,
-                    "candidate_tail_len": int(len(table_data["rollout_seqs"][entry_rollout_idx]) - entry_offset),
+                    "candidate_entry_idx": int(entry_i),
+                    "candidate_sim": sim_value,
+                    "candidate_accept_len": accept_len,
+                    "candidate_reward": None if math.isnan(entry_reward) else float(entry_reward),
+                    "candidate_rollout_idx": int(rollout_idx_arr[rank_idx - 1]),
+                    "candidate_entry_offset": int(entry_offsets_arr[rank_idx - 1]),
+                    "candidate_tail_len": int(tail_lens_arr[rank_idx - 1]),
                     "is_top1": bool(rank_idx == 1),
                     "is_oracle_best": False,
                 }
             )
             if rank_idx == 1:
-                top1_accept_len = int(accept_len)
+                top1_accept_len = accept_len
             if (
-                int(accept_len) > oracle_best_accept
-                or (
-                    int(accept_len) == oracle_best_accept
-                    and float(sim_value) > oracle_best_sim
-                )
+                accept_len > running_best_accept
+                or (accept_len == running_best_accept and sim_value > running_best_sim)
             ):
-                oracle_best_accept = int(accept_len)
-                oracle_best_sim = float(sim_value)
-                oracle_best_rank = int(rank_idx)
-                oracle_best_entry_idx = entry_i
+                running_best_accept = accept_len
+                running_best_rank = rank_idx
+                running_best_entry = int(entry_i)
+                running_best_sim = sim_value
+            prefix_best_accept[rank_idx - 1] = int(running_best_accept)
+            prefix_best_rank[rank_idx - 1] = int(running_best_rank)
+            prefix_best_entry_idx[rank_idx - 1] = int(running_best_entry)
 
         if top1_accept_len is None:
             raise RuntimeError(
                 f"top-1 accept length missing for step={step} prompt={prompt_id} query={q_idx}"
             )
 
-        for cand_idx in range(candidate_start, len(candidate_records)):
-            cand = candidate_records[cand_idx]
-            if (
-                int(cand["global_step"]) == int(step)
-                and str(cand["prompt_id"]) == str(prompt_id)
-                and str(cand["request_id"]) == str(meta["request_id"])
-                and int(cand["query_token_idx"]) == int(meta["query_token_idx"])
-                and int(cand["candidate_entry_idx"]) == int(oracle_best_entry_idx)
-                and int(cand["candidate_rank_by_sim"]) == int(oracle_best_rank)
-            ):
-                cand["is_oracle_best"] = True
-                break
-
         step_counters["num_query_points_usable"] += 1
         if eligible:
             step_counters["num_query_points_spec_eligible"] += 1
 
-        query_records.append(
-            {
+        for topk_requested in topk_values:
+            eff_k = min(int(topk_requested), int(candidate_entry_indices.shape[0]))
+            eff_idx = eff_k - 1
+            oracle_best_accept = int(prefix_best_accept[eff_idx])
+            oracle_best_rank = int(prefix_best_rank[eff_idx])
+            oracle_best_entry_idx = int(prefix_best_entry_idx[eff_idx])
+            if int(topk_requested) == int(max_topk):
+                for cand_idx in range(candidate_start, len(candidate_records)):
+                    cand = candidate_records[cand_idx]
+                    if (
+                        int(cand["global_step"]) == int(step)
+                        and str(cand["prompt_id"]) == str(prompt_id)
+                        and str(cand["request_id"]) == str(meta["request_id"])
+                        and int(cand["query_token_idx"]) == int(meta["query_token_idx"])
+                        and int(cand["candidate_entry_idx"]) == int(oracle_best_entry_idx)
+                        and int(cand["candidate_rank_by_sim"]) == int(oracle_best_rank)
+                    ):
+                        cand["is_oracle_best"] = True
+                        break
+            query_row = {
                 "epoch": int(epoch),
                 "global_step": int(step),
+                "topk_requested": int(topk_requested),
+                "topk_effective": int(eff_k),
                 "prompt_id": str(prompt_id),
-                    "request_id": str(meta["request_id"]),
-                    "external_request_id": str(meta["external_request_id"]),
-                    "shard_id": int(shard_id),
-                    "tp_group_id": int(meta["tp_group_id"]),
-                    "query_token_idx": int(meta["query_token_idx"]),
+                "request_id": str(meta["request_id"]),
+                "external_request_id": str(meta["external_request_id"]),
+                "shard_id": int(shard_id),
+                "tp_group_id": int(meta["tp_group_id"]),
+                "query_token_idx": int(meta["query_token_idx"]),
                 "query_token_id": int(meta["query_token_id"]),
                 "response_len": int(meta["response_len"]),
                 "table_present": True,
                 "table_version": int(version_record["version"]),
                 "table_active_epoch": int(version_record["active_epoch"]),
                 "table_entry_count": int(keys.shape[0]),
-                "top1_sim": top1_sim,
-                "top2_sim": top2_sim,
-                "top1_margin": top1_margin,
+                "top1_sim": float(top1_sim),
+                "top2_sim": float(top2_sim) if top2_sim is not None else None,
+                "top1_margin": float(top1_margin) if top1_margin is not None else None,
                 "top1_accept_len": int(top1_accept_len),
                 "oracle_topk_accept_len": int(oracle_best_accept),
                 "oracle_gain": int(oracle_best_accept - top1_accept_len),
                 "oracle_best_rank": int(oracle_best_rank),
                 "oracle_best_entry_idx": int(oracle_best_entry_idx),
-                "eligible_by_threshold": eligible,
+                "eligible_by_threshold": bool(eligible),
+                "analysis_universe_main": bool(eligible),
                 "query_target_len": int(len(target)),
             }
-        )
+            query_records.append(query_row)
 
 
 def _analyze_command(args: argparse.Namespace) -> int:
@@ -997,6 +1350,7 @@ def _analyze_command(args: argparse.Namespace) -> int:
         raise ValueError("hspec table store dir is required")
 
     target_steps = set(_parse_step_spec(args.target_steps))
+    topk_values = _parse_positive_int_spec(args.topk)
     threshold = float(
         args.similarity_threshold
         if args.similarity_threshold is not None
@@ -1109,74 +1463,127 @@ def _analyze_command(args: argparse.Namespace) -> int:
                 prompt_desc_cache=prompt_desc_cache,
                 hspec_store_mod=hspec_store_mod,
                 hspec_table_store_mod=hspec_table_store_mod,
-                topk=int(args.topk),
+                topk_values=topk_values,
                 horizon=horizon,
                 threshold=threshold,
                 query_block_size=int(args.query_block_size),
                 key_block_size=int(args.key_block_size),
+                compute_backend=str(args.compute_backend),
+                torch_device=str(args.torch_device),
                 query_records=query_records,
                 candidate_records=candidate_records,
                 step_counters=step_counters,
             )
 
         step_query_rows = [row for row in query_records if int(row["global_step"]) == step]
-        usable_rows = [row for row in step_query_rows if bool(row["table_present"])]
-        eligible_rows = [row for row in usable_rows if bool(row["eligible_by_threshold"])]
-        step_rows.append(
-            {
-                "epoch": epoch,
-                "global_step": step,
-                **step_counters,
-                "top1_mean_accept_len_all": _summarize_subset(usable_rows)["top1_mean_accept_len"],
-                "oracle_mean_accept_len_all": _summarize_subset(usable_rows)["oracle_mean_accept_len"],
-                "oracle_mean_gain_all": _summarize_subset(usable_rows)["mean_gain"],
-                "oracle_win_rate_all": _summarize_subset(usable_rows)["win_rate"],
-                "top1_mean_accept_len_spec_eligible": _summarize_subset(eligible_rows)["top1_mean_accept_len"],
-                "oracle_mean_accept_len_spec_eligible": _summarize_subset(eligible_rows)["oracle_mean_accept_len"],
-                "oracle_mean_gain_spec_eligible": _summarize_subset(eligible_rows)["mean_gain"],
-                "oracle_win_rate_spec_eligible": _summarize_subset(eligible_rows)["win_rate"],
-            }
-        )
+        for topk_requested in topk_values:
+            step_topk_rows = [
+                row for row in step_query_rows
+                if int(row["topk_requested"]) == int(topk_requested)
+            ]
+            usable_rows = [row for row in step_topk_rows if bool(row["table_present"])]
+            eligible_rows = [row for row in usable_rows if bool(row["eligible_by_threshold"])]
+            step_rows.append(
+                {
+                    "epoch": epoch,
+                    "global_step": step,
+                    "topk_requested": int(topk_requested),
+                    **step_counters,
+                    "top1_mean_accept_len_all": _summarize_subset(usable_rows)["top1_mean_accept_len"],
+                    "oracle_mean_accept_len_all": _summarize_subset(usable_rows)["oracle_mean_accept_len"],
+                    "oracle_mean_gain_all": _summarize_subset(usable_rows)["mean_gain"],
+                    "oracle_win_rate_all": _summarize_subset(usable_rows)["win_rate"],
+                    "top1_mean_accept_len_spec_eligible": _summarize_subset(eligible_rows)["top1_mean_accept_len"],
+                    "oracle_mean_accept_len_spec_eligible": _summarize_subset(eligible_rows)["oracle_mean_accept_len"],
+                    "oracle_mean_gain_spec_eligible": _summarize_subset(eligible_rows)["mean_gain"],
+                    "oracle_win_rate_spec_eligible": _summarize_subset(eligible_rows)["win_rate"],
+                }
+            )
 
     usable_query_rows = [row for row in query_records if bool(row["table_present"])]
     eligible_query_rows = [row for row in usable_query_rows if bool(row["eligible_by_threshold"])]
+    summary_by_topk: dict[str, Any] = {}
+    for topk_requested in topk_values:
+        topk_all_rows = [
+            row for row in usable_query_rows
+            if int(row["topk_requested"]) == int(topk_requested)
+        ]
+        topk_eligible_rows = [
+            row for row in eligible_query_rows
+            if int(row["topk_requested"]) == int(topk_requested)
+        ]
+        summary_by_topk[str(int(topk_requested))] = {
+            "all_query_points": _summarize_subset(topk_all_rows),
+            "spec_eligible_query_points": _summarize_subset(topk_eligible_rows),
+        }
+
+    unique_step_rows = [
+        row for row in step_rows
+        if int(row["topk_requested"]) == int(topk_values[0])
+    ]
+
     summary = {
+        "topk_values": topk_values,
         "num_steps_analyzed": len(target_steps),
-        "num_desc_scanned": int(sum(int(row["num_desc_scanned"]) for row in step_rows)),
-        "num_desc_after_tp_dedupe": int(
-            sum(int(row["num_desc_after_tp_dedupe"]) for row in step_rows)
-        ),
-        "num_desc_analyzed": int(sum(int(row["num_desc_analyzed"]) for row in step_rows)),
-        "num_query_points_total": int(len(query_records)),
-        "num_query_points_usable": int(len(usable_query_rows)),
-        "num_query_points_with_table": int(len(usable_query_rows)),
-        "num_query_points_spec_eligible": int(len(eligible_query_rows)),
+        "num_desc_scanned": int(sum(int(row["num_desc_scanned"]) for row in unique_step_rows)),
+        "num_desc_after_tp_dedupe": int(sum(int(row["num_desc_after_tp_dedupe"]) for row in unique_step_rows)),
+        "num_desc_analyzed": int(sum(int(row["num_desc_analyzed"]) for row in unique_step_rows)),
+        "num_query_points_total": int(sum(int(row["num_query_points_total"]) for row in unique_step_rows)),
+        "num_query_points_usable": int(sum(int(row["num_query_points_usable"]) for row in unique_step_rows)),
+        "num_query_points_with_table": int(sum(int(row["num_query_points_with_table"]) for row in unique_step_rows)),
+        "num_query_points_spec_eligible": int(sum(int(row["num_query_points_spec_eligible"]) for row in unique_step_rows)),
         "analysis_config": {
-            "topk": int(args.topk),
+            "topk_values": topk_values,
             "draft_horizon": int(horizon),
             "similarity_threshold": float(threshold),
             "query_block_size": int(args.query_block_size),
             "key_block_size": int(args.key_block_size),
             "table_cache_prompts": int(args.table_cache_prompts),
+            "compute_backend": str(args.compute_backend),
+            "torch_device": str(args.torch_device),
             "target_steps": sorted(target_steps),
         },
-        "all_query_points": _summarize_subset(usable_query_rows),
-        "spec_eligible_query_points": _summarize_subset(eligible_query_rows),
+        "by_topk": summary_by_topk,
     }
 
     out_dir = Path(args.out_dir).resolve()
     _ensure_dir(out_dir)
-    _write_json(out_dir / "summary.json", summary)
-    _write_csv(out_dir / "step_summary.csv", step_rows)
-    query_outputs = _write_records(out_dir / "query_records", query_records)
-    candidate_outputs = _write_records(out_dir / "candidate_records", candidate_records)
+    _write_json(out_dir / "summary_by_topk.json", summary)
+    _write_csv(out_dir / "step_summary_by_topk.csv", step_rows)
+    query_outputs = _write_records(out_dir / "query_records_by_topk", query_records)
+    candidate_outputs = _write_records(out_dir / "candidate_records_max_topk", candidate_records)
+    plot_outputs = _write_topk_plot_a1(out_dir, summary_by_topk)
     _write_json(
         out_dir / "artifact_paths.json",
         {
-            "query_records": query_outputs,
-            "candidate_records": candidate_outputs,
+            "query_records_by_topk": query_outputs,
+            "candidate_records_max_topk": candidate_outputs,
+            "plots": plot_outputs,
         },
     )
+
+    if len(topk_values) == 1:
+        topk_key = str(int(topk_values[0]))
+        legacy_summary = {
+            "num_steps_analyzed": int(summary["num_steps_analyzed"]),
+            "num_desc_scanned": int(summary["num_desc_scanned"]),
+            "num_desc_after_tp_dedupe": int(summary["num_desc_after_tp_dedupe"]),
+            "num_desc_analyzed": int(summary["num_desc_analyzed"]),
+            "num_query_points_total": int(summary["num_query_points_total"]),
+            "num_query_points_usable": int(summary["num_query_points_usable"]),
+            "num_query_points_with_table": int(summary["num_query_points_with_table"]),
+            "num_query_points_spec_eligible": int(summary["num_query_points_spec_eligible"]),
+            "analysis_config": summary["analysis_config"],
+            "all_query_points": summary_by_topk[topk_key]["all_query_points"],
+            "spec_eligible_query_points": summary_by_topk[topk_key]["spec_eligible_query_points"],
+        }
+        _write_json(out_dir / "summary.json", legacy_summary)
+        _write_csv(out_dir / "step_summary.csv", [row for row in step_rows if int(row["topk_requested"]) == int(topk_values[0])])
+        _write_records(
+            out_dir / "query_records",
+            [row for row in query_records if int(row["topk_requested"]) == int(topk_values[0])],
+        )
+        _write_records(out_dir / "candidate_records", candidate_records)
 
     print(f"A1 analysis written to {out_dir}")
     return 0
@@ -1198,12 +1605,26 @@ def _build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--hspec-table-store-dir", type=str, default=None, help="table store root")
     analyze.add_argument("--table-version-catalog", type=str, default=None, help="optional JSON catalog from inventory")
     analyze.add_argument("--target-steps", type=str, required=True, help="comma list or ranges, e.g. 12,13,20-25")
-    analyze.add_argument("--topk", type=int, default=8, help="exact top-k to compute")
+    analyze.add_argument("--topk", type=str, default="8", help="one or more positive integers, e.g. 8 or 2,4,8")
     analyze.add_argument("--draft-horizon", type=int, default=None, help="draft horizon H; defaults from run manifest or 15")
     analyze.add_argument("--similarity-threshold", type=float, default=None, help="eligibility threshold; defaults from run manifest or 0.85")
     analyze.add_argument("--query-block-size", type=int, default=256, help="number of query rows per blocked similarity pass")
     analyze.add_argument("--key-block-size", type=int, default=8192, help="number of keys per blocked similarity pass")
     analyze.add_argument("--table-cache-prompts", type=int, default=64, help="max materialized prompt tables to keep in the LRU")
+    analyze.add_argument(
+        "--compute-backend",
+        type=str,
+        choices=("auto", "numpy", "torch"),
+        default=DEFAULT_COMPUTE_BACKEND,
+        help="backend for blocked exact top-k retrieval",
+    )
+    analyze.add_argument(
+        "--torch-device",
+        type=str,
+        choices=("auto", "cpu", "cuda", "npu"),
+        default=DEFAULT_TORCH_DEVICE,
+        help="device used when compute-backend=torch or auto resolves to torch",
+    )
     analyze.add_argument("--out-dir", type=str, required=True, help="directory to write analysis artifacts")
 
     return parser
