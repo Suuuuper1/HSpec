@@ -257,13 +257,21 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
         **{name: num_overall_tokens for name in ["ref", "values", "adv", "update_critic", "update_actor"]},
     }
 
-    return {
+    metrics = {
         **{f"timing_s/{name}": value for name, value in timing_raw.items()},
         **{
             f"timing_per_token_ms/{name}": timing_raw[name] * 1000 / num_tokens_of_section[name]
             for name in set(num_tokens_of_section.keys()) & set(timing_raw.keys())
         },
     }
+    generation_seconds = float(timing_raw.get("gen", 0.0))
+    metrics["rollout/generated_tokens"] = float(num_response_tokens)
+    metrics["rollout/generated_tokens_per_second"] = (
+        float(num_response_tokens) / generation_seconds
+        if generation_seconds > 0.0
+        else 0.0
+    )
+    return metrics
 
 
 def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n_gpus: int) -> dict[str, Any]:

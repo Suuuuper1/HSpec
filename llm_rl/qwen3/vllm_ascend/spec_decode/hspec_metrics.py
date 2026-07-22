@@ -48,6 +48,15 @@ _BASE_ADDITIVE_KEYS = frozenset({
     "select_top1_top2_margin_count",
     "select_active_table_version_sum",
     "select_active_table_version_sq_sum",
+    # S2 baseline-audit funnel. These are request counts from one strictly
+    # nested population, so every downstream value must be <= its parent.
+    "select_funnel_decode_requests",
+    "select_funnel_active_table_requests",
+    "select_funnel_prompt_id_ready_requests",
+    "select_funnel_prompt_table_ready_requests",
+    "select_funnel_batch_cache_ready_requests",
+    "select_funnel_anchor_ready_requests",
+    "select_funnel_eligible_queries",
 })
 SELECTOR_ADDITIVE_METRIC_KEYS = frozenset(
     set(_BASE_ADDITIVE_KEYS)
@@ -85,6 +94,25 @@ def derive_selector_metrics(counters: Mapping[str, float]) -> Dict[str, float]:
         counters.get("select_active_table_version_sq_sum", 0.0)
     )
     version_mean = _safe_ratio(version_sum, windows)
+    funnel_decode = float(counters.get("select_funnel_decode_requests", 0.0))
+    funnel_active_table = float(
+        counters.get("select_funnel_active_table_requests", 0.0)
+    )
+    funnel_prompt_id = float(
+        counters.get("select_funnel_prompt_id_ready_requests", 0.0)
+    )
+    funnel_prompt_table = float(
+        counters.get("select_funnel_prompt_table_ready_requests", 0.0)
+    )
+    funnel_batch_cache = float(
+        counters.get("select_funnel_batch_cache_ready_requests", 0.0)
+    )
+    funnel_anchor = float(
+        counters.get("select_funnel_anchor_ready_requests", 0.0)
+    )
+    funnel_eligible = float(
+        counters.get("select_funnel_eligible_queries", 0.0)
+    )
 
     result = {
         "select_proposal_coverage": _safe_ratio(proposed, eligible),
@@ -103,6 +131,27 @@ def derive_selector_metrics(counters: Mapping[str, float]) -> Dict[str, float]:
         "select_active_table_version_variance": max(
             _safe_ratio(version_sq_sum, windows) - version_mean * version_mean,
             0.0,
+        ),
+        "select_funnel_active_table_ratio": _safe_ratio(
+            funnel_active_table, funnel_decode
+        ),
+        "select_funnel_prompt_id_ready_ratio": _safe_ratio(
+            funnel_prompt_id, funnel_active_table
+        ),
+        "select_funnel_prompt_table_ready_ratio": _safe_ratio(
+            funnel_prompt_table, funnel_prompt_id
+        ),
+        "select_funnel_batch_cache_ready_ratio": _safe_ratio(
+            funnel_batch_cache, funnel_prompt_table
+        ),
+        "select_funnel_anchor_ready_ratio": _safe_ratio(
+            funnel_anchor, funnel_batch_cache
+        ),
+        "select_funnel_eligible_after_anchor_ratio": _safe_ratio(
+            funnel_eligible, funnel_anchor
+        ),
+        "select_funnel_end_to_end_eligible_ratio": _safe_ratio(
+            funnel_eligible, funnel_decode
         ),
     }
     for field_name in _TIMING_FIELDS:

@@ -534,6 +534,9 @@ class HSpecProposer(Proposer):
         self._selector_timing_enabled = (
             os.environ.get("HSPEC_SELECT_OBSERVE_TIMING", "0") != "0"
         )
+        self._s2_baseline_audit_enabled = (
+            os.environ.get("HSPEC_S2_BASELINE_AUDIT", "0") != "0"
+        )
         self._selector_metadata_sample_every = _get_env_int(
             "HSPEC_SELECT_METADATA_SAMPLE_EVERY", 0, 0
         )
@@ -730,12 +733,13 @@ class HSpecProposer(Proposer):
 
         logger.info(
             "HSpec Patch 0 selector observability: mode=%s topk=%d "
-            "margin=%s timing=%s metadata_sample_every=%d",
+            "margin=%s timing=%s metadata_sample_every=%d s2_baseline_audit=%s",
             self._selector_mode,
             self._selector_topk,
             self._selector_margin_enabled,
             self._selector_timing_enabled,
             self._selector_metadata_sample_every,
+            self._s2_baseline_audit_enabled,
         )
 
         logger.info(
@@ -2083,6 +2087,71 @@ class HSpecProposer(Proposer):
         except Exception:
             pass
 
+    def _record_s2_baseline_funnel(
+        self,
+        *,
+        prompt_ids: List[str],
+        anchor_indices: List[int],
+        sampled_token_ids: List[List[int]],
+        batch_table_cache: Optional[_BatchedPromptTableCache],
+    ) -> None:
+        """Record a strictly nested request funnel for the S2 baseline audit."""
+        if not self._s2_baseline_audit_enabled:
+            return
+
+        decode_requests = len(prompt_ids)
+        active_table_requests = (
+            decode_requests if int(self._cache_version) >= 0 else 0
+        )
+        prompt_id_ready_requests = 0
+        prompt_table_ready_requests = 0
+        batch_cache_ready_requests = 0
+        anchor_ready_requests = 0
+        eligible_queries = 0
+
+        if active_table_requests > 0:
+            for batch_idx, prompt_id in enumerate(prompt_ids):
+                if not prompt_id:
+                    continue
+                prompt_id_ready_requests += 1
+                prompt_table = self._cache.get(prompt_id)
+                if prompt_table is None or int(prompt_table.n_entries) <= 0:
+                    continue
+                prompt_table_ready_requests += 1
+                if (
+                    batch_table_cache is None
+                    or batch_table_cache.batch_idx_to_row.get(batch_idx) is None
+                ):
+                    continue
+                batch_cache_ready_requests += 1
+                anchor_idx = (
+                    anchor_indices[batch_idx]
+                    if batch_idx < len(anchor_indices)
+                    else -1
+                )
+                if int(anchor_idx) < 0:
+                    continue
+                anchor_ready_requests += 1
+                sampled = (
+                    sampled_token_ids[batch_idx]
+                    if batch_idx < len(sampled_token_ids)
+                    else []
+                )
+                if len(sampled) >= int(self.min_match_len):
+                    eligible_queries += 1
+
+        counters = {
+            "select_funnel_decode_requests": decode_requests,
+            "select_funnel_active_table_requests": active_table_requests,
+            "select_funnel_prompt_id_ready_requests": prompt_id_ready_requests,
+            "select_funnel_prompt_table_ready_requests": prompt_table_ready_requests,
+            "select_funnel_batch_cache_ready_requests": batch_cache_ready_requests,
+            "select_funnel_anchor_ready_requests": anchor_ready_requests,
+            "select_funnel_eligible_queries": eligible_queries,
+        }
+        for key, value in counters.items():
+            self._record_proposer_metric(key, value)
+
     def _record_closed_selector_metrics(
         self, counters: Optional[Dict[str, float]]
     ) -> None:
@@ -3185,6 +3254,14 @@ class HSpecProposer(Proposer):
                         continue
                     active_batch_indices.append(i)
                     active_table_rows.append(row)
+
+        if self._s2_baseline_audit_enabled:
+            self._record_s2_baseline_funnel(
+                prompt_ids=prompt_ids,
+                anchor_indices=anchor_indices,
+                sampled_token_ids=valid_sampled_token_ids,
+                batch_table_cache=batch_table_cache,
+            )
 
         with (hspec_record_function("hspec/proposal/get_active_cached_tables_and_position", use_npu_stream=True)
               if prof_enabled else nullcontext()):
