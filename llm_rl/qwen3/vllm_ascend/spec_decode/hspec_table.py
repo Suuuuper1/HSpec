@@ -35,6 +35,12 @@ from vllm_ascend.spec_decode.hspec_builder import (
     HSpecPCAInsufficientSamples,
     build_prompt_table_to_store,
 )
+from vllm_ascend.spec_decode.hspec_metrics import (
+    HSpecSelectorMetricStore,
+    SELECTOR_ADDITIVE_METRIC_KEYS,
+    derive_selector_metrics,
+    hspec_abs_delta_bucket,
+)
 from vllm_ascend.spec_decode.hspec_table_store import (
     HSpecActivePromptRecord,
     HSpecPromptTableDesc,
@@ -1074,9 +1080,12 @@ class HSpecTableGroup:
         self._entry_verify_count = 0
         self._entry_accept_count = 0
         self._entry_accept_len_sum = 0
-        self._entry_abs_delta_verify: Dict[int, int] = {}
-        self._entry_abs_delta_accept: Dict[int, int] = {}
-        self._entry_abs_delta_accept_len_sum: Dict[int, int] = {}
+        self._entry_abs_delta_verify: Dict[str, int] = {}
+        self._entry_abs_delta_accept: Dict[str, int] = {}
+        self._entry_abs_delta_accept_len_sum: Dict[str, int] = {}
+        # Patch 0 selector counters are interval deltas. They are kept separate
+        # from legacy counters, which reset at table lifecycle boundaries.
+        self._selector_metric_store = HSpecSelectorMetricStore()
         self._proposer_prefetch_descriptor_payload_count = 0
         self._proposer_prefetch_legacy_payload_count = 0
         self._proposer_prefetch_absent_payload_count = 0
@@ -3724,12 +3733,21 @@ class HSpecTableGroup:
             "proposer_cache_load_count": self._proposer_cache_load_count,
             "proposer_cache_load_bytes": self._proposer_cache_load_bytes,
         }
-        for abs_delta, count in self._entry_abs_delta_verify.items():
-            metrics[f"entry_abs_delta_verify_{abs_delta}"] = float(count)
-        for abs_delta, count in self._entry_abs_delta_accept.items():
-            metrics[f"entry_abs_delta_accept_{abs_delta}"] = float(count)
-        for abs_delta, total_len in self._entry_abs_delta_accept_len_sum.items():
-            metrics[f"entry_abs_delta_accept_len_sum_{abs_delta}"] = float(total_len)
+        for bucket, count in self._entry_abs_delta_verify.items():
+            metrics[f"entry_abs_delta_bucket_verify_{bucket}"] = float(count)
+        for bucket, count in self._entry_abs_delta_accept.items():
+            metrics[f"entry_abs_delta_bucket_accept_{bucket}"] = float(count)
+        for bucket, total_len in self._entry_abs_delta_accept_len_sum.items():
+            metrics[f"entry_abs_delta_bucket_accept_len_sum_{bucket}"] = float(total_len)
+        selector_window_id, selector_interval, selector_cumulative = (
+            self._selector_metric_store.snapshot_and_reset()
+        )
+        metrics["select_metric_window_id"] = float(selector_window_id)
+        for key, value in selector_interval.items():
+            metrics[key] = float(value)
+        for key, value in selector_cumulative.items():
+            suffix = key[len("select_"):] if key.startswith("select_") else key
+            metrics[f"select_cumulative_{suffix}"] = float(value)
         actor_store_metrics = collect_hspec_store_metrics(reset=True)
         for key in _TABLE_STORE_ADDITIVE_METRIC_KEYS:
             metrics[key] = float(actor_store_metrics.get(key, 0))
@@ -3956,13 +3974,13 @@ class HSpecTableGroup:
             self._entry_accept_len_sum += int(accept_len_sum)
 
             for abs_delta, count in (abs_delta_verify or {}).items():
-                key = int(abs_delta)
+                key = hspec_abs_delta_bucket(int(abs_delta))
                 self._entry_abs_delta_verify[key] = self._entry_abs_delta_verify.get(key, 0) + int(count)
             for abs_delta, count in (abs_delta_accept or {}).items():
-                key = int(abs_delta)
+                key = hspec_abs_delta_bucket(int(abs_delta))
                 self._entry_abs_delta_accept[key] = self._entry_abs_delta_accept.get(key, 0) + int(count)
             for abs_delta, total_len in (abs_delta_accept_len_sum or {}).items():
-                key = int(abs_delta)
+                key = hspec_abs_delta_bucket(int(abs_delta))
                 self._entry_abs_delta_accept_len_sum[key] = (
                     self._entry_abs_delta_accept_len_sum.get(key, 0) + int(total_len))
         except Exception:
@@ -3975,6 +3993,10 @@ class HSpecTableGroup:
         """Aggregate descriptor-cache metrics from worker-local proposers."""
         if not isinstance(metrics, dict):
             return
+        try:
+            self._selector_metric_store.record(metrics)
+        except Exception:
+            logger.debug("Failed to aggregate HSpec Patch 0 selector metrics", exc_info=True)
         additive_map = {
             "prefetch_descriptor_payload_count": "_proposer_prefetch_descriptor_payload_count",
             "prefetch_legacy_payload_count": "_proposer_prefetch_legacy_payload_count",
@@ -5031,7 +5053,7 @@ class GlobalHSpecTableGroup:
     def compute_metrics(self) -> Dict[str, float]:
         """Aggregate metrics from all partition actors."""
         if not self.groups:
-            return {
+            result = {
                 "hspec/match_rate": 0.0,
                 "hspec/avg_draft_length": 0.0,
                 "hspec/avg_accept_length": 0.0,
@@ -5161,6 +5183,8 @@ class GlobalHSpecTableGroup:
                 "hspec/proposer_cache_load_bytes": 0,
                 "hspec/proposer_cache_load_mb": 0.0,
             }
+            result.update(self._format_selector_metrics({}))
+            return result
         tasks = [g.compute_metrics.remote() for g in self.groups]
         metrics_list = ray.get(tasks)
 
@@ -5186,6 +5210,7 @@ class GlobalHSpecTableGroup:
             "proposer_cache_load_ms_max",
             "build_cpu_profile_enabled",
             "build_cpu_profile_top_cumtime_ms_max",
+            "select_metric_window_id",
         }
         for metrics in metrics_list:
             for key, value in metrics.items():
@@ -5343,6 +5368,7 @@ class GlobalHSpecTableGroup:
             "hspec/entry_avg_accept_length": (
                 entry_accept_len_sum / entry_verify_count if entry_verify_count > 0 else 0.0),
         }
+        result.update(self._format_selector_metrics(agg))
 
         driver_store_metrics = collect_hspec_store_metrics(reset=True)
         result["hspec/collect_budget_drop"] = float(
@@ -5487,26 +5513,109 @@ class GlobalHSpecTableGroup:
             / (1024 * 1024)
         )
 
-        abs_deltas = set()
+        abs_delta_buckets = set()
         for key in agg:
-            if key.startswith("entry_abs_delta_verify_"):
-                abs_deltas.add(int(key.rsplit("_", 1)[-1]))
-            elif key.startswith("entry_abs_delta_accept_"):
-                abs_deltas.add(int(key.rsplit("_", 1)[-1]))
-            elif key.startswith("entry_abs_delta_accept_len_sum_"):
-                abs_deltas.add(int(key.rsplit("_", 1)[-1]))
+            if key.startswith("entry_abs_delta_bucket_verify_"):
+                abs_delta_buckets.add(
+                    key[len("entry_abs_delta_bucket_verify_"):]
+                )
+            elif key.startswith("entry_abs_delta_bucket_accept_len_sum_"):
+                abs_delta_buckets.add(
+                    key[len("entry_abs_delta_bucket_accept_len_sum_"):]
+                )
+            elif key.startswith("entry_abs_delta_bucket_accept_"):
+                abs_delta_buckets.add(
+                    key[len("entry_abs_delta_bucket_accept_"):]
+                )
 
-        for abs_delta in sorted(abs_deltas):
-            verify_count = agg.get(f"entry_abs_delta_verify_{abs_delta}", 0.0)
-            accept_count = agg.get(f"entry_abs_delta_accept_{abs_delta}", 0.0)
-            accept_len_total = agg.get(f"entry_abs_delta_accept_len_sum_{abs_delta}", 0.0)
-            prefix = f"hspec/entry_abs_delta_{abs_delta}"
+        bucket_order = (
+            "0", "1_2", "3_8", "9_32", "33_64", "65_256", "gt_256"
+        )
+        for bucket in bucket_order:
+            if bucket not in abs_delta_buckets:
+                continue
+            verify_count = agg.get(
+                f"entry_abs_delta_bucket_verify_{bucket}", 0.0
+            )
+            accept_count = agg.get(
+                f"entry_abs_delta_bucket_accept_{bucket}", 0.0
+            )
+            accept_len_total = agg.get(
+                f"entry_abs_delta_bucket_accept_len_sum_{bucket}", 0.0
+            )
+            prefix = f"hspec/entry_abs_delta_bucket_{bucket}"
             result[f"{prefix}_verify_times"] = verify_count
             result[f"{prefix}_accept_times"] = accept_count
             result[f"{prefix}_match_rate"] = accept_count / verify_count if verify_count > 0 else 0.0
             result[f"{prefix}_avg_accept_length"] = (
                 accept_len_total / accept_count if accept_count > 0 else 0.0)
 
+        return result
+
+    @staticmethod
+    def _format_selector_metrics(agg: Dict[str, float]) -> Dict[str, float]:
+        """Expose aligned interval counters without changing legacy semantics."""
+        essential = {
+            "select_metric_windows",
+            "select_eligible_queries",
+            "select_proposed_requests",
+            "select_abstained_requests",
+            "select_drafted_tokens",
+            "select_verified_requests",
+            "select_first_token_accepts",
+            "select_accepted_tokens",
+            "select_emitted_tokens",
+            "select_zero_accept_requests",
+            "select_canceled_requests",
+            "select_drafted_length_mismatch_count",
+            "select_top1_top2_margin_sum",
+            "select_top1_top2_margin_count",
+            "select_active_table_version_sum",
+            "select_active_table_version_sq_sum",
+            "select_project_submit_ms",
+            "select_match_submit_ms",
+            "select_d2h_sync_ms",
+            "select_cpu_retrieve_ms",
+            "select_total_ms",
+        }
+        interval = {
+            key: float(agg.get(key, 0.0))
+            for key in essential
+        }
+        for key in SELECTOR_ADDITIVE_METRIC_KEYS:
+            value = float(agg.get(key, 0.0))
+            if value != 0.0:
+                interval[key] = value
+
+        result = {f"hspec/{key}": value for key, value in interval.items()}
+        for key, value in derive_selector_metrics(interval).items():
+            result[f"hspec/{key}"] = value
+
+        cumulative = {
+            key: float(value)
+            for key, value in agg.items()
+            if key.startswith("select_cumulative_")
+        }
+        result.update({f"hspec/{key}": value for key, value in cumulative.items()})
+        cumulative_primitives = {
+            "select_" + key[len("select_cumulative_"):]: value
+            for key, value in cumulative.items()
+        }
+        for key, value in derive_selector_metrics(cumulative_primitives).items():
+            suffix = key[len("select_"):] if key.startswith("select_") else key
+            result[f"hspec/select_cumulative_{suffix}"] = value
+
+        result["hspec/select_metric_window_id"] = float(
+            agg.get("select_metric_window_id", 0.0)
+        )
+        result["hspec/select_metrics_are_interval"] = 1.0
+        # Reserved Patch 1 fields are explicit zeroes in hard-max Patch 0.
+        result["hspec/select_rerank_changed_count"] = 0.0
+        result["hspec/select_rerank_changed_accept_count"] = 0.0
+        result["hspec/select_stop_low_utility_count"] = 0.0
+        result["hspec/select_stop_prefix_disagreement_count"] = 0.0
+        result["hspec/select_npu_topk_ms"] = 0.0
+        result["hspec/select_cpu_rerank_ms"] = 0.0
         return result
 
     # ZMQ helpers

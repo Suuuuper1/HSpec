@@ -100,6 +100,11 @@ from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
+from vllm_ascend.spec_decode.hspec_parity import (
+    HSPEC_S1_PARITY_ENABLED,
+    flush_hspec_s1_parity,
+    record_hspec_s1_parity_batch,
+)
 from vllm_ascend.spec_decode.hspec_proposer import HSpecProposer
 from vllm_ascend.spec_decode.hspec_utils import hspec_record_function
 from vllm_ascend.spec_decode.interface import SpecDcodeType
@@ -496,6 +501,16 @@ class NPUModelRunner(GPUModelRunner):
                 self.drafter.clear_request(req_id)
             except Exception:
                 pass
+        if (scheduler_output.finished_req_ids
+                and self.input_batch.num_reqs == 0
+                and hasattr(self.drafter, "flush_observability_metrics")):
+            try:
+                self.drafter.flush_observability_metrics()
+            except Exception:
+                pass
+        if (HSPEC_S1_PARITY_ENABLED and scheduler_output.finished_req_ids
+                and self.input_batch.num_reqs == 0):
+            flush_hspec_s1_parity()
 
     def hspec_prefetch_prompt_token_ids_batch(
         self,
@@ -2334,6 +2349,33 @@ class NPUModelRunner(GPUModelRunner):
                     valid_sampled_token_ids,
                 )
 
+            if HSPEC_S1_PARITY_ENABLED:
+                parity_req_ids = list(self.input_batch.req_ids)
+                parity_req_states = [
+                    self.requests.get(req_id) for req_id in parity_req_ids
+                ]
+                record_hspec_s1_parity_batch(
+                    request_ids=parity_req_ids,
+                    prompt_token_ids=[
+                        list(getattr(state, "prompt_token_ids", []) or [])
+                        if state is not None else []
+                        for state in parity_req_states
+                    ],
+                    output_prefix_token_ids=[
+                        list(getattr(state, "output_token_ids", []) or [])
+                        if state is not None else []
+                        for state in parity_req_states
+                    ],
+                    scheduled_drafts=(
+                        scheduler_output.scheduled_spec_decode_tokens
+                    ),
+                    target_token_ids=valid_sampled_token_ids,
+                    accepted_prefix_lengths=accepted_prefix_lengths,
+                    spec_decode_active=(
+                        spec_decode_metadata is not None and max_gen_len > 1
+                    ),
+                )
+
             accept_advan_add = 0
             reject_advan_add = 0
             if (self.drafter is not None
@@ -2343,9 +2385,20 @@ class NPUModelRunner(GPUModelRunner):
                     and max_gen_len > 1):
                 try:
                     n = min(len(self.input_batch.req_ids), len(accepted_prefix_lengths))
+                    drafted_lengths = [
+                        len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, []))
+                        for req_id in self.input_batch.req_ids[:n]
+                    ]
+                    emitted_token_lengths = [
+                        len(valid_sampled_token_ids[i])
+                        if i < len(valid_sampled_token_ids) else 0
+                        for i in range(n)
+                    ]
                     accept_advan_add, reject_advan_add = self.drafter.update_verification_outcomes(
                         self.input_batch.req_ids[:n],
                         accepted_prefix_lengths[:n],
+                        drafted_lengths=drafted_lengths,
+                        emitted_token_lengths=emitted_token_lengths,
                     )
                     accept_advan_add = int(accept_advan_add)
                     reject_advan_add = int(reject_advan_add)

@@ -42,6 +42,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+from vllm_ascend.spec_decode.hspec_metrics import HSpecSelectionMetricTracker
 from vllm_ascend.spec_decode.hspec_table import GlobalHSpecTableGroup, get_hspec_tables
 from vllm_ascend.spec_decode.hspec_table_store import (
     HSpecPromptTableDesc,
@@ -516,6 +517,30 @@ class HSpecProposer(Proposer):
         self.min_match_len: int = getattr(spec_config, "hspec_min_match_len", 1)
         self.n_components: int = getattr(spec_config, "hspec_n_components", 64)
         self.max_entries_per_prompt: int = getattr(spec_config, "hspec_max_entries_per_prompt", 10_000)
+        self._selector_mode = os.environ.get("HSPEC_SELECT_MODE", "hardmax").strip().lower()
+        if self._selector_mode != "hardmax":
+            raise ValueError(
+                "Patch 0 supports only HSPEC_SELECT_MODE=hardmax; "
+                f"got {self._selector_mode!r}"
+            )
+        self._selector_topk = _get_env_int("HSPEC_SELECT_TOPK", 1, 1)
+        if self._selector_topk != 1:
+            raise ValueError(
+                "Patch 0 requires HSPEC_SELECT_TOPK=1; top-k selection is introduced by Patch 1"
+            )
+        self._selector_margin_enabled = (
+            os.environ.get("HSPEC_SELECT_OBSERVE_MARGIN", "0") != "0"
+        )
+        self._selector_timing_enabled = (
+            os.environ.get("HSPEC_SELECT_OBSERVE_TIMING", "0") != "0"
+        )
+        self._selector_metadata_sample_every = _get_env_int(
+            "HSPEC_SELECT_METADATA_SAMPLE_EVERY", 0, 0
+        )
+        self._selector_metadata_sample_count = 0
+        self._selector_metric_tracker = HSpecSelectionMetricTracker(
+            self.max_draft_tokens
+        )
 
         self.hspec_tables: GlobalHSpecTableGroup = get_hspec_tables(
             similarity_threshold=self.similarity_threshold,
@@ -702,6 +727,16 @@ class HSpecProposer(Proposer):
         self._entry_pending_abs_delta_verify = defaultdict(int)
         self._entry_pending_abs_delta_accept = defaultdict(int)
         self._entry_pending_abs_delta_accept_len_sum = defaultdict(int)
+
+        logger.info(
+            "HSpec Patch 0 selector observability: mode=%s topk=%d "
+            "margin=%s timing=%s metadata_sample_every=%d",
+            self._selector_mode,
+            self._selector_topk,
+            self._selector_margin_enabled,
+            self._selector_timing_enabled,
+            self._selector_metadata_sample_every,
+        )
 
         logger.info(
             "HSpec proposer initialised: threshold=%.3f, max_draft=%d, "
@@ -2048,6 +2083,63 @@ class HSpecProposer(Proposer):
         except Exception:
             pass
 
+    def _record_closed_selector_metrics(
+        self, counters: Optional[Dict[str, float]]
+    ) -> None:
+        if not counters:
+            return
+        for key, value in counters.items():
+            self._record_proposer_metric(key, value)
+
+    @staticmethod
+    def _selector_draft_stop_reason(
+        draft_len: int,
+        effective_wnd: int,
+        base_effective_wnd: int,
+        max_draft_tokens: int,
+    ) -> str:
+        if int(draft_len) < int(effective_wnd):
+            return "value_end"
+        if int(effective_wnd) < int(base_effective_wnd):
+            return "abs_delta_cap"
+        if int(base_effective_wnd) < int(max_draft_tokens):
+            return "adaptive_window"
+        return "max_draft_tokens"
+
+    def _maybe_log_selector_metadata_sample(
+        self,
+        req_id: str,
+        metadata: Dict[str, Any],
+        accepted_prefix_len: int,
+        emitted_tokens: int,
+    ) -> None:
+        every = int(self._selector_metadata_sample_every)
+        if every <= 0:
+            return
+        self._selector_metadata_sample_count += 1
+        if self._selector_metadata_sample_count % every != 0:
+            return
+        logger.info(
+            "HSpec selector sample req_id=%s mode=%s window=%s entry=%s rank=%s "
+            "score=%s margin=%s drafted=%s accepted=%d emitted=%d base_pos=%s "
+            "matched_pos=%s delta=%s suffix=%s stop=%s",
+            req_id,
+            metadata.get("selector_mode"),
+            metadata.get("metric_window_id"),
+            metadata.get("matched_entry_idx"),
+            metadata.get("candidate_rank"),
+            metadata.get("score"),
+            metadata.get("top1_top2_margin"),
+            metadata.get("drafted_len"),
+            int(accepted_prefix_len),
+            int(emitted_tokens),
+            metadata.get("base_pos"),
+            metadata.get("matched_pos"),
+            metadata.get("delta"),
+            metadata.get("suffix_match"),
+            metadata.get("stop_reason"),
+        )
+
     def _record_prompt_access(
         self,
         prompt_id: str,
@@ -2793,14 +2885,30 @@ class HSpecProposer(Proposer):
         z_batch: torch.Tensor,
         keys_batch: torch.Tensor,
         invalid_key_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        observe_margin: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         """Fully batched similarity matching with precomputed key padding mask."""
         if keys_batch.dtype != z_batch.dtype:
             z_batch = z_batch.to(dtype=keys_batch.dtype)
         sims = torch.bmm(keys_batch, z_batch.unsqueeze(-1)).squeeze(-1)
         if invalid_key_mask.numel() > 0:
             sims = sims.masked_fill(invalid_key_mask, torch.finfo(sims.dtype).min)
-        return sims.max(dim=1)
+        # Keep the production decision on the exact pre-Patch-0 max path.
+        best_sims, best_idxs = sims.max(dim=1)
+        if not observe_margin:
+            return best_sims, best_idxs
+        if sims.shape[1] < 2:
+            margins = torch.full_like(best_sims, float("nan"))
+            return best_sims, best_idxs, margins
+        top2 = torch.topk(sims, k=2, dim=1, largest=True, sorted=True).values
+        margins = top2[:, 0] - top2[:, 1]
+        if invalid_key_mask.numel() > 0:
+            valid_counts = (~invalid_key_mask).sum(dim=1)
+            margins = margins.masked_fill(valid_counts < 2, float("nan"))
+        return best_sims, best_idxs, margins
 
     @staticmethod
     def _has_same_histo_ngram(
@@ -2930,6 +3038,8 @@ class HSpecProposer(Proposer):
         if gen_enabled and HSPEC_GEN_MAX_CALLS > 0 and getattr(self, "_stat_calls", 0) >= HSPEC_GEN_MAX_CALLS:
             gen_enabled = False
         prof_enabled = hspec_profile_context_enabled()
+        selector_timing_enabled = bool(self._selector_timing_enabled)
+        observe_selector_clock = gen_enabled or selector_timing_enabled
 
         # 1. Stable prompt_id + batch anchor hidden states
         req_ids = list(input_batch.req_ids[:batch_size])
@@ -3084,12 +3194,15 @@ class HSpecProposer(Proposer):
                     self._window_base_pos(decoded_lens[batch_idx]) for batch_idx in active_batch_indices
                 ]
 
+        selector_window_id: Optional[int] = None
+        selector_total_t0 = 0
         if active_batch_indices and batch_table_cache is not None:
+            selector_total_t0 = _now_ns() if selector_timing_enabled else 0
             self._stat_queries += len(active_batch_indices)
             for batch_idx in active_batch_indices:
                 if batch_idx < len(prompt_ids):
                     self._record_prompt_access(prompt_ids[batch_idx], query=1)
-            t0_cast = _now_ns() if gen_enabled else 0
+            t0_cast = _now_ns() if observe_selector_clock else 0
             with (hspec_record_function("hspec/proposal/anchor_gather", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
                 gather_idx = torch.tensor(
@@ -3098,11 +3211,11 @@ class HSpecProposer(Proposer):
                     device=hidden_states.device,
                 )
                 active_anchor_hs = hidden_states.index_select(0, gather_idx).float()
-                t1_cast = _now_ns() if gen_enabled else 0
+                t1_cast = _now_ns() if observe_selector_clock else 0
 
             with (hspec_record_function("hspec/proposal/project", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
-                t0_proj = _now_ns() if gen_enabled else 0
+                t0_proj = _now_ns() if observe_selector_clock else 0
                 use_full_cached_batch = (
                     len(active_table_rows) == len(batch_table_cache.cached_tables)
                     and all(row == idx for idx, row in enumerate(active_table_rows))
@@ -3120,19 +3233,29 @@ class HSpecProposer(Proposer):
                     (active_anchor_hs - mean_batch).unsqueeze(1),
                     components_t_batch,
                 ).squeeze(1)
-                t1_proj = _now_ns() if gen_enabled else 0
+                t1_proj = _now_ns() if observe_selector_clock else 0
 
             with (hspec_record_function("hspec/proposal/match", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
-                t0_sim = _now_ns() if gen_enabled else 0
+                t0_sim = _now_ns() if observe_selector_clock else 0
                 if use_full_cached_batch:
                     keys_batch = batch_table_cache.keys_batch
                     invalid_key_mask = batch_table_cache.invalid_key_mask
                 else:
                     keys_batch = batch_table_cache.keys_batch.index_select(0, table_rows)
                     invalid_key_mask = batch_table_cache.invalid_key_mask.index_select(0, table_rows)
-                best_sims, best_idxs = self._match_projected_batch(z_batch, keys_batch, invalid_key_mask)
-                t1_sim = _now_ns() if gen_enabled else 0
+                match_result = self._match_projected_batch(
+                    z_batch,
+                    keys_batch,
+                    invalid_key_mask,
+                    observe_margin=self._selector_margin_enabled,
+                )
+                if self._selector_margin_enabled:
+                    best_sims, best_idxs, best_margins = match_result
+                else:
+                    best_sims, best_idxs = match_result
+                    best_margins = None
+                t1_sim = _now_ns() if observe_selector_clock else 0
 
             if gen_enabled:
                 for row, batch_idx in enumerate(active_batch_indices):
@@ -3149,6 +3272,7 @@ class HSpecProposer(Proposer):
         else:
             best_sims = None
             best_idxs = None
+            best_margins = None
 
         if HSPEC_DEBUG:
             try:
@@ -3277,16 +3401,31 @@ class HSpecProposer(Proposer):
             return results
 
         # 4. Single device → host sync for the whole batch
-        t0_stack = _now_ns() if gen_enabled else 0
+        t0_stack = _now_ns() if observe_selector_clock else 0
         with hspec_record_function("hspec/proposal/device_to_host_sync", use_npu_stream=True):
-            t1_stack = _now_ns() if gen_enabled else 0
-            t0_copy = _now_ns() if gen_enabled else 0
+            t1_stack = _now_ns() if observe_selector_clock else 0
+            t0_copy = _now_ns() if observe_selector_clock else 0
             sims_cpu = best_sims.cpu().numpy()
             idxs_cpu = best_idxs.cpu().numpy()
-            t1_copy = _now_ns() if gen_enabled else 0
+            margins_cpu = (
+                best_margins.float().cpu().numpy()
+                if best_margins is not None
+                else None
+            )
+            t1_copy = _now_ns() if observe_selector_clock else 0
 
         # 5. Draft token retrieval (CPU-only, O(1) per request)
         hit_rows = np.flatnonzero(sims_cpu >= self.similarity_threshold)
+        selector_window_id = self._selector_metric_tracker.begin_window(
+            eligible_queries=len(active_batch_indices),
+            active_table_version=int(self._cache_version),
+        )
+        selector_stop_reasons: Dict[str, int] = {
+            "score_gate": max(len(active_batch_indices) - len(hit_rows), 0)
+        }
+        selector_proposed_requests = 0
+        selector_drafted_tokens = 0
+        selector_cpu_t0 = _now_ns() if selector_timing_enabled else 0
         pending = []
         for j in hit_rows.tolist():
             i = active_batch_indices[j]
@@ -3321,6 +3460,13 @@ class HSpecProposer(Proposer):
             pending.append((i, sims_cpu[j], idxs_cpu[j], cached, base_pos, effective_wnd))
 
             if draft:
+                old_meta = self._pending_verify_meta.pop(req_id, None)
+                if old_meta is not None:
+                    self._record_closed_selector_metrics(
+                        self._selector_metric_tracker.record_cancellation(
+                            int(old_meta.get("metric_window_id", -1))
+                        )
+                    )
                 matched_rollout_idx = int(cached.entry_rollout_idx[matched_entry_idx])
                 req_state = req_states[i]
                 current_tokens = list(getattr(req_state, "output_token_ids", [])) if req_state is not None else []
@@ -3333,7 +3479,27 @@ class HSpecProposer(Proposer):
                 self._entry_pending_match_count += 1
                 self._entry_pending_delta_sum += delta
                 self._entry_pending_abs_delta_sum += abs_delta
+                stop_reason = self._selector_draft_stop_reason(
+                    draft_len=len(draft),
+                    effective_wnd=effective_wnd,
+                    base_effective_wnd=base_effective_wnd,
+                    max_draft_tokens=self.max_draft_tokens,
+                )
+                selector_stop_reasons[stop_reason] = (
+                    selector_stop_reasons.get(stop_reason, 0) + 1
+                )
+                selector_proposed_requests += 1
+                selector_drafted_tokens += len(draft)
                 self._pending_verify_meta[req_id] = {
+                    "selector_mode": self._selector_mode,
+                    "candidate_rank": 0,
+                    "score": float(sims_cpu[j]),
+                    "top1_top2_margin": (
+                        float(margins_cpu[j]) if margins_cpu is not None else None
+                    ),
+                    "predicted_accept_probability": None,
+                    "stop_reason": stop_reason,
+                    "metric_window_id": int(selector_window_id),
                     "prompt_id": prompt_ids[i],
                     "delta": delta,
                     "abs_delta": abs_delta,
@@ -3341,6 +3507,7 @@ class HSpecProposer(Proposer):
                     "matched_pos": matched_pos,
                     "matched_rollout_idx": matched_rollout_idx,
                     "histo_ngram_match": int(histo_ngram_match),
+                    "suffix_match": int(histo_ngram_match),
                     "matched_entry_idx": matched_entry_idx,
                     "drafted_len": int(len(draft)),
                     "wnd_size_at_match": int(cached.wnd_size),
@@ -3352,6 +3519,10 @@ class HSpecProposer(Proposer):
                     "min_wnd": int(cached.min_wnd),
                     "max_wnd": int(cached.max_wnd),
                 }
+            else:
+                selector_stop_reasons["empty_value"] = (
+                    selector_stop_reasons.get("empty_value", 0) + 1
+                )
 
             t1_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
             if gen_enabled and i == gen_req_idx:
@@ -3364,6 +3535,35 @@ class HSpecProposer(Proposer):
                     "draft_retrieve_ms": _ns_to_ms(t1_retrieve - t0_retrieve) if t0_retrieve else 0.0,
                 })
                 self._hspec_gen_timing = td
+
+        selector_cpu_t1 = _now_ns() if selector_timing_enabled else 0
+        selector_total_t1 = _now_ns() if selector_timing_enabled else 0
+        margin_sum = 0.0
+        margin_count = 0
+        if margins_cpu is not None:
+            finite_margins = margins_cpu[np.isfinite(margins_cpu)]
+            margin_sum = float(finite_margins.astype(np.float64).sum())
+            margin_count = int(finite_margins.size)
+        selector_timings: Dict[str, float] = {}
+        if selector_timing_enabled:
+            selector_timings = {
+                "project_submit_ms": _ns_to_ms(t1_proj - t0_proj),
+                "match_submit_ms": _ns_to_ms(t1_sim - t0_sim),
+                "d2h_sync_ms": _ns_to_ms(t1_copy - t0_copy),
+                "cpu_retrieve_ms": _ns_to_ms(selector_cpu_t1 - selector_cpu_t0),
+                "total_ms": _ns_to_ms(selector_total_t1 - selector_total_t0),
+            }
+        self._record_closed_selector_metrics(
+            self._selector_metric_tracker.finalize_proposals(
+                int(selector_window_id),
+                proposed_requests=selector_proposed_requests,
+                drafted_tokens=selector_drafted_tokens,
+                stop_reasons=selector_stop_reasons,
+                margin_sum=margin_sum,
+                margin_count=margin_count,
+                timings=selector_timings,
+            )
+        )
 
         self._maybe_log_metrics()
 
@@ -3547,6 +3747,8 @@ class HSpecProposer(Proposer):
         self,
         req_ids: List[str],
         accepted_prefix_lengths: List[int],
+        drafted_lengths: Optional[List[int]] = None,
+        emitted_token_lengths: Optional[List[int]] = None,
     ) -> tuple[int, int]:
         """Consume true draft-prefix acceptance outcomes for HSpec studies.
 
@@ -3555,13 +3757,27 @@ class HSpecProposer(Proposer):
         """
         accept_advan_count = 0
         reject_advan_count = 0
-        for rid, accepted_prefix_len in zip(req_ids, accepted_prefix_lengths):
+        for outcome_idx, (rid, accepted_prefix_len) in enumerate(
+            zip(req_ids, accepted_prefix_lengths)
+        ):
             meta = self._pending_verify_meta.pop(rid, None)
             if meta is None:
                 continue
             prompt_id = str(meta.get("prompt_id", ""))
             abs_delta = int(meta["abs_delta"])
             apl = int(accepted_prefix_len)
+            expected_drafted_len = int(meta.get("drafted_len", 0))
+            observed_drafted_len = (
+                int(drafted_lengths[outcome_idx])
+                if drafted_lengths is not None and outcome_idx < len(drafted_lengths)
+                else expected_drafted_len
+            )
+            emitted_tokens = (
+                int(emitted_token_lengths[outcome_idx])
+                if emitted_token_lengths is not None
+                and outcome_idx < len(emitted_token_lengths)
+                else 0
+            )
             if prompt_id:
                 self._update_prompt_window_after_verification(
                     prompt_id=prompt_id,
@@ -3589,6 +3805,22 @@ class HSpecProposer(Proposer):
             else:
                 if not bool(meta.get("histo_ngram_match", 0)):
                     reject_advan_count += 1
+            self._record_closed_selector_metrics(
+                self._selector_metric_tracker.record_verification(
+                    int(meta.get("metric_window_id", -1)),
+                    accepted_prefix_len=apl,
+                    emitted_tokens=emitted_tokens,
+                    drafted_length_mismatch=(
+                        observed_drafted_len != expected_drafted_len
+                    ),
+                )
+            )
+            self._maybe_log_selector_metadata_sample(
+                str(rid),
+                meta,
+                accepted_prefix_len=apl,
+                emitted_tokens=emitted_tokens,
+            )
         return (accept_advan_count, reject_advan_count)
 
     def update_entry_verification_outcomes(
@@ -3602,12 +3834,22 @@ class HSpecProposer(Proposer):
     def clear_request(self, req_id: str):
         """Clear per-request state on completion."""
         self._accept_lengths.pop(req_id, None)
-        self._pending_verify_meta.pop(req_id, None)
+        meta = self._pending_verify_meta.pop(req_id, None)
+        if meta is not None:
+            self._record_closed_selector_metrics(
+                self._selector_metric_tracker.record_cancellation(
+                    int(meta.get("metric_window_id", -1))
+                )
+            )
         self._req_prompt_ids.pop(req_id, None)
         if req_id in self._cached_batch_req_ids:
             self._cached_batch_req_ids = ()
             self._cached_batch_prompt_ids = []
             self._batched_table_cache = None
+
+    def flush_observability_metrics(self) -> None:
+        """Flush tail counters outside the selector generation hot path."""
+        self._maybe_report_metrics(force_proposer_metrics=True)
 
     # interface stubs
 
