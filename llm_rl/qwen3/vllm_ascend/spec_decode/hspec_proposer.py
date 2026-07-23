@@ -72,6 +72,14 @@ HSPEC_GEN_REQ_IDX = int(os.getenv("HSPEC_GEN_REQ_IDX", os.getenv("HSPEC_DEBUG_RE
 HSPEC_GEN_MAX_CALLS = int(os.getenv("HSPEC_GEN_MAX_CALLS", "0"))
 HSPEC_ADVAN_NGRAM = int(os.getenv("HSPEC_ADVAN_NGRAM", "3"))
 
+# Capacity defaults keep the 30B rollout's full 64-row workspace serviceable
+# while retaining byte- and compute-based guards against an unexpected shape.
+_DEFAULT_MAX_READY_PREFETCH_BYTES = 512 * 1024 * 1024
+_DEFAULT_MAX_PROMPT_CPU_BYTES = 64 * 1024 * 1024
+_DEFAULT_MAX_PROMPT_ENTRIES = 160_000
+_DEFAULT_BATCH_CACHE_MAX_NPU_BYTES = 2304 * 1024 * 1024
+_DEFAULT_BATCH_CACHE_MAX_BMM_ELEMS = 576 * 1024 * 1024
+
 
 def _get_env_int(name: str, default: int, minimum: int = 0) -> int:
     try:
@@ -565,7 +573,10 @@ class HSpecProposer(Proposer):
         self._max_ready_prefetch_materialize: int = _get_env_int(
             "HSPEC_MAX_READY_PREFETCH_MATERIALIZE", 0, 0)
         self._max_ready_prefetch_bytes: int = _get_env_int(
-            "HSPEC_MAX_READY_PREFETCH_BYTES", 0, 0)
+            "HSPEC_MAX_READY_PREFETCH_BYTES",
+            _DEFAULT_MAX_READY_PREFETCH_BYTES,
+            0,
+        )
         self._prefetch_window_max_bytes: int = _get_env_int(
             "HSPEC_PROPOSER_PREFETCH_WINDOW_MAX_BYTES",
             (
@@ -575,9 +586,15 @@ class HSpecProposer(Proposer):
             0,
         )
         self._max_prompt_cpu_bytes: int = _get_env_int(
-            "HSPEC_PROPOSER_MAX_PROMPT_CPU_BYTES", 64 * 1024 * 1024, 0)
+            "HSPEC_PROPOSER_MAX_PROMPT_CPU_BYTES",
+            _DEFAULT_MAX_PROMPT_CPU_BYTES,
+            0,
+        )
         self._max_prompt_entries: int = _get_env_int(
-            "HSPEC_PROPOSER_MAX_PROMPT_ENTRIES", 32768, 0)
+            "HSPEC_PROPOSER_MAX_PROMPT_ENTRIES",
+            _DEFAULT_MAX_PROMPT_ENTRIES,
+            0,
+        )
         self._max_prompt_token_bytes: int = _get_env_int(
             "HSPEC_PROPOSER_MAX_PROMPT_TOKEN_BYTES", 0, 0)
         self._batch_cache_prebuild: bool = (
@@ -587,11 +604,17 @@ class HSpecProposer(Proposer):
             os.environ.get("HSPEC_ALLOW_HOT_BATCH_CACHE_BUILD", "0") != "0"
         )
         self._batch_cache_max_npu_bytes: int = _get_env_int(
-            "HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES", 0, 0)
+            "HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES",
+            _DEFAULT_BATCH_CACHE_MAX_NPU_BYTES,
+            0,
+        )
         self._batch_cache_max_total_entries: int = _get_env_int(
-            "HSPEC_PROPOSER_BATCH_CACHE_MAX_TOTAL_ENTRIES", 131072, 0)
+            "HSPEC_PROPOSER_BATCH_CACHE_MAX_TOTAL_ENTRIES", 0, 0)
         self._batch_cache_max_bmm_elems: int = _get_env_int(
-            "HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS", 134217728, 0)
+            "HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS",
+            _DEFAULT_BATCH_CACHE_MAX_BMM_ELEMS,
+            0,
+        )
         self._batch_cache_copy_stream: Optional[Any] = None
         self._batch_cache_copy_stream_disabled: bool = False
         self._prefix_cache_enabled: bool = (
