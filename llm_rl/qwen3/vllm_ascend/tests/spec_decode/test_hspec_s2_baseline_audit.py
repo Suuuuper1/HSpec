@@ -46,6 +46,10 @@ def _extract_method(path: Path, class_name: str, method_name: str):
                     "List": List,
                     "Optional": Optional,
                     "_BatchedPromptTableCache": object,
+                    "SamplingMetadata": object,
+                    "SchedulerOutput": object,
+                    "SpecDecodeMetadata": object,
+                    "torch": torch,
                 }
                 exec(compile(module, str(path), "exec"), namespace)
                 return namespace[method_name]
@@ -206,6 +210,117 @@ class TestS2FunnelMetricDerivation(unittest.TestCase):
         self.assertEqual(
             formatted["hspec/select_funnel_eligible_after_anchor_ratio"], 0.0
         )
+
+
+class TestHSpecTpDraftSynchronization(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        proposer_path = (
+            PROJECT_ROOT / "vllm_ascend/spec_decode/hspec_proposer.py"
+        )
+        cls.generate = staticmethod(
+            _extract_method(proposer_path, "HSpecProposer", "generate_token_ids")
+        )
+        cls.sync = staticmethod(
+            _extract_method(
+                proposer_path,
+                "HSpecProposer",
+                "_sync_tp_draft_token_ids",
+            )
+        )
+
+    def test_follower_uses_leader_result_without_running_local_selector(self):
+        group = SimpleNamespace(world_size=4, rank_in_group=2)
+        observer = SimpleNamespace(
+            _in_generate_token_ids=False,
+            _get_tp_draft_sync_group=lambda: group,
+            _generate_token_ids_impl=lambda **_kwargs: self.fail(
+                "TP follower must not execute the rank-local HSpec selector"
+            ),
+            _sync_tp_draft_token_ids=lambda size, drafts, sampled: (
+                self.assertEqual(
+                    (size, drafts, sampled),
+                    (2, [[], []], [[1], [2]]),
+                ) or [[7], [8, 9]]
+            ),
+        )
+        result = self.generate(observer, [[1], [2]])
+        self.assertEqual(result, [[7], [8, 9]])
+        self.assertFalse(observer._in_generate_token_ids)
+
+    def test_leader_payload_is_authoritative_and_normalized(self):
+        group = SimpleNamespace(
+            world_size=4,
+            rank_in_group=0,
+            broadcast_object=lambda payload, src=0: payload,
+        )
+        observer = SimpleNamespace(
+            max_draft_tokens=3,
+            _get_tp_draft_sync_group=lambda: group,
+            _tp_request_sync_keys=lambda _size: [("386", 12, 13)],
+        )
+        result = self.sync(observer, 1, [[1, 2]], [[9]])
+        self.assertEqual(result, [[1, 2]])
+
+    def test_request_state_mismatch_fails_fast(self):
+        leader_payload = {
+            "request_keys": [("386", 12, 13)],
+            "sampled_token_ids": [(9,)],
+            "draft_token_ids": [[1, 2]],
+        }
+        group = SimpleNamespace(
+            world_size=4,
+            rank_in_group=2,
+            broadcast_object=lambda _payload, src=0: leader_payload,
+        )
+        observer = SimpleNamespace(
+            max_draft_tokens=3,
+            _get_tp_draft_sync_group=lambda: group,
+            _tp_request_sync_keys=lambda _size: [("469", 12, 13)],
+        )
+        with self.assertRaisesRegex(RuntimeError, "scheduler divergence"):
+            self.sync(observer, 1, [[]], [[9]])
+
+    def test_sampled_token_mismatch_fails_fast(self):
+        leader_payload = {
+            "request_keys": [("386", 12, 13)],
+            "sampled_token_ids": [(9,)],
+            "draft_token_ids": [[1, 2]],
+        }
+        group = SimpleNamespace(
+            world_size=4,
+            rank_in_group=3,
+            broadcast_object=lambda _payload, src=0: leader_payload,
+        )
+        observer = SimpleNamespace(
+            max_draft_tokens=3,
+            _get_tp_draft_sync_group=lambda: group,
+            _tp_request_sync_keys=lambda _size: [("386", 12, 13)],
+        )
+        with self.assertRaisesRegex(RuntimeError, "sampled_equal=False"):
+            self.sync(observer, 1, [[]], [[10]])
+
+    def test_30b_scripts_enable_log_and_forward_tp_draft_sync(self):
+        for script_name in (
+            "train_grpo_qwen3_30b_hspec.sh",
+            "train_grpo_qwen3_30b_hspec_gsm8k.sh",
+        ):
+            source = (PROJECT_ROOT / "scripts" / script_name).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                'export HSPEC_TP_DRAFT_SYNC="${HSPEC_TP_DRAFT_SYNC:-1}"',
+                source,
+            )
+            self.assertIn(
+                'echo "hspec_tp_draft_sync=${HSPEC_TP_DRAFT_SYNC}"',
+                source,
+            )
+            self.assertIn(
+                "runtime_env.env_vars.HSPEC_TP_DRAFT_SYNC=",
+                source,
+            )
 
 
 class TestRolloutThroughputPrimitives(unittest.TestCase):

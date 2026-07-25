@@ -38,6 +38,7 @@ except Exception:  # pragma: no cover - optional dependency
     _HSPEC_NUMBA_AVAILABLE = False
 
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.distributed import get_tp_group
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -72,13 +73,15 @@ HSPEC_GEN_REQ_IDX = int(os.getenv("HSPEC_GEN_REQ_IDX", os.getenv("HSPEC_DEBUG_RE
 HSPEC_GEN_MAX_CALLS = int(os.getenv("HSPEC_GEN_MAX_CALLS", "0"))
 HSPEC_ADVAN_NGRAM = int(os.getenv("HSPEC_ADVAN_NGRAM", "3"))
 
-# Capacity defaults keep the 30B rollout's full 64-row workspace serviceable
-# while retaining byte- and compute-based guards against an unexpected shape.
+# CPU admission accepts every table the 30B builder can produce. The NPU
+# workspace remains bounded independently: a full 64-row batch at the largest
+# legal table shape leaves too little room for the target sampler's transient
+# allocations on a 64 GiB device.
 _DEFAULT_MAX_READY_PREFETCH_BYTES = 512 * 1024 * 1024
 _DEFAULT_MAX_PROMPT_CPU_BYTES = 64 * 1024 * 1024
 _DEFAULT_MAX_PROMPT_ENTRIES = 160_000
-_DEFAULT_BATCH_CACHE_MAX_NPU_BYTES = 2304 * 1024 * 1024
-_DEFAULT_BATCH_CACHE_MAX_BMM_ELEMS = 576 * 1024 * 1024
+_DEFAULT_BATCH_CACHE_MAX_NPU_BYTES = 768 * 1024 * 1024
+_DEFAULT_BATCH_CACHE_MAX_BMM_ELEMS = 192 * 1024 * 1024
 
 
 def _get_env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -545,6 +548,12 @@ class HSpecProposer(Proposer):
         self._s2_baseline_audit_enabled = (
             os.environ.get("HSPEC_S2_BASELINE_AUDIT", "0") != "0"
         )
+        # HSpec cache readiness is worker-local and therefore cannot be used
+        # independently by tensor-parallel ranks. One rank is authoritative
+        # and shares its small draft-token result over vLLM's TP message queue.
+        self._tp_draft_sync_enabled = (
+            os.environ.get("HSPEC_TP_DRAFT_SYNC", "1") != "0"
+        )
         self._selector_metadata_sample_every = _get_env_int(
             "HSPEC_SELECT_METADATA_SAMPLE_EVERY", 0, 0
         )
@@ -756,13 +765,31 @@ class HSpecProposer(Proposer):
 
         logger.info(
             "HSpec Patch 0 selector observability: mode=%s topk=%d "
-            "margin=%s timing=%s metadata_sample_every=%d s2_baseline_audit=%s",
+            "margin=%s timing=%s metadata_sample_every=%d s2_baseline_audit=%s "
+            "tp_draft_sync=%s",
             self._selector_mode,
             self._selector_topk,
             self._selector_margin_enabled,
             self._selector_timing_enabled,
             self._selector_metadata_sample_every,
             self._s2_baseline_audit_enabled,
+            self._tp_draft_sync_enabled,
+        )
+
+        tp_group = self._get_tp_draft_sync_group()
+        logger.info(
+            "HSpec TP draft authority: enabled=%s tp_rank=%d tp_world_size=%d "
+            "leader=%s transport=%s",
+            self._tp_draft_sync_enabled,
+            int(tp_group.rank_in_group) if tp_group is not None else 0,
+            int(tp_group.world_size) if tp_group is not None else 1,
+            self._is_tp_draft_leader(),
+            (
+                "shared_memory"
+                if tp_group is not None
+                and getattr(tp_group, "mq_broadcaster", None) is not None
+                else "local_or_cpu_group"
+            ),
         )
 
         logger.info(
@@ -811,7 +838,7 @@ class HSpecProposer(Proposer):
             str(self._keys_device_dtype),
         )
 
-        if self._use_numba_rebuild:
+        if self._use_numba_rebuild and self._is_tp_draft_leader():
             try:
                 self._warm_numba_rebuild_kernel()
             except Exception:
@@ -830,6 +857,8 @@ class HSpecProposer(Proposer):
         If a prompt is not ready yet, ``generate_token_ids()`` simply
         returns ``draft=[]`` for that request (graceful degradation).
         """
+        if not self._is_tp_draft_leader():
+            return
         prompt_ids = self._get_prompt_ids_for_batch(req_ids)
         fetch_prompt_ids = [pid for pid in prompt_ids if pid]
         if not fetch_prompt_ids:
@@ -866,6 +895,8 @@ class HSpecProposer(Proposer):
         token ids, avoiding several baseline decode steps after each wave
         enters the scheduler.
         """
+        if not self._is_tp_draft_leader():
+            return 0
         if not prompt_token_ids_batch:
             return 0
 
@@ -897,6 +928,8 @@ class HSpecProposer(Proposer):
         the caller computes prompt ids once and the worker only schedules table
         actor fetches.
         """
+        if not self._is_tp_draft_leader():
+            return 0
         prompt_ids = [str(pid) for pid in prompt_ids if pid]
         if not prompt_ids:
             return 0
@@ -913,6 +946,8 @@ class HSpecProposer(Proposer):
 
     def begin_prefetch_window(self) -> None:
         """Reset per-rollout prefetch materialization state."""
+        if not self._is_tp_draft_leader():
+            return
         self._prefetch_window_active = True
         self._prefetch_window_materialized_bytes = 0
         self._prefetch_window_generation += 1
@@ -1529,6 +1564,114 @@ class HSpecProposer(Proposer):
         self._cached_batch_req_ids = req_ids_tuple
         self._cached_batch_prompt_ids = prompt_ids
         return prompt_ids
+
+    def _get_tp_draft_sync_group(self):
+        """Return the initialized multi-rank TP group when sync is enabled."""
+        if not self._tp_draft_sync_enabled:
+            return None
+        try:
+            group = get_tp_group()
+        except (AssertionError, RuntimeError):
+            # Unit tests and single-process model-runner construction may occur
+            # before model-parallel initialization.
+            return None
+        return group if int(group.world_size) > 1 else None
+
+    def _is_tp_draft_leader(self) -> bool:
+        group = self._get_tp_draft_sync_group()
+        return group is None or int(group.rank_in_group) == 0
+
+    @staticmethod
+    def _external_request_id(req_id: str) -> str:
+        """Strip the per-engine UUID suffix added by vLLM InputProcessor."""
+        req_id = str(req_id)
+        return req_id.rsplit("-", 1)[0] if "-" in req_id else req_id
+
+    def _tp_request_sync_keys(self, batch_size: int) -> List[tuple]:
+        """Build rank-comparable keys without hashing full prompt tokens."""
+        req_ids = list(self.runner.input_batch.req_ids[:batch_size])
+        if len(req_ids) != batch_size:
+            raise RuntimeError(
+                "HSpec TP draft sync cannot align the scheduled batch: "
+                f"batch_size={batch_size}, request_ids={len(req_ids)}"
+            )
+
+        keys: List[tuple] = []
+        for req_id in req_ids:
+            req_state = self.runner.requests.get(req_id)
+            output_len = (
+                len(req_state.output_token_ids) if req_state is not None else -1
+            )
+            computed_tokens = (
+                int(req_state.num_computed_tokens) if req_state is not None else -1
+            )
+            keys.append((
+                self._external_request_id(req_id),
+                int(output_len),
+                int(computed_tokens),
+            ))
+        return keys
+
+    def _sync_tp_draft_token_ids(
+        self,
+        batch_size: int,
+        draft_token_ids: List[List[int]],
+        sampled_token_ids: List[List[int]],
+    ) -> List[List[int]]:
+        """Broadcast leader drafts and fail fast if TP schedulers diverged."""
+        group = self._get_tp_draft_sync_group()
+        if group is None:
+            return draft_token_ids
+
+        local_keys = self._tp_request_sync_keys(batch_size)
+        local_sampled = [
+            tuple(int(token_id) for token_id in row)
+            for row in sampled_token_ids
+        ]
+        payload = None
+        if int(group.rank_in_group) == 0:
+            payload = {
+                "request_keys": local_keys,
+                "sampled_token_ids": local_sampled,
+                "draft_token_ids": draft_token_ids,
+            }
+        payload = group.broadcast_object(payload, src=0)
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                "HSpec TP draft sync received an invalid leader payload"
+            )
+
+        leader_keys = payload.get("request_keys")
+        leader_sampled = payload.get("sampled_token_ids")
+        if leader_keys != local_keys or leader_sampled != local_sampled:
+            raise RuntimeError(
+                "HSpec detected tensor-parallel scheduler divergence before "
+                "the target-model collective: "
+                f"leader={leader_keys!r}, local={local_keys!r}, "
+                f"sampled_equal={leader_sampled == local_sampled}, "
+                f"tp_rank={int(group.rank_in_group)}"
+            )
+
+        leader_drafts = payload.get("draft_token_ids")
+        if not isinstance(leader_drafts, (list, tuple)):
+            raise RuntimeError("HSpec TP leader returned invalid draft_token_ids")
+        if len(leader_drafts) != batch_size:
+            raise RuntimeError(
+                "HSpec TP leader returned a batch with the wrong size: "
+                f"expected={batch_size}, actual={len(leader_drafts)}"
+            )
+
+        normalized: List[List[int]] = []
+        for row in leader_drafts:
+            if not isinstance(row, (list, tuple)):
+                raise RuntimeError("HSpec TP leader returned an invalid draft row")
+            if len(row) > self.max_draft_tokens:
+                raise RuntimeError(
+                    "HSpec TP leader exceeded max_draft_tokens: "
+                    f"limit={self.max_draft_tokens}, actual={len(row)}"
+                )
+            normalized.append([int(token_id) for token_id in row])
+        return normalized
 
     def _warm_numba_rebuild_kernel(self) -> None:
         """Compile the Numba rebuild kernel once outside the hot path."""
@@ -3080,16 +3223,26 @@ class HSpecProposer(Proposer):
     ) -> List[List[int]]:
         self._in_generate_token_ids = True
         try:
-            return self._generate_token_ids_impl(
-                valid_sampled_token_ids=valid_sampled_token_ids,
-                sampling_metadata=sampling_metadata,
-                scheduler_output=scheduler_output,
-                spec_decode_metadata=spec_decode_metadata,
-                positions=positions,
-                num_scheduled_tokens=num_scheduled_tokens,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                aux_hidden_states=aux_hidden_states,
+            batch_size = len(valid_sampled_token_ids)
+            group = self._get_tp_draft_sync_group()
+            if group is None or int(group.rank_in_group) == 0:
+                draft_token_ids = self._generate_token_ids_impl(
+                    valid_sampled_token_ids=valid_sampled_token_ids,
+                    sampling_metadata=sampling_metadata,
+                    scheduler_output=scheduler_output,
+                    spec_decode_metadata=spec_decode_metadata,
+                    positions=positions,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    aux_hidden_states=aux_hidden_states,
+                )
+            else:
+                draft_token_ids = [[] for _ in range(batch_size)]
+            return self._sync_tp_draft_token_ids(
+                batch_size,
+                draft_token_ids,
+                valid_sampled_token_ids,
             )
         finally:
             self._in_generate_token_ids = False
@@ -3114,9 +3267,10 @@ class HSpecProposer(Proposer):
         ``hidden_states`` should be **sample_hidden_states** (already
         indexed at logits positions) for correct per-request extraction.
 
-        **Hot-loop invariant:** zero Ray / ZMQ / network calls in the
-        steady state.  The only CPU work is a tiny scalar transfer
-        ``(P, 2)`` and sub-µs numpy slices for draft tokens.
+        **Hot-loop invariant:** zero Ray / external ZMQ / network calls in the
+        steady state. The TP leader performs the tiny scalar transfer
+        ``(P, 2)`` and numpy slices, then shares draft ids through vLLM's local
+        TP message queue.
         """
         batch_size = len(valid_sampled_token_ids)
         if batch_size == 0:

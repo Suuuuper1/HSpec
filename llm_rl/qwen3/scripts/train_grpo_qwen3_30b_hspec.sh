@@ -91,9 +91,9 @@ export HSPEC_MAX_READY_PREFETCH_BYTES="${HSPEC_MAX_READY_PREFETCH_BYTES:-5368709
 export HSPEC_PROPOSER_PREFETCH_WINDOW_MAX_BYTES="${HSPEC_PROPOSER_PREFETCH_WINDOW_MAX_BYTES:-2147483648}"
 export HSPEC_PROPOSER_BATCH_CACHE_PREBUILD="${HSPEC_PROPOSER_BATCH_CACHE_PREBUILD:-1}"
 export HSPEC_ALLOW_HOT_BATCH_CACHE_BUILD="${HSPEC_ALLOW_HOT_BATCH_CACHE_BUILD:-0}"
-export HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES="${HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES:-2415919104}"
+export HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES="${HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES:-805306368}"
 export HSPEC_PROPOSER_BATCH_CACHE_MAX_TOTAL_ENTRIES="${HSPEC_PROPOSER_BATCH_CACHE_MAX_TOTAL_ENTRIES:-0}"
-export HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS="${HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS:-603979776}"
+export HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS="${HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS:-201326592}"
 export HSPEC_PROPOSER_PREFIX_CACHE="${HSPEC_PROPOSER_PREFIX_CACHE:-0}"
 export HSPEC_PROPOSER_STORE_PER_PROMPT_NPU="${HSPEC_PROPOSER_STORE_PER_PROMPT_NPU:-0}"
 export HSPEC_PROPOSER_KEYS_CPU_DTYPE="${HSPEC_PROPOSER_KEYS_CPU_DTYPE:-float32}"
@@ -164,6 +164,9 @@ export HSPEC_PROFILE_BUILD_CPU_MIN_BATCH_MS="${HSPEC_PROFILE_BUILD_CPU_MIN_BATCH
 export HSPEC_PROFILE_BUILD_CPU_EVERY_EPOCHS="${HSPEC_PROFILE_BUILD_CPU_EVERY_EPOCHS:-0}"
 
 export USE_HSPEC_DECODE="${USE_HSPEC_DECODE:-1}"
+# HSpec table/cache readiness is rank-local. Keep one authoritative proposer
+# per tensor-parallel group and share its draft ids over vLLM's TP message queue.
+export HSPEC_TP_DRAFT_SYNC="${HSPEC_TP_DRAFT_SYNC:-1}"
 export VLLM_SPECULATIVE_BATCH_SIZE_THRE="${VLLM_SPECULATIVE_BATCH_SIZE_THRE:--1}"
 
 # Logging behavior.
@@ -238,6 +241,7 @@ fi
     echo "rollout_length_dir=${ROLLOUT_LENGTH_DIR}"
     echo "tensorboard_dir=${TENSORBOARD_DIR}"
     echo "use_hspec_decode=${USE_HSPEC_DECODE}"
+    echo "hspec_tp_draft_sync=${HSPEC_TP_DRAFT_SYNC}"
     echo "hspec_legacy_dataproto_hs=${HSPEC_LEGACY_DATAPROTO_HS}"
     echo "hspec_strict_descriptor_mode=${HSPEC_STRICT_DESCRIPTOR_MODE}"
     echo "hspec_strict_prompt_id_on_seal=${HSPEC_STRICT_PROMPT_ID_ON_SEAL}"
@@ -318,6 +322,7 @@ fi
     echo "hspec_proposer_store_per_prompt_npu=${HSPEC_PROPOSER_STORE_PER_PROMPT_NPU}"
     echo "hspec_proposer_keys_cpu_dtype=${HSPEC_PROPOSER_KEYS_CPU_DTYPE}"
     echo "hspec_proposer_keys_device_dtype=${HSPEC_PROPOSER_KEYS_DEVICE_DTYPE}"
+    echo "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
     echo "hspec_table_store_retain_versions=${HSPEC_TABLE_STORE_RETAIN_VERSIONS}"
     echo "hspec_table_store_gc_after_swap=${HSPEC_TABLE_STORE_GC_AFTER_SWAP}"
     echo "hspec_table_store_fsync_on_seal=${HSPEC_TABLE_STORE_FSYNC_ON_SEAL}"
@@ -495,6 +500,7 @@ env \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RAW_STORE_STOP_COLLECT_ON_BUDGET='"'"${HSPEC_RAW_STORE_STOP_COLLECT_ON_BUDGET}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_COLLECT_SKIP_ON_PINNED_FALLBACK_RATIO='"'"${HSPEC_COLLECT_SKIP_ON_PINNED_FALLBACK_RATIO}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TP_GROUP_ID='"'"${HSPEC_TP_GROUP_ID}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TP_DRAFT_SYNC='"'"${HSPEC_TP_DRAFT_SYNC}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_BYTES='"'"${HSPEC_PINNED_POOL_BYTES}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_MAX_SLOTS='"'"${HSPEC_PINNED_POOL_MAX_SLOTS}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_BUCKET_ROWS='"'"${HSPEC_PINNED_POOL_BUCKET_ROWS}"'"' \

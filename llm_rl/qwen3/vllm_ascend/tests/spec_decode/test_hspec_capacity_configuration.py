@@ -25,9 +25,9 @@ SCRIPT_DEFAULTS = {
     "HSPEC_MAX_READY_PREFETCH_MATERIALIZE": 0,
     "HSPEC_MAX_READY_PREFETCH_BYTES": 512 * 1024**2,
     "HSPEC_PROPOSER_PREFETCH_WINDOW_MAX_BYTES": 2 * 1024**3,
-    "HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES": 2304 * 1024**2,
+    "HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES": 768 * 1024**2,
     "HSPEC_PROPOSER_BATCH_CACHE_MAX_TOTAL_ENTRIES": 0,
-    "HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS": 576 * 1024**2,
+    "HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS": 192 * 1024**2,
     "HSPEC_PROPOSER_PREFIX_CACHE": 0,
     "HSPEC_PROPOSER_STORE_PER_PROMPT_NPU": 0,
 }
@@ -98,16 +98,16 @@ def _extract_proposer_method(method_name: str):
 
 class TestHSpecCapacityConfiguration(unittest.TestCase):
 
-    def test_framework_defaults_remove_entry_sum_bottleneck(self):
+    def test_framework_defaults_keep_cpu_tables_and_bound_npu_workspace(self):
         defaults = _extract_proposer_env_defaults()
         expected = {
             "HSPEC_MAX_READY_PREFETCH_BYTES": 512 * 1024**2,
             "HSPEC_PROPOSER_MAX_PROMPT_CPU_BYTES": 64 * 1024**2,
             "HSPEC_PROPOSER_MAX_PROMPT_ENTRIES": 160_000,
             "HSPEC_PROPOSER_MAX_PROMPT_TOKEN_BYTES": 0,
-            "HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES": 2304 * 1024**2,
+            "HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES": 768 * 1024**2,
             "HSPEC_PROPOSER_BATCH_CACHE_MAX_TOTAL_ENTRIES": 0,
-            "HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS": 576 * 1024**2,
+            "HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS": 192 * 1024**2,
         }
         self.assertEqual({name: defaults[name] for name in expected}, expected)
 
@@ -137,8 +137,16 @@ class TestHSpecCapacityConfiguration(unittest.TestCase):
                     "actor_rollout_ref.rollout.hspec_max_entries_per_prompt=160000",
                     source,
                 )
+                self.assertIn(
+                    'GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.87}"',
+                    source,
+                )
+                self.assertIn(
+                    'echo "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"',
+                    source,
+                )
 
-    def test_30b_rollout_shape_fits_physical_guards(self):
+    def test_30b_capacity_preserves_sampler_headroom(self):
         rows = 64
         entries = 8 * (16_384 - 1)
         hidden_dim = 2048
@@ -154,17 +162,39 @@ class TestHSpecCapacityConfiguration(unittest.TestCase):
         )
         bmm_elements = rows * entries * components
 
-        self.assertLessEqual(entries, SCRIPT_DEFAULTS["HSPEC_PROPOSER_MAX_PROMPT_ENTRIES"])
         self.assertLessEqual(
+            entries,
+            SCRIPT_DEFAULTS["HSPEC_PROPOSER_MAX_PROMPT_ENTRIES"],
+        )
+        # The failed configuration admitted this 2.04 GiB full workspace.
+        # Physical NPU guards must deliberately select a subset instead.
+        self.assertGreater(
             workspace_bytes,
             SCRIPT_DEFAULTS["HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES"],
         )
-        self.assertLessEqual(
+        self.assertGreater(
             bmm_elements,
             SCRIPT_DEFAULTS["HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS"],
         )
 
-    def test_full_30b_batch_is_not_filtered_by_entry_sum(self):
+        per_row_bytes = workspace_bytes // rows
+        rows_by_bytes = (
+            SCRIPT_DEFAULTS["HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES"]
+            // per_row_bytes
+        )
+        rows_by_bmm = (
+            SCRIPT_DEFAULTS["HSPEC_PROPOSER_BATCH_CACHE_MAX_BMM_ELEMS"]
+            // (entries * components)
+        )
+        selected_rows = min(rows, rows_by_bytes, rows_by_bmm)
+        self.assertEqual(selected_rows, 23)
+        self.assertGreaterEqual(selected_rows, 8)
+        self.assertLessEqual(
+            selected_rows * per_row_bytes,
+            SCRIPT_DEFAULTS["HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES"],
+        )
+
+    def test_entry_sum_is_disabled_but_physical_guards_select_safe_subset(self):
         method = _extract_proposer_method("_select_batch_cache_subset")
         entries = 8 * (16_384 - 1)
         observer = SimpleNamespace(
@@ -199,10 +229,11 @@ class TestHSpecCapacityConfiguration(unittest.TestCase):
             object(),
         )
 
-        self.assertEqual(selected_indices, list(range(64)))
-        self.assertEqual(selected_tables, tables)
-        self.assertEqual(total_entries, 64 * entries)
-        self.assertEqual(bmm_elements, 64 * entries * 64)
+        expected_rows = 23
+        self.assertEqual(selected_indices, list(range(expected_rows)))
+        self.assertEqual(selected_tables, tables[:expected_rows])
+        self.assertEqual(total_entries, expected_rows * entries)
+        self.assertEqual(bmm_elements, expected_rows * entries * 64)
 
 
 if __name__ == "__main__":
