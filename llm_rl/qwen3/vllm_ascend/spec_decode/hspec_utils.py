@@ -1794,6 +1794,21 @@ def _hspec_finish_pending(
         _hspec_store_cond.notify_all()
 
 
+def _hspec_mark_trajectory_gap(req_ids: List[str], reason: str) -> None:
+    if not req_ids:
+        return
+    try:
+        from vllm_ascend.spec_decode.hspec_store import mark_hspec_trajectory_gap
+
+        mark_hspec_trajectory_gap(req_ids, reason)
+    except Exception:
+        logger.exception(
+            "Failed to persist HSpec trajectory gap: reason=%s req_count=%d",
+            reason,
+            len(req_ids),
+        )
+
+
 def _hspec_copy_worker() -> None:
     while True:
         task = _hspec_copy_queue.get()
@@ -1828,6 +1843,9 @@ def _hspec_copy_worker() -> None:
                     expected = int(end) - int(start)
                     if len(tokens) != expected:
                         _hspec_metric_add("copy_token_hidden_len_mismatch")
+                        _hspec_mark_trajectory_gap(
+                            [str(req_id)], "copy_token_hidden_len_mismatch"
+                        )
                         continue
                     try:
                         if hasattr(collector, "append_hidden_and_tokens"):
@@ -1837,6 +1855,9 @@ def _hspec_copy_worker() -> None:
                             collector.extend_tokens(req_id, tokens, epoch=task.epoch)
                     except Exception:
                         _hspec_metric_add("copy_worker_pair_write_error")
+                        _hspec_mark_trajectory_gap(
+                            [str(req_id)], "copy_worker_pair_write_error"
+                        )
                         logger.exception(
                             "HSpec async copy worker failed to write pair for req_id=%s",
                             req_id,
@@ -1844,6 +1865,7 @@ def _hspec_copy_worker() -> None:
         except Exception:
             logger.exception("HSpec async copy worker failed")
             _hspec_metric_add("copy_worker_error")
+            _hspec_mark_trajectory_gap(task_req_ids, "copy_worker_error")
         finally:
             _hspec_finish_pending(
                 task_req_ids,
@@ -1906,6 +1928,9 @@ def _hspec_accumulate_worker() -> None:
         except Exception:
             logger.exception("HSpec async accumulate worker failed")
             _hspec_metric_add("copy_submit_error")
+            _hspec_mark_trajectory_gap(
+                list(task.pending_req_ids), "copy_accumulate_submit_error"
+            )
             _hspec_finish_pending(
                 list(task.pending_req_ids),
                 rows=int(getattr(task, "num_rows", 0)),
@@ -2088,8 +2113,14 @@ def hspec_submit_accumulate_task(
         req_slices,
     )
     if token_slices is None:
+        _hspec_mark_trajectory_gap(
+            pending_req_ids, "copy_token_hidden_len_mismatch"
+        )
         return False
     if not _hspec_validate_token_slices(req_slices, token_slices):
+        _hspec_mark_trajectory_gap(
+            pending_req_ids, "copy_token_hidden_len_mismatch"
+        )
         return False
 
     num_rows = len(flat_indices)
@@ -2106,6 +2137,7 @@ def hspec_submit_accumulate_task(
         estimated_bytes=estimated_bytes,
         epoch=collect_epoch,
     ):
+        _hspec_mark_trajectory_gap(pending_req_ids, "collect_step_rejected")
         return False
 
     legacy_async = _hspec_use_legacy_async_accumulate()
@@ -2166,6 +2198,7 @@ def hspec_submit_accumulate_task(
         except Exception:
             logger.exception("HSpec main-thread async copy submit failed")
             _hspec_metric_add("copy_submit_error")
+            _hspec_mark_trajectory_gap(pending_req_ids, "copy_submit_error")
             _hspec_pinned_pool.release(pool_handle)
             _hspec_finish_pending(pending_req_ids, rows=num_rows, task_count=1)
             return False
@@ -2233,10 +2266,18 @@ def hspec_flush_and_get_descriptors(
     _hspec_metric_max("flush_wait_ms_max", wait_ms)
     from vllm_ascend.spec_decode.hspec_store import get_hspec_local_collector
 
+    # Snapshot without resetting: vllm_rollout_spmd owns the existing metric
+    # interval and resets it after constructing trainer meta_info.
+    runtime_metrics = (
+        hspec_collect_runtime_metrics(reset=False)
+        if os.getenv("HSPEC_S3_PHASE_A_COLLECTION", "0") == "1"
+        else None
+    )
     return get_hspec_local_collector().flush_descriptors(
         request_id_to_prompt_id=request_id_to_prompt_id,
         epoch=epoch,
         global_step=global_step,
+        runtime_metrics=runtime_metrics,
     )
 
 

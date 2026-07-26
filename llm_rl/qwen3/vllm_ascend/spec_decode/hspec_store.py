@@ -167,6 +167,9 @@ _store_metrics: Dict[str, int] = {
     "desc_extent_total": 0,
     "desc_extent_max": 0,
     "desc_extent_coalesced_count": 0,
+    "desc_extent_boundary_count": 0,
+    "desc_gap_mark_count": 0,
+    "desc_has_gap_count": 0,
     "prompt_id_bind_success": 0,
     "prompt_id_bind_conflict": 0,
     "prompt_id_bind_missing_tokens": 0,
@@ -634,6 +637,8 @@ class HSpecTrajectoryDesc:
     hs_offset_rows: int = 0
     token_offset: int = 0
     reward: float | None = None
+    has_gap: bool = False
+    gap_reasons: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         length = int(self.length)
@@ -682,6 +687,14 @@ class HSpecTrajectoryDesc:
         object.__setattr__(self, "token_offset", token_offset)
         object.__setattr__(self, "chunk_count", chunk_count)
         object.__setattr__(self, "extents", norm_extents)
+        raw_gap_reasons = self.gap_reasons or ()
+        if isinstance(raw_gap_reasons, str):
+            raw_gap_reasons = (raw_gap_reasons, )
+        gap_reasons = tuple(
+            sorted({str(reason) for reason in raw_gap_reasons if str(reason)})
+        )
+        object.__setattr__(self, "has_gap", bool(self.has_gap or gap_reasons))
+        object.__setattr__(self, "gap_reasons", gap_reasons or None)
 
     def with_updates(self, **kwargs: Any) -> "HSpecTrajectoryDesc":
         return replace(self, **kwargs)
@@ -1078,6 +1091,9 @@ class HSpecLocalCollector:
             "hs_offset_rows": None,
             "token_offset": None,
             "extents": [],
+            "extent_boundary_pending": False,
+            "has_gap": False,
+            "gap_reasons": set(),
             "pending_hidden_segments": [],
             "pending_token_segments": [],
         }
@@ -1111,6 +1127,16 @@ class HSpecLocalCollector:
     def record_prompt_id_missing_tokens(self, count: int = 1) -> None:
         with self._lock:
             _metric_add("prompt_id_bind_missing_tokens", max(int(count), 1))
+
+    def mark_gap(self, req_ids: Iterable[str], reason: str) -> None:
+        """Persist a collection discontinuity for later replay filtering."""
+        reason = str(reason or "unknown")
+        with self._lock:
+            for req_id in {str(value) for value in req_ids if str(value)}:
+                state = self._state_for_req(req_id)
+                state["has_gap"] = True
+                state.setdefault("gap_reasons", set()).add(reason)
+                _metric_add("desc_gap_mark_count", 1)
 
     @staticmethod
     def _close_state_files(state: Dict[str, Any]) -> None:
@@ -1180,6 +1206,43 @@ class HSpecLocalCollector:
             _metric_add("segment_manifest_write_error", 1)
             raise
 
+    def _append_collection_health_locked(
+        self,
+        *,
+        epoch: int,
+        global_step: int,
+        desc_count: int,
+        dropped_count: int,
+        runtime_metrics: Optional[Dict[str, int]],
+    ) -> None:
+        if os.getenv("HSPEC_S3_PHASE_A_COLLECTION", "0") != "1":
+            return
+        health_path = self._segment_dir.parent / "collection_health.jsonl"
+        payload = {
+            "schema_version": 1,
+            "node_id": self.node_id,
+            "worker_rank": int(self.worker_rank),
+            "tp_group_id": int(self.tp_group_id),
+            "pid": int(os.getpid()),
+            "batch_id": int(self._batch_counter),
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "desc_count": int(desc_count),
+            "dropped_count": int(dropped_count),
+            "runtime_metrics": {
+                str(key): int(value)
+                for key, value in sorted((runtime_metrics or {}).items())
+            },
+            "recorded_time_ns": time.time_ns(),
+        }
+        health_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(health_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            f.write("\n")
+            f.flush()
+            if hspec_segment_fsync_on_seal_enabled():
+                os.fsync(f.fileno())
+
     def _rotate_to_next_segment_locked(self) -> None:
         self._batch_counter += 1
         self._segment_dir = self._batch_dir()
@@ -1225,6 +1288,7 @@ class HSpecLocalCollector:
         hidden_dim = int(rows.shape[1])
         estimated_bytes = self._estimate_payload_bytes(rows_count, hidden_dim, 0)
         if not self.try_reserve_collect_budget(estimated_bytes, epoch=epoch, reqs=1):
+            self.mark_gap((str(req_id),), "collector_budget_hidden")
             return
 
         store_dtype = get_hspec_store_dtype()
@@ -1238,6 +1302,7 @@ class HSpecLocalCollector:
 
         with self._lock:
             state = self._state_for_req(str(req_id))
+            state["extent_boundary_pending"] = True
             self._append_hidden_rows_locked(
                 str(req_id),
                 state,
@@ -1257,6 +1322,7 @@ class HSpecLocalCollector:
             return
         estimated_bytes = self._estimate_payload_bytes(0, 0, len(token_list))
         if not self.try_reserve_collect_budget(estimated_bytes, epoch=epoch, reqs=1):
+            self.mark_gap((str(req_id),), "collector_budget_tokens")
             return
         token_np = np.ascontiguousarray(token_list, dtype=np.int32)
 
@@ -1287,6 +1353,7 @@ class HSpecLocalCollector:
             )
         estimated_bytes = self._estimate_payload_bytes(rows_count, hidden_dim, len(token_list))
         if not self.try_reserve_collect_budget(estimated_bytes, epoch=epoch, reqs=1):
+            self.mark_gap((str(req_id),), "collector_budget_pair")
             return
 
         store_dtype = get_hspec_store_dtype()
@@ -1301,6 +1368,7 @@ class HSpecLocalCollector:
 
         with self._lock:
             state = self._state_for_req(str(req_id))
+            state["extent_boundary_pending"] = True
             self._append_hidden_rows_locked(
                 str(req_id),
                 state,
@@ -1387,7 +1455,8 @@ class HSpecLocalCollector:
             token_offset=int(token_offset),
             length=int(length),
         )
-        if extents:
+        preserve_boundary = bool(state.pop("extent_boundary_pending", False))
+        if extents and not preserve_boundary:
             prev = extents[-1]
             if (
                 int(prev.hs_offset_rows) + int(prev.length) == int(new_extent.hs_offset_rows)
@@ -1401,6 +1470,7 @@ class HSpecLocalCollector:
                 _metric_add("desc_extent_coalesced_count", 1)
                 return
         extents.append(new_extent)
+        _metric_add("desc_extent_boundary_count", 1)
 
     def _pair_pending_segments_locked(self, state: Dict[str, Any]) -> None:
         pending_hidden: list[tuple[int, int]] = state.setdefault(
@@ -1445,12 +1515,20 @@ class HSpecLocalCollector:
         request_id_to_prompt_id: Optional[Dict[str, str]] = None,
         epoch: int = -1,
         global_step: int = -1,
+        runtime_metrics: Optional[Dict[str, int]] = None,
     ) -> Dict[str, HSpecTrajectoryDesc]:
         request_id_to_prompt_id = request_id_to_prompt_id or {}
         descs: Dict[str, HSpecTrajectoryDesc] = {}
 
         with self._lock:
             if not self._segment_has_work_locked():
+                self._append_collection_health_locked(
+                    epoch=int(epoch),
+                    global_step=int(global_step),
+                    desc_count=0,
+                    dropped_count=0,
+                    runtime_metrics=runtime_metrics,
+                )
                 return {}
             states = self._req_states
             self._req_states = {}
@@ -1585,6 +1663,8 @@ class HSpecLocalCollector:
                     hs_offset_rows=int(first_extent.hs_offset_rows),
                     token_offset=int(first_extent.token_offset),
                     reward=None,
+                    has_gap=bool(state.get("has_gap", False)),
+                    gap_reasons=tuple(state.get("gap_reasons", ())) or None,
                 )
                 descs[req_id] = desc
                 self._append_manifest(desc)
@@ -1593,6 +1673,8 @@ class HSpecLocalCollector:
                 hspec_record_store_metric_max("desc_extent_max", len(extents))
                 if len(extents) > 1:
                     _metric_add("desc_multiextent_count", 1)
+                if desc.has_gap:
+                    _metric_add("desc_has_gap_count", 1)
 
             self._flush_and_close_segment_files_locked()
             segment_status = "sealed" if descs else "gc_deletable"
@@ -1602,6 +1684,13 @@ class HSpecLocalCollector:
                 epoch=int(epoch),
                 global_step=int(global_step),
                 dropped_count=dropped_count,
+            )
+            self._append_collection_health_locked(
+                epoch=int(epoch),
+                global_step=int(global_step),
+                desc_count=len(descs),
+                dropped_count=dropped_count,
+                runtime_metrics=runtime_metrics,
             )
             if descs:
                 _metric_add("segment_sealed", 1)
@@ -1661,6 +1750,10 @@ def bind_hspec_prompt_id(req_id: str, prompt_id: str) -> None:
 
 def record_hspec_prompt_id_missing_tokens(count: int = 1) -> None:
     get_hspec_local_collector().record_prompt_id_missing_tokens(count)
+
+
+def mark_hspec_trajectory_gap(req_ids: Iterable[str], reason: str) -> None:
+    get_hspec_local_collector().mark_gap(req_ids, reason)
 
 
 def hspec_collect_budget_decision(

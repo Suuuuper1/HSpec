@@ -27,8 +27,8 @@ export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 
 # HSpec system data-plane switches.
 export HSPEC_RUN_UID="$(date -u '+%Y%m%dT%H%M%SZ')_$$"
-export HSPEC_STORE_DIR="/home/sharedata/xy_hspec/hspec_store/${RUN_NAME}/${HSPEC_RUN_UID}"
-export HSPEC_TABLE_STORE_DIR="/home/sharedata/xy_hspec/hspec_table_store/${RUN_NAME}/${HSPEC_RUN_UID}"
+export HSPEC_STORE_DIR="${HSPEC_STORE_DIR:-/home/sharedata/xy_hspec/hspec_store/${RUN_NAME}/${HSPEC_RUN_UID}}"
+export HSPEC_TABLE_STORE_DIR="${HSPEC_TABLE_STORE_DIR:-/home/sharedata/xy_hspec/hspec_table_store/${RUN_NAME}/${HSPEC_RUN_UID}}"
 mkdir -p "$HSPEC_STORE_DIR" "$HSPEC_TABLE_STORE_DIR"
 export HSPEC_LEGACY_DATAPROTO_HS="${HSPEC_LEGACY_DATAPROTO_HS:-0}"
 export HSPEC_STRICT_DESCRIPTOR_MODE="${HSPEC_STRICT_DESCRIPTOR_MODE:-1}"
@@ -597,6 +597,6 @@ env \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_ACCUMULATE='"'"${HSPEC_ASYNC_HS_ACCUMULATE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_COPY_STREAM='"'"${HSPEC_ASYNC_HS_COPY_STREAM}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_SPECULATIVE_BATCH_SIZE_THRE='"'"${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"'"' \
-    > "${OUT}" 2>&1 "$@"
+    >> "${OUT}" 2>&1 "$@"
 
 echo "OK: training finished. See log at ${OUT}"
