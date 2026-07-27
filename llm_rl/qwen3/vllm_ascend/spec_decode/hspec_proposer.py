@@ -44,6 +44,13 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.spec_decode.hspec_metrics import HSpecSelectionMetricTracker
+from vllm_ascend.spec_decode.hspec_s4_trace import (
+    HSPEC_S4_TRACE_CAPTURE_PROJECTED,
+    HSPEC_S4_TRACE_ENABLED,
+    hspec_s4_token_hash,
+    hspec_s4_trace_query_id,
+    record_hspec_s4_trace_events,
+)
 from vllm_ascend.spec_decode.hspec_table import GlobalHSpecTableGroup, get_hspec_tables
 from vllm_ascend.spec_decode.hspec_table_store import (
     HSpecPromptTableDesc,
@@ -3502,9 +3509,12 @@ class HSpecProposer(Proposer):
                     z_batch,
                     keys_batch,
                     invalid_key_mask,
-                    observe_margin=self._selector_margin_enabled,
+                    observe_margin=(
+                        self._selector_margin_enabled
+                        or HSPEC_S4_TRACE_ENABLED
+                    ),
                 )
-                if self._selector_margin_enabled:
+                if self._selector_margin_enabled or HSPEC_S4_TRACE_ENABLED:
                     best_sims, best_idxs, best_margins = match_result
                 else:
                     best_sims, best_idxs = match_result
@@ -3668,6 +3678,23 @@ class HSpecProposer(Proposer):
             )
             t1_copy = _now_ns() if observe_selector_clock else 0
 
+        s4_trace_query_ids: Optional[List[Optional[str]]] = None
+        s4_projected_cpu: Optional[np.ndarray] = None
+        if HSPEC_S4_TRACE_ENABLED:
+            s4_trace_query_ids = [None for _ in active_batch_indices]
+            for row, batch_idx in enumerate(active_batch_indices):
+                s4_trace_query_ids[row] = hspec_s4_trace_query_id(
+                    request_id=req_ids[batch_idx],
+                    prompt_id=prompt_ids[batch_idx],
+                    decoded_len=decoded_lens[batch_idx],
+                    active_table_version=int(self._cache_version),
+                )
+            if (
+                HSPEC_S4_TRACE_CAPTURE_PROJECTED
+                and any(query_id is not None for query_id in s4_trace_query_ids)
+            ):
+                s4_projected_cpu = z_batch.float().cpu().numpy()
+
         # 5. Draft token retrieval (CPU-only, O(1) per request)
         hit_rows = np.flatnonzero(sims_cpu >= self.similarity_threshold)
         selector_window_id = self._selector_metric_tracker.begin_window(
@@ -3716,6 +3743,15 @@ class HSpecProposer(Proposer):
             if draft:
                 old_meta = self._pending_verify_meta.pop(req_id, None)
                 if old_meta is not None:
+                    if HSPEC_S4_TRACE_ENABLED:
+                        old_trace_query_id = old_meta.get("s4_trace_query_id")
+                        if old_trace_query_id is not None:
+                            record_hspec_s4_trace_events([{
+                                "event": "cancellation",
+                                "query_id": str(old_trace_query_id),
+                                "request_id": str(req_id),
+                                "reason": "superseded_before_verification",
+                            }])
                     self._record_closed_selector_metrics(
                         self._selector_metric_tracker.record_cancellation(
                             int(old_meta.get("metric_window_id", -1))
@@ -3744,7 +3780,7 @@ class HSpecProposer(Proposer):
                 )
                 selector_proposed_requests += 1
                 selector_drafted_tokens += len(draft)
-                self._pending_verify_meta[req_id] = {
+                pending_meta = {
                     "selector_mode": self._selector_mode,
                     "candidate_rank": 0,
                     "score": float(sims_cpu[j]),
@@ -3773,6 +3809,14 @@ class HSpecProposer(Proposer):
                     "min_wnd": int(cached.min_wnd),
                     "max_wnd": int(cached.max_wnd),
                 }
+                if HSPEC_S4_TRACE_ENABLED:
+                    assert s4_trace_query_ids is not None
+                    pending_meta.update({
+                        "decoded_len_at_match": int(decoded_lens[i]),
+                        "active_table_version": int(self._cache_version),
+                        "s4_trace_query_id": s4_trace_query_ids[j],
+                    })
+                self._pending_verify_meta[req_id] = pending_meta
             else:
                 selector_stop_reasons["empty_value"] = (
                     selector_stop_reasons.get("empty_value", 0) + 1
@@ -3790,11 +3834,92 @@ class HSpecProposer(Proposer):
                 })
                 self._hspec_gen_timing = td
 
+        if HSPEC_S4_TRACE_ENABLED:
+            assert s4_trace_query_ids is not None
+            trace_events: List[Dict[str, Any]] = []
+            for row, batch_idx in enumerate(active_batch_indices):
+                query_id = s4_trace_query_ids[row]
+                if query_id is None:
+                    continue
+                cached = active_cached_tables[row]
+                entry_idx = int(idxs_cpu[row])
+                rollout_idx = int(cached.entry_rollout_idx[entry_idx])
+                entry_offset = int(cached.entry_offset[entry_idx])
+                matched_pos = entry_offset - 1
+                base_pos = int(active_base_positions[row])
+                abs_delta = abs(matched_pos - base_pos)
+                base_effective_wnd = min(
+                    cached.get_effective_window(entry_idx),
+                    int(self.max_draft_tokens),
+                )
+                effective_wnd = self._apply_abs_delta_cap(
+                    window=base_effective_wnd,
+                    abs_delta=abs_delta,
+                    min_wnd=int(cached.min_wnd),
+                )
+                rollout_len = int(cached.rollout_token_len[rollout_idx])
+                draft = results[batch_idx]
+                req_state = req_states[batch_idx]
+                output_prefix = (
+                    list(getattr(req_state, "output_token_ids", []))
+                    if req_state is not None else []
+                )
+                entry_bias, entry_hits = cached.get_entry_state(entry_idx)
+                event: Dict[str, Any] = {
+                    "event": "selection",
+                    "query_id": str(query_id),
+                    "request_id": str(req_ids[batch_idx]),
+                    "prompt_id": str(prompt_ids[batch_idx]),
+                    "decoded_len": int(decoded_lens[batch_idx]),
+                    "query_pos": int(base_pos),
+                    "active_table_version": int(self._cache_version),
+                    "table_entries": int(cached.n_entries),
+                    "hidden_dtype": str(hidden_states.dtype),
+                    "projection_dtype": str(z_batch.dtype),
+                    "keys_device_dtype": str(keys_batch.dtype),
+                    "top1_entry_idx": int(entry_idx),
+                    "top1_raw_score": float(sims_cpu[row]),
+                    "top1_top2_margin": (
+                        float(margins_cpu[row])
+                        if margins_cpu is not None else None
+                    ),
+                    "similarity_threshold": float(self.similarity_threshold),
+                    "min_match_len": int(self.min_match_len),
+                    "max_draft_tokens": int(self.max_draft_tokens),
+                    "threshold_hit": bool(
+                        sims_cpu[row] >= self.similarity_threshold
+                    ),
+                    "historical_rollout_idx": int(rollout_idx),
+                    "entry_offset": int(entry_offset),
+                    "matched_pos": int(matched_pos),
+                    "signed_delta": int(matched_pos - base_pos),
+                    "abs_delta": int(abs_delta),
+                    "candidate_remaining_len": max(
+                        int(rollout_len - entry_offset), 0
+                    ),
+                    "wnd_size_at_match": int(cached.wnd_size),
+                    "entry_bias_at_match": int(entry_bias),
+                    "entry_hits_at_match": int(entry_hits),
+                    "base_effective_wnd": int(base_effective_wnd),
+                    "effective_wnd": int(effective_wnd),
+                    "drafted_len": int(len(draft)),
+                    "draft_token_ids_sha256": hspec_s4_token_hash(draft),
+                    "output_prefix_token_ids_sha256": hspec_s4_token_hash(
+                        output_prefix
+                    ),
+                }
+                if s4_projected_cpu is not None:
+                    event["projected_query_fp32"] = [
+                        float(value) for value in s4_projected_cpu[row].tolist()
+                    ]
+                trace_events.append(event)
+            record_hspec_s4_trace_events(trace_events)
+
         selector_cpu_t1 = _now_ns() if selector_timing_enabled else 0
         selector_total_t1 = _now_ns() if selector_timing_enabled else 0
         margin_sum = 0.0
         margin_count = 0
-        if margins_cpu is not None:
+        if self._selector_margin_enabled and margins_cpu is not None:
             finite_margins = margins_cpu[np.isfinite(margins_cpu)]
             margin_sum = float(finite_margins.astype(np.float64).sum())
             margin_count = int(finite_margins.size)
@@ -4075,6 +4200,28 @@ class HSpecProposer(Proposer):
                 accepted_prefix_len=apl,
                 emitted_tokens=emitted_tokens,
             )
+            if HSPEC_S4_TRACE_ENABLED:
+                trace_query_id = meta.get("s4_trace_query_id")
+                if trace_query_id is not None:
+                    record_hspec_s4_trace_events([{
+                        "event": "verification",
+                        "query_id": str(trace_query_id),
+                        "request_id": str(rid),
+                        "prompt_id": str(prompt_id),
+                        "decoded_len": int(
+                            meta.get("decoded_len_at_match", -1)
+                        ),
+                        "active_table_version": int(
+                            meta.get("active_table_version", -1)
+                        ),
+                        "accepted_prefix_len": int(apl),
+                        "expected_drafted_len": int(expected_drafted_len),
+                        "observed_drafted_len": int(observed_drafted_len),
+                        "emitted_token_len": int(emitted_tokens),
+                        "drafted_length_mismatch": bool(
+                            observed_drafted_len != expected_drafted_len
+                        ),
+                    }])
         return (accept_advan_count, reject_advan_count)
 
     def update_entry_verification_outcomes(
@@ -4090,6 +4237,15 @@ class HSpecProposer(Proposer):
         self._accept_lengths.pop(req_id, None)
         meta = self._pending_verify_meta.pop(req_id, None)
         if meta is not None:
+            if HSPEC_S4_TRACE_ENABLED:
+                trace_query_id = meta.get("s4_trace_query_id")
+                if trace_query_id is not None:
+                    record_hspec_s4_trace_events([{
+                        "event": "cancellation",
+                        "query_id": str(trace_query_id),
+                        "request_id": str(req_id),
+                        "reason": "request_finished_before_verification",
+                    }])
             self._record_closed_selector_metrics(
                 self._selector_metric_tracker.record_cancellation(
                     int(meta.get("metric_window_id", -1))

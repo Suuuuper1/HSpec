@@ -258,19 +258,31 @@ def get_hspec_store_dtype() -> str:
     """Return HSpec raw-store on-disk dtype.
 
     Phase 1 stores hidden rows as float16 by default to minimize local IO and
-    page-cache pressure. This dtype describes bytes on disk, not the model's
-    original hidden-state dtype.
+    page-cache pressure. Float32 is an opt-in replay-calibration format that
+    losslessly carries bf16 model values; it is not intended for normal
+    high-volume collection. This dtype describes bytes on disk, not the
+    model's original hidden-state dtype.
     """
     value = os.getenv("HSPEC_STORE_DTYPE", "float16").strip().lower()
     aliases = {
         "fp16": "float16",
         "float16": "float16",
+        "fp32": "float32",
+        "float32": "float32",
     }
     if value in aliases:
         return aliases[value]
     raise ValueError(
         f"Unsupported HSPEC_STORE_DTYPE={value!r}. "
-        "HSpec Phase 1 currently supports only 'float16' on disk."
+        "HSpec supports 'float16' and diagnostic 'float32' on disk."
+    )
+
+
+def get_hspec_store_hidden_filename() -> str:
+    return (
+        "hs.fp32.bin"
+        if get_hspec_store_dtype() == "float32"
+        else "hs.fp16.bin"
     )
 
 
@@ -785,7 +797,7 @@ def update_hspec_segment_manifest_status(
 class HSpecLocalCollector:
     """Process-local writer for HSpec rollout trajectories.
 
-    Hidden states are written as fp16 rows. Tokens are written as int32.
+    Hidden states are written as configured fp16/fp32 rows. Tokens are int32.
     Storage is per-worker append-only segment per batch, while each request
     records one or more logical extents into the shared segment files.
     """
@@ -808,7 +820,9 @@ class HSpecLocalCollector:
                 self.store_root,
             )
         self._segment_dir = self._batch_dir()
-        self._segment_hs_path = str(self._segment_dir / "hs.fp16.bin")
+        self._segment_hs_path = str(
+            self._segment_dir / get_hspec_store_hidden_filename()
+        )
         self._segment_token_path = str(self._segment_dir / "tokens.i32.bin")
         self._segment_hs_fh = None
         self._segment_token_fh = None
@@ -863,7 +877,11 @@ class HSpecLocalCollector:
 
     @staticmethod
     def _estimate_payload_bytes(rows_count: int, hidden_dim: int, token_count: int = 0) -> int:
-        hidden_bytes = max(int(rows_count), 0) * max(int(hidden_dim), 0) * np.dtype(np.float16).itemsize
+        hidden_bytes = (
+            max(int(rows_count), 0)
+            * max(int(hidden_dim), 0)
+            * np.dtype(get_hspec_store_dtype()).itemsize
+        )
         token_bytes = max(int(token_count), 0) * np.dtype(np.int32).itemsize
         return int(hidden_bytes + token_bytes)
 
@@ -1246,7 +1264,9 @@ class HSpecLocalCollector:
     def _rotate_to_next_segment_locked(self) -> None:
         self._batch_counter += 1
         self._segment_dir = self._batch_dir()
-        self._segment_hs_path = str(self._segment_dir / "hs.fp16.bin")
+        self._segment_hs_path = str(
+            self._segment_dir / get_hspec_store_hidden_filename()
+        )
         self._segment_token_path = str(self._segment_dir / "tokens.i32.bin")
         self._segment_hs_fh = None
         self._segment_token_fh = None
@@ -1295,6 +1315,9 @@ class HSpecLocalCollector:
         if store_dtype == "float16":
             rows_cpu = rows.detach().to(device="cpu", dtype=torch.float16).contiguous()
             hs_dtype = "float16"
+        elif store_dtype == "float32":
+            rows_cpu = rows.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            hs_dtype = "float32"
         else:
             raise AssertionError(f"Unsupported HSpec store dtype after validation: {store_dtype}")
         rows_np = rows_cpu.numpy()
@@ -1360,6 +1383,9 @@ class HSpecLocalCollector:
         if store_dtype == "float16":
             rows_cpu = rows.detach().to(device="cpu", dtype=torch.float16).contiguous()
             hs_dtype = "float16"
+        elif store_dtype == "float32":
+            rows_cpu = rows.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            hs_dtype = "float32"
         else:
             raise AssertionError(f"Unsupported HSpec store dtype after validation: {store_dtype}")
         rows_np = rows_cpu.numpy()

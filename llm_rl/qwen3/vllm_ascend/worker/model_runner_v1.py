@@ -106,6 +106,10 @@ from vllm_ascend.spec_decode.hspec_parity import (
     record_hspec_s1_parity_batch,
 )
 from vllm_ascend.spec_decode.hspec_proposer import HSpecProposer
+from vllm_ascend.spec_decode.hspec_s4_trace import (
+    HSPEC_S4_TRACE_ENABLED,
+    flush_hspec_s4_trace,
+)
 from vllm_ascend.spec_decode.hspec_utils import hspec_record_function
 from vllm_ascend.spec_decode.interface import SpecDcodeType
 from vllm_ascend.spec_decode.medusa_proposer import MedusaProposer
@@ -511,6 +515,9 @@ class NPUModelRunner(GPUModelRunner):
         if (HSPEC_S1_PARITY_ENABLED and scheduler_output.finished_req_ids
                 and self.input_batch.num_reqs == 0):
             flush_hspec_s1_parity()
+        if (HSPEC_S4_TRACE_ENABLED and scheduler_output.finished_req_ids
+                and self.input_batch.num_reqs == 0):
+            flush_hspec_s4_trace()
 
     def hspec_prefetch_prompt_token_ids_batch(
         self,
