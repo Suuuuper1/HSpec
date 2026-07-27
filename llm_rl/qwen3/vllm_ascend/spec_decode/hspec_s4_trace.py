@@ -112,8 +112,10 @@ class HSpecS4TraceRecorder:
         self._flush_records = max(int(flush_records), 1)
         self._lock = threading.Lock()
         self._buffer: list[dict[str, object]] = []
+        self._open_queries: dict[str, dict[str, object]] = {}
         self._sequence = 0
         self._pid = os.getpid()
+        self._closed = False
         host = socket.gethostname().replace("/", "_")
         rank = _producer_rank()
         self._producer_id = f"{host}:rank-{rank}:pid-{self._pid}"
@@ -129,19 +131,74 @@ class HSpecS4TraceRecorder:
         if not events:
             return
         with self._lock:
+            if self._closed:
+                raise RuntimeError("HSpec S4 trace recorder is closed")
             for raw_event in events:
                 event = dict(raw_event)
-                event.setdefault("schema_version", "hspec.s4.online-trace.v1")
-                event["producer_id"] = self._producer_id
-                event["producer_sequence"] = self._sequence
-                self._sequence += 1
-                self._buffer.append(event)
+                query_id = str(event.get("query_id", ""))
+                event_type = str(event.get("event", ""))
+                if event_type == "selection" and int(
+                    event.get("drafted_len", 0) or 0
+                ) > 0:
+                    self._open_queries[query_id] = {
+                        "request_id": str(event.get("request_id", "")),
+                        "prompt_id": str(event.get("prompt_id", "")),
+                        "active_table_version": int(
+                            event.get("active_table_version", -1) or -1
+                        ),
+                    }
+                elif event_type in {"verification", "cancellation"}:
+                    self._open_queries.pop(query_id, None)
+                self._append_locked(event)
             if len(self._buffer) >= self._flush_records:
                 self._flush_locked()
+
+    def _append_locked(self, event: dict[str, object]) -> None:
+        event.setdefault("schema_version", "hspec.s4.online-trace.v1")
+        event["producer_id"] = self._producer_id
+        event["producer_sequence"] = self._sequence
+        self._sequence += 1
+        self._buffer.append(event)
 
     def flush(self) -> None:
         with self._lock:
             self._flush_locked()
+
+    def seal_open_queries(self, reason: str) -> int:
+        """Cancel pending drafts at a lifecycle boundary and keep writing."""
+        with self._lock:
+            if self._closed:
+                return 0
+            canceled = self._cancel_open_queries_locked(reason)
+            self._flush_locked()
+            return canceled
+
+    def close(self) -> None:
+        """Close the producer and explicitly cancel unverified tail drafts."""
+        with self._lock:
+            if self._closed:
+                return
+            self._cancel_open_queries_locked(
+                "producer_exit_before_verification"
+            )
+            self._closed = True
+            self._flush_locked()
+
+    def _cancel_open_queries_locked(self, reason: str) -> int:
+        canceled = len(self._open_queries)
+        for query_id, metadata in self._open_queries.items():
+            self._append_locked({
+                "event": "cancellation",
+                "query_id": str(query_id),
+                "request_id": str(metadata.get("request_id", "")),
+                "prompt_id": str(metadata.get("prompt_id", "")),
+                "active_table_version": int(
+                    metadata.get("active_table_version", -1)
+                ),
+                "reason": str(reason),
+            })
+        self._open_queries.clear()
+        return canceled
 
     def _flush_locked(self) -> None:
         if not self._buffer:
@@ -191,4 +248,15 @@ def flush_hspec_s4_trace() -> None:
         _RECORDER.flush()
 
 
-atexit.register(flush_hspec_s4_trace)
+def seal_hspec_s4_trace_open_queries(reason: str) -> int:
+    if _RECORDER is None:
+        return 0
+    return _RECORDER.seal_open_queries(reason)
+
+
+def close_hspec_s4_trace() -> None:
+    if _RECORDER is not None:
+        _RECORDER.close()
+
+
+atexit.register(close_hspec_s4_trace)
