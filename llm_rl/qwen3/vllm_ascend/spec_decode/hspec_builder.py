@@ -478,24 +478,6 @@ def iter_prompt_hidden_tiles(
             yield desc, start, tile
 
 
-def _as_owned_writable_fp32_work_tile(tile: np.ndarray) -> np.ndarray:
-    """Return a disposable fp32 tile, reusing only caller-owned work memory.
-
-    Float16 raw rows are already copied into an owned fp32 conversion buffer,
-    while float32 raw rows remain read-only mmap views. PCA centers tiles
-    in-place, so only the latter needs another copy.
-    """
-    array = np.asarray(tile)
-    if (
-        array.dtype == np.dtype(np.float32)
-        and array.flags.c_contiguous
-        and array.flags.writeable
-        and array.flags.owndata
-    ):
-        return array
-    return np.array(array, dtype=np.float32, order="C", copy=True)
-
-
 def compute_streaming_mean(
     prompt_id: str,
     descs: Sequence[HSpecTrajectoryDesc | dict[str, Any]],
@@ -613,9 +595,8 @@ def compute_pca_tiled_covariance(
             tile_bytes = int(tile.nbytes)
             metrics.basis_processed_fp32_tile_bytes += tile_bytes
             metrics.processed_fp32_tile_bytes += tile_bytes
-            centered_fp32 = _as_owned_writable_fp32_work_tile(tile)
-            centered_fp32 -= mean_fp32
-            centered = centered_fp32.astype(accum_dtype, copy=False)
+            tile -= mean_fp32
+            centered = tile.astype(accum_dtype, copy=False)
             cov += centered.T @ centered
         cov /= float(max(int(n_samples) - 1, 1))
         eigvals, eigvecs = np.linalg.eigh(cov)
@@ -702,10 +683,9 @@ def compute_pca_randomized_cov(
             tile_bytes = int(tile.nbytes)
             metrics.basis_processed_fp32_tile_bytes += tile_bytes
             metrics.processed_fp32_tile_bytes += tile_bytes
-            centered = _as_owned_writable_fp32_work_tile(tile)
-            centered -= mean_fp32
-            sketch = centered @ omega
-            y += centered.T @ sketch
+            tile -= mean_fp32
+            sketch = tile @ omega
+            y += tile.T @ sketch
 
         q, _ = np.linalg.qr(y, mode="reduced")
         q = np.ascontiguousarray(q.astype(np.float32, copy=False))
@@ -715,9 +695,8 @@ def compute_pca_randomized_cov(
             tile_bytes = int(tile.nbytes)
             metrics.basis_processed_fp32_tile_bytes += tile_bytes
             metrics.processed_fp32_tile_bytes += tile_bytes
-            centered = _as_owned_writable_fp32_work_tile(tile)
-            centered -= mean_fp32
-            aq = centered @ q
+            tile -= mean_fp32
+            aq = tile @ q
             b += aq.T @ aq
         b /= float(max(int(n_samples) - 1, 1))
         eigvals, eigvecs = np.linalg.eigh(b)

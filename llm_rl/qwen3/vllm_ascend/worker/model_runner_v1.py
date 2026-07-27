@@ -108,7 +108,7 @@ from vllm_ascend.spec_decode.hspec_parity import (
 from vllm_ascend.spec_decode.hspec_proposer import HSpecProposer
 from vllm_ascend.spec_decode.hspec_s4_trace import (
     HSPEC_S4_TRACE_ENABLED,
-    seal_hspec_s4_trace_open_queries,
+    flush_hspec_s4_trace,
 )
 from vllm_ascend.spec_decode.hspec_utils import hspec_record_function
 from vllm_ascend.spec_decode.interface import SpecDcodeType
@@ -517,9 +517,7 @@ class NPUModelRunner(GPUModelRunner):
             flush_hspec_s1_parity()
         if (HSPEC_S4_TRACE_ENABLED and scheduler_output.finished_req_ids
                 and self.input_batch.num_reqs == 0):
-            seal_hspec_s4_trace_open_queries(
-                "scheduler_batch_drained_before_verification"
-            )
+            flush_hspec_s4_trace()
 
     def hspec_prefetch_prompt_token_ids_batch(
         self,
