@@ -5,7 +5,7 @@ import runpy
 import subprocess
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Dict, Optional
 
 import torch
@@ -19,7 +19,11 @@ S0_PROPOSER_PATH = (
 
 
 def _extract_method_from_source(
-    source: str, filename: str, class_name: str, method_name: str
+    source: str,
+    filename: str,
+    class_name: str,
+    method_name: str,
+    extra_globals: Optional[dict] = None,
 ):
     tree = ast.parse(source, filename=filename)
     for node in tree.body:
@@ -34,6 +38,7 @@ def _extract_method_from_source(
                         "Dict": Dict,
                         "Optional": Optional,
                     }
+                    namespace.update(extra_globals or {})
                     exec(compile(module, filename, "exec"), namespace)
                     return namespace[method_name]
     raise AssertionError(f"Could not find {class_name}.{method_name}")
@@ -236,6 +241,169 @@ class TestVerificationEquivalence(unittest.TestCase):
         )
         self.assertIn("entry_abs_delta_bucket_verify_", source)
         self.assertNotIn('prefix = f"hspec/entry_abs_delta_{abs_delta}"', source)
+
+
+class TestRolloutRoundFinalization(unittest.TestCase):
+
+    def test_proposer_finalization_closes_pending_metric_window_once(self):
+        proposer_path = (
+            PROJECT_ROOT / "vllm_ascend" / "spec_decode" / "hspec_proposer.py"
+        )
+        source = proposer_path.read_text(encoding="utf-8")
+        trace_events = []
+        globals_for_cancel = {
+            "HSPEC_S4_TRACE_ENABLED": True,
+            "record_hspec_s4_trace_events": trace_events.extend,
+        }
+        cancel_method = _extract_method_from_source(
+            source,
+            str(proposer_path),
+            "HSpecProposer",
+            "_cancel_pending_request",
+            globals_for_cancel,
+        )
+        finalize_method = _extract_method_from_source(
+            source,
+            str(proposer_path),
+            "HSpecProposer",
+            "finalize_rollout_round",
+        )
+        metrics_namespace = runpy.run_path(str(
+            PROJECT_ROOT / "vllm_ascend" / "spec_decode" / "hspec_metrics.py"
+        ))
+        tracker = metrics_namespace["HSpecSelectionMetricTracker"](
+            max_draft_tokens=15
+        )
+        window_id = tracker.begin_window(eligible_queries=2)
+        tracker.finalize_proposals(
+            window_id,
+            proposed_requests=2,
+            drafted_tokens=4,
+        )
+        self.assertIsNone(tracker.record_verification(
+            window_id,
+            accepted_prefix_len=2,
+        ))
+        closed_metrics = []
+        flush_calls = []
+        proposer = SimpleNamespace(
+            _accept_lengths={"r2": 0},
+            _pending_verify_meta={
+                "r2": {
+                    "metric_window_id": window_id,
+                    "s4_trace_query_id": "q2",
+                }
+            },
+            _req_prompt_ids={"r2": "p2"},
+            _cached_batch_req_ids=("r2",),
+            _cached_batch_prompt_ids=["p2"],
+            _batched_table_cache=object(),
+            _selector_metric_tracker=tracker,
+            _record_closed_selector_metrics=lambda value: (
+                closed_metrics.append(value) if value is not None else None
+            ),
+            flush_observability_metrics=lambda: flush_calls.append(True),
+        )
+        proposer._cancel_pending_request = MethodType(cancel_method, proposer)
+        proposer.finalize_rollout_round = MethodType(finalize_method, proposer)
+
+        reason = "rollout_round_completed_with_unresolved_trace_outcome"
+        self.assertEqual(proposer.finalize_rollout_round(reason), 1)
+        self.assertEqual(tracker.pending_window_count, 0)
+        self.assertEqual(len(closed_metrics), 1)
+        self.assertEqual(closed_metrics[0]["select_proposed_requests"], 2)
+        self.assertEqual(closed_metrics[0]["select_verified_requests"], 1)
+        self.assertEqual(closed_metrics[0]["select_canceled_requests"], 1)
+        self.assertEqual(trace_events[0]["reason"], reason)
+        self.assertFalse(proposer._pending_verify_meta)
+        self.assertFalse(proposer._accept_lengths)
+        self.assertFalse(proposer._req_prompt_ids)
+        self.assertEqual(proposer._cached_batch_req_ids, ())
+        self.assertIsNone(proposer._batched_table_cache)
+
+        self.assertEqual(proposer.finalize_rollout_round(reason), 0)
+        self.assertEqual(len(trace_events), 1)
+        self.assertEqual(len(closed_metrics), 1)
+        self.assertEqual(len(flush_calls), 2)
+
+    def test_model_runner_fails_closed_on_trace_mirror_orphan(self):
+        runner_path = (
+            PROJECT_ROOT / "vllm_ascend" / "worker" / "model_runner_v1.py"
+        )
+        source = runner_path.read_text(encoding="utf-8")
+        seal_results = [0]
+        method = _extract_method_from_source(
+            source,
+            str(runner_path),
+            "NPUModelRunner",
+            "hspec_finalize_rollout_round",
+            {
+                "HSPEC_S4_TRACE_ROUND_REASON": "round",
+                "HSPEC_S4_TRACE_ORPHAN_REASON": "orphan",
+                "HSPEC_S4_TRACE_ENABLED": True,
+                "SpecDcodeType": SimpleNamespace(HSPEC="hspec"),
+                "seal_hspec_s4_trace_pending": lambda reason: seal_results.pop(0),
+            },
+        )
+        finalized = []
+        runner = SimpleNamespace(
+            _hspec_collect=True,
+            drafter=SimpleNamespace(
+                name="hspec",
+                finalize_rollout_round=lambda reason: finalized.append(reason) or 2,
+            ),
+        )
+        result = method(runner)
+        self.assertEqual(result["canceled_proposals"], 2)
+        self.assertEqual(result["trace_orphans"], 0)
+        self.assertEqual(finalized, ["round"])
+
+        method.__globals__["HSPEC_S4_TRACE_ENABLED"] = False
+        method.__globals__["seal_hspec_s4_trace_pending"] = lambda reason: (
+            self.fail("trace seal must remain inert when S4 tracing is disabled")
+        )
+        disabled_result = method(runner)
+        self.assertEqual(disabled_result["trace_orphans"], 0)
+
+        method.__globals__["HSPEC_S4_TRACE_ENABLED"] = True
+        method.__globals__["seal_hspec_s4_trace_pending"] = lambda reason: 1
+        with self.assertRaisesRegex(RuntimeError, "trace lifecycle diverged"):
+            method(runner)
+
+    def test_round_finalize_lifecycle_hooks_are_outside_decode_hot_path(self):
+        worker_source = (
+            PROJECT_ROOT / "vllm_ascend" / "worker" / "worker.py"
+        ).read_text(encoding="utf-8")
+        worker_tree = ast.parse(worker_source)
+        worker_class = next(
+            node for node in worker_tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "NPUWorker"
+        )
+        methods = {
+            node.name: ast.get_source_segment(worker_source, node)
+            for node in worker_class.body if isinstance(node, ast.FunctionDef)
+        }
+        sleep_source = methods["sleep"]
+        self.assertLess(
+            sleep_source.index("self.hspec_finalize_rollout_round()"),
+            sleep_source.index("allocator.sleep("),
+        )
+        self.assertIn("HSPEC_S4_TRACE_SHUTDOWN_REASON", methods["shutdown"])
+        self.assertIn("finalize_hspec_s4_trace()", methods["shutdown"])
+
+        rollout_source = (
+            PROJECT_ROOT
+            / "verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py"
+        ).read_text(encoding="utf-8")
+        generate_pos = rollout_source.index(
+            "outputs = self.inference_engine.generate("
+        )
+        finalize_pos = rollout_source.index(
+            '"hspec_finalize_rollout_round"', generate_pos
+        )
+        flush_pos = rollout_source.index("hs_store: dict", generate_pos)
+        self.assertLess(generate_pos, finalize_pos)
+        self.assertLess(finalize_pos, flush_pos)
 
 
 class TestGlobalMetricFormatting(unittest.TestCase):

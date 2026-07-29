@@ -737,6 +737,12 @@ class vLLMRollout(BaseRollout):
                         lora_request=lora_requests,
                         use_tqdm=True,
                     )
+                if use_hspec:
+                    with hspec_record_function("hspec/rollout/round_finalize"):
+                        self.inference_engine.llm_engine.collective_rpc(
+                            "hspec_finalize_rollout_round",
+                            args=(),
+                        )
 
                 hs_store: dict = {}
                 hs_store_index: tuple[dict[str, Any], dict[str, Any]] = ({}, {})

@@ -51,6 +51,15 @@ HSPEC_S4_TRACE_SAMPLE_EVERY = _positive_int(
 HSPEC_S4_TRACE_CAPTURE_PROJECTED = (
     os.environ.get("HSPEC_S4_TRACE_CAPTURE_PROJECTED", "1") != "0"
 )
+HSPEC_S4_TRACE_ROUND_REASON = (
+    "rollout_round_completed_with_unresolved_trace_outcome"
+)
+HSPEC_S4_TRACE_ORPHAN_REASON = (
+    "trace_orphan_after_proposer_round_finalize"
+)
+HSPEC_S4_TRACE_SHUTDOWN_REASON = (
+    "worker_shutdown_with_unresolved_trace_outcome"
+)
 
 
 def hspec_s4_token_hash(tokens: Sequence[int]) -> str:
@@ -146,6 +155,13 @@ class HSpecS4TraceRecorder:
             for recorded_row, raw_event in enumerate(events):
                 event = dict(raw_event)
                 event.setdefault("schema_version", "hspec.s4.online-trace.v2")
+                query_id = str(event.get("query_id", ""))
+                event_type = str(event.get("event", ""))
+                if query_id and event_type in {"verification", "cancellation"}:
+                    pending = self._pending_selections.get(query_id)
+                    if pending is not None:
+                        for key, value in pending.items():
+                            event.setdefault(key, value)
                 if match_group_id is not None:
                     event.setdefault("match_group_id", match_group_id)
                     event.setdefault("match_group_recorded_row", recorded_row)
@@ -154,8 +170,6 @@ class HSpecS4TraceRecorder:
                 event["producer_sequence"] = self._sequence
                 self._sequence += 1
                 self._buffer.append(event)
-                query_id = str(event.get("query_id", ""))
-                event_type = str(event.get("event", ""))
                 if (
                     query_id
                     and event_type == "selection"
@@ -183,6 +197,19 @@ class HSpecS4TraceRecorder:
         with self._lock:
             self._flush_locked()
 
+    def seal_pending(self, reason: str) -> int:
+        """Write explicit cancellations while keeping the recorder reusable."""
+        normalized_reason = str(reason).strip()
+        if not normalized_reason:
+            raise ValueError("HSpec S4 trace cancellation reason must be non-empty")
+        with self._lock:
+            if self._finalized:
+                self._flush_locked()
+                return 0
+            canceled = self._cancel_pending_locked(normalized_reason)
+            self._flush_locked()
+            return canceled
+
     def finalize(self) -> None:
         """Close trace-only pending selections when the worker exits.
 
@@ -194,20 +221,25 @@ class HSpecS4TraceRecorder:
             if self._finalized:
                 self._flush_locked()
                 return
-            for pending in self._pending_selections.values():
-                event = {
-                    "schema_version": "hspec.s4.online-trace.v2",
-                    "event": "cancellation",
-                    **pending,
-                    "reason": "worker_shutdown_with_unresolved_trace_outcome",
-                    "producer_id": self._producer_id,
-                    "producer_sequence": self._sequence,
-                }
-                self._sequence += 1
-                self._buffer.append(event)
-            self._pending_selections.clear()
+            self._cancel_pending_locked(HSPEC_S4_TRACE_SHUTDOWN_REASON)
             self._finalized = True
             self._flush_locked()
+
+    def _cancel_pending_locked(self, reason: str) -> int:
+        canceled = len(self._pending_selections)
+        for pending in self._pending_selections.values():
+            event = {
+                "schema_version": "hspec.s4.online-trace.v2",
+                "event": "cancellation",
+                **pending,
+                "reason": str(reason),
+                "producer_id": self._producer_id,
+                "producer_sequence": self._sequence,
+            }
+            self._sequence += 1
+            self._buffer.append(event)
+        self._pending_selections.clear()
+        return canceled
 
     def _flush_locked(self) -> None:
         if not self._buffer:
@@ -255,6 +287,12 @@ def record_hspec_s4_trace_events(
 def flush_hspec_s4_trace() -> None:
     if _RECORDER is not None:
         _RECORDER.flush()
+
+
+def seal_hspec_s4_trace_pending(reason: str) -> int:
+    if _RECORDER is None:
+        return 0
+    return _RECORDER.seal_pending(reason)
 
 
 def finalize_hspec_s4_trace() -> None:

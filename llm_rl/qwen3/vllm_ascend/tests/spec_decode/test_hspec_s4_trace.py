@@ -124,6 +124,86 @@ class HSpecS4TraceTest(unittest.TestCase):
                 [row["producer_sequence"] for row in rows], [0, 1, 2, 3, 4]
             )
 
+    def test_round_seal_is_idempotent_and_recorder_remains_writable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            module = _load_trace_module("hspec_s4_trace_round_seal_test", root)
+            recorder = module.HSpecS4TraceRecorder(root, flush_records=100)
+            recorder.record_many([
+                {
+                    "event": "selection",
+                    "query_id": "q1",
+                    "request_id": "r1",
+                    "prompt_id": "p1",
+                    "decoded_len": 7,
+                    "active_table_version": 1,
+                    "drafted_len": 2,
+                },
+                {
+                    "event": "selection",
+                    "query_id": "q2",
+                    "request_id": "r2",
+                    "prompt_id": "p2",
+                    "decoded_len": 8,
+                    "active_table_version": 1,
+                    "drafted_len": 2,
+                },
+            ])
+            recorder.record_many([{"event": "verification", "query_id": "q1"}])
+            self.assertEqual(
+                recorder.seal_pending(module.HSPEC_S4_TRACE_ROUND_REASON), 1
+            )
+            self.assertEqual(
+                recorder.seal_pending(module.HSPEC_S4_TRACE_ROUND_REASON), 0
+            )
+
+            recorder.record_many([{
+                "event": "selection",
+                "query_id": "q3",
+                "request_id": "r3",
+                "prompt_id": "p3",
+                "decoded_len": 9,
+                "active_table_version": 2,
+                "drafted_len": 2,
+            }])
+            recorder.record_many([{"event": "verification", "query_id": "q3"}])
+            recorder.record_many([{
+                "event": "selection",
+                "query_id": "q4",
+                "request_id": "r4",
+                "prompt_id": "p4",
+                "decoded_len": 10,
+                "active_table_version": 2,
+                "drafted_len": 2,
+            }])
+            recorder.finalize()
+
+            rows = [
+                json.loads(line)
+                for line in recorder.path.read_text(encoding="utf-8").splitlines()
+            ]
+            terminal = {
+                row["query_id"]: row.get("reason")
+                for row in rows
+                if row.get("event") == "cancellation"
+            }
+            self.assertEqual(terminal, {
+                "q2": module.HSPEC_S4_TRACE_ROUND_REASON,
+                "q4": module.HSPEC_S4_TRACE_SHUTDOWN_REASON,
+            })
+            q2_terminal = next(
+                row for row in rows
+                if row.get("event") == "cancellation"
+                and row.get("query_id") == "q2"
+            )
+            self.assertEqual(q2_terminal["prompt_id"], "p2")
+            self.assertEqual(q2_terminal["decoded_len"], 8)
+            self.assertEqual(q2_terminal["active_table_version"], 1)
+            self.assertEqual(
+                [row["producer_sequence"] for row in rows],
+                list(range(len(rows))),
+            )
+
     def test_token_hash_has_length_domain_separation(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = _load_trace_module("hspec_s4_trace_hash_test", Path(tmp))

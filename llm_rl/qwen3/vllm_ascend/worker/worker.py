@@ -56,6 +56,11 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+from vllm_ascend.spec_decode.hspec_s4_trace import (
+    HSPEC_S4_TRACE_ROUND_REASON,
+    HSPEC_S4_TRACE_SHUTDOWN_REASON,
+    finalize_hspec_s4_trace,
+)
 from vllm_ascend.utils import (AscendDeviceType, check_ascend_device_type,
                                enable_sp, get_ascend_device_type,
                                register_ascend_customop)
@@ -132,6 +137,7 @@ class NPUWorker(WorkerBase):
         self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
 
     def sleep(self, level: int = 1) -> None:
+        self.hspec_finalize_rollout_round()
         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
         # Save the buffers before level 2 sleep
         if level == 2:
@@ -384,6 +390,31 @@ class NPUWorker(WorkerBase):
                 self.model_runner, "hspec_begin_prefetch_window"):
             return False
         return bool(self.model_runner.hspec_begin_prefetch_window())
+
+    def hspec_finalize_rollout_round(
+        self,
+        reason: str = HSPEC_S4_TRACE_ROUND_REASON,
+    ) -> dict[str, int | bool]:
+        if self.model_runner is None or not hasattr(
+                self.model_runner, "hspec_finalize_rollout_round"):
+            return {
+                "hspec_enabled": False,
+                "canceled_proposals": 0,
+                "trace_orphans": 0,
+            }
+        return self.model_runner.hspec_finalize_rollout_round(reason)
+
+    def shutdown(self) -> None:
+        try:
+            if getattr(self, "model_runner", None) is not None:
+                self.hspec_finalize_rollout_round(
+                    HSPEC_S4_TRACE_SHUTDOWN_REASON
+                )
+        finally:
+            try:
+                finalize_hspec_s4_trace()
+            finally:
+                super().shutdown()
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:

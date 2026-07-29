@@ -4239,8 +4239,8 @@ class HSpecProposer(Proposer):
         """Backward-compatible wrapper for entry-only callers."""
         self.update_verification_outcomes(req_ids, accepted_prefix_lengths)
 
-    def clear_request(self, req_id: str):
-        """Clear per-request state on completion."""
+    def _cancel_pending_request(self, req_id: str, reason: str) -> bool:
+        """Close one unverified proposal without treating it as a rejection."""
         self._accept_lengths.pop(req_id, None)
         meta = self._pending_verify_meta.pop(req_id, None)
         if meta is not None:
@@ -4251,7 +4251,7 @@ class HSpecProposer(Proposer):
                         "event": "cancellation",
                         "query_id": str(trace_query_id),
                         "request_id": str(req_id),
-                        "reason": "request_finished_before_verification",
+                        "reason": str(reason),
                     }])
             self._record_closed_selector_metrics(
                 self._selector_metric_tracker.record_cancellation(
@@ -4263,6 +4263,48 @@ class HSpecProposer(Proposer):
             self._cached_batch_req_ids = ()
             self._cached_batch_prompt_ids = []
             self._batched_table_cache = None
+        return meta is not None
+
+    def clear_request(self, req_id: str):
+        """Clear per-request state on completion."""
+        self._cancel_pending_request(
+            req_id,
+            reason="request_finished_before_verification",
+        )
+
+    def finalize_rollout_round(self, reason: str) -> int:
+        """Cancel proposals that cannot cross a completed rollout boundary."""
+        normalized_reason = str(reason).strip()
+        if not normalized_reason:
+            raise ValueError("HSpec rollout cancellation reason must be non-empty")
+
+        pending_req_ids = tuple(self._pending_verify_meta)
+        canceled = 0
+        for req_id in pending_req_ids:
+            canceled += int(self._cancel_pending_request(
+                req_id,
+                reason=normalized_reason,
+            ))
+
+        # LLM.generate() has returned, so no request-local decode state may
+        # cross this boundary even when a final scheduler cleanup callback was
+        # omitted. Prompt tables and their adaptive state remain untouched.
+        self._accept_lengths.clear()
+        self._req_prompt_ids.clear()
+        self._cached_batch_req_ids = ()
+        self._cached_batch_prompt_ids = []
+        self._batched_table_cache = None
+
+        pending_windows = int(
+            self._selector_metric_tracker.pending_window_count
+        )
+        self.flush_observability_metrics()
+        if pending_windows:
+            raise RuntimeError(
+                "HSpec selector metric lifecycle diverged at rollout boundary: "
+                f"pending_windows={pending_windows} canceled={canceled}"
+            )
+        return int(canceled)
 
     def flush_observability_metrics(self) -> None:
         """Flush tail counters outside the selector generation hot path."""

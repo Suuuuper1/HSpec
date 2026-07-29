@@ -108,7 +108,10 @@ from vllm_ascend.spec_decode.hspec_parity import (
 from vllm_ascend.spec_decode.hspec_proposer import HSpecProposer
 from vllm_ascend.spec_decode.hspec_s4_trace import (
     HSPEC_S4_TRACE_ENABLED,
+    HSPEC_S4_TRACE_ORPHAN_REASON,
+    HSPEC_S4_TRACE_ROUND_REASON,
     flush_hspec_s4_trace,
+    seal_hspec_s4_trace_pending,
 )
 from vllm_ascend.spec_decode.hspec_utils import hspec_record_function
 from vllm_ascend.spec_decode.interface import SpecDcodeType
@@ -578,6 +581,44 @@ class NPUModelRunner(GPUModelRunner):
         except Exception:
             logger.debug("HSpec: failed to begin prefetch window", exc_info=True)
             return False
+
+    def hspec_finalize_rollout_round(
+        self,
+        reason: str = HSPEC_S4_TRACE_ROUND_REASON,
+    ) -> dict[str, int | bool]:
+        """Close HSpec proposal state after a completed rollout call.
+
+        The proposer owns the verification lifecycle. The trace recorder is a
+        defensive mirror: any pending trace left after proposer finalization
+        is made auditable and then treated as a hard lifecycle error.
+        """
+        if (not self._hspec_collect or self.drafter is None
+                or getattr(self.drafter, "name", None) != SpecDcodeType.HSPEC
+                or not hasattr(self.drafter, "finalize_rollout_round")):
+            return {
+                "hspec_enabled": False,
+                "canceled_proposals": 0,
+                "trace_orphans": 0,
+            }
+
+        canceled = int(self.drafter.finalize_rollout_round(reason))
+        trace_orphans = 0
+        if HSPEC_S4_TRACE_ENABLED:
+            trace_orphans = int(seal_hspec_s4_trace_pending(
+                HSPEC_S4_TRACE_ORPHAN_REASON
+            ))
+            if trace_orphans:
+                raise RuntimeError(
+                    "HSpec S4 trace lifecycle diverged from proposer state at "
+                    "rollout boundary: "
+                    f"trace_orphans={trace_orphans} "
+                    f"canceled_proposals={canceled}"
+                )
+        return {
+            "hspec_enabled": True,
+            "canceled_proposals": canceled,
+            "trace_orphans": trace_orphans,
+        }
 
     def hspec_prefetch_prompt_ids_batch(self, prompt_ids: list[str]) -> int:
         """Warm HSpec proposer cache from stable prompt ids."""
