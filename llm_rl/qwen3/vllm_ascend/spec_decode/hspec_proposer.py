@@ -3874,6 +3874,13 @@ class HSpecProposer(Proposer):
                     "query_pos": int(base_pos),
                     "active_table_version": int(self._cache_version),
                     "table_entries": int(cached.n_entries),
+                    # Ascend BMM reduction is shape-sensitive near ties.  S4
+                    # replay must preserve the online active-batch row and the
+                    # padded M/K dimensions, not only this prompt's n_entries.
+                    "match_batch_row": int(row),
+                    "match_batch_rows": int(len(active_batch_indices)),
+                    "match_padded_entries": int(keys_batch.shape[1]),
+                    "match_components": int(keys_batch.shape[2]),
                     "hidden_dtype": str(hidden_states.dtype),
                     "projection_dtype": str(z_batch.dtype),
                     "keys_device_dtype": str(keys_batch.dtype),
