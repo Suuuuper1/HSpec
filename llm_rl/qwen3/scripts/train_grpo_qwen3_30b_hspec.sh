@@ -188,6 +188,11 @@ TEST_FILE="${TEST_FILE:-/data/deepscaler/test.parquet}"
 DISTCP_PATH="${DISTCP_PATH:-/home/data/Qwen3-30B-A3B_megatron}"
 
 NODES="${NODES:-1}"
+TRAIN_GPUS_PER_NODE="${TRAIN_GPUS_PER_NODE:-16}"
+TRAIN_TP="${TRAIN_TP:-4}"
+TRAIN_PP="${TRAIN_PP:-4}"
+TRAIN_EP="${TRAIN_EP:-4}"
+TRAIN_ETP="${TRAIN_ETP:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.87}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-16384}"
@@ -198,6 +203,33 @@ export HSPEC_INFER_TP="${HSPEC_INFER_TP:-${INFER_TP}}"
 export HSPEC_NUM_SHARDS="${HSPEC_NUM_SHARDS:-${HSPEC_INFER_TP}}"
 export NODE_RANK="${NODE_RANK:-0}"
 export HSPEC_TP_GROUP_ID="${HSPEC_TP_GROUP_ID:-}"
+
+for parallel_value in \
+    NODES TRAIN_GPUS_PER_NODE TRAIN_TP TRAIN_PP TRAIN_EP TRAIN_ETP INFER_TP; do
+    value=${!parallel_value}
+    if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: ${parallel_value} must be a positive integer, got ${value}" >&2
+        exit 2
+    fi
+done
+TRAIN_WORLD_SIZE=$((NODES * TRAIN_GPUS_PER_NODE))
+TRAIN_MP_SIZE=$((TRAIN_TP * TRAIN_PP))
+if [ $((TRAIN_WORLD_SIZE % TRAIN_MP_SIZE)) -ne 0 ]; then
+    echo "ERROR: train world ${TRAIN_WORLD_SIZE} is not divisible by TP*PP=${TRAIN_MP_SIZE}" >&2
+    exit 2
+fi
+if [ $((TRAIN_WORLD_SIZE % INFER_TP)) -ne 0 ]; then
+    echo "ERROR: train world ${TRAIN_WORLD_SIZE} is not divisible by INFER_TP=${INFER_TP}" >&2
+    exit 2
+fi
+if [ "${TRAIN_PP}" -ne 4 ]; then
+    echo "ERROR: the frozen 30B pipeline layer layout [11,13,13,11] requires TRAIN_PP=4" >&2
+    exit 2
+fi
+if [ $((128 % TRAIN_EP)) -ne 0 ] || [ $((TRAIN_TP % TRAIN_ETP)) -ne 0 ]; then
+    echo "ERROR: invalid MoE parallelism: experts=128 EP=${TRAIN_EP} TP=${TRAIN_TP} ETP=${TRAIN_ETP}" >&2
+    exit 2
+fi
 
 # dump-mode behavior for batch sizes and rollout count.
 if [ "${HSPEC_DUMP}" = "0" ]; then
@@ -360,7 +392,12 @@ fi
     echo "pca_components=${PCA_COMPONENTS}"
     echo "vllm_spec_batch_threshold=${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"
     echo "nodes=${NODES}"
-    echo "trainer_n_gpus_per_node=16"
+    echo "trainer_n_gpus_per_node=${TRAIN_GPUS_PER_NODE}"
+    echo "train_world_size=${TRAIN_WORLD_SIZE}"
+    echo "train_tp=${TRAIN_TP}"
+    echo "train_pp=${TRAIN_PP}"
+    echo "train_ep=${TRAIN_EP}"
+    echo "train_etp=${TRAIN_ETP}"
     echo "infer_tp=${INFER_TP}"
     echo "max_prompt_length=${MAX_PROMPT_LENGTH}"
     echo "max_response_length=${MAX_RESPONSE_LENGTH}"
@@ -399,10 +436,10 @@ env \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.actor.megatron.sequence_parallel=True \
-    actor_rollout_ref.actor.megatron.expert_model_parallel_size=4 \
-    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
-    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=4 \
-    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1 \
+    actor_rollout_ref.actor.megatron.expert_model_parallel_size="${TRAIN_EP}" \
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size="${TRAIN_TP}" \
+    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size="${TRAIN_PP}" \
+    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size="${TRAIN_ETP}" \
     actor_rollout_ref.actor.megatron.param_offload=True \
     actor_rollout_ref.actor.megatron.grad_offload=True \
     actor_rollout_ref.actor.megatron.optimizer_offload=False \
@@ -444,7 +481,7 @@ env \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name='verl_grpo_gsm8k_hspec_validate' \
     trainer.experiment_name='qwen_hspec_validate_small' \
-    trainer.n_gpus_per_node=16 \
+    trainer.n_gpus_per_node="${TRAIN_GPUS_PER_NODE}" \
     trainer.nnodes="${NODES}" \
     trainer.save_freq=-1 \
     trainer.test_freq=1 \
