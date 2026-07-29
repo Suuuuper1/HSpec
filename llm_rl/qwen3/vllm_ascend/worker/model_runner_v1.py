@@ -17,8 +17,9 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
-import os
+import json
 import math
+import os
 import time
 import sys
 from collections import defaultdict
@@ -2207,8 +2208,32 @@ class NPUModelRunner(GPUModelRunner):
                 captured_name = "Decode"
             elif self.attn_state == AscendAttentionState.SpecDecoding:
                 captured_name = "SpecDecode"
+            s7_shape_suffix = ""
+            if os.getenv("HSPEC_S7_ENGINE_TIMING", "0") != "0":
+                draft_lengths = [
+                    len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+                    for req_id in scheduler_output.num_scheduled_tokens
+                ]
+                draft_histogram: Dict[str, int] = {}
+                for draft_len in draft_lengths:
+                    key = str(int(draft_len))
+                    draft_histogram[key] = draft_histogram.get(key, 0) + 1
+                s7_shape_suffix = " S7Shape:" + json.dumps(
+                    {
+                        "num_requests": len(draft_lengths),
+                        "num_spec_requests": sum(
+                            length > 0 for length in draft_lengths
+                        ),
+                        "draft_sum": sum(draft_lengths),
+                        "draft_max": max(draft_lengths, default=0),
+                        "draft_histogram": draft_histogram,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
             logger.info(f"Current reqs:{self.input_batch.num_reqs} " +
-                        f"Profile execute duration [{captured_name}]:{' '.join(dr_str)}")
+                        f"Profile execute duration [{captured_name}]:{' '.join(dr_str)}" +
+                        s7_shape_suffix)
 
         if self.dynamic_eplb:
             self.eplb_updator.forward_end()
@@ -2270,7 +2295,12 @@ class NPUModelRunner(GPUModelRunner):
         _hspec_gen = _hspec_gen_enabled()
         _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
         _t0_rej = time.perf_counter_ns() if _hspec_gen else 0
-        with hspec_record_function("hspec/verification/rejection_sampler", use_npu_stream=True):
+        with (
+            ProfileExecuteDuration().capture_async("rejection_sampler"),
+            hspec_record_function(
+                "hspec/verification/rejection_sampler", use_npu_stream=True
+            ),
+        ):
             sampler_output = self.rejection_sampler(
                 spec_decode_metadata,
                 None,  # draft_probs

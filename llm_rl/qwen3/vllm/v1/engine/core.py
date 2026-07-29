@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import os
 import queue
 import signal
@@ -72,6 +73,7 @@ logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
+_HSPEC_S7_ENGINE_TIMING = os.getenv("HSPEC_S7_ENGINE_TIMING", "0") != "0"
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -378,7 +380,9 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        s7_step_start = time.perf_counter_ns() if _HSPEC_S7_ENGINE_TIMING else 0
         scheduler_output = self.scheduler.schedule()
+        s7_schedule_end = time.perf_counter_ns() if _HSPEC_S7_ENGINE_TIMING else 0
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -388,6 +392,7 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        s7_execute_end = time.perf_counter_ns() if _HSPEC_S7_ENGINE_TIMING else 0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -395,6 +400,38 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+
+        if _HSPEC_S7_ENGINE_TIMING:
+            s7_update_end = time.perf_counter_ns()
+            draft_lengths = [
+                len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+                for req_id in scheduler_output.num_scheduled_tokens
+            ]
+            draft_histogram: dict[str, int] = {}
+            for draft_len in draft_lengths:
+                key = str(int(draft_len))
+                draft_histogram[key] = draft_histogram.get(key, 0) + 1
+            iteration = compute_iteration_details(scheduler_output)
+            self._hspec_s7_last_step_timing = {
+                "schema_version": "hspec.s7.engine-step.v1",
+                "schedule_ms": (s7_schedule_end - s7_step_start) / 1_000_000.0,
+                "execute_model_ms": (s7_execute_end - s7_schedule_end)
+                / 1_000_000.0,
+                "scheduler_update_ms": (s7_update_end - s7_execute_end)
+                / 1_000_000.0,
+                "core_step_ms": (s7_update_end - s7_step_start) / 1_000_000.0,
+                "num_requests": len(draft_lengths),
+                "num_context_requests": int(iteration.num_ctx_requests),
+                "num_generation_requests": int(iteration.num_generation_requests),
+                "num_generation_tokens": int(iteration.num_generation_tokens),
+                "num_spec_requests": sum(length > 0 for length in draft_lengths),
+                "draft_sum": sum(draft_lengths),
+                "draft_max": max(draft_lengths, default=0),
+                "draft_histogram": draft_histogram,
+                "total_num_scheduled_tokens": int(
+                    scheduler_output.total_num_scheduled_tokens
+                ),
+            }
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -1000,12 +1037,34 @@ class EngineCoreProc(EngineCore):
         """Called only when there are unfinished local requests."""
 
         # Step the engine core.
+        s7_loop_start = time.perf_counter_ns() if _HSPEC_S7_ENGINE_TIMING else 0
         outputs, model_executed = self.step_fn()
+        s7_core_end = time.perf_counter_ns() if _HSPEC_S7_ENGINE_TIMING else 0
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
+        s7_queue_end = time.perf_counter_ns() if _HSPEC_S7_ENGINE_TIMING else 0
         # Post-step hook.
         self.post_step(model_executed)
+        if _HSPEC_S7_ENGINE_TIMING:
+            s7_post_end = time.perf_counter_ns()
+            record = getattr(self, "_hspec_s7_last_step_timing", None)
+            if record is not None:
+                record.update(
+                    {
+                        "output_queue_ms": (s7_queue_end - s7_core_end)
+                        / 1_000_000.0,
+                        "post_step_ms": (s7_post_end - s7_queue_end)
+                        / 1_000_000.0,
+                        "full_loop_ms": (s7_post_end - s7_loop_start)
+                        / 1_000_000.0,
+                    }
+                )
+                logger.info(
+                    "HSPEC_S7_ENGINE_STEP %s",
+                    json.dumps(record, sort_keys=True, separators=(",", ":")),
+                )
+                self._hspec_s7_last_step_timing = None
 
         # If no model execution happened but there are waiting requests
         # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow

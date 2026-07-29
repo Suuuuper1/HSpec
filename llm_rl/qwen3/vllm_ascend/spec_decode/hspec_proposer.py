@@ -44,6 +44,9 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.spec_decode.hspec_metrics import HSpecSelectionMetricTracker
+from vllm_ascend.spec_decode.hspec_s7_benchmark import (
+    S7VerificationPatternController,
+)
 from vllm_ascend.spec_decode.hspec_s4_trace import (
     HSPEC_S4_TRACE_CAPTURE_PROJECTED,
     HSPEC_S4_TRACE_ENABLED,
@@ -568,6 +571,10 @@ class HSpecProposer(Proposer):
         self._selector_metric_tracker = HSpecSelectionMetricTracker(
             self.max_draft_tokens
         )
+        self._s7_pattern_controller = (
+            S7VerificationPatternController.from_environment()
+        )
+        self._s7_pattern_enabled = self._s7_pattern_controller.enabled
 
         self.hspec_tables: GlobalHSpecTableGroup = get_hspec_tables(
             similarity_threshold=self.similarity_threshold,
@@ -3707,6 +3714,12 @@ class HSpecProposer(Proposer):
         selector_proposed_requests = 0
         selector_drafted_tokens = 0
         selector_cpu_t0 = _now_ns() if selector_timing_enabled else 0
+        if self._s7_pattern_enabled:
+            s7_pattern, s7_caps = self._s7_pattern_controller.next_caps(
+                len(active_batch_indices)
+            )
+        else:
+            s7_pattern, s7_caps = None, None
         pending = []
         for j in hit_rows.tolist():
             i = active_batch_indices[j]
@@ -3726,6 +3739,12 @@ class HSpecProposer(Proposer):
                 abs_delta=abs_delta,
                 min_wnd=int(cached.min_wnd),
             )
+            if s7_caps is not None:
+                # The S7 cost experiment controls only draft length. Entry
+                # selection remains P0, and the disabled path is unchanged.
+                effective_wnd = min(
+                    max(int(s7_caps[j]), 0), int(self.max_draft_tokens)
+                )
             t0_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
 
             # Draft tokens from CPU cache (sub-µs numpy slice)
@@ -3809,6 +3828,8 @@ class HSpecProposer(Proposer):
                     "min_wnd": int(cached.min_wnd),
                     "max_wnd": int(cached.max_wnd),
                 }
+                if s7_pattern is not None:
+                    pending_meta["s7_verification_pattern"] = s7_pattern
                 if HSPEC_S4_TRACE_ENABLED:
                     assert s4_trace_query_ids is not None
                     pending_meta.update({
