@@ -105,6 +105,10 @@ class S7VerificationPatternController:
             raise ValueError(
                 "S7 verification patterns require HSPEC_S7_ENGINE_TIMING=1"
             )
+        if patterns and os.getenv("HSPEC_S7_OBSERVER_SCHEMA", "") != "v2":
+            raise ValueError(
+                "S7 verification patterns require HSPEC_S7_OBSERVER_SCHEMA=v2"
+            )
         if patterns and (
             os.getenv("HSPEC_S4_EXTENT_REPLAY", "0") != "0"
             or os.getenv("HSPEC_S4_TRACE_DIR", "")

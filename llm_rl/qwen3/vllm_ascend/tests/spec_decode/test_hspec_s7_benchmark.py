@@ -2,6 +2,9 @@ import os
 import unittest
 from unittest.mock import patch
 
+import vllm.v1.engine.core as engine_core_module
+from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.core_client import InprocClient
 from vllm_ascend.spec_decode.hspec_s7_benchmark import (
     S7VerificationPatternController,
     parse_pattern_sequence,
@@ -64,12 +67,78 @@ class TestS7VerificationPatterns(unittest.TestCase):
             {
                 "HSPEC_S7_VERIFY_PATTERN_SEQUENCE": "all0",
                 "HSPEC_S7_ENGINE_TIMING": "1",
+                "HSPEC_S7_OBSERVER_SCHEMA": "v2",
                 "HSPEC_S4_EXTENT_REPLAY": "1",
             },
             clear=True,
         ):
             with self.assertRaises(ValueError):
                 S7VerificationPatternController.from_environment()
+
+    def test_pattern_injection_requires_observer_v2(self):
+        with patch.dict(
+            os.environ,
+            {
+                "HSPEC_S7_VERIFY_PATTERN_SEQUENCE": "all0",
+                "HSPEC_S7_ENGINE_TIMING": "1",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "OBSERVER_SCHEMA=v2"):
+                S7VerificationPatternController.from_environment()
+
+    def test_inproc_client_completes_s7_timing(self):
+        class FakeCore:
+            hspec_s7_timing_enabled = True
+
+            def __init__(self):
+                self.completed = None
+                self.posted = None
+
+            def step_fn(self):
+                return {0: "output"}, True
+
+            def post_step(self, model_executed):
+                self.posted = model_executed
+
+            def complete_hspec_s7_step_timing(self, **kwargs):
+                self.completed = kwargs
+
+        client = object.__new__(InprocClient)
+        client.engine_core = FakeCore()
+        self.assertEqual(client.get_output(), "output")
+        self.assertTrue(client.engine_core.posted)
+        self.assertEqual(client.engine_core.completed["transport"], "inproc")
+        self.assertEqual(
+            client.engine_core.completed["core_end_ns"],
+            client.engine_core.completed["output_queue_end_ns"],
+        )
+
+    def test_engine_timing_completion_samples_and_clears(self):
+        fake = type(
+            "FakeEngineCore",
+            (),
+            {
+                "_hspec_s7_last_step_timing": {"draft_sum": 0},
+                "_hspec_s7_timing_ordinal": 0,
+            },
+        )()
+        with (
+            patch.object(engine_core_module, "_HSPEC_S7_ENGINE_TIMING", True),
+            patch.object(engine_core_module, "_HSPEC_S7_OBSERVER_SAMPLE_EVERY", 4),
+            patch.object(engine_core_module.logger, "info") as log_info,
+        ):
+            EngineCore.complete_hspec_s7_step_timing(
+                fake,
+                loop_start_ns=0,
+                core_end_ns=10,
+                output_queue_end_ns=10,
+                post_end_ns=20,
+                transport="inproc",
+            )
+        self.assertIsNone(fake._hspec_s7_last_step_timing)
+        self.assertEqual(fake._hspec_s7_timing_ordinal, 1)
+        log_info.assert_called_once()
 
 
 if __name__ == "__main__":

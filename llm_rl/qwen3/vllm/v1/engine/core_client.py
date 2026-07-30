@@ -5,6 +5,7 @@ import contextlib
 import multiprocessing
 import queue
 import sys
+import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -269,6 +270,20 @@ class InprocClient(EngineCoreClient):
         self.engine_core = EngineCore(*args, **kwargs)
 
     def get_output(self) -> EngineCoreOutputs:
+        if self.engine_core.hspec_s7_timing_enabled:
+            loop_start = time.perf_counter_ns()
+            outputs, model_executed = self.engine_core.step_fn()
+            core_end = time.perf_counter_ns()
+            self.engine_core.post_step(model_executed=model_executed)
+            post_end = time.perf_counter_ns()
+            self.engine_core.complete_hspec_s7_step_timing(
+                loop_start_ns=loop_start,
+                core_end_ns=core_end,
+                output_queue_end_ns=core_end,
+                post_end_ns=post_end,
+                transport="inproc",
+            )
+            return outputs and outputs.get(0) or EngineCoreOutputs()
         outputs, model_executed = self.engine_core.step_fn()
         self.engine_core.post_step(model_executed=model_executed)
         return outputs and outputs.get(0) or EngineCoreOutputs()

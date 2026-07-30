@@ -74,6 +74,18 @@ logger = init_logger(__name__)
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
 _HSPEC_S7_ENGINE_TIMING = os.getenv("HSPEC_S7_ENGINE_TIMING", "0") != "0"
+_HSPEC_S7_OBSERVER_SCHEMA = os.getenv("HSPEC_S7_OBSERVER_SCHEMA", "")
+if _HSPEC_S7_ENGINE_TIMING:
+    try:
+        _HSPEC_S7_OBSERVER_SAMPLE_EVERY = int(
+            os.getenv("HSPEC_S7_OBSERVER_SAMPLE_EVERY", "4")
+        )
+    except ValueError as exc:
+        raise ValueError("HSPEC_S7_OBSERVER_SAMPLE_EVERY must be an integer") from exc
+    if _HSPEC_S7_OBSERVER_SAMPLE_EVERY < 1:
+        raise ValueError("HSPEC_S7_OBSERVER_SAMPLE_EVERY must be >= 1")
+else:
+    _HSPEC_S7_OBSERVER_SAMPLE_EVERY = 1
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -413,7 +425,8 @@ class EngineCore:
                 draft_histogram[key] = draft_histogram.get(key, 0) + 1
             iteration = compute_iteration_details(scheduler_output)
             self._hspec_s7_last_step_timing = {
-                "schema_version": "hspec.s7.engine-step.v1",
+                "schema_version": "hspec.s7.engine-step.v2",
+                "observer_schema": _HSPEC_S7_OBSERVER_SCHEMA,
                 "schedule_ms": (s7_schedule_end - s7_step_start) / 1_000_000.0,
                 "execute_model_ms": (s7_execute_end - s7_schedule_end)
                 / 1_000_000.0,
@@ -434,6 +447,47 @@ class EngineCore:
             }
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    @property
+    def hspec_s7_timing_enabled(self) -> bool:
+        return _HSPEC_S7_ENGINE_TIMING
+
+    def complete_hspec_s7_step_timing(
+        self,
+        *,
+        loop_start_ns: int,
+        core_end_ns: int,
+        output_queue_end_ns: int,
+        post_end_ns: int,
+        transport: str,
+    ) -> None:
+        """Finish one opt-in S7 record for either engine execution mode."""
+        if not _HSPEC_S7_ENGINE_TIMING:
+            return
+        record = getattr(self, "_hspec_s7_last_step_timing", None)
+        if record is None:
+            return
+        self._hspec_s7_last_step_timing = None
+        ordinal = int(getattr(self, "_hspec_s7_timing_ordinal", 0))
+        self._hspec_s7_timing_ordinal = ordinal + 1
+        if ordinal % _HSPEC_S7_OBSERVER_SAMPLE_EVERY != 0:
+            return
+        record.update(
+            {
+                "sample_ordinal": ordinal,
+                "sample_every": _HSPEC_S7_OBSERVER_SAMPLE_EVERY,
+                "transport": transport,
+                "output_queue_ms": (output_queue_end_ns - core_end_ns)
+                / 1_000_000.0,
+                "post_step_ms": (post_end_ns - output_queue_end_ns)
+                / 1_000_000.0,
+                "full_loop_ms": (post_end_ns - loop_start_ns) / 1_000_000.0,
+            }
+        )
+        logger.info(
+            "HSPEC_S7_ENGINE_STEP %s",
+            json.dumps(record, sort_keys=True, separators=(",", ":")),
+        )
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -1048,23 +1102,13 @@ class EngineCoreProc(EngineCore):
         self.post_step(model_executed)
         if _HSPEC_S7_ENGINE_TIMING:
             s7_post_end = time.perf_counter_ns()
-            record = getattr(self, "_hspec_s7_last_step_timing", None)
-            if record is not None:
-                record.update(
-                    {
-                        "output_queue_ms": (s7_queue_end - s7_core_end)
-                        / 1_000_000.0,
-                        "post_step_ms": (s7_post_end - s7_queue_end)
-                        / 1_000_000.0,
-                        "full_loop_ms": (s7_post_end - s7_loop_start)
-                        / 1_000_000.0,
-                    }
-                )
-                logger.info(
-                    "HSPEC_S7_ENGINE_STEP %s",
-                    json.dumps(record, sort_keys=True, separators=(",", ":")),
-                )
-                self._hspec_s7_last_step_timing = None
+            self.complete_hspec_s7_step_timing(
+                loop_start_ns=s7_loop_start,
+                core_end_ns=s7_core_end,
+                output_queue_end_ns=s7_queue_end,
+                post_end_ns=s7_post_end,
+                transport="multiprocess",
+            )
 
         # If no model execution happened but there are waiting requests
         # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow

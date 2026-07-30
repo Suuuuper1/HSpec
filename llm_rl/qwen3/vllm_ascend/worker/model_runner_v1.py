@@ -490,6 +490,41 @@ class NPUModelRunner(GPUModelRunner):
         self._hspec_verify_pending_accept_advan = 0
         self._hspec_verify_pending_reject_advan = 0
         self._hspec_align_debug_logs = 0
+        self._hspec_s7_observer_enabled = (
+            os.environ.get("HSPEC_S7_ENGINE_TIMING", "0") != "0"
+            and os.environ.get("HSPEC_S7_OBSERVER_SCHEMA", "") == "v2"
+        )
+        self._hspec_s7_observer_leader = (
+            not self._hspec_s7_observer_enabled
+            or int(get_tp_group().rank_in_group) == 0
+        )
+        if self._hspec_s7_observer_enabled:
+            try:
+                self._hspec_s7_observer_sample_every = int(
+                    os.environ.get("HSPEC_S7_OBSERVER_SAMPLE_EVERY", "4")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "HSPEC_S7_OBSERVER_SAMPLE_EVERY must be an integer"
+                ) from exc
+            if self._hspec_s7_observer_sample_every < 1:
+                raise ValueError("HSPEC_S7_OBSERVER_SAMPLE_EVERY must be >= 1")
+        else:
+            self._hspec_s7_observer_sample_every = 1
+        self._hspec_s7_observer_ordinal = 0
+        self._hspec_s7_observer_emit = False
+        if self._hspec_s7_observer_enabled:
+            # The four TP ranks execute identical phase shapes. Only the
+            # authority rank records Events; the others retain the exact
+            # default model path without per-step synchronization.
+            os.environ["VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE"] = (
+                "1" if self._hspec_s7_observer_leader else "0"
+            )
+            if self._hspec_s7_observer_leader:
+                logger.info(
+                    "HSpec S7 observer v2 enabled: tp_leader=true sample_every=%d",
+                    self._hspec_s7_observer_sample_every,
+                )
         self.discard_request_indices = self._make_buffer(self.max_num_reqs,
                                                          dtype=torch.int64)
         self.num_discarded_requests = 0
@@ -1823,6 +1858,21 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
 
+        if self._hspec_s7_observer_enabled:
+            ordinal = self._hspec_s7_observer_ordinal
+            self._hspec_s7_observer_ordinal = ordinal + 1
+            self._hspec_s7_observer_emit = (
+                self._hspec_s7_observer_leader
+                and ordinal % self._hspec_s7_observer_sample_every == 0
+            )
+            if self._hspec_s7_observer_leader:
+                # A connector early-return can bypass pop_captured_sync(). Do
+                # not let a sampled Event leak into a later shape.
+                ProfileExecuteDuration().destroy()
+            os.environ["VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE"] = (
+                "1" if self._hspec_s7_observer_emit else "0"
+            )
+
         with ProfileExecuteDuration().capture_async("prepare input"):
             self._update_states(scheduler_output)
             _hspec_trace_banner(logger)
@@ -2220,6 +2270,9 @@ class NPUModelRunner(GPUModelRunner):
                     draft_histogram[key] = draft_histogram.get(key, 0) + 1
                 s7_shape_suffix = " S7Shape:" + json.dumps(
                     {
+                        "observer_schema": "v2",
+                        "sample_every": self._hspec_s7_observer_sample_every,
+                        "sample_ordinal": self._hspec_s7_observer_ordinal - 1,
                         "num_requests": len(draft_lengths),
                         "num_spec_requests": sum(
                             length > 0 for length in draft_lengths
