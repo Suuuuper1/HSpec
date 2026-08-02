@@ -2530,6 +2530,11 @@ class NPUModelRunner(GPUModelRunner):
                         accepted_prefix_lengths[:n],
                         drafted_lengths=drafted_lengths,
                         emitted_token_lengths=emitted_token_lengths,
+                        emitted_token_ids=[
+                            list(valid_sampled_token_ids[i])
+                            if i < len(valid_sampled_token_ids) else []
+                            for i in range(n)
+                        ],
                     )
                     accept_advan_add = int(accept_advan_add)
                     reject_advan_add = int(reject_advan_add)

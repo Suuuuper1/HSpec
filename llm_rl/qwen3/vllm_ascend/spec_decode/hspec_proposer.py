@@ -16,6 +16,7 @@ HSpec proposer: on-device hidden-state similarity speculative decoding.
 """
 
 import logging
+import math
 import os
 import time
 from collections import OrderedDict, defaultdict
@@ -48,6 +49,7 @@ from vllm_ascend.spec_decode.hspec_selector_r1 import (
     HSPEC_R1_NUMBA_AVAILABLE,
     HSpecR1Config,
     rerank_one_prompt_numba,
+    rerank_one_prompt_python,
     warm_r1_reranker,
 )
 from vllm_ascend.spec_decode.hspec_s7_benchmark import (
@@ -59,6 +61,17 @@ from vllm_ascend.spec_decode.hspec_s4_trace import (
     hspec_s4_token_hash,
     hspec_s4_trace_query_id,
     record_hspec_s4_trace_events,
+)
+from vllm_ascend.spec_decode.hspec_s9_shadow import (
+    HSPEC_S9_CAPTURE_ALL_DIVERGENCE,
+    HSPEC_S9_CAPTURE_PROJECTED,
+    HSPEC_S9_SHADOW_ENABLED,
+    HSPEC_S9_TIMING_SAMPLE_EVERY,
+    flush_hspec_s9_shadow,
+    hspec_s9_divergence_sampled,
+    hspec_s9_query_identity,
+    hspec_s9_token_hash,
+    record_hspec_s9_shadow_events,
 )
 from vllm_ascend.spec_decode.hspec_table import GlobalHSpecTableGroup, get_hspec_tables
 from vllm_ascend.spec_decode.hspec_table_store import (
@@ -604,6 +617,19 @@ class HSpecProposer(Proposer):
             S7VerificationPatternController.from_environment()
         )
         self._s7_pattern_enabled = self._s7_pattern_controller.enabled
+        self._s9_shadow_enabled = bool(
+            HSPEC_S9_SHADOW_ENABLED
+            and self._r1_config.computes_topk
+            and self._r1_config.shadow
+        )
+        if HSPEC_S9_SHADOW_ENABLED and not self._s9_shadow_enabled:
+            logger.warning(
+                "HSPEC_S9_SHADOW_DIR requires a valid topk_position shadow "
+                "selector; S9 observation is disabled on this worker"
+            )
+        self._s9_shadow_probes: Dict[str, List[Dict[str, Any]]] = {}
+        self._s9_match_batch_sequence = 0
+        self._s9_timing_sequence = 0
 
         self.hspec_tables: GlobalHSpecTableGroup = get_hspec_tables(
             similarity_threshold=self.similarity_threshold,
@@ -1235,6 +1261,9 @@ class HSpecProposer(Proposer):
                 else:
                     if version > self._cache_version:
                         # Epoch swap detected → invalidate old cache
+                        self._cancel_all_s9_shadow_state(
+                            "active_table_version_changed"
+                        )
                         self._clear_prompt_cache()
                         self._not_in_table.clear()
                         self._cache_version = version
@@ -1411,6 +1440,7 @@ class HSpecProposer(Proposer):
 
         version_bumped = False
         if newest_version > int(self._cache_version):
+            self._cancel_all_s9_shadow_state("active_table_version_changed")
             self._clear_prompt_cache()
             self._not_in_table.clear()
             self._online_disabled.clear()
@@ -1885,6 +1915,205 @@ class HSpecProposer(Proposer):
         self._r1_sample_counter += 1
         period = max(int(round(1.0 / rate)), 1)
         return self._r1_sample_counter % period == 0
+
+    def _s9_explain_r1_row(
+        self,
+        candidate_scores: np.ndarray,
+        candidate_indices: np.ndarray,
+        cached: _CachedPromptTable,
+        current_tokens: Sequence[int],
+        base_pos: int,
+    ) -> tuple[list[dict[str, Any]], tuple[int, int, float, int, int]]:
+        """Build bounded K<=16 parity evidence only for recorded S9 groups."""
+        tail_cap = max(int(self._r1_config.suffix_cap), 0)
+        current = np.ascontiguousarray(
+            current_tokens[-tail_cap:] if tail_cap > 0 else (), dtype=np.int32
+        )
+        scores = np.ascontiguousarray(candidate_scores, dtype=np.float32)
+        indices = np.ascontiguousarray(candidate_indices, dtype=np.int64)
+        reference = rerank_one_prompt_python(
+            scores,
+            indices,
+            cached.entry_rollout_idx,
+            cached.entry_offset,
+            cached.token_buffer,
+            cached.rollout_token_offset,
+            cached.rollout_token_len,
+            current,
+            int(base_pos),
+            int(cached.n_entries),
+            float(self._r1_config.relative_radius),
+            int(self._r1_config.suffix_cap),
+            float(self._r1_config.relative_weight),
+            float(self._r1_config.suffix_weight),
+            int(self._r1_config.position_mode_code),
+            float(self._r1_config.position_exact_weight),
+            float(self._r1_config.position_log_weight),
+            float(self._r1_config.utility_threshold),
+        )
+        valid_scores = [
+            float(score)
+            for score, idx in zip(scores.tolist(), indices.tolist())
+            if 0 <= int(idx) < int(cached.n_entries) and math.isfinite(float(score))
+        ]
+        top_score = max(valid_scores, default=float("-inf"))
+        denominator = max(abs(top_score), 1.0e-12)
+        rows: list[dict[str, Any]] = []
+        for slot, (score_raw, idx_raw) in enumerate(
+            zip(scores.tolist(), indices.tolist())
+        ):
+            score = float(score_raw)
+            idx = int(idx_raw)
+            row: dict[str, Any] = {
+                "slot": int(slot),
+                "entry_idx": idx,
+                "score": score if math.isfinite(score) else None,
+                "valid": False,
+                "eligible": False,
+            }
+            if not (0 <= idx < int(cached.n_entries) and math.isfinite(score)):
+                rows.append(row)
+                continue
+            rollout_idx = int(cached.entry_rollout_idx[idx])
+            offset = int(cached.entry_offset[idx])
+            if not (0 <= rollout_idx < int(cached.rollout_token_len.shape[0])):
+                rows.append(row)
+                continue
+            rollout_len = int(cached.rollout_token_len[rollout_idx])
+            remaining = int(rollout_len - offset)
+            relative_drop = max((top_score - score) / denominator, 0.0)
+            history = cached.get_rollout_tokens(rollout_idx)
+            history_end = offset - 1
+            suffix = 0
+            limit = min(tail_cap, int(current.shape[0]), max(offset, 0))
+            while suffix < limit:
+                if int(current[-1 - suffix]) != int(history[history_end - suffix]):
+                    break
+                suffix += 1
+            matched_pos = int(offset - 1)
+            abs_delta = abs(matched_pos - int(base_pos))
+            utility = (
+                -float(self._r1_config.relative_weight) * relative_drop
+                + float(self._r1_config.suffix_weight) * suffix
+            )
+            if self._r1_config.position_mode_code == 1 and abs_delta == 0:
+                utility += float(self._r1_config.position_exact_weight)
+            elif self._r1_config.position_mode_code == 2:
+                utility -= float(self._r1_config.position_log_weight) * math.log1p(
+                    abs_delta
+                )
+            valid = offset > 0 and remaining > 0
+            row.update({
+                "valid": bool(valid),
+                "eligible": bool(
+                    valid
+                    and relative_drop <= float(self._r1_config.relative_radius)
+                ),
+                "rollout_idx": rollout_idx,
+                "entry_offset": offset,
+                "matched_pos": matched_pos,
+                "remaining": remaining,
+                "relative_drop": float(relative_drop),
+                "suffix": int(suffix),
+                "abs_delta": int(abs_delta),
+                "utility": float(utility),
+                "history_tail_tokens": [
+                    int(value)
+                    for value in history[max(0, offset - tail_cap):offset].tolist()
+                ],
+            })
+            rows.append(row)
+        return rows, reference
+
+    def _s9_advance_request(
+        self,
+        req_id: str,
+        emitted_tokens: Sequence[int],
+        *,
+        finish_reason: Optional[str] = None,
+    ) -> None:
+        if not self._s9_shadow_enabled:
+            return
+        emitted = [int(token) for token in emitted_tokens]
+        probes = self._s9_shadow_probes.get(str(req_id), [])
+        if not probes:
+            return
+        remaining: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
+        for probe in probes:
+            decoded_len = int(probe["decoded_len"])
+            label_start_len = int(probe.get("label_start_len", decoded_len))
+            shadow_draft = [int(token) for token in probe["shadow_draft_tokens"]]
+            future = [
+                int(token)
+                for token in probe.get("observed_future_tokens", [])
+            ]
+            lcp = int(probe.get("shadow_accept_len", 0))
+            exact = False
+            for token in emitted:
+                if len(future) >= len(shadow_draft):
+                    exact = True
+                    break
+                expected = int(shadow_draft[len(future)])
+                future.append(int(token))
+                if int(token) != expected:
+                    exact = True
+                    break
+                lcp += 1
+                if len(future) >= len(shadow_draft):
+                    exact = True
+                    break
+            if exact or finish_reason is not None:
+                events.append({
+                    "event": "counterfactual",
+                    "query_id": str(probe["query_id"]),
+                    "request_id": str(req_id),
+                    "prompt_id": str(probe["prompt_id"]),
+                    "decoded_len": decoded_len,
+                    "label_start_len": label_start_len,
+                    "active_table_version": int(
+                        probe["active_table_version"]
+                    ),
+                    "shadow_accept_len": int(lcp),
+                    "shadow_drafted_len": int(len(shadow_draft)),
+                    "label_exact": bool(exact),
+                    "label_censored": bool(not exact),
+                    "observed_future_len": int(len(future)),
+                    "finish_reason": finish_reason,
+                    "observed_future_token_ids_sha256": hspec_s9_token_hash(
+                        future
+                    ),
+                })
+            else:
+                probe["shadow_accept_len"] = int(lcp)
+                probe["observed_future_tokens"] = future
+                remaining.append(probe)
+        if events:
+            record_hspec_s9_shadow_events(events)
+        if remaining:
+            self._s9_shadow_probes[str(req_id)] = remaining
+        else:
+            self._s9_shadow_probes.pop(str(req_id), None)
+
+    def _cancel_all_s9_shadow_state(self, reason: str) -> None:
+        if not self._s9_shadow_enabled:
+            return
+        events = [
+            {
+                "event": "counterfactual_cancellation",
+                "query_id": str(probe["query_id"]),
+                "request_id": str(req_id),
+                "prompt_id": str(probe["prompt_id"]),
+                "decoded_len": int(probe["decoded_len"]),
+                "active_table_version": int(probe["active_table_version"]),
+                "reason": str(reason),
+            }
+            for req_id, probes in self._s9_shadow_probes.items()
+            for probe in probes
+        ]
+        if events:
+            record_hspec_s9_shadow_events(events)
+        self._s9_shadow_probes.clear()
 
     def _get_or_build_batched_table_cache(
         self,
@@ -3563,6 +3792,18 @@ class HSpecProposer(Proposer):
             len(getattr(req_state, "output_token_ids", [])) if req_state is not None else 0
             for req_state in req_states
         ]
+        s9_lifecycle_ms = 0.0
+        if self._s9_shadow_enabled:
+            s9_lifecycle_t0 = _now_ns()
+            for batch_idx, req_id in enumerate(req_ids):
+                self._s9_advance_request(
+                    req_id,
+                    (
+                        valid_sampled_token_ids[batch_idx]
+                        if batch_idx < len(valid_sampled_token_ids) else ()
+                    ),
+                )
+            s9_lifecycle_ms = _ns_to_ms(_now_ns() - s9_lifecycle_t0)
 
         t0_extract = _now_ns() if gen_enabled else 0
         with (hspec_record_function("hspec/proposal/extract_anchor_hs")
@@ -4007,9 +4248,8 @@ class HSpecProposer(Proposer):
                 batch_idx = active_batch_indices[row]
                 req_state = req_states[batch_idx]
                 current_tokens = (
-                    getattr(req_state, "output_token_ids", ())
-                    if req_state is not None
-                    else ()
+                    list(getattr(req_state, "output_token_ids", ()))
+                    if req_state is not None else []
                 )
                 try:
                     slot, suffix, utility, _, _ = self._rerank_r1_row(
@@ -4044,6 +4284,51 @@ class HSpecProposer(Proposer):
                         candidate_scores_cpu[row, slot]
                     )
                     selected_rank_cpu[row] = int(slot)
+        s9_query_ids: Optional[List[str]] = None
+        s9_primary_samples: Optional[List[bool]] = None
+        s9_projected_cpu: Optional[np.ndarray] = None
+        s9_record_group = False
+        s9_trace_d2h_ms = 0.0
+        s9_match_group_local_id: Optional[int] = None
+        if self._s9_shadow_enabled:
+            s9_query_ids = []
+            s9_primary_samples = []
+            for row, batch_idx in enumerate(active_batch_indices):
+                query_id, sampled = hspec_s9_query_identity(
+                    request_id=req_ids[batch_idx],
+                    prompt_id=prompt_ids[batch_idx],
+                    decoded_len=decoded_lens[batch_idx],
+                    active_table_version=int(self._cache_version),
+                )
+                s9_query_ids.append(query_id)
+                s9_primary_samples.append(bool(sampled))
+            divergence_mask = (
+                raw_gate_hits
+                & (shadow_idxs_cpu >= 0)
+                & (shadow_idxs_cpu != np.asarray(idxs_cpu, dtype=np.int64))
+            )
+            s9_record_group = bool(
+                any(s9_primary_samples)
+                or (
+                    bool(np.any(divergence_mask))
+                    and (
+                        HSPEC_S9_CAPTURE_ALL_DIVERGENCE
+                        or any(
+                            hspec_s9_divergence_sampled(s9_query_ids[row])
+                            for row in np.flatnonzero(divergence_mask).tolist()
+                        )
+                    )
+                )
+            )
+            if s9_record_group:
+                s9_match_group_local_id = self._s9_match_batch_sequence
+                self._s9_match_batch_sequence += 1
+                if HSPEC_S9_CAPTURE_PROJECTED:
+                    s9_trace_d2h_t0 = _now_ns()
+                    s9_projected_cpu = z_batch.float().cpu().numpy()
+                    s9_trace_d2h_ms = _ns_to_ms(
+                        _now_ns() - s9_trace_d2h_t0
+                    )
         hit_rows = np.flatnonzero(selected_valid)
         selector_window_id = self._selector_metric_tracker.begin_window(
             eligible_queries=len(active_batch_indices),
@@ -4117,6 +4402,15 @@ class HSpecProposer(Proposer):
                             record_hspec_s4_trace_events([{
                                 "event": "cancellation",
                                 "query_id": str(old_trace_query_id),
+                                "request_id": str(req_id),
+                                "reason": "superseded_before_verification",
+                            }])
+                    if self._s9_shadow_enabled:
+                        old_s9_query_id = old_meta.get("s9_shadow_query_id")
+                        if old_s9_query_id is not None:
+                            record_hspec_s9_shadow_events([{
+                                "event": "verification_cancellation",
+                                "query_id": str(old_s9_query_id),
                                 "request_id": str(req_id),
                                 "reason": "superseded_before_verification",
                             }])
@@ -4202,6 +4496,14 @@ class HSpecProposer(Proposer):
                         "decoded_len_at_match": int(decoded_lens[i]),
                         "active_table_version": int(self._cache_version),
                         "s4_trace_query_id": s4_trace_query_ids[j],
+                    })
+                if self._s9_shadow_enabled and s9_record_group:
+                    assert s9_query_ids is not None
+                    pending_meta.update({
+                        "decoded_len_at_match": int(decoded_lens[i]),
+                        "s9_label_start_len": int(decoded_lens[i]),
+                        "active_table_version": int(self._cache_version),
+                        "s9_shadow_query_id": str(s9_query_ids[j]),
                     })
                 self._pending_verify_meta[req_id] = pending_meta
                 if self._r1_config.computes_topk and self._sample_r1_metadata():
@@ -4333,6 +4635,218 @@ class HSpecProposer(Proposer):
                 trace_events.append(event)
             record_hspec_s4_trace_events(trace_events)
 
+        if self._s9_shadow_enabled and s9_record_group:
+            assert s9_query_ids is not None
+            assert s9_primary_samples is not None
+            assert s9_match_group_local_id is not None
+            s9_events: List[Dict[str, Any]] = []
+            for row, batch_idx in enumerate(active_batch_indices):
+                cached = active_cached_tables[row]
+                req_id = str(req_ids[batch_idx])
+                prompt_id = str(prompt_ids[batch_idx])
+                req_state = req_states[batch_idx]
+                current_tokens = list(
+                    getattr(req_state, "output_token_ids", [])
+                    if req_state is not None else []
+                )
+                raw_idx = int(idxs_cpu[row])
+                r1_idx = int(shadow_idxs_cpu[row])
+                raw_gate_hit = bool(raw_gate_hits[row])
+                divergence = bool(
+                    raw_gate_hit and r1_idx >= 0 and r1_idx != raw_idx
+                )
+                try:
+                    candidate_rows, reference = self._s9_explain_r1_row(
+                        candidate_scores_cpu[row],
+                        candidate_idxs_cpu[row],
+                        cached,
+                        current_tokens,
+                        active_base_positions[row],
+                    )
+                    reference_error = None
+                except Exception as exc:
+                    candidate_rows = []
+                    reference = (-1, 0, float("nan"), 0, 0)
+                    reference_error = f"{type(exc).__name__}:{exc}"
+                reference_slot = int(reference[0])
+                raw_draft: List[int] = []
+                raw_effective_wnd = 0
+                if raw_gate_hit and 0 <= raw_idx < int(cached.n_entries):
+                    raw_pos = int(cached.entry_offset[raw_idx]) - 1
+                    raw_base_wnd = min(
+                        cached.get_effective_window(raw_idx),
+                        int(self.max_draft_tokens),
+                    )
+                    raw_effective_wnd = self._apply_abs_delta_cap(
+                        window=raw_base_wnd,
+                        abs_delta=abs(
+                            raw_pos - int(active_base_positions[row])
+                        ),
+                        min_wnd=int(cached.min_wnd),
+                    )
+                    raw_draft = cached.get_draft_tokens(
+                        raw_idx, raw_effective_wnd
+                    )
+                shadow_draft: List[int] = []
+                shadow_effective_wnd = 0
+                if raw_gate_hit and 0 <= r1_idx < int(cached.n_entries):
+                    shadow_pos = int(cached.entry_offset[r1_idx]) - 1
+                    shadow_base_wnd = min(
+                        cached.get_effective_window(r1_idx),
+                        int(self.max_draft_tokens),
+                    )
+                    shadow_effective_wnd = self._apply_abs_delta_cap(
+                        window=shadow_base_wnd,
+                        abs_delta=abs(
+                            shadow_pos - int(active_base_positions[row])
+                        ),
+                        min_wnd=int(cached.min_wnd),
+                    )
+                    shadow_draft = cached.get_draft_tokens(
+                        r1_idx, shadow_effective_wnd
+                    )
+                final_draft = [int(token) for token in results[batch_idx]]
+                output_parity = final_draft == [int(token) for token in raw_draft]
+                event: Dict[str, Any] = {
+                    "event": "selection",
+                    "query_id": str(s9_query_ids[row]),
+                    "request_id": req_id,
+                    "prompt_id": prompt_id,
+                    "decoded_len": int(decoded_lens[batch_idx]),
+                    "label_start_len": int(decoded_lens[batch_idx]),
+                    "query_pos": int(active_base_positions[row]),
+                    "p0_window_base_pos": int(active_base_positions[row]),
+                    "active_table_version": int(self._cache_version),
+                    "cache_generation": int(self._cache_generation),
+                    "match_group_local_id": int(s9_match_group_local_id),
+                    "match_batch_row": int(row),
+                    "match_batch_rows": int(len(active_batch_indices)),
+                    "match_padded_entries": int(keys_batch.shape[1]),
+                    "match_components": int(keys_batch.shape[2]),
+                    "table_entries": int(cached.n_entries),
+                    "primary_sample": bool(s9_primary_samples[row]),
+                    "group_companion": bool(not s9_primary_samples[row]),
+                    "captured_for_divergence": bool(divergence),
+                    "projection_dtype": str(z_batch.dtype),
+                    "keys_device_dtype": str(keys_batch.dtype),
+                    "raw_gate_threshold": float(self.similarity_threshold),
+                    "raw_gate_hit": raw_gate_hit,
+                    "raw_top1_entry_idx": raw_idx,
+                    "raw_top1_score": float(sims_cpu[row]),
+                    "candidate_entry_indices": [
+                        int(value) for value in candidate_idxs_cpu[row].tolist()
+                    ],
+                    "candidate_scores": [
+                        float(value)
+                        if math.isfinite(float(value)) else None
+                        for value in candidate_scores_cpu[row].tolist()
+                    ],
+                    "candidate_features": candidate_rows,
+                    "r1_kernel_slot": int(shadow_rank_cpu[row]),
+                    "r1_reference_slot": reference_slot,
+                    "r1_reference_suffix": int(reference[1]),
+                    "r1_reference_utility": (
+                        float(reference[2])
+                        if math.isfinite(float(reference[2])) else None
+                    ),
+                    "r1_entry_idx": r1_idx,
+                    "r1_score": (
+                        float(r1_scores_cpu[row])
+                        if np.isfinite(r1_scores_cpu[row]) else None
+                    ),
+                    "r1_suffix": int(selected_suffix_cpu[row]),
+                    "r1_utility": (
+                        float(selected_utility_cpu[row])
+                        if np.isfinite(selected_utility_cpu[row]) else None
+                    ),
+                    "old_new_divergence": divergence,
+                    "selector_output_entry_idx": (
+                        int(decision_idxs_cpu[row]) if raw_gate_hit else -1
+                    ),
+                    "baseline_effective_wnd": int(raw_effective_wnd),
+                    "shadow_effective_wnd": int(shadow_effective_wnd),
+                    "baseline_draft_token_ids": [
+                        int(token) for token in raw_draft
+                    ],
+                    "shadow_draft_token_ids": [
+                        int(token) for token in shadow_draft
+                    ],
+                    "final_draft_token_ids_sha256": hspec_s9_token_hash(
+                        final_draft
+                    ),
+                    "baseline_draft_token_ids_sha256": hspec_s9_token_hash(
+                        raw_draft
+                    ),
+                    "shadow_draft_token_ids_sha256": hspec_s9_token_hash(
+                        shadow_draft
+                    ),
+                    "current_emitted_token_ids_sha256": hspec_s9_token_hash(
+                        valid_sampled_token_ids[batch_idx]
+                    ),
+                    "current_emitted_token_ids": [
+                        int(token)
+                        for token in valid_sampled_token_ids[batch_idx]
+                    ],
+                    "shadow_output_equal_baseline": bool(output_parity),
+                    "current_suffix_tokens": [
+                        int(token)
+                        for token in (
+                            current_tokens[-int(self._r1_config.suffix_cap):]
+                            if int(self._r1_config.suffix_cap) > 0 else []
+                        )
+                    ],
+                    "reference_error": reference_error,
+                    "r1_config": {
+                        "mode": str(self._r1_config.mode),
+                        "topk": int(self._r1_config.topk),
+                        "sim_mode": str(self._r1_config.sim_mode),
+                        "relative_radius": float(
+                            self._r1_config.relative_radius
+                        ),
+                        "suffix_cap": int(self._r1_config.suffix_cap),
+                        "relative_weight": float(
+                            self._r1_config.relative_weight
+                        ),
+                        "suffix_weight": float(
+                            self._r1_config.suffix_weight
+                        ),
+                        "position_mode": str(
+                            self._r1_config.position_mode
+                        ),
+                        "utility_threshold": float(
+                            self._r1_config.utility_threshold
+                        ),
+                        "position_exact_weight": float(
+                            self._r1_config.position_exact_weight
+                        ),
+                        "position_log_weight": float(
+                            self._r1_config.position_log_weight
+                        ),
+                        "shadow": bool(self._r1_config.shadow),
+                        "d2h_strategy": str(self._r1_config.d2h_strategy),
+                    },
+                }
+                if s9_projected_cpu is not None:
+                    event["projected_query_fp32"] = [
+                        float(value)
+                        for value in s9_projected_cpu[row].tolist()
+                    ]
+                s9_events.append(event)
+                if divergence and shadow_draft:
+                    self._s9_shadow_probes.setdefault(req_id, []).append({
+                        "query_id": str(s9_query_ids[row]),
+                        "prompt_id": prompt_id,
+                        "decoded_len": int(decoded_lens[batch_idx]),
+                        "label_start_len": int(decoded_lens[batch_idx]),
+                        "active_table_version": int(self._cache_version),
+                        "shadow_draft_tokens": [
+                            int(token) for token in shadow_draft
+                        ],
+                        "shadow_accept_len": 0,
+                        "observed_future_tokens": [],
+                    })
+            record_hspec_s9_shadow_events(s9_events)
+
         selector_cpu_t1 = _now_ns() if selector_timing_enabled else 0
         selector_total_t1 = _now_ns() if selector_timing_enabled else 0
         margin_sum = 0.0
@@ -4347,6 +4861,7 @@ class HSpecProposer(Proposer):
                 "project_submit_ms": _ns_to_ms(t1_proj - t0_proj),
                 "match_submit_ms": _ns_to_ms(t1_sim - t0_sim),
                 "d2h_sync_ms": _ns_to_ms(t1_copy - t0_copy),
+                "shadow_trace_d2h_ms": float(s9_trace_d2h_ms),
                 "cpu_retrieve_ms": _ns_to_ms(selector_cpu_t1 - selector_cpu_t0),
                 "total_ms": _ns_to_ms(selector_total_t1 - selector_total_t0),
             }
@@ -4361,6 +4876,56 @@ class HSpecProposer(Proposer):
                 timings=selector_timings,
             )
         )
+        if self._s9_shadow_enabled and selector_timing_enabled:
+            timing_sequence = self._s9_timing_sequence
+            self._s9_timing_sequence += 1
+            if timing_sequence % HSPEC_S9_TIMING_SAMPLE_EVERY == 0:
+                record_hspec_s9_shadow_events([{
+                    "event": "batch_timing",
+                    "timing_sequence": int(timing_sequence),
+                    "active_table_version": int(self._cache_version),
+                    "cache_generation": int(self._cache_generation),
+                    "active_rows": int(len(active_batch_indices)),
+                    "padded_entries": int(keys_batch.shape[1]),
+                    "components": int(keys_batch.shape[2]),
+                    "actual_entries_min": int(min(
+                        cached.n_entries for cached in active_cached_tables
+                    )),
+                    "actual_entries_max": int(max(
+                        cached.n_entries for cached in active_cached_tables
+                    )),
+                    "actual_entries_sum": int(sum(
+                        cached.n_entries for cached in active_cached_tables
+                    )),
+                    "raw_gate_hits": int(np.count_nonzero(raw_gate_hits)),
+                    "r1_selected_count": int(np.count_nonzero(
+                        raw_gate_hits & (shadow_idxs_cpu >= 0)
+                    )),
+                    "r1_divergence_count": int(np.count_nonzero(
+                        raw_gate_hits
+                        & (shadow_idxs_cpu >= 0)
+                        & (
+                            shadow_idxs_cpu
+                            != np.asarray(idxs_cpu, dtype=np.int64)
+                        )
+                    )),
+                    "r1_rank_one_based_sum": int(np.sum(
+                        shadow_rank_cpu[
+                            raw_gate_hits & (shadow_idxs_cpu >= 0)
+                        ].astype(np.int64) + 1
+                    )),
+                    "r1_suffix_sum": int(np.sum(
+                        selected_suffix_cpu[
+                            raw_gate_hits & (shadow_idxs_cpu >= 0)
+                        ].astype(np.int64)
+                    )),
+                    "selector_timings_ms": {
+                        key: float(value)
+                        for key, value in selector_timings.items()
+                    },
+                    "shadow_lifecycle_ms": float(s9_lifecycle_ms),
+                    "selection_group_recorded": bool(s9_record_group),
+                }])
 
         self._maybe_log_metrics()
 
@@ -4546,6 +5111,7 @@ class HSpecProposer(Proposer):
         accepted_prefix_lengths: List[int],
         drafted_lengths: Optional[List[int]] = None,
         emitted_token_lengths: Optional[List[int]] = None,
+        emitted_token_ids: Optional[List[List[int]]] = None,
     ) -> tuple[int, int]:
         """Consume true draft-prefix acceptance outcomes for HSpec studies.
 
@@ -4574,6 +5140,12 @@ class HSpecProposer(Proposer):
                 if emitted_token_lengths is not None
                 and outcome_idx < len(emitted_token_lengths)
                 else 0
+            )
+            emitted_ids = (
+                [int(token) for token in emitted_token_ids[outcome_idx]]
+                if emitted_token_ids is not None
+                and outcome_idx < len(emitted_token_ids)
+                else []
             )
             if prompt_id:
                 self._update_prompt_window_after_verification(
@@ -4640,6 +5212,31 @@ class HSpecProposer(Proposer):
                             observed_drafted_len != expected_drafted_len
                         ),
                     }])
+            if getattr(self, "_s9_shadow_enabled", False):
+                trace_query_id = meta.get("s9_shadow_query_id")
+                if trace_query_id is not None:
+                    record_hspec_s9_shadow_events([{
+                        "event": "verification",
+                        "query_id": str(trace_query_id),
+                        "request_id": str(rid),
+                        "prompt_id": str(prompt_id),
+                        "decoded_len": int(
+                            meta.get("decoded_len_at_match", -1)
+                        ),
+                        "active_table_version": int(
+                            meta.get("active_table_version", -1)
+                        ),
+                        "baseline_accept_len": int(apl),
+                        "baseline_drafted_len": int(expected_drafted_len),
+                        "observed_drafted_len": int(observed_drafted_len),
+                        "emitted_token_len": int(emitted_tokens),
+                        "emitted_token_ids_sha256": hspec_s9_token_hash(
+                            emitted_ids
+                        ),
+                        "drafted_length_mismatch": bool(
+                            observed_drafted_len != expected_drafted_len
+                        ),
+                    }])
         return (accept_advan_count, reject_advan_count)
 
     def update_entry_verification_outcomes(
@@ -4664,6 +5261,15 @@ class HSpecProposer(Proposer):
                         "request_id": str(req_id),
                         "reason": str(reason),
                     }])
+            if getattr(self, "_s9_shadow_enabled", False):
+                trace_query_id = meta.get("s9_shadow_query_id")
+                if trace_query_id is not None:
+                    record_hspec_s9_shadow_events([{
+                        "event": "verification_cancellation",
+                        "query_id": str(trace_query_id),
+                        "request_id": str(req_id),
+                        "reason": str(reason),
+                    }])
             self._record_closed_selector_metrics(
                 self._selector_metric_tracker.record_cancellation(
                     int(meta.get("metric_window_id", -1))
@@ -4678,6 +5284,12 @@ class HSpecProposer(Proposer):
 
     def clear_request(self, req_id: str):
         """Clear per-request state on completion."""
+        if getattr(self, "_s9_shadow_enabled", False):
+            self._s9_advance_request(
+                req_id,
+                (),
+                finish_reason="request_finished",
+            )
         self._cancel_pending_request(
             req_id,
             reason="request_finished_before_verification",
@@ -4696,6 +5308,15 @@ class HSpecProposer(Proposer):
                 req_id,
                 reason=normalized_reason,
             ))
+
+        if getattr(self, "_s9_shadow_enabled", False):
+            for req_id in tuple(self._s9_shadow_probes):
+                self._s9_advance_request(
+                    req_id,
+                    (),
+                    finish_reason=str(normalized_reason),
+                )
+            flush_hspec_s9_shadow(str(normalized_reason))
 
         # LLM.generate() has returned, so no request-local decode state may
         # cross this boundary even when a final scheduler cleanup callback was
