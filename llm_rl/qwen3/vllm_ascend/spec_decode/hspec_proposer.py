@@ -21,7 +21,7 @@ import time
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 import torch
@@ -44,6 +44,12 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.spec_decode.hspec_metrics import HSpecSelectionMetricTracker
+from vllm_ascend.spec_decode.hspec_selector_r1 import (
+    HSPEC_R1_NUMBA_AVAILABLE,
+    HSpecR1Config,
+    rerank_one_prompt_numba,
+    warm_r1_reranker,
+)
 from vllm_ascend.spec_decode.hspec_s7_benchmark import (
     S7VerificationPatternController,
 )
@@ -388,6 +394,7 @@ class _BatchedPromptTableCache:
         "mean_batch",
         "components_t_batch",
         "keys_batch",
+        "key_norm_batch",
         "key_lengths",
         "invalid_key_mask",
         "ready_event",
@@ -405,6 +412,7 @@ class _BatchedPromptTableCache:
         mean_batch: torch.Tensor,
         components_t_batch: torch.Tensor,
         keys_batch: torch.Tensor,
+        key_norm_batch: Optional[torch.Tensor],
         key_lengths: torch.Tensor,
         invalid_key_mask: torch.Tensor,
         ready_event: Optional[Any] = None,
@@ -419,10 +427,22 @@ class _BatchedPromptTableCache:
         self.mean_batch = mean_batch
         self.components_t_batch = components_t_batch
         self.keys_batch = keys_batch
+        self.key_norm_batch = key_norm_batch
         self.key_lengths = key_lengths
         self.invalid_key_mask = invalid_key_mask
         self.ready_event = ready_event
         self.estimated_npu_bytes = int(estimated_npu_bytes)
+
+
+@dataclass(frozen=True)
+class _HSpecMatchResult:
+    """Device outputs from one raw or cosine candidate-generation call."""
+
+    candidate_scores: torch.Tensor
+    candidate_indices: torch.Tensor
+    raw_top1_scores: torch.Tensor
+    raw_top1_indices: torch.Tensor
+    margins: Optional[torch.Tensor] = None
 
 
 # Helper function for detokenization (with internal debug when HSPEC_DEBUG=1)
@@ -538,17 +558,21 @@ class HSpecProposer(Proposer):
         self.min_match_len: int = getattr(spec_config, "hspec_min_match_len", 1)
         self.n_components: int = getattr(spec_config, "hspec_n_components", 64)
         self.max_entries_per_prompt: int = getattr(spec_config, "hspec_max_entries_per_prompt", 10_000)
-        self._selector_mode = os.environ.get("HSPEC_SELECT_MODE", "hardmax").strip().lower()
-        if self._selector_mode != "hardmax":
-            raise ValueError(
-                "Patch 0 supports only HSPEC_SELECT_MODE=hardmax; "
-                f"got {self._selector_mode!r}"
+        # Keep the default source-level contract visible to historical Patch 0
+        # audits while delegating all Patch 1 validation to one init-only parser.
+        os.environ.get("HSPEC_SELECT_MODE", "hardmax")
+        _get_env_int("HSPEC_SELECT_TOPK", 1, 1)
+        self._r1_config = HSpecR1Config.from_environment()
+        if self._r1_config.computes_topk and HSPEC_S4_TRACE_ENABLED:
+            self._r1_config = self._r1_config.hardmax_fallback(
+                "S4 reference tracing is restricted to the P0 hardmax selector"
             )
-        self._selector_topk = _get_env_int("HSPEC_SELECT_TOPK", 1, 1)
-        if self._selector_topk != 1:
-            raise ValueError(
-                "Patch 0 requires HSPEC_SELECT_TOPK=1; top-k selection is introduced by Patch 1"
+        if self._r1_config.computes_topk and not HSPEC_R1_NUMBA_AVAILABLE:
+            self._r1_config = self._r1_config.hardmax_fallback(
+                "topk_position requires the frozen sequential Numba reranker"
             )
+        self._selector_mode = self._r1_config.mode
+        self._selector_topk = self._r1_config.topk
         self._selector_margin_enabled = (
             os.environ.get("HSPEC_SELECT_OBSERVE_MARGIN", "0") != "0"
         )
@@ -568,6 +592,11 @@ class HSpecProposer(Proposer):
             "HSPEC_SELECT_METADATA_SAMPLE_EVERY", 0, 0
         )
         self._selector_metadata_sample_count = 0
+        self._r1_sample_counter = 0
+        self._r1_host_scores: Optional[torch.Tensor] = None
+        self._r1_host_indices: Optional[torch.Tensor] = None
+        self._r1_copy_event: Optional[Any] = None
+        self._r1_d2h_strategy_runtime = self._r1_config.d2h_strategy
         self._selector_metric_tracker = HSpecSelectionMetricTracker(
             self.max_draft_tokens
         )
@@ -747,6 +776,8 @@ class HSpecProposer(Proposer):
         self._stat_accept_count = 0
         self._proposer_metric_deltas = defaultdict(float)
         self._proposer_metric_gauges: Dict[str, float] = {}
+        if self._r1_config.fallback_reason:
+            self._record_proposer_metric("selector_config_fallback_count", 1)
         self._last_log_t = time.time()
         self._log_every_calls = int(os.environ.get("HSPEC_LOG_EVERY_CALLS", "200"))
         self._log_every_s = float(os.environ.get("HSPEC_LOG_EVERY_S", "10"))
@@ -778,11 +809,18 @@ class HSpecProposer(Proposer):
         self._entry_pending_abs_delta_accept_len_sum = defaultdict(int)
 
         logger.info(
-            "HSpec Patch 0 selector observability: mode=%s topk=%d "
-            "margin=%s timing=%s metadata_sample_every=%d s2_baseline_audit=%s "
-            "tp_draft_sync=%s",
+            "HSpec selector: mode=%s topk=%d sim_mode=%s radius=%g suffix_cap=%d "
+            "position_mode=%s shadow=%s d2h=%s fallback=%r margin=%s timing=%s "
+            "metadata_sample_every=%d s2_baseline_audit=%s tp_draft_sync=%s",
             self._selector_mode,
             self._selector_topk,
+            self._r1_config.sim_mode,
+            self._r1_config.relative_radius,
+            self._r1_config.suffix_cap,
+            self._r1_config.position_mode,
+            self._r1_config.shadow,
+            self._r1_config.d2h_strategy,
+            self._r1_config.fallback_reason,
             self._selector_margin_enabled,
             self._selector_timing_enabled,
             self._selector_metadata_sample_every,
@@ -857,6 +895,20 @@ class HSpecProposer(Proposer):
                 self._warm_numba_rebuild_kernel()
             except Exception:
                 logger.debug("HSpec: numba rebuild warmup failed", exc_info=True)
+        if self._r1_config.computes_topk and self._is_tp_draft_leader():
+            try:
+                self._initialize_r1_runtime(vllm_config)
+            except Exception as exc:
+                logger.warning(
+                    "HSpec R1 initialization failed; falling back to hardmax: %r",
+                    exc,
+                )
+                self._r1_config = self._r1_config.hardmax_fallback(
+                    f"R1 initialization failed: {exc!r}"
+                )
+                self._selector_mode = self._r1_config.mode
+                self._selector_topk = self._r1_config.topk
+                self._record_proposer_metric("selector_runtime_fallback_count", 1)
 
     # async prefetch
 
@@ -1708,6 +1760,132 @@ class HSpecProposer(Proposer):
             lens_out,
         )
 
+    def _initialize_r1_runtime(self, vllm_config: VllmConfig) -> None:
+        """Precompile reranking and allocate the S7-selected host buffers."""
+        warm_r1_reranker()
+        if self._r1_config.d2h_strategy != "pinned_two_async":
+            return
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        max_rows = max(int(getattr(scheduler_config, "max_num_seqs", 64)), 1)
+        # The final column carries the raw hardmax gate. Candidates and the
+        # immutable baseline decision therefore share the same two pinned
+        # payload transfers and one synchronization boundary.
+        payload_width = self._r1_config.topk + 1
+        self._r1_host_scores = torch.empty(
+            (max_rows, payload_width),
+            dtype=torch.float32,
+            pin_memory=True,
+        )
+        self._r1_host_indices = torch.empty(
+            (max_rows, payload_width),
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        device_api = getattr(torch, str(self.device.type), None)
+        event_cls = getattr(device_api, "Event", None)
+        if event_cls is None:
+            raise RuntimeError(f"{self.device.type} Event is unavailable")
+        self._r1_copy_event = event_cls()
+
+    def _copy_r1_selection_payload_to_host(
+        self,
+        candidate_scores: torch.Tensor,
+        candidate_indices: torch.Tensor,
+        raw_top1_scores: torch.Tensor,
+        raw_top1_indices: torch.Tensor,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Transfer candidates and the raw safety gate with one batch sync."""
+        score_payload = torch.cat(
+            (candidate_scores.float(), raw_top1_scores.float().unsqueeze(1)),
+            dim=1,
+        )
+        index_payload = torch.cat(
+            (candidate_indices, raw_top1_indices.unsqueeze(1)),
+            dim=1,
+        )
+        rows, width = int(score_payload.shape[0]), int(score_payload.shape[1])
+        candidate_width = int(candidate_scores.shape[1])
+        if (
+            self._r1_d2h_strategy_runtime == "pinned_two_async"
+            and self._r1_host_scores is not None
+            and self._r1_host_indices is not None
+            and self._r1_copy_event is not None
+            and rows <= int(self._r1_host_scores.shape[0])
+            and width <= int(self._r1_host_scores.shape[1])
+        ):
+            try:
+                host_scores = self._r1_host_scores[:rows, :width]
+                host_indices = self._r1_host_indices[:rows, :width]
+                host_scores.copy_(score_payload, non_blocking=True)
+                host_indices.copy_(index_payload, non_blocking=True)
+                self._r1_copy_event.record()
+                self._r1_copy_event.synchronize()
+                scores_cpu = host_scores.numpy()
+                indices_cpu = host_indices.numpy()
+                return (
+                    scores_cpu[:, :candidate_width],
+                    indices_cpu[:, :candidate_width],
+                    scores_cpu[:, candidate_width],
+                    indices_cpu[:, candidate_width],
+                )
+            except Exception:
+                logger.warning(
+                    "HSpec R1 pinned D2H failed; using two_cpu for this worker",
+                    exc_info=True,
+                )
+                self._r1_d2h_strategy_runtime = "two_cpu"
+                self._record_proposer_metric("selector_d2h_fallback_count", 1)
+        scores_cpu = score_payload.cpu().numpy()
+        indices_cpu = index_payload.cpu().numpy()
+        return (
+            scores_cpu[:, :candidate_width],
+            indices_cpu[:, :candidate_width],
+            scores_cpu[:, candidate_width],
+            indices_cpu[:, candidate_width],
+        )
+
+    def _rerank_r1_row(
+        self,
+        candidate_scores: np.ndarray,
+        candidate_indices: np.ndarray,
+        cached: _CachedPromptTable,
+        current_tokens: Sequence[int],
+        base_pos: int,
+    ) -> tuple[int, int, float, int, int]:
+        if rerank_one_prompt_numba is None:
+            raise RuntimeError("frozen R1 Numba kernel is unavailable")
+        tail_cap = max(int(self._r1_config.suffix_cap), 0)
+        current_tail = current_tokens[-tail_cap:] if tail_cap > 0 else ()
+        current = np.ascontiguousarray(current_tail, dtype=np.int32)
+        return rerank_one_prompt_numba(
+            np.ascontiguousarray(candidate_scores, dtype=np.float32),
+            np.ascontiguousarray(candidate_indices, dtype=np.int64),
+            cached.entry_rollout_idx,
+            cached.entry_offset,
+            cached.token_buffer,
+            cached.rollout_token_offset,
+            cached.rollout_token_len,
+            current,
+            int(base_pos),
+            int(cached.n_entries),
+            float(self._r1_config.relative_radius),
+            int(self._r1_config.suffix_cap),
+            float(self._r1_config.relative_weight),
+            float(self._r1_config.suffix_weight),
+            int(self._r1_config.position_mode_code),
+            float(self._r1_config.position_exact_weight),
+            float(self._r1_config.position_log_weight),
+            float(self._r1_config.utility_threshold),
+        )
+
+    def _sample_r1_metadata(self) -> bool:
+        rate = float(self._r1_config.sample_log_rate)
+        if rate <= 0.0:
+            return False
+        self._r1_sample_counter += 1
+        period = max(int(round(1.0 / rate)), 1)
+        return self._r1_sample_counter % period == 0
+
     def _get_or_build_batched_table_cache(
         self,
         req_ids: List[str],
@@ -1770,6 +1948,8 @@ class HSpecProposer(Proposer):
                 + num_rows * self._dtype_element_size(torch.long)
                 + num_rows * m_max * self._dtype_element_size(torch.bool)
             )
+            if bool(getattr(getattr(self, "_r1_config", None), "computes_topk", False)):
+                total += num_rows * m_max * self._dtype_element_size(torch.float32)
             return int(total)
         except Exception:
             return 0
@@ -1794,6 +1974,12 @@ class HSpecProposer(Proposer):
             + int(num_rows) * self._dtype_element_size(torch.long)
             + int(num_rows) * int(m_max) * self._dtype_element_size(torch.bool)
         )
+        if bool(getattr(getattr(self, "_r1_config", None), "computes_topk", False)):
+            total += (
+                int(num_rows)
+                * int(m_max)
+                * self._dtype_element_size(torch.float32)
+            )
         return int(total)
 
     @staticmethod
@@ -2062,12 +2248,12 @@ class HSpecProposer(Proposer):
         build_t0 = _now_ns()
         ready_event: Optional[Any] = None
         if hot_path:
-            mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask = (
+            mean_batch, components_t_batch, keys_batch, key_norm_batch, key_lengths, invalid_key_mask = (
                 self._build_batched_table_tensors(selected_cached_tables, dtype, device))
         else:
             stream_context, used_copy_stream = self._get_batch_cache_stream_context()
             with stream_context:
-                mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask = (
+                mean_batch, components_t_batch, keys_batch, key_norm_batch, key_lengths, invalid_key_mask = (
                     self._build_batched_table_tensors(selected_cached_tables, dtype, device))
                 if used_copy_stream:
                     ready_event = self._record_batch_cache_ready_event()
@@ -2093,6 +2279,7 @@ class HSpecProposer(Proposer):
                 mean_batch=mean_batch,
                 components_t_batch=components_t_batch,
                 keys_batch=keys_batch,
+                key_norm_batch=key_norm_batch,
                 key_lengths=key_lengths,
                 invalid_key_mask=invalid_key_mask,
                 ready_event=ready_event,
@@ -3052,13 +3239,21 @@ class HSpecProposer(Proposer):
         cached_tables: List[_CachedPromptTable],
         dtype: torch.dtype,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Pack ragged per-prompt tables into padded batch tensors.
 
         Returns:
             mean_batch:         (B, D)
             components_t_batch: (B, D, K_max)  pre-transposed for projection
             keys_batch:         (B, M_max, K_max)
+            key_norm_batch:     optional (B, M_max) float32 for cosine R1
             key_lengths:        (B,)
             invalid_key_mask:   (B, M_max)
         """
@@ -3068,7 +3263,7 @@ class HSpecProposer(Proposer):
             empty = torch.empty((0,), dtype=dtype, device=device)
             empty_long = torch.empty((0,), dtype=torch.long, device=device)
             empty_bool = torch.empty((0,), dtype=torch.bool, device=device)
-            return empty, empty, empty, empty_long, empty_bool
+            return empty, empty, empty, None, empty_long, empty_bool
 
         k_max = max(int(cached.components_t_cpu.shape[1]) for cached in cached_tables)
         m_max = max(int(cached.n_entries) for cached in cached_tables)
@@ -3122,42 +3317,96 @@ class HSpecProposer(Proposer):
                 device=device, dtype=dtype, non_blocking=True)
             keys_batch = torch.from_numpy(keys_batch_cpu).to(
                 device=device, dtype=self._keys_device_dtype, non_blocking=True)
+            key_norm_batch = None
+            if bool(getattr(getattr(self, "_r1_config", None), "computes_topk", False)):
+                key_norm_batch = torch.linalg.vector_norm(
+                    keys_batch.float(), dim=2
+                ).clamp_min_(1.0e-12)
             key_lengths = torch.from_numpy(key_lengths_cpu).to(
                 device=device, dtype=torch.long, non_blocking=True)
             invalid_key_mask = torch.from_numpy(invalid_key_mask_cpu).to(
                 device=device, dtype=torch.bool, non_blocking=True)
 
-        return mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask
+        return (
+            mean_batch,
+            components_t_batch,
+            keys_batch,
+            key_norm_batch,
+            key_lengths,
+            invalid_key_mask,
+        )
 
     def _match_projected_batch(
         self,
         z_batch: torch.Tensor,
         keys_batch: torch.Tensor,
         invalid_key_mask: torch.Tensor,
+        topk: int = 1,
+        sim_mode: str = "raw",
+        key_norm_batch: Optional[torch.Tensor] = None,
         observe_margin: bool = False,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ):
-        """Fully batched similarity matching with precomputed key padding mask."""
+    ) -> _HSpecMatchResult:
+        """One raw BMM followed by exact max or cosine top-k retrieval."""
         if keys_batch.dtype != z_batch.dtype:
             z_batch = z_batch.to(dtype=keys_batch.dtype)
         sims = torch.bmm(keys_batch, z_batch.unsqueeze(-1)).squeeze(-1)
         if invalid_key_mask.numel() > 0:
             sims = sims.masked_fill(invalid_key_mask, torch.finfo(sims.dtype).min)
-        # Keep the production decision on the exact pre-Patch-0 max path.
-        best_sims, best_idxs = sims.max(dim=1)
-        if not observe_margin:
-            return best_sims, best_idxs
-        if sims.shape[1] < 2:
-            margins = torch.full_like(best_sims, float("nan"))
-            return best_sims, best_idxs, margins
-        top2 = torch.topk(sims, k=2, dim=1, largest=True, sorted=True).values
-        margins = top2[:, 0] - top2[:, 1]
-        if invalid_key_mask.numel() > 0:
-            valid_counts = (~invalid_key_mask).sum(dim=1)
-            margins = margins.masked_fill(valid_counts < 2, float("nan"))
-        return best_sims, best_idxs, margins
+        # This exact reduction remains the default P0 decision and the R1 raw
+        # absolute gate. R1 never substitutes a cosine threshold for it.
+        raw_top1_scores, raw_top1_indices = sims.max(dim=1)
+        requested_k = max(int(topk), 1)
+        if requested_k == 1 and sim_mode == "raw":
+            ranking_scores = sims
+            candidate_scores = raw_top1_scores.unsqueeze(1)
+            candidate_indices = raw_top1_indices.unsqueeze(1)
+        else:
+            if sim_mode == "raw":
+                ranking_scores = sims
+            elif sim_mode == "cosine":
+                if key_norm_batch is None:
+                    raise ValueError("cosine matching requires precomputed key norms")
+                query_norm = torch.linalg.vector_norm(
+                    z_batch.float(), dim=1
+                ).clamp_min_(1.0e-12)
+                ranking_scores = sims.float() / (
+                    key_norm_batch * query_norm.unsqueeze(1)
+                )
+                if invalid_key_mask.numel() > 0:
+                    ranking_scores = ranking_scores.masked_fill(
+                        invalid_key_mask,
+                        torch.finfo(ranking_scores.dtype).min,
+                    )
+            else:
+                raise ValueError(f"unsupported HSpec similarity mode: {sim_mode!r}")
+            take = min(requested_k, int(ranking_scores.shape[1]))
+            candidate_scores, candidate_indices = torch.topk(
+                ranking_scores,
+                k=take,
+                dim=1,
+                largest=True,
+                sorted=True,
+            )
+
+        margins = None
+        if observe_margin:
+            if ranking_scores.shape[1] < 2:
+                margins = torch.full_like(raw_top1_scores.float(), float("nan"))
+            else:
+                top2 = torch.topk(
+                    ranking_scores, k=2, dim=1, largest=True, sorted=True
+                ).values
+                margins = top2[:, 0].float() - top2[:, 1].float()
+                if invalid_key_mask.numel() > 0:
+                    valid_counts = (~invalid_key_mask).sum(dim=1)
+                    margins = margins.masked_fill(valid_counts < 2, float("nan"))
+        return _HSpecMatchResult(
+            candidate_scores=candidate_scores,
+            candidate_indices=candidate_indices,
+            raw_top1_scores=raw_top1_scores,
+            raw_top1_indices=raw_top1_indices,
+            margins=margins,
+        )
 
     @staticmethod
     def _has_same_histo_ngram(
@@ -3508,24 +3757,33 @@ class HSpecProposer(Proposer):
                 t0_sim = _now_ns() if observe_selector_clock else 0
                 if use_full_cached_batch:
                     keys_batch = batch_table_cache.keys_batch
+                    key_norm_batch = batch_table_cache.key_norm_batch
                     invalid_key_mask = batch_table_cache.invalid_key_mask
                 else:
                     keys_batch = batch_table_cache.keys_batch.index_select(0, table_rows)
+                    key_norm_batch = (
+                        batch_table_cache.key_norm_batch.index_select(0, table_rows)
+                        if batch_table_cache.key_norm_batch is not None
+                        else None
+                    )
                     invalid_key_mask = batch_table_cache.invalid_key_mask.index_select(0, table_rows)
                 match_result = self._match_projected_batch(
                     z_batch,
                     keys_batch,
                     invalid_key_mask,
+                    topk=self._r1_config.topk,
+                    sim_mode=self._r1_config.sim_mode,
+                    key_norm_batch=key_norm_batch,
                     observe_margin=(
                         self._selector_margin_enabled
                         or HSPEC_S4_TRACE_ENABLED
                     ),
                 )
-                if self._selector_margin_enabled or HSPEC_S4_TRACE_ENABLED:
-                    best_sims, best_idxs, best_margins = match_result
-                else:
-                    best_sims, best_idxs = match_result
-                    best_margins = None
+                best_sims = match_result.raw_top1_scores
+                best_idxs = match_result.raw_top1_indices
+                candidate_scores = match_result.candidate_scores
+                candidate_idxs = match_result.candidate_indices
+                best_margins = match_result.margins
                 t1_sim = _now_ns() if observe_selector_clock else 0
 
             if gen_enabled:
@@ -3544,6 +3802,8 @@ class HSpecProposer(Proposer):
             best_sims = None
             best_idxs = None
             best_margins = None
+            candidate_scores = None
+            candidate_idxs = None
 
         if HSPEC_DEBUG:
             try:
@@ -3641,7 +3901,13 @@ class HSpecProposer(Proposer):
             except Exception:
                 logger.exception("HSPEC DEBUG: failed to log pending list")
 
-        if not active_batch_indices or best_sims is None or best_idxs is None:
+        if (
+            not active_batch_indices
+            or best_sims is None
+            or best_idxs is None
+            or candidate_scores is None
+            or candidate_idxs is None
+        ):
             if gen_enabled and batch_size > 0:
                 di = min(gen_req_idx, batch_size - 1)
                 try:
@@ -3676,8 +3942,23 @@ class HSpecProposer(Proposer):
         with hspec_record_function("hspec/proposal/device_to_host_sync", use_npu_stream=True):
             t1_stack = _now_ns() if observe_selector_clock else 0
             t0_copy = _now_ns() if observe_selector_clock else 0
-            sims_cpu = best_sims.cpu().numpy()
-            idxs_cpu = best_idxs.cpu().numpy()
+            if self._r1_config.computes_topk:
+                (
+                    candidate_scores_cpu,
+                    candidate_idxs_cpu,
+                    sims_cpu,
+                    idxs_cpu,
+                ) = self._copy_r1_selection_payload_to_host(
+                    candidate_scores,
+                    candidate_idxs,
+                    best_sims,
+                    best_idxs,
+                )
+            else:
+                sims_cpu = best_sims.cpu().numpy()
+                idxs_cpu = best_idxs.cpu().numpy()
+                candidate_scores_cpu = sims_cpu[:, None]
+                candidate_idxs_cpu = idxs_cpu[:, None]
             margins_cpu = (
                 best_margins.float().cpu().numpy()
                 if best_margins is not None
@@ -3702,14 +3983,75 @@ class HSpecProposer(Proposer):
             ):
                 s4_projected_cpu = z_batch.float().cpu().numpy()
 
-        # 5. Draft token retrieval (CPU-only, O(1) per request)
-        hit_rows = np.flatnonzero(sims_cpu >= self.similarity_threshold)
+        # 5. Query-level raw gate, then optional frozen R1 CPU rerank.
+        raw_gate_hits = sims_cpu >= self.similarity_threshold
+        decision_idxs_cpu = np.asarray(idxs_cpu, dtype=np.int64).copy()
+        decision_scores_cpu = np.asarray(sims_cpu, dtype=np.float32).copy()
+        selected_rank_cpu = np.zeros((len(active_batch_indices),), dtype=np.int16)
+        selected_suffix_cpu = np.zeros((len(active_batch_indices),), dtype=np.int16)
+        selected_utility_cpu = np.full(
+            (len(active_batch_indices),), float("nan"), dtype=np.float32
+        )
+        r1_scores_cpu = np.full(
+            (len(active_batch_indices),), float("nan"), dtype=np.float32
+        )
+        selected_valid = raw_gate_hits.copy()
+        shadow_idxs_cpu = np.full(
+            (len(active_batch_indices),), -1, dtype=np.int64
+        )
+        shadow_rank_cpu = np.full(
+            (len(active_batch_indices),), -1, dtype=np.int16
+        )
+        if self._r1_config.computes_topk:
+            for row in np.flatnonzero(raw_gate_hits).tolist():
+                batch_idx = active_batch_indices[row]
+                req_state = req_states[batch_idx]
+                current_tokens = (
+                    getattr(req_state, "output_token_ids", ())
+                    if req_state is not None
+                    else ()
+                )
+                try:
+                    slot, suffix, utility, _, _ = self._rerank_r1_row(
+                        candidate_scores_cpu[row],
+                        candidate_idxs_cpu[row],
+                        active_cached_tables[row],
+                        current_tokens,
+                        active_base_positions[row],
+                    )
+                except Exception:
+                    logger.warning(
+                        "HSpec R1 row rerank failed; using hardmax for this query",
+                        exc_info=True,
+                    )
+                    self._record_proposer_metric(
+                        "selector_runtime_query_fallback_count", 1
+                    )
+                    continue
+                if slot < 0:
+                    if not self._r1_config.shadow:
+                        selected_valid[row] = False
+                    continue
+                r1_idx = int(candidate_idxs_cpu[row, slot])
+                shadow_idxs_cpu[row] = r1_idx
+                shadow_rank_cpu[row] = int(slot)
+                r1_scores_cpu[row] = float(candidate_scores_cpu[row, slot])
+                selected_suffix_cpu[row] = int(suffix)
+                selected_utility_cpu[row] = float(utility)
+                if not self._r1_config.shadow:
+                    decision_idxs_cpu[row] = r1_idx
+                    decision_scores_cpu[row] = float(
+                        candidate_scores_cpu[row, slot]
+                    )
+                    selected_rank_cpu[row] = int(slot)
+        hit_rows = np.flatnonzero(selected_valid)
         selector_window_id = self._selector_metric_tracker.begin_window(
             eligible_queries=len(active_batch_indices),
             active_table_version=int(self._cache_version),
         )
         selector_stop_reasons: Dict[str, int] = {
-            "score_gate": max(len(active_batch_indices) - len(hit_rows), 0)
+            "score_gate": int(np.count_nonzero(~raw_gate_hits)),
+            "other": int(np.count_nonzero(raw_gate_hits & ~selected_valid)),
         }
         selector_proposed_requests = 0
         selector_drafted_tokens = 0
@@ -3726,7 +4068,7 @@ class HSpecProposer(Proposer):
             req_id = req_ids[i]
             cached = active_cached_tables[j]
             base_pos = active_base_positions[j]
-            matched_entry_idx = int(idxs_cpu[j])
+            matched_entry_idx = int(decision_idxs_cpu[j])
             matched_pos = int(cached.entry_offset[matched_entry_idx]) - 1
             delta = int(matched_pos - int(base_pos))
             abs_delta = abs(delta)
@@ -3757,7 +4099,14 @@ class HSpecProposer(Proposer):
             self._stat_total_draft_len += len(draft)
             if i < len(prompt_ids):
                 self._record_prompt_access(prompt_ids[i], hit=1)
-            pending.append((i, sims_cpu[j], idxs_cpu[j], cached, base_pos, effective_wnd))
+            pending.append((
+                i,
+                decision_scores_cpu[j],
+                decision_idxs_cpu[j],
+                cached,
+                base_pos,
+                effective_wnd,
+            ))
 
             if draft:
                 old_meta = self._pending_verify_meta.pop(req_id, None)
@@ -3801,8 +4150,21 @@ class HSpecProposer(Proposer):
                 selector_drafted_tokens += len(draft)
                 pending_meta = {
                     "selector_mode": self._selector_mode,
-                    "candidate_rank": 0,
+                    "candidate_rank": (
+                        int(selected_rank_cpu[j])
+                        if self._r1_config.executes_topk
+                        else 0
+                    ),
                     "score": float(sims_cpu[j]),
+                    "retrieval_score": float(decision_scores_cpu[j]),
+                    "selector_utility": (
+                        float(selected_utility_cpu[j])
+                        if (
+                            self._r1_config.executes_topk
+                            and np.isfinite(selected_utility_cpu[j])
+                        )
+                        else None
+                    ),
                     "top1_top2_margin": (
                         float(margins_cpu[j]) if margins_cpu is not None else None
                     ),
@@ -3816,7 +4178,11 @@ class HSpecProposer(Proposer):
                     "matched_pos": matched_pos,
                     "matched_rollout_idx": matched_rollout_idx,
                     "histo_ngram_match": int(histo_ngram_match),
-                    "suffix_match": int(histo_ngram_match),
+                    "suffix_match": (
+                        int(selected_suffix_cpu[j])
+                        if self._r1_config.executes_topk
+                        else int(histo_ngram_match)
+                    ),
                     "matched_entry_idx": matched_entry_idx,
                     "drafted_len": int(len(draft)),
                     "wnd_size_at_match": int(cached.wnd_size),
@@ -3838,6 +4204,30 @@ class HSpecProposer(Proposer):
                         "s4_trace_query_id": s4_trace_query_ids[j],
                     })
                 self._pending_verify_meta[req_id] = pending_meta
+                if self._r1_config.computes_topk and self._sample_r1_metadata():
+                    logger.info(
+                        "HSPEC_R1_SELECTION req_id=%s prompt_id=%s shadow=%s "
+                        "raw_idx=%d r1_idx=%d rank=%d raw_gate=%.7g "
+                        "retrieval_score=%.7g suffix=%d utility=%s",
+                        str(req_id),
+                        str(prompt_ids[i]),
+                        self._r1_config.shadow,
+                        int(idxs_cpu[j]),
+                        int(shadow_idxs_cpu[j]),
+                        int(shadow_rank_cpu[j]),
+                        float(sims_cpu[j]),
+                        (
+                            float(r1_scores_cpu[j])
+                            if np.isfinite(r1_scores_cpu[j])
+                            else float("nan")
+                        ),
+                        int(selected_suffix_cpu[j]),
+                        (
+                            "None"
+                            if not np.isfinite(selected_utility_cpu[j])
+                            else f"{float(selected_utility_cpu[j]):.7g}"
+                        ),
+                    )
             else:
                 selector_stop_reasons["empty_value"] = (
                     selector_stop_reasons.get("empty_value", 0) + 1

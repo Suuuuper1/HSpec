@@ -44,9 +44,18 @@ def _extract_method_from_source(
     raise AssertionError(f"Could not find {class_name}.{method_name}")
 
 
-def _extract_method(path: Path, class_name: str, method_name: str):
+def _extract_method(
+    path: Path,
+    class_name: str,
+    method_name: str,
+    extra_globals: Optional[dict] = None,
+):
     return _extract_method_from_source(
-        path.read_text(encoding="utf-8"), str(path), class_name, method_name
+        path.read_text(encoding="utf-8"),
+        str(path),
+        class_name,
+        method_name,
+        extra_globals=extra_globals,
     )
 
 
@@ -58,6 +67,7 @@ class TestHardmaxEquivalence(unittest.TestCase):
             PROJECT_ROOT / "vllm_ascend" / "spec_decode" / "hspec_proposer.py",
             "HSpecProposer",
             "_match_projected_batch",
+            extra_globals={"_HSpecMatchResult": SimpleNamespace},
         ))
 
     def test_default_and_observation_path_keep_exact_hardmax_output(self):
@@ -76,18 +86,24 @@ class TestHardmaxEquivalence(unittest.TestCase):
         expected_sims = sims.masked_fill(invalid, torch.finfo(sims.dtype).min)
         expected_values, expected_indices = expected_sims.max(dim=1)
 
-        values, indices = self.method(object(), z, keys, invalid)
-        self.assertTrue(torch.equal(values, expected_values))
-        self.assertTrue(torch.equal(indices, expected_indices))
+        result = self.method(object(), z, keys, invalid)
+        self.assertTrue(torch.equal(result.raw_top1_scores, expected_values))
+        self.assertTrue(torch.equal(result.raw_top1_indices, expected_indices))
+        self.assertTrue(
+            torch.equal(result.candidate_scores[:, 0], expected_values)
+        )
+        self.assertTrue(
+            torch.equal(result.candidate_indices[:, 0], expected_indices)
+        )
 
-        observed_values, observed_indices, observed_margins = self.method(
+        observed = self.method(
             object(), z, keys, invalid, observe_margin=True
         )
-        self.assertTrue(torch.equal(observed_values, expected_values))
-        self.assertTrue(torch.equal(observed_indices, expected_indices))
-        assert observed_margins is not None
-        self.assertTrue(torch.isnan(observed_margins[1]))
-        self.assertAlmostEqual(float(observed_margins[0]), 0.05, places=6)
+        self.assertTrue(torch.equal(observed.raw_top1_scores, expected_values))
+        self.assertTrue(torch.equal(observed.raw_top1_indices, expected_indices))
+        assert observed.margins is not None
+        self.assertTrue(torch.isnan(observed.margins[1]))
+        self.assertAlmostEqual(float(observed.margins[0]), 0.05, places=6)
 
     def test_frozen_s0_and_patch0_produce_identical_drafts(self):
         frozen_source = subprocess.run(
@@ -121,9 +137,11 @@ class TestHardmaxEquivalence(unittest.TestCase):
         frozen_scores, frozen_indices = frozen_method(
             object(), projected, keys, invalid
         )
-        patch0_scores, patch0_indices = self.method(
+        patch0 = self.method(
             object(), projected, keys, invalid
         )
+        patch0_scores = patch0.raw_top1_scores
+        patch0_indices = patch0.raw_top1_indices
         self.assertTrue(torch.equal(patch0_scores, frozen_scores))
         self.assertTrue(torch.equal(patch0_indices, frozen_indices))
 
@@ -138,13 +156,17 @@ class TestHardmaxEquivalence(unittest.TestCase):
 
     def test_topk_one_contract_is_the_default_signature(self):
         signature = inspect.signature(self.method)
+        self.assertEqual(signature.parameters["topk"].default, 1)
+        self.assertEqual(signature.parameters["sim_mode"].default, "raw")
         self.assertEqual(signature.parameters["observe_margin"].default, False)
         source = (
             PROJECT_ROOT / "vllm_ascend" / "spec_decode" / "hspec_proposer.py"
         ).read_text(encoding="utf-8")
         self.assertIn('os.environ.get("HSPEC_SELECT_MODE", "hardmax")', source)
         self.assertIn('_get_env_int("HSPEC_SELECT_TOPK", 1, 1)', source)
-        self.assertIn("best_sims, best_idxs = sims.max(dim=1)", source)
+        self.assertIn(
+            "raw_top1_scores, raw_top1_indices = sims.max(dim=1)", source
+        )
         tree = ast.parse(source)
         generate_method = None
         for node in ast.walk(tree):
