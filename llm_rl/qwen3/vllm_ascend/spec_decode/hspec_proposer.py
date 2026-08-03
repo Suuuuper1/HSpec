@@ -630,6 +630,10 @@ class HSpecProposer(Proposer):
         self._s9_shadow_probes: Dict[str, List[Dict[str, Any]]] = {}
         self._s9_match_batch_sequence = 0
         self._s9_timing_sequence = 0
+        # A batch_timing event cannot contain the cost of enqueueing itself.
+        # Carry that scalar into the next event; S9 freezes timing sampling to
+        # every batch, so this is a one-sample shift of the same distribution.
+        self._s9_previous_timing_emit_ms = 0.0
 
         self.hspec_tables: GlobalHSpecTableGroup = get_hspec_tables(
             similarity_threshold=self.similarity_threshold,
@@ -3793,6 +3797,8 @@ class HSpecProposer(Proposer):
             for req_state in req_states
         ]
         s9_lifecycle_ms = 0.0
+        s9_cancel_ms = 0.0
+        s9_pending_meta_ms = 0.0
         if self._s9_shadow_enabled:
             s9_lifecycle_t0 = _now_ns()
             for batch_idx, req_id in enumerate(req_ids):
@@ -4228,6 +4234,7 @@ class HSpecProposer(Proposer):
         raw_gate_hits = sims_cpu >= self.similarity_threshold
         decision_idxs_cpu = np.asarray(idxs_cpu, dtype=np.int64).copy()
         decision_scores_cpu = np.asarray(sims_cpu, dtype=np.float32).copy()
+        r1_cpu_t0 = _now_ns() if selector_timing_enabled else 0
         selected_rank_cpu = np.zeros((len(active_batch_indices),), dtype=np.int16)
         selected_suffix_cpu = np.zeros((len(active_batch_indices),), dtype=np.int16)
         selected_utility_cpu = np.full(
@@ -4284,13 +4291,18 @@ class HSpecProposer(Proposer):
                         candidate_scores_cpu[row, slot]
                     )
                     selected_rank_cpu[row] = int(slot)
+        r1_cpu_rerank_ms = (
+            _ns_to_ms(_now_ns() - r1_cpu_t0) if r1_cpu_t0 else 0.0
+        )
         s9_query_ids: Optional[List[str]] = None
         s9_primary_samples: Optional[List[bool]] = None
         s9_projected_cpu: Optional[np.ndarray] = None
         s9_record_group = False
         s9_trace_d2h_ms = 0.0
+        s9_identity_ms = 0.0
         s9_match_group_local_id: Optional[int] = None
         if self._s9_shadow_enabled:
+            s9_identity_t0 = _now_ns() if selector_timing_enabled else 0
             s9_query_ids = []
             s9_primary_samples = []
             for row, batch_idx in enumerate(active_batch_indices):
@@ -4329,6 +4341,12 @@ class HSpecProposer(Proposer):
                     s9_trace_d2h_ms = _ns_to_ms(
                         _now_ns() - s9_trace_d2h_t0
                     )
+            if s9_identity_t0:
+                s9_identity_ms = max(
+                    _ns_to_ms(_now_ns() - s9_identity_t0)
+                    - s9_trace_d2h_ms,
+                    0.0,
+                )
         hit_rows = np.flatnonzero(selected_valid)
         selector_window_id = self._selector_metric_tracker.begin_window(
             eligible_queries=len(active_batch_indices),
@@ -4408,12 +4426,19 @@ class HSpecProposer(Proposer):
                     if self._s9_shadow_enabled:
                         old_s9_query_id = old_meta.get("s9_shadow_query_id")
                         if old_s9_query_id is not None:
+                            s9_cancel_t0 = (
+                                _now_ns() if selector_timing_enabled else 0
+                            )
                             record_hspec_s9_shadow_events([{
                                 "event": "verification_cancellation",
                                 "query_id": str(old_s9_query_id),
                                 "request_id": str(req_id),
                                 "reason": "superseded_before_verification",
                             }])
+                            if s9_cancel_t0:
+                                s9_cancel_ms += _ns_to_ms(
+                                    _now_ns() - s9_cancel_t0
+                                )
                     self._record_closed_selector_metrics(
                         self._selector_metric_tracker.record_cancellation(
                             int(old_meta.get("metric_window_id", -1))
@@ -4499,12 +4524,19 @@ class HSpecProposer(Proposer):
                     })
                 if self._s9_shadow_enabled and s9_record_group:
                     assert s9_query_ids is not None
+                    s9_pending_meta_t0 = (
+                        _now_ns() if selector_timing_enabled else 0
+                    )
                     pending_meta.update({
                         "decoded_len_at_match": int(decoded_lens[i]),
                         "s9_label_start_len": int(decoded_lens[i]),
                         "active_table_version": int(self._cache_version),
                         "s9_shadow_query_id": str(s9_query_ids[j]),
                     })
+                    if s9_pending_meta_t0:
+                        s9_pending_meta_ms += _ns_to_ms(
+                            _now_ns() - s9_pending_meta_t0
+                        )
                 self._pending_verify_meta[req_id] = pending_meta
                 if self._r1_config.computes_topk and self._sample_r1_metadata():
                     logger.info(
@@ -4635,7 +4667,9 @@ class HSpecProposer(Proposer):
                 trace_events.append(event)
             record_hspec_s4_trace_events(trace_events)
 
+        s9_record_ms = 0.0
         if self._s9_shadow_enabled and s9_record_group:
+            s9_record_t0 = _now_ns() if selector_timing_enabled else 0
             assert s9_query_ids is not None
             assert s9_primary_samples is not None
             assert s9_match_group_local_id is not None
@@ -4846,6 +4880,8 @@ class HSpecProposer(Proposer):
                         "observed_future_tokens": [],
                     })
             record_hspec_s9_shadow_events(s9_events)
+            if s9_record_t0:
+                s9_record_ms = _ns_to_ms(_now_ns() - s9_record_t0)
 
         selector_cpu_t1 = _now_ns() if selector_timing_enabled else 0
         selector_total_t1 = _now_ns() if selector_timing_enabled else 0
@@ -4862,6 +4898,14 @@ class HSpecProposer(Proposer):
                 "match_submit_ms": _ns_to_ms(t1_sim - t0_sim),
                 "d2h_sync_ms": _ns_to_ms(t1_copy - t0_copy),
                 "shadow_trace_d2h_ms": float(s9_trace_d2h_ms),
+                "r1_cpu_rerank_ms": float(r1_cpu_rerank_ms),
+                "shadow_identity_ms": float(s9_identity_ms),
+                "shadow_cancel_ms": float(s9_cancel_ms),
+                "shadow_pending_meta_ms": float(s9_pending_meta_ms),
+                "shadow_record_ms": float(s9_record_ms),
+                "shadow_timing_emit_lagged_ms": float(
+                    self._s9_previous_timing_emit_ms
+                ),
                 "cpu_retrieve_ms": _ns_to_ms(selector_cpu_t1 - selector_cpu_t0),
                 "total_ms": _ns_to_ms(selector_total_t1 - selector_total_t0),
             }
@@ -4880,8 +4924,10 @@ class HSpecProposer(Proposer):
             timing_sequence = self._s9_timing_sequence
             self._s9_timing_sequence += 1
             if timing_sequence % HSPEC_S9_TIMING_SAMPLE_EVERY == 0:
+                s9_timing_emit_t0 = _now_ns()
                 record_hspec_s9_shadow_events([{
                     "event": "batch_timing",
+                    "timing_schema_version": 2,
                     "timing_sequence": int(timing_sequence),
                     "active_table_version": int(self._cache_version),
                     "cache_generation": int(self._cache_generation),
@@ -4926,6 +4972,9 @@ class HSpecProposer(Proposer):
                     "shadow_lifecycle_ms": float(s9_lifecycle_ms),
                     "selection_group_recorded": bool(s9_record_group),
                 }])
+                self._s9_previous_timing_emit_ms = _ns_to_ms(
+                    _now_ns() - s9_timing_emit_t0
+                )
 
         self._maybe_log_metrics()
 

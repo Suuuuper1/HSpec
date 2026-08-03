@@ -1,6 +1,7 @@
 import ast
 import importlib.util
 import json
+import math
 import os
 import sys
 import tempfile
@@ -380,6 +381,159 @@ class S9OfflineReplayTest(unittest.TestCase):
             self.assertEqual(replay["replayed_groups"], 1)
             self.assertEqual(replay["entry_errors"], 0)
             self.assertEqual(replay["score_errors"], 0)
+
+
+class S9IncrementTimingTest(unittest.TestCase):
+    @staticmethod
+    def _timing_event(**overrides):
+        values = {
+            "r1_cpu_rerank_ms": 0.10,
+            "shadow_identity_ms": 0.02,
+            "shadow_trace_d2h_ms": 0.0,
+            "shadow_cancel_ms": 0.0,
+            "shadow_pending_meta_ms": 0.01,
+            "shadow_record_ms": 0.03,
+            "shadow_timing_emit_lagged_ms": 0.01,
+            "total_ms": 4.50,
+        }
+        values.update(overrides.pop("selector_overrides", {}))
+        return {
+            "event": "batch_timing",
+            "timing_schema_version": 2,
+            "shadow_lifecycle_ms": 0.03,
+            "selector_timings_ms": values,
+            **overrides,
+        }
+
+    def test_increment_summary_excludes_existing_p0_total(self):
+        analyzer = load_module("analyze_s9_shadow_timing_test", ANALYZER_PATH)
+        summary = analyzer.summarize_increment_timings(
+            [self._timing_event()],
+            {
+                "candidate_increment_p95_ms": 0.50,
+                "d2h_increment_p95_ms": 0.0,
+            },
+        )
+        self.assertEqual(summary["increment_timing_schema_errors"], 0)
+        self.assertEqual(summary["increment_timing_samples"], 1)
+        self.assertAlmostEqual(
+            summary["production_selector_increment_model_p95_ms"], 0.60
+        )
+        self.assertAlmostEqual(
+            summary["shadow_hot_path_increment_model_p95_ms"], 0.70
+        )
+
+    def test_legacy_or_incomplete_timing_cannot_pass_as_v2(self):
+        analyzer = load_module("analyze_s9_shadow_legacy_timing_test", ANALYZER_PATH)
+        legacy = self._timing_event()
+        legacy.pop("timing_schema_version")
+        incomplete = self._timing_event()
+        incomplete["selector_timings_ms"].pop("r1_cpu_rerank_ms")
+        summary = analyzer.summarize_increment_timings(
+            [legacy, incomplete],
+            {
+                "candidate_increment_p95_ms": 0.50,
+                "d2h_increment_p95_ms": 0.0,
+            },
+        )
+        self.assertEqual(summary["increment_timing_schema_errors"], 2)
+        self.assertEqual(summary["increment_timing_samples"], 0)
+        self.assertTrue(
+            math.isnan(summary["shadow_hot_path_increment_model_p95_ms"])
+        )
+
+    def test_gate_uses_increment_not_full_selector_latency(self):
+        analyzer = load_module("analyze_s9_shadow_increment_gate_test", ANALYZER_PATH)
+        contract = analyzer.read_json(
+            PROJECT_ROOT
+            / "HSpec_research_doc/HSpec_draft_delect_optim/s9_shadow/s9_contract.json"
+        )
+        replay = {
+            "replayed_groups": 16,
+            "entry_errors": 0,
+            "score_errors": 0,
+            "missing_tables": 0,
+            "device": "npu:0",
+            "replayed_table_versions": [1],
+            "replayed_producers": ["p"],
+            "replayed_producer_version_strata": [["p", 1]],
+        }
+        run = {
+            "environment_errors": [],
+            "selection_count": 1,
+            "dropped_records": 0,
+            "write_errors": 0,
+            "unfinished_tasks": 0,
+            "nonquiescent_recorders": 0,
+            "recorder_accounting_errors": 0,
+            "recorder_trace_count_errors": 0,
+            "duplicate_status_producers": 0,
+            "missing_status_producers": [],
+            "shadow_output_parity_errors": 0,
+            "compact_reference_error_count": 0,
+            "bounded_trace_errors": 0,
+            "selector_contract_error_count": 0,
+            "full_table_replay": replay,
+            "trace_table_versions": [1],
+            "trace_producers": ["p"],
+            "trace_producer_version_strata": [["p", 1]],
+            "lifecycle_errors": 0,
+            "label_linkage_errors": 0,
+            "exact_divergence_labels": 10,
+            "baseline_divergence_atq": 0.5,
+            "shadow_divergence_atq": 1.0,
+            "selected_rank_one_based_mean": 1.0,
+            "selected_suffix_mean": contract["reference_distribution"][
+                "s6_test_selected_suffix"
+            ],
+            "max_decoded_len": 1024,
+            "timing_samples": 200,
+            "increment_timing_samples": 200,
+            "increment_timing_schema_errors": 0,
+            "selector_total_p95_ms": 4.50,
+            "shadow_hot_path_increment_model_p95_ms": 1.0,
+            "max_padded_entries": 128,
+            "max_timing_padded_entries": 128,
+            "max_active_rows": 16,
+            "max_timing_components": 64,
+            "min_actual_entries": 64,
+            "max_actual_entries": 128,
+            "topology": {
+                "INFER_TP": "4",
+                "TRAIN_TP": "4",
+                "TRAIN_PP": "4",
+                "TRAIN_EP": "4",
+                "MAX_PROMPT_LENGTH": "1024",
+                "MAX_RESPONSE_LENGTH": "16384",
+            },
+        }
+        gate = analyzer.build_gate(dict(run), dict(run), contract)
+        self.assertTrue(gate["checks"]["increment_timing_schema_v2"])
+        self.assertTrue(
+            gate["checks"][
+                "large_run_selector_increment_model_p95_under_budget"
+            ]
+        )
+        self.assertNotIn("large_run_selector_p95_under_budget", gate["checks"])
+        self.assertTrue(gate["promotion_allowed"])
+
+        slow = dict(run)
+        slow["shadow_hot_path_increment_model_p95_ms"] = 2.0
+        slow_gate = analyzer.build_gate(dict(run), slow, contract)
+        self.assertFalse(
+            slow_gate["checks"][
+                "large_run_selector_increment_model_p95_under_budget"
+            ]
+        )
+        self.assertFalse(slow_gate["promotion_allowed"])
+
+        uncovered = dict(run)
+        uncovered["max_timing_padded_entries"] = 131065
+        uncovered_gate = analyzer.build_gate(dict(run), uncovered, contract)
+        self.assertFalse(
+            uncovered_gate["checks"]["large_run_increment_model_shape_covered"]
+        )
+        self.assertFalse(uncovered_gate["promotion_allowed"])
 
 
 if __name__ == "__main__":
