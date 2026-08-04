@@ -5584,6 +5584,12 @@ class GlobalHSpecTableGroup:
             "select_d2h_sync_ms",
             "select_cpu_retrieve_ms",
             "select_total_ms",
+            "select_r1_execution_batches",
+            "select_r1_execution_queries",
+            "select_r1_changed_entry_count",
+            "select_r1_rank_one_based_sum",
+            "select_r1_suffix_sum",
+            "select_r1_cpu_rerank_samples",
         }
         interval = {
             key: float(agg.get(key, 0.0))

@@ -31,6 +31,39 @@ _TIMING_FIELDS = frozenset({
     "cpu_retrieve_ms",
     "total_ms",
 })
+R1_RERANK_HISTOGRAM_US_BOUNDS = (
+    50,
+    100,
+    200,
+    300,
+    400,
+    500,
+    600,
+    700,
+    800,
+    1000,
+    1250,
+    1500,
+    2000,
+    4000,
+    8000,
+)
+_R1_ONLINE_ADDITIVE_KEYS = frozenset({
+    "select_r1_execution_batches",
+    "select_r1_execution_queries",
+    "select_r1_changed_entry_count",
+    "select_r1_rank_one_based_sum",
+    "select_r1_suffix_sum",
+    "select_r1_cpu_rerank_samples",
+    "select_r1_cpu_rerank_us_overflow",
+    "selector_config_fallback_count",
+    "selector_runtime_fallback_count",
+    "selector_runtime_query_fallback_count",
+    "selector_d2h_fallback_count",
+}) | frozenset(
+    f"select_r1_cpu_rerank_us_le_{bound}"
+    for bound in R1_RERANK_HISTOGRAM_US_BOUNDS
+)
 _BASE_ADDITIVE_KEYS = frozenset({
     "select_metric_windows",
     "select_eligible_queries",
@@ -60,11 +93,21 @@ _BASE_ADDITIVE_KEYS = frozenset({
 })
 SELECTOR_ADDITIVE_METRIC_KEYS = frozenset(
     set(_BASE_ADDITIVE_KEYS)
+    | set(_R1_ONLINE_ADDITIVE_KEYS)
     | {f"select_stop_{reason}_count" for reason in _STOP_REASONS}
     | {f"select_{name}" for name in _TIMING_FIELDS}
     | {f"select_accept_len_{length}_count" for length in range(_MAX_ACCEPT_HISTOGRAM_BIN + 1)}
     | {"select_accept_len_overflow_count"}
 )
+
+
+def hspec_r1_rerank_histogram_key(milliseconds: float) -> str:
+    """Map one batch-level R1 CPU rerank duration to one fixed bucket."""
+    microseconds = max(float(milliseconds) * 1000.0, 0.0)
+    for bound in R1_RERANK_HISTOGRAM_US_BOUNDS:
+        if microseconds <= float(bound):
+            return f"select_r1_cpu_rerank_us_le_{bound}"
+    return "select_r1_cpu_rerank_us_overflow"
 
 
 def is_selector_additive_metric(key: str) -> bool:

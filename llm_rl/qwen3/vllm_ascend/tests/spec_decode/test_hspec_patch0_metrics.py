@@ -136,6 +136,40 @@ class TestSelectionWindowTracker(unittest.TestCase):
 
 class TestSelectorMetricStore(unittest.TestCase):
 
+    def test_r1_online_histogram_has_one_bounded_bucket_per_sample(self):
+        cases = {
+            0.0: "select_r1_cpu_rerank_us_le_50",
+            0.05: "select_r1_cpu_rerank_us_le_50",
+            0.051: "select_r1_cpu_rerank_us_le_100",
+            0.7: "select_r1_cpu_rerank_us_le_700",
+            1.25: "select_r1_cpu_rerank_us_le_1250",
+            8.001: "select_r1_cpu_rerank_us_overflow",
+        }
+        observed = {
+            value: metrics.hspec_r1_rerank_histogram_key(value)
+            for value in cases
+        }
+        self.assertEqual(observed, cases)
+        self.assertTrue(
+            all(metrics.is_selector_additive_metric(key) for key in observed.values())
+        )
+
+        store = metrics.HSpecSelectorMetricStore()
+        for key in observed.values():
+            store.record({key: 1, "select_r1_cpu_rerank_samples": 1})
+        _, interval, cumulative = store.snapshot_and_reset()
+        self.assertEqual(interval["select_r1_cpu_rerank_samples"], len(cases))
+        self.assertEqual(
+            sum(
+                value
+                for key, value in interval.items()
+                if key.startswith("select_r1_cpu_rerank_us_")
+                and key != "select_r1_cpu_rerank_us_samples"
+            ),
+            len(cases),
+        )
+        self.assertEqual(cumulative, interval)
+
     def test_interval_reset_and_cumulative_monotonicity(self):
         store = metrics.HSpecSelectorMetricStore()
         store.record({

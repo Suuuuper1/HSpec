@@ -44,7 +44,10 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-from vllm_ascend.spec_decode.hspec_metrics import HSpecSelectionMetricTracker
+from vllm_ascend.spec_decode.hspec_metrics import (
+    HSpecSelectionMetricTracker,
+    hspec_r1_rerank_histogram_key,
+)
 from vllm_ascend.spec_decode.hspec_selector_r1 import (
     HSPEC_R1_NUMBA_AVAILABLE,
     HSpecR1Config,
@@ -4294,6 +4297,31 @@ class HSpecProposer(Proposer):
         r1_cpu_rerank_ms = (
             _ns_to_ms(_now_ns() - r1_cpu_t0) if r1_cpu_t0 else 0.0
         )
+        if self._r1_config.executes_topk:
+            executed_mask = raw_gate_hits & (shadow_idxs_cpu >= 0)
+            changed_mask = executed_mask & (
+                shadow_idxs_cpu != np.asarray(idxs_cpu, dtype=np.int64)
+            )
+            self._record_proposer_metric("select_r1_execution_batches", 1)
+            self._record_proposer_metric(
+                "select_r1_execution_queries", int(np.count_nonzero(executed_mask))
+            )
+            self._record_proposer_metric(
+                "select_r1_changed_entry_count", int(np.count_nonzero(changed_mask))
+            )
+            self._record_proposer_metric(
+                "select_r1_rank_one_based_sum",
+                int(np.sum(selected_rank_cpu[executed_mask].astype(np.int64) + 1)),
+            )
+            self._record_proposer_metric(
+                "select_r1_suffix_sum",
+                int(np.sum(selected_suffix_cpu[executed_mask].astype(np.int64))),
+            )
+            if selector_timing_enabled:
+                self._record_proposer_metric("select_r1_cpu_rerank_samples", 1)
+                self._record_proposer_metric(
+                    hspec_r1_rerank_histogram_key(r1_cpu_rerank_ms), 1
+                )
         s9_query_ids: Optional[List[str]] = None
         s9_primary_samples: Optional[List[bool]] = None
         s9_projected_cpu: Optional[np.ndarray] = None
