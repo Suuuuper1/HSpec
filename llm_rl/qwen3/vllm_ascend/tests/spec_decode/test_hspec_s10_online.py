@@ -126,6 +126,70 @@ def _write_run(
 
 
 class TestS10Analyzer(unittest.TestCase):
+    def test_semantic_log_scan_ignores_metric_and_config_cooccurrence(self):
+        log = "\n".join((
+            "Warning: The watchdog timeout 600000ms is less than or equal to "
+            "HCCL execution timeout 1836000ms!",
+            "step:1 - hspec/build_timeout_discard:0.0 - "
+            "hspec/build_timeout_unfinished_prompts:0.0 - "
+            "hspec/phase4_metrics_error_count:0.0",
+            "StructuredOutputsConfig(disable_fallback=False), "
+            "compilation_config={'cudagraph_mode': 'PIECEWISE'}",
+        ))
+        audit = analyzer.scan_runtime_log_events(log)
+        self.assertEqual(audit["policy"], analyzer.LOG_EVENT_POLICY)
+        self.assertTrue(all(count == 0 for count in audit["counts"].values()))
+        self.assertEqual(
+            audit["nonfailure_observations"][
+                "timeout_threshold_configuration_warning"
+            ],
+            1,
+        )
+
+    def test_semantic_log_scan_preserves_real_failure_events(self):
+        log = "\n".join((
+            "worker raised TimeoutError while waiting for HCCL",
+            "ERROR: NPU graph fallback triggered after graph capture failed",
+            "RuntimeError: NPU out of memory",
+            "Traceback (most recent call last):",
+        ))
+        audit = analyzer.scan_runtime_log_events(log)
+        self.assertEqual(
+            audit["counts"],
+            {"oom": 1, "timeout": 1, "graph_fallback": 1, "traceback": 1},
+        )
+        self.assertEqual(
+            [item["line_number"] for item in audit["evidence"]],
+            [1, 2, 3, 4],
+        )
+
+    def test_historical_analyzer_exception_is_exact_and_functional_only(self):
+        contract = analyzer.read_json(S10_DIR / "s10_contract.json")
+        environment = analyzer.expected_environment(contract, "r1")
+        historical = contract["analysis_remediation"][
+            "accepted_historical_functional_provenance"
+        ][0]
+        environment.update(historical["environment"])
+        errors, compatibility = analyzer.validate_environment(
+            contract, "r1", "functional_1p5b", environment,
+            historical["git_head"],
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            compatibility["mode"], "exact_historical_functional_provenance"
+        )
+        errors, _ = analyzer.validate_environment(
+            contract, "r1", "performance_30b", environment,
+            historical["git_head"],
+        )
+        self.assertGreaterEqual(len(errors), 1)
+        environment["HSPEC_S10_IMPLEMENTATION_SHA256"] = "different"
+        errors, _ = analyzer.validate_environment(
+            contract, "r1", "functional_1p5b", environment,
+            historical["git_head"],
+        )
+        self.assertGreaterEqual(len(errors), 1)
+
     def test_exact_independent_bootstrap_uses_run_not_query_as_unit(self):
         interval = analyzer.exact_independent_bootstrap_ci(
             [0.1, 0.1, 0.1], [0.2, 0.2, 0.2]
@@ -148,6 +212,7 @@ class TestS10Analyzer(unittest.TestCase):
                 gate_root, gate_root / "functional_analysis", contract, True
             )
             self.assertEqual(functional["status"], "PASS", functional["diagnostics"])
+            analyzer.atomic_write(gate_root / "functional_analysis/PASS", "PASS\n")
 
             for seed in (20260721, 20260722, 20260723):
                 for arm in ("p0", "r1"):
@@ -167,6 +232,32 @@ class TestS10Analyzer(unittest.TestCase):
                 final["effects"]["rollout_tokens_per_second"]["relative_ratio"],
                 1.25,
             )
+
+    def test_v2_functional_analysis_is_authoritative_and_must_be_current(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            gate_root = Path(temporary)
+            canonical = gate_root / "functional_analysis"
+            canonical.mkdir()
+            analyzer.atomic_json(canonical / "gate_result.json", {
+                "mode": "functional", "status": "FAIL",
+                "may_run_performance": False, "checks": {"old": False},
+            })
+            analyzer.atomic_write(canonical / "FAIL", "FAIL\n")
+            remediation = gate_root / "functional_analysis_v2"
+            remediation.mkdir()
+            analyzer.atomic_json(remediation / "gate_result.json", {
+                "mode": "functional", "status": "PASS",
+                "may_run_performance": True, "checks": {"fixed": True},
+                "analysis_provenance": analyzer.current_provenance(),
+                "log_event_policy": analyzer.LOG_EVENT_POLICY,
+            })
+            analyzer.atomic_write(remediation / "PASS", "PASS\n")
+            result, selected, errors = analyzer.load_authoritative_functional_gate(
+                gate_root
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(selected, remediation)
+            self.assertEqual(result["status"], "PASS")
 
     def test_source_scope_excludes_target_and_reward_paths(self):
         self.assertTrue(analyzer.target_path_scope_is_untouched())
