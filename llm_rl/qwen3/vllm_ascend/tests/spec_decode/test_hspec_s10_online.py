@@ -94,10 +94,20 @@ def _write_run(
     run_dir.mkdir(parents=True)
     epochs = range(5) if performance else range(2)
     log_path = run_dir / "train.log"
-    log_path.write_text(
-        "".join(_step_line(index + 1, epoch, arm, performance) for index, epoch in enumerate(epochs)),
-        encoding="utf-8",
+    log_text = "".join(
+        _step_line(index + 1, epoch, arm, performance)
+        for index, epoch in enumerate(epochs)
     )
+    if performance:
+        log_text = (
+            "".join(
+                "GPU KV cache size: 1,900,000 tokens\n"
+                "Maximum concurrency for 17,408 tokens per request: 109.00x\n"
+                for _ in range(16)
+            )
+            + log_text
+        )
+    log_path.write_text(log_text, encoding="utf-8")
     environment = analyzer.expected_environment(contract, arm)
     manifest = {
         "schema_version": "hspec.s0.run-manifest.v1",
@@ -110,6 +120,11 @@ def _write_run(
         "status": "completed",
         "exit_code": 0,
         "effective_hspec_environment": environment,
+        "effective_launcher_assignments": ({
+            "gpu_memory_utilization": "0.83",
+            "max_num_seqs": "64",
+            "max_response_length": "16384",
+        } if performance else {}),
         "deviations": [{"id": "s10-online-ab"}],
         "git": {"head": "synthetic"},
         "inputs": {
@@ -126,6 +141,57 @@ def _write_run(
 
 
 class TestS10Analyzer(unittest.TestCase):
+    def test_30b_memory_envelope_is_frozen_without_target_sampler_change(self):
+        contract = analyzer.read_json(S10_DIR / "s10_contract.json")
+        envelope = contract["runtime_envelope"]["performance_30b"]
+        self.assertEqual(
+            envelope["effective_launcher_assignments"],
+            {
+                "gpu_memory_utilization": "0.83",
+                "max_num_seqs": "64",
+                "max_response_length": "16384",
+            },
+        )
+        runner = (
+            PROJECT_ROOT
+            / "HSpec_research_doc/HSpec_draft_delect_optim/"
+            "s0_baseline_freeze/bin/run_frozen_profile.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('PROFILE_ENV+=("GPU_MEMORY_UTILIZATION=0.83")', runner)
+        self.assertTrue(analyzer.target_path_scope_is_untouched())
+
+    def test_kv_cache_evidence_parser_and_capacity_floor(self):
+        evidence = analyzer.parse_kv_cache_evidence(
+            "Maximum concurrency for 17,408 tokens per request: 109.26x\n"
+            "Maximum concurrency for 17,408 tokens per request: 108.75x\n"
+        )
+        self.assertEqual(evidence["worker_reports"], 2)
+        self.assertEqual(evidence["request_token_values"], [17408])
+        self.assertEqual(evidence["minimum_full_length_concurrency"], 108.75)
+
+    def test_performance_run_rejects_old_087_memory_envelope(self):
+        contract = analyzer.read_json(S10_DIR / "s10_contract.json")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_run(
+                root, profile="performance_30b", arm="r1", seed=20260721,
+                performance=True, contract=contract,
+            )
+            manifest_path = next(root.rglob("run_manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["effective_launcher_assignments"][
+                "gpu_memory_utilization"
+            ] = "0.87"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = analyzer.analyze_run(
+                root, profile="performance_30b", arm="r1", seed=20260721,
+                contract=contract,
+            )
+            self.assertTrue(any(
+                "gpu_memory_utilization='0.87'" in error
+                for error in result["errors"]
+            ))
+
     def test_semantic_log_scan_ignores_metric_and_config_cooccurrence(self):
         log = "\n".join((
             "Warning: The watchdog timeout 600000ms is less than or equal to "
