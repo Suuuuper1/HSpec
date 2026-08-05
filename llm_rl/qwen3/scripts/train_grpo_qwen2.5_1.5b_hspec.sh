@@ -92,6 +92,7 @@ export HSPEC_MAX_READY_PREFETCH_BYTES="${HSPEC_MAX_READY_PREFETCH_BYTES:-0}"
 export HSPEC_PROPOSER_BATCH_CACHE_PREBUILD="${HSPEC_PROPOSER_BATCH_CACHE_PREBUILD:-1}"
 export HSPEC_ALLOW_HOT_BATCH_CACHE_BUILD="${HSPEC_ALLOW_HOT_BATCH_CACHE_BUILD:-0}"
 export HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES="${HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES:-536870912}"
+export HSPEC_MAX_DRAFT_TOKENS_PER_BATCH="${HSPEC_MAX_DRAFT_TOKENS_PER_BATCH:-0}"
 export HSPEC_PROPOSER_PREFIX_CACHE="${HSPEC_PROPOSER_PREFIX_CACHE:-0}"
 export HSPEC_PROPOSER_STORE_PER_PROMPT_NPU="${HSPEC_PROPOSER_STORE_PER_PROMPT_NPU:-0}"
 export HSPEC_PROPOSER_KEYS_CPU_DTYPE="${HSPEC_PROPOSER_KEYS_CPU_DTYPE:-float32}"
@@ -305,6 +306,7 @@ hspec_maybe_clean_store_dirs
     echo "hspec_proposer_batch_cache_prebuild=${HSPEC_PROPOSER_BATCH_CACHE_PREBUILD}"
     echo "hspec_allow_hot_batch_cache_build=${HSPEC_ALLOW_HOT_BATCH_CACHE_BUILD}"
     echo "hspec_proposer_batch_cache_max_npu_bytes=${HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES}"
+    echo "hspec_max_draft_tokens_per_batch=${HSPEC_MAX_DRAFT_TOKENS_PER_BATCH}"
     echo "hspec_proposer_prefix_cache=${HSPEC_PROPOSER_PREFIX_CACHE}"
     echo "hspec_proposer_store_per_prompt_npu=${HSPEC_PROPOSER_STORE_PER_PROMPT_NPU}"
     echo "hspec_proposer_keys_cpu_dtype=${HSPEC_PROPOSER_KEYS_CPU_DTYPE}"
@@ -449,6 +451,7 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROPOSER_BATCH_CACHE_PREBUILD='"'"${HSPEC_PROPOSER_BATCH_CACHE_PREBUILD}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ALLOW_HOT_BATCH_CACHE_BUILD='"'"${HSPEC_ALLOW_HOT_BATCH_CACHE_BUILD}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES='"'"${HSPEC_PROPOSER_BATCH_CACHE_MAX_NPU_BYTES}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_MAX_DRAFT_TOKENS_PER_BATCH='"'"${HSPEC_MAX_DRAFT_TOKENS_PER_BATCH}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROPOSER_PREFIX_CACHE='"'"${HSPEC_PROPOSER_PREFIX_CACHE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROPOSER_STORE_PER_PROMPT_NPU='"'"${HSPEC_PROPOSER_STORE_PER_PROMPT_NPU}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROPOSER_KEYS_CPU_DTYPE='"'"${HSPEC_PROPOSER_KEYS_CPU_DTYPE}"'"' \

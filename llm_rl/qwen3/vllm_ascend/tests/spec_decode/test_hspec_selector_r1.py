@@ -56,6 +56,24 @@ def _extract_matcher():
 MATCHER = _extract_matcher()
 
 
+def _extract_prefix_budget_allocator():
+    tree = ast.parse(PROPOSER_PATH.read_text(encoding="utf-8"))
+    node = next(
+        item
+        for item in tree.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "_prefix_fair_budget_caps"
+    )
+    node.decorator_list = []
+    module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+    namespace = {"List": list}
+    exec(compile(module, str(PROPOSER_PATH), "exec"), namespace)
+    return namespace[node.name]
+
+
+PREFIX_BUDGET_ALLOCATOR = _extract_prefix_budget_allocator()
+
+
 def _extract_payload_copy():
     tree = ast.parse(PROPOSER_PATH.read_text(encoding="utf-8"))
     for node in tree.body:
@@ -324,6 +342,25 @@ class TestR1Reranker(unittest.TestCase):
 
 
 class TestR1IntegrationContracts(unittest.TestCase):
+    def test_prefix_fair_batch_budget_is_bounded_and_depth_ordered(self):
+        self.assertEqual(
+            PREFIX_BUDGET_ALLOCATOR([15, 15, 2, 0], 0),
+            [15, 15, 2, 0],
+        )
+        self.assertEqual(
+            PREFIX_BUDGET_ALLOCATOR([15, 15, 2, 0], 8),
+            [3, 3, 2, 0],
+        )
+        caps = PREFIX_BUDGET_ALLOCATOR([14] * 64, 384)
+        self.assertEqual(caps, [6] * 64)
+        self.assertEqual(sum(caps), 384)
+        self.assertTrue(all(cap <= length for cap, length in zip(caps, [14] * 64)))
+
+    def test_prefix_budget_preserves_short_values_and_redistributes_depth(self):
+        caps = PREFIX_BUDGET_ALLOCATOR([1, 3, 10], 8)
+        self.assertEqual(caps, [1, 3, 4])
+        self.assertEqual(sum(caps), 8)
+
     def test_shadow_cannot_mutate_raw_entry_or_admission_decision(self):
         source = PROPOSER_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -446,6 +483,10 @@ class TestR1IntegrationContracts(unittest.TestCase):
                 self.assertIn(
                     f"runtime_env.env_vars.HSPEC_SELECT_{suffix}=", source
                 )
+            self.assertIn(
+                "runtime_env.env_vars.HSPEC_MAX_DRAFT_TOKENS_PER_BATCH=",
+                source,
+            )
 
 
 if __name__ == "__main__":

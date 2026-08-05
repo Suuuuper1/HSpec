@@ -58,6 +58,18 @@ def _step_line(step: int, epoch: int, arm: str, performance: bool) -> str:
         "hspec/select_zero_accept_requests": zero,
         "hspec/select_canceled_requests": 0,
         "hspec/select_drafted_length_mismatch_count": 0,
+        "hspec/select_draft_budget_batches": 2,
+        "hspec/select_draft_budget_hit_batches": int(arm == "r1"),
+        "hspec/select_draft_budget_raw_tokens": (
+            500 if arm == "r1" else 400
+        ),
+        "hspec/select_draft_budget_emitted_tokens": 400,
+        "hspec/select_draft_budget_truncated_tokens": (
+            100 if arm == "r1" else 0
+        ),
+        "hspec/select_draft_budget_limited_requests": (
+            20 if arm == "r1" else 0
+        ),
         "hspec/select_funnel_decode_requests": 100,
         "hspec/select_funnel_active_table_requests": 100,
         "hspec/select_funnel_prompt_id_ready_requests": 100,
@@ -158,7 +170,48 @@ class TestS10Analyzer(unittest.TestCase):
             "s0_baseline_freeze/bin/run_frozen_profile.sh"
         ).read_text(encoding="utf-8")
         self.assertIn('PROFILE_ENV+=("GPU_MEMORY_UTILIZATION=0.83")', runner)
+        self.assertIn(
+            '"HSPEC_MAX_DRAFT_TOKENS_PER_BATCH=384"', runner
+        )
+        self.assertEqual(
+            contract["common_environment"][
+                "HSPEC_MAX_DRAFT_TOKENS_PER_BATCH"
+            ],
+            "384",
+        )
         self.assertTrue(analyzer.target_path_scope_is_untouched())
+
+    def test_draft_budget_conservation_and_bound_are_audited(self):
+        contract = analyzer.read_json(S10_DIR / "s10_contract.json")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_run(
+                root, profile="performance_30b", arm="r1", seed=20260721,
+                performance=True, contract=contract,
+            )
+            result = analyzer.analyze_run(
+                root, profile="performance_30b", arm="r1", seed=20260721,
+                contract=contract,
+            )
+            self.assertEqual(result["errors"], [], result["errors"])
+            budget = result["draft_budget"]
+            self.assertEqual(budget["configured_tokens_per_batch"], 384)
+            self.assertGreater(budget["draft_budget_truncated_tokens"], 0)
+
+            log_path = next(root.rglob("train.log"))
+            text = log_path.read_text(encoding="utf-8")
+            text = text.replace(
+                "hspec/select_draft_budget_emitted_tokens:400",
+                "hspec/select_draft_budget_emitted_tokens:900",
+            )
+            log_path.write_text(text, encoding="utf-8")
+            failed = analyzer.analyze_run(
+                root, profile="performance_30b", arm="r1", seed=20260721,
+                contract=contract,
+            )
+            self.assertTrue(any(
+                "draft budget" in error for error in failed["errors"]
+            ))
 
     def test_kv_cache_evidence_parser_and_capacity_floor(self):
         evidence = analyzer.parse_kv_cache_evidence(

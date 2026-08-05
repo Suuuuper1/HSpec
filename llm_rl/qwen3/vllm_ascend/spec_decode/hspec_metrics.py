@@ -18,6 +18,7 @@ _MAX_ACCEPT_HISTOGRAM_BIN = 64
 _STOP_REASONS = frozenset({
     "score_gate",
     "empty_value",
+    "batch_resource_cap",
     "abs_delta_cap",
     "adaptive_window",
     "value_end",
@@ -77,6 +78,15 @@ _BASE_ADDITIVE_KEYS = frozenset({
     "select_zero_accept_requests",
     "select_canceled_requests",
     "select_drafted_length_mismatch_count",
+    # HSpec-only resource controller. Raw = emitted + truncated is audited at
+    # the trainer interval boundary; emitted is the actual downstream draft
+    # population and therefore must equal select_drafted_tokens.
+    "select_draft_budget_batches",
+    "select_draft_budget_hit_batches",
+    "select_draft_budget_raw_tokens",
+    "select_draft_budget_emitted_tokens",
+    "select_draft_budget_truncated_tokens",
+    "select_draft_budget_limited_requests",
     "select_top1_top2_margin_sum",
     "select_top1_top2_margin_count",
     "select_active_table_version_sum",

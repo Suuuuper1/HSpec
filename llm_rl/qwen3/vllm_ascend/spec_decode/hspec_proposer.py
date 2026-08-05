@@ -133,6 +133,40 @@ def _tensor_nbytes(tensor: Any) -> int:
         return 0
 
 
+def _prefix_fair_budget_caps(
+    draft_lengths: List[int],
+    token_budget: int,
+) -> List[int]:
+    """Allocate a batch token budget breadth-first across draft prefixes.
+
+    Speculative token value is prefix ordered: a request's depth ``d + 1``
+    cannot be accepted unless depths ``0..d`` are accepted.  A breadth-first
+    allocation therefore preserves every request's shallow prefix before
+    spending memory on deeper, lower-marginal positions.  The bounded HSpec
+    batch is tiny (normally <= 64 requests and <= 15 tokens/request), so this
+    deterministic CPU loop is cheaper than another device synchronization.
+
+    A non-positive budget keeps the historical behavior exactly unchanged.
+    """
+    lengths = [max(int(length), 0) for length in draft_lengths]
+    budget = int(token_budget)
+    total = sum(lengths)
+    if budget <= 0 or total <= budget:
+        return lengths
+
+    caps = [0 for _ in lengths]
+    remaining = max(budget, 0)
+    max_depth = max(lengths, default=0)
+    for depth in range(max_depth):
+        for index, length in enumerate(lengths):
+            if remaining <= 0:
+                return caps
+            if length > depth:
+                caps[index] += 1
+                remaining -= 1
+    return caps
+
+
 if _HSPEC_NUMBA_AVAILABLE:
 
     @njit(cache=True, parallel=True)
@@ -314,6 +348,23 @@ class _CachedPromptTable:
         if take <= 0:
             return []
         return self.token_buffer[base + off:base + off + take].tolist()
+
+    def get_draft_token_count(self, entry_idx: int, max_tokens: int) -> int:
+        """Return the available prefix length without materializing tokens."""
+        if entry_idx < 0 or entry_idx >= self.n_entries:
+            return 0
+        max_tokens = int(max_tokens)
+        if max_tokens <= 0:
+            return 0
+        if self.draft_prefix_tokens is not None and self.draft_prefix_lens is not None:
+            return max(min(max_tokens, int(self.draft_prefix_lens[entry_idx])), 0)
+
+        ridx = int(self.entry_rollout_idx[entry_idx])
+        if ridx < 0 or ridx >= int(self.rollout_token_offset.shape[0]):
+            return 0
+        off = int(self.entry_offset[entry_idx])
+        length = int(self.rollout_token_len[ridx])
+        return max(min(max_tokens, length - off), 0)
 
     def get_rollout_tokens(self, rollout_idx: int) -> np.ndarray:
         ridx = int(rollout_idx)
@@ -700,6 +751,12 @@ class HSpecProposer(Proposer):
             _DEFAULT_BATCH_CACHE_MAX_BMM_ELEMS,
             0,
         )
+        # Limit downstream target-verification rows without shrinking the
+        # prompt-table cache or the scheduler/KV-cache envelope. Zero keeps
+        # the pre-fix behavior for stages that have not registered a budget.
+        self._max_draft_tokens_per_batch: int = _get_env_int(
+            "HSPEC_MAX_DRAFT_TOKENS_PER_BATCH", 0, 0
+        )
         self._batch_cache_copy_stream: Optional[Any] = None
         self._batch_cache_copy_stream_disabled: bool = False
         self._prefix_cache_enabled: bool = (
@@ -844,7 +901,8 @@ class HSpecProposer(Proposer):
         logger.info(
             "HSpec selector: mode=%s topk=%d sim_mode=%s radius=%g suffix_cap=%d "
             "position_mode=%s shadow=%s d2h=%s fallback=%r margin=%s timing=%s "
-            "metadata_sample_every=%d s2_baseline_audit=%s tp_draft_sync=%s",
+            "metadata_sample_every=%d s2_baseline_audit=%s tp_draft_sync=%s "
+            "max_draft_tokens_per_batch=%d",
             self._selector_mode,
             self._selector_topk,
             self._r1_config.sim_mode,
@@ -859,6 +917,7 @@ class HSpecProposer(Proposer):
             self._selector_metadata_sample_every,
             self._s2_baseline_audit_enabled,
             self._tp_draft_sync_enabled,
+            self._max_draft_tokens_per_batch,
         )
 
         tp_group = self._get_tp_draft_sync_group()
@@ -2769,9 +2828,12 @@ class HSpecProposer(Proposer):
         effective_wnd: int,
         base_effective_wnd: int,
         max_draft_tokens: int,
+        batch_budget_cap_applied: bool = False,
     ) -> str:
         if int(draft_len) < int(effective_wnd):
             return "value_end"
+        if batch_budget_cap_applied:
+            return "batch_resource_cap"
         if int(effective_wnd) < int(base_effective_wnd):
             return "abs_delta_cap"
         if int(base_effective_wnd) < int(max_draft_tokens):
@@ -4393,6 +4455,80 @@ class HSpecProposer(Proposer):
             )
         else:
             s7_pattern, s7_caps = None, None
+
+        # Plan available lengths without copying token values.  When enabled,
+        # the prefix-fair batch budget bounds the number of target verification
+        # rows while preserving shallow prefixes across all matched requests.
+        planned_windows: Dict[int, tuple[int, int, int]] = {}
+        budget_cap_by_row: Dict[int, int] = {}
+        if self._max_draft_tokens_per_batch > 0:
+            for j in hit_rows.tolist():
+                cached = active_cached_tables[j]
+                base_pos = active_base_positions[j]
+                matched_entry_idx = int(decision_idxs_cpu[j])
+                matched_pos = int(cached.entry_offset[matched_entry_idx]) - 1
+                abs_delta = abs(int(matched_pos - int(base_pos)))
+                base_effective_wnd = min(
+                    cached.get_effective_window(matched_entry_idx),
+                    int(self.max_draft_tokens),
+                )
+                effective_wnd = self._apply_abs_delta_cap(
+                    window=base_effective_wnd,
+                    abs_delta=abs_delta,
+                    min_wnd=int(cached.min_wnd),
+                )
+                if s7_caps is not None:
+                    effective_wnd = min(
+                        max(int(s7_caps[j]), 0), int(self.max_draft_tokens)
+                    )
+                raw_draft_len = cached.get_draft_token_count(
+                    matched_entry_idx, effective_wnd
+                )
+                planned_windows[j] = (
+                    int(base_effective_wnd),
+                    int(effective_wnd),
+                    int(raw_draft_len),
+                )
+
+            raw_draft_lengths = [
+                planned_windows[j][2] for j in hit_rows.tolist()
+            ]
+            budget_caps = _prefix_fair_budget_caps(
+                raw_draft_lengths, self._max_draft_tokens_per_batch
+            )
+            budget_cap_by_row = dict(zip(hit_rows.tolist(), budget_caps))
+            if raw_draft_lengths:
+                raw_batch_tokens = int(sum(raw_draft_lengths))
+                emitted_batch_tokens = int(sum(budget_caps))
+                truncated_batch_tokens = (
+                    raw_batch_tokens - emitted_batch_tokens
+                )
+                limited_requests = sum(
+                    int(cap < length)
+                    for cap, length in zip(budget_caps, raw_draft_lengths)
+                )
+                self._record_proposer_metric(
+                    "select_draft_budget_batches", 1
+                )
+                self._record_proposer_metric(
+                    "select_draft_budget_raw_tokens", raw_batch_tokens
+                )
+                self._record_proposer_metric(
+                    "select_draft_budget_emitted_tokens",
+                    emitted_batch_tokens,
+                )
+                self._record_proposer_metric(
+                    "select_draft_budget_truncated_tokens",
+                    truncated_batch_tokens,
+                )
+                self._record_proposer_metric(
+                    "select_draft_budget_limited_requests", limited_requests
+                )
+                if truncated_batch_tokens > 0:
+                    self._record_proposer_metric(
+                        "select_draft_budget_hit_batches", 1
+                    )
+
         pending = []
         for j in hit_rows.tolist():
             i = active_batch_indices[j]
@@ -4403,21 +4539,34 @@ class HSpecProposer(Proposer):
             matched_pos = int(cached.entry_offset[matched_entry_idx]) - 1
             delta = int(matched_pos - int(base_pos))
             abs_delta = abs(delta)
-            base_effective_wnd = min(
-                cached.get_effective_window(matched_entry_idx),
-                int(self.max_draft_tokens),
-            )
-            effective_wnd = self._apply_abs_delta_cap(
-                window=base_effective_wnd,
-                abs_delta=abs_delta,
-                min_wnd=int(cached.min_wnd),
-            )
-            if s7_caps is not None:
-                # The S7 cost experiment controls only draft length. Entry
-                # selection remains P0, and the disabled path is unchanged.
-                effective_wnd = min(
-                    max(int(s7_caps[j]), 0), int(self.max_draft_tokens)
+            if self._max_draft_tokens_per_batch > 0:
+                (
+                    base_effective_wnd,
+                    pre_budget_effective_wnd,
+                    raw_draft_len,
+                ) = planned_windows[j]
+                effective_wnd = int(pre_budget_effective_wnd)
+                budget_cap = int(budget_cap_by_row[j])
+                batch_budget_cap_applied = budget_cap < int(raw_draft_len)
+                if batch_budget_cap_applied:
+                    effective_wnd = min(effective_wnd, budget_cap)
+            else:
+                base_effective_wnd = min(
+                    cached.get_effective_window(matched_entry_idx),
+                    int(self.max_draft_tokens),
                 )
+                pre_budget_effective_wnd = self._apply_abs_delta_cap(
+                    window=base_effective_wnd,
+                    abs_delta=abs_delta,
+                    min_wnd=int(cached.min_wnd),
+                )
+                if s7_caps is not None:
+                    pre_budget_effective_wnd = min(
+                        max(int(s7_caps[j]), 0),
+                        int(self.max_draft_tokens),
+                    )
+                effective_wnd = int(pre_budget_effective_wnd)
+                batch_budget_cap_applied = False
             t0_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
 
             # Draft tokens from CPU cache (sub-µs numpy slice)
@@ -4489,6 +4638,7 @@ class HSpecProposer(Proposer):
                     effective_wnd=effective_wnd,
                     base_effective_wnd=base_effective_wnd,
                     max_draft_tokens=self.max_draft_tokens,
+                    batch_budget_cap_applied=batch_budget_cap_applied,
                 )
                 selector_stop_reasons[stop_reason] = (
                     selector_stop_reasons.get(stop_reason, 0) + 1
@@ -4535,7 +4685,12 @@ class HSpecProposer(Proposer):
                     "wnd_size_at_match": int(cached.wnd_size),
                     "base_effective_wnd_at_match": int(base_effective_wnd),
                     "effective_wnd_at_match": int(effective_wnd),
-                    "abs_delta_cap_applied": int(effective_wnd < base_effective_wnd),
+                    "abs_delta_cap_applied": int(
+                        pre_budget_effective_wnd < base_effective_wnd
+                    ),
+                    "batch_draft_budget_cap_applied": int(
+                        batch_budget_cap_applied
+                    ),
                     "entry_bias_at_match": int(entry_bias),
                     "entry_hits_at_match": int(entry_hits),
                     "min_wnd": int(cached.min_wnd),
