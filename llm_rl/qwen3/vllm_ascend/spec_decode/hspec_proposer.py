@@ -47,6 +47,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm_ascend.spec_decode.hspec_metrics import (
     HSpecSelectionMetricTracker,
     hspec_r1_rerank_histogram_key,
+    hspec_utility_score_histogram_key,
 )
 from vllm_ascend.spec_decode.hspec_selector_r1 import (
     HSPEC_R1_NUMBA_AVAILABLE,
@@ -54,6 +55,13 @@ from vllm_ascend.spec_decode.hspec_selector_r1 import (
     rerank_one_prompt_numba,
     rerank_one_prompt_python,
     warm_r1_reranker,
+)
+from vllm_ascend.spec_decode.hspec_selector_survival import (
+    HSPEC_SURVIVAL_MODE,
+    HSPEC_SURVIVAL_NUMBA_AVAILABLE,
+    HSpecSurvivalConfig,
+    score_utility_one_prompt_numba,
+    warm_survival_selector,
 )
 from vllm_ascend.spec_decode.hspec_s7_benchmark import (
     S7VerificationPatternController,
@@ -75,6 +83,14 @@ from vllm_ascend.spec_decode.hspec_s9_shadow import (
     hspec_s9_query_identity,
     hspec_s9_token_hash,
     record_hspec_s9_shadow_events,
+)
+from vllm_ascend.spec_decode.hspec_s13_shadow import (
+    HSPEC_S13_CAPTURE_ALL_DIVERGENCE,
+    HSPEC_S13_SHADOW_ENABLED,
+    flush_hspec_s13_shadow,
+    hspec_s13_query_identity,
+    hspec_s13_token_hash,
+    record_hspec_s13_shadow_events,
 )
 from vllm_ascend.spec_decode.hspec_table import GlobalHSpecTableGroup, get_hspec_tables
 from vllm_ascend.spec_decode.hspec_table_store import (
@@ -167,6 +183,29 @@ def _prefix_fair_budget_caps(
     return caps
 
 
+def _utility_action_window(
+    safety_window: int,
+    action: int,
+    status: int,
+    candidate_idx: int,
+    executes_utility: bool,
+) -> tuple[int, bool]:
+    """Apply a valid Patch 3A length action after the safety window.
+
+    A non-zero scorer status is a row-local R1 fallback.  In particular, its
+    placeholder action is zero and must never be mistaken for abstention or a
+    zero-length proposal.
+    """
+    window = max(int(safety_window), 0)
+    valid = bool(
+        executes_utility and int(status) == 0 and int(candidate_idx) >= 0
+    )
+    if not valid:
+        return window, False
+    action_window = max(int(action), 0)
+    return min(window, action_window), action_window < window
+
+
 if _HSPEC_NUMBA_AVAILABLE:
 
     @njit(cache=True, parallel=True)
@@ -242,6 +281,7 @@ class _CachedPromptTable:
         "mean_cpu",
         "components_t_cpu",
         "keys_cpu",
+        "key_norm_cpu",
         "mean",
         "components",
         "keys",
@@ -270,6 +310,7 @@ class _CachedPromptTable:
         mean_cpu: np.ndarray,
         components_t_cpu: np.ndarray,
         keys_cpu: np.ndarray,
+        key_norm_cpu: np.ndarray | None,
         mean: Optional[torch.Tensor],
         components: Optional[torch.Tensor],
         keys: Optional[torch.Tensor],
@@ -295,6 +336,7 @@ class _CachedPromptTable:
         self.mean_cpu = mean_cpu                      # (D,) float32, CPU
         self.components_t_cpu = components_t_cpu      # (D,K) float32, CPU
         self.keys_cpu = keys_cpu                      # (M,K) table dtype or float32, CPU
+        self.key_norm_cpu = key_norm_cpu              # optional (M,) float32, CPU
         self.mean = mean                              # optional (D,) device
         self.components = components                  # optional (K,D) device
         self.keys = keys                              # optional (M,K) device
@@ -509,6 +551,7 @@ class _HSpecMatchResult:
     candidate_indices: torch.Tensor
     raw_top1_scores: torch.Tensor
     raw_top1_indices: torch.Tensor
+    query_norms: Optional[torch.Tensor] = None
     margins: Optional[torch.Tensor] = None
 
 
@@ -629,7 +672,26 @@ class HSpecProposer(Proposer):
         # audits while delegating all Patch 1 validation to one init-only parser.
         os.environ.get("HSPEC_SELECT_MODE", "hardmax")
         _get_env_int("HSPEC_SELECT_TOPK", 1, 1)
-        self._r1_config = HSpecR1Config.from_environment()
+        self._survival_config = HSpecSurvivalConfig.from_environment()
+        requested_selector_mode = str(
+            os.environ.get("HSPEC_SELECT_MODE", "hardmax")
+        ).strip().lower()
+        self._survival_requested = requested_selector_mode == HSPEC_SURVIVAL_MODE
+        if requested_selector_mode == HSPEC_SURVIVAL_MODE:
+            # Patch 3A is layered on the already promoted R1.  R1 is always a
+            # complete executable decision so a learned-row or model failure
+            # cannot fall through to an empty proposal by accident.
+            r1_environment = dict(os.environ)
+            r1_environment.update({
+                "HSPEC_SELECT_MODE": "topk_position",
+                "HSPEC_SELECT_TOPK": "8",
+                "HSPEC_SELECT_SIM_MODE": "cosine",
+                "HSPEC_SELECT_POSITION_MODE": "none",
+                "HSPEC_SELECT_SHADOW": "0",
+            })
+            self._r1_config = HSpecR1Config.from_environment(r1_environment)
+        else:
+            self._r1_config = HSpecR1Config.from_environment()
         if self._r1_config.computes_topk and HSPEC_S4_TRACE_ENABLED:
             self._r1_config = self._r1_config.hardmax_fallback(
                 "S4 reference tracing is restricted to the P0 hardmax selector"
@@ -638,7 +700,20 @@ class HSpecProposer(Proposer):
             self._r1_config = self._r1_config.hardmax_fallback(
                 "topk_position requires the frozen sequential Numba reranker"
             )
-        self._selector_mode = self._r1_config.mode
+        if self._survival_config.enabled and not self._r1_config.computes_topk:
+            self._survival_config = HSpecSurvivalConfig.disabled(
+                self._r1_config.fallback_reason
+                or "topk_utility requires an executable R1 fallback"
+            )
+        if self._survival_config.enabled and not HSPEC_SURVIVAL_NUMBA_AVAILABLE:
+            self._survival_config = HSpecSurvivalConfig.disabled(
+                "topk_utility requires the sequential Numba survival scorer"
+            )
+        self._selector_mode = (
+            HSPEC_SURVIVAL_MODE
+            if self._survival_config.enabled
+            else self._r1_config.mode
+        )
         self._selector_topk = self._r1_config.topk
         self._selector_margin_enabled = (
             os.environ.get("HSPEC_SELECT_OBSERVE_MARGIN", "0") != "0"
@@ -688,6 +763,17 @@ class HSpecProposer(Proposer):
         # Carry that scalar into the next event; S9 freezes timing sampling to
         # every batch, so this is a one-sample shift of the same distribution.
         self._s9_previous_timing_emit_ms = 0.0
+        self._s13_shadow_enabled = bool(
+            HSPEC_S13_SHADOW_ENABLED
+            and self._survival_config.enabled
+            and self._survival_config.shadow
+        )
+        if HSPEC_S13_SHADOW_ENABLED and not self._s13_shadow_enabled:
+            logger.warning(
+                "HSPEC_S13_SHADOW_DIR requires a validated topk_utility "
+                "shadow model; S13 observation is disabled"
+            )
+        self._s13_shadow_probes: Dict[str, List[Dict[str, Any]]] = {}
 
         self.hspec_tables: GlobalHSpecTableGroup = get_hspec_tables(
             similarity_threshold=self.similarity_threshold,
@@ -868,6 +954,12 @@ class HSpecProposer(Proposer):
         self._proposer_metric_gauges: Dict[str, float] = {}
         if self._r1_config.fallback_reason:
             self._record_proposer_metric("selector_config_fallback_count", 1)
+        if self._survival_requested and not self._survival_config.enabled:
+            self._record_proposer_metric("selector_utility_model_fallback_count", 1)
+            logger.warning(
+                "HSpec S13 utility selector disabled; executing R1 fallback: %s",
+                self._survival_config.fallback_reason,
+            )
         self._last_log_t = time.time()
         self._log_every_calls = int(os.environ.get("HSPEC_LOG_EVERY_CALLS", "200"))
         self._log_every_s = float(os.environ.get("HSPEC_LOG_EVERY_S", "10"))
@@ -902,7 +994,8 @@ class HSpecProposer(Proposer):
             "HSpec selector: mode=%s topk=%d sim_mode=%s radius=%g suffix_cap=%d "
             "position_mode=%s shadow=%s d2h=%s fallback=%r margin=%s timing=%s "
             "metadata_sample_every=%d s2_baseline_audit=%s tp_draft_sync=%s "
-            "max_draft_tokens_per_batch=%d",
+            "max_draft_tokens_per_batch=%d utility_model=%s utility_shadow=%s "
+            "utility_execute=%s utility_fallback=%r",
             self._selector_mode,
             self._selector_topk,
             self._r1_config.sim_mode,
@@ -918,6 +1011,10 @@ class HSpecProposer(Proposer):
             self._s2_baseline_audit_enabled,
             self._tp_draft_sync_enabled,
             self._max_draft_tokens_per_batch,
+            self._survival_config.model_version,
+            self._survival_config.shadow,
+            self._survival_config.executes_utility,
+            self._survival_config.fallback_reason,
         )
 
         tp_group = self._get_tp_draft_sync_group()
@@ -1000,7 +1097,30 @@ class HSpecProposer(Proposer):
                 )
                 self._selector_mode = self._r1_config.mode
                 self._selector_topk = self._r1_config.topk
+                self._survival_config = HSpecSurvivalConfig.disabled(
+                    "R1 fallback initialization failed"
+                )
+                self._s13_shadow_enabled = False
                 self._record_proposer_metric("selector_runtime_fallback_count", 1)
+        if self._survival_config.enabled and self._is_tp_draft_leader():
+            try:
+                if int(self.max_draft_tokens) < 15:
+                    raise ValueError(
+                        "frozen S13 model requires num_speculative_tokens >= 15"
+                    )
+                warm_survival_selector()
+            except Exception as exc:
+                logger.warning(
+                    "HSpec utility initialization failed; executing R1: %r", exc
+                )
+                self._survival_config = HSpecSurvivalConfig.disabled(
+                    f"utility initialization failed: {exc!r}"
+                )
+                self._selector_mode = self._r1_config.mode
+                self._s13_shadow_enabled = False
+                self._record_proposer_metric(
+                    "selector_utility_runtime_fallback_count", 1
+                )
 
     # async prefetch
 
@@ -1330,6 +1450,9 @@ class HSpecProposer(Proposer):
                         self._cancel_all_s9_shadow_state(
                             "active_table_version_changed"
                         )
+                        self._cancel_all_s13_shadow_state(
+                            "active_table_version_changed"
+                        )
                         self._clear_prompt_cache()
                         self._not_in_table.clear()
                         self._cache_version = version
@@ -1507,6 +1630,7 @@ class HSpecProposer(Proposer):
         version_bumped = False
         if newest_version > int(self._cache_version):
             self._cancel_all_s9_shadow_state("active_table_version_changed")
+            self._cancel_all_s13_shadow_state("active_table_version_changed")
             self._clear_prompt_cache()
             self._not_in_table.clear()
             self._online_disabled.clear()
@@ -1866,7 +1990,9 @@ class HSpecProposer(Proposer):
         # The final column carries the raw hardmax gate. Candidates and the
         # immutable baseline decision therefore share the same two pinned
         # payload transfers and one synchronization boundary.
-        payload_width = self._r1_config.topk + 1
+        payload_width = self._r1_config.topk + 1 + int(
+            self._survival_config.enabled
+        )
         self._r1_host_scores = torch.empty(
             (max_rows, payload_width),
             dtype=torch.float32,
@@ -1940,6 +2066,71 @@ class HSpecProposer(Proposer):
             indices_cpu[:, candidate_width],
         )
 
+    def _copy_utility_selection_payload_to_host(
+        self,
+        candidate_scores: torch.Tensor,
+        candidate_indices: torch.Tensor,
+        raw_top1_scores: torch.Tensor,
+        raw_top1_indices: torch.Tensor,
+        query_norms: torch.Tensor,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Transfer full-top8, raw gate, and one query norm in two payloads."""
+        score_payload = torch.cat(
+            (
+                candidate_scores.float(),
+                raw_top1_scores.float().unsqueeze(1),
+                query_norms.float().unsqueeze(1),
+            ),
+            dim=1,
+        )
+        index_payload = torch.cat(
+            (candidate_indices, raw_top1_indices.unsqueeze(1)), dim=1
+        )
+        rows = int(score_payload.shape[0])
+        score_width = int(score_payload.shape[1])
+        index_width = int(index_payload.shape[1])
+        candidate_width = int(candidate_scores.shape[1])
+        if (
+            self._r1_d2h_strategy_runtime == "pinned_two_async"
+            and self._r1_host_scores is not None
+            and self._r1_host_indices is not None
+            and self._r1_copy_event is not None
+            and rows <= int(self._r1_host_scores.shape[0])
+            and score_width <= int(self._r1_host_scores.shape[1])
+            and index_width <= int(self._r1_host_indices.shape[1])
+        ):
+            try:
+                host_scores = self._r1_host_scores[:rows, :score_width]
+                host_indices = self._r1_host_indices[:rows, :index_width]
+                host_scores.copy_(score_payload, non_blocking=True)
+                host_indices.copy_(index_payload, non_blocking=True)
+                self._r1_copy_event.record()
+                self._r1_copy_event.synchronize()
+                scores_cpu = host_scores.numpy()
+                indices_cpu = host_indices.numpy()
+                return (
+                    scores_cpu[:, :candidate_width],
+                    indices_cpu[:, :candidate_width],
+                    scores_cpu[:, candidate_width],
+                    indices_cpu[:, candidate_width],
+                    scores_cpu[:, candidate_width + 1],
+                )
+            except Exception:
+                logger.warning(
+                    "HSpec utility pinned D2H failed; using two_cpu", exc_info=True
+                )
+                self._r1_d2h_strategy_runtime = "two_cpu"
+                self._record_proposer_metric("selector_d2h_fallback_count", 1)
+        scores_cpu = score_payload.cpu().numpy()
+        indices_cpu = index_payload.cpu().numpy()
+        return (
+            scores_cpu[:, :candidate_width],
+            indices_cpu[:, :candidate_width],
+            scores_cpu[:, candidate_width],
+            indices_cpu[:, candidate_width],
+            scores_cpu[:, candidate_width + 1],
+        )
+
     def _rerank_r1_row(
         self,
         candidate_scores: np.ndarray,
@@ -1972,6 +2163,52 @@ class HSpecProposer(Proposer):
             float(self._r1_config.position_exact_weight),
             float(self._r1_config.position_log_weight),
             float(self._r1_config.utility_threshold),
+        )
+
+    def _score_survival_row(
+        self,
+        candidate_scores: np.ndarray,
+        candidate_indices: np.ndarray,
+        cached: _CachedPromptTable,
+        current_tokens: Sequence[int],
+        query_norm: float,
+        base_pos: int,
+        decoded_len: int,
+    ) -> tuple[int, int, float, float, int, int, int, int]:
+        config = self._survival_config
+        if score_utility_one_prompt_numba is None or cached.key_norm_cpu is None:
+            raise RuntimeError("S13 survival scorer or compact key norms unavailable")
+        assert config.feature_mean is not None
+        assert config.feature_scale is not None
+        assert config.theta is not None
+        assert config.depth_bias is not None
+        assert config.actions is not None
+        assert config.costs_ms is not None
+        current = np.ascontiguousarray(
+            current_tokens[-8:] if current_tokens else (), dtype=np.int32
+        )
+        return score_utility_one_prompt_numba(
+            np.ascontiguousarray(candidate_scores, dtype=np.float32),
+            np.ascontiguousarray(candidate_indices, dtype=np.int64),
+            cached.entry_rollout_idx,
+            cached.entry_offset,
+            cached.token_buffer,
+            cached.rollout_token_offset,
+            cached.rollout_token_len,
+            cached.key_norm_cpu,
+            current,
+            float(query_norm),
+            int(base_pos),
+            int(decoded_len),
+            int(cached.n_entries),
+            config.feature_mean,
+            config.feature_scale,
+            config.theta,
+            config.depth_bias,
+            config.actions,
+            config.costs_ms,
+            float(config.temperature),
+            float(config.utility_threshold),
         )
 
     def _sample_r1_metadata(self) -> bool:
@@ -2180,6 +2417,262 @@ class HSpecProposer(Proposer):
         if events:
             record_hspec_s9_shadow_events(events)
         self._s9_shadow_probes.clear()
+
+    def _s13_advance_request(
+        self,
+        req_id: str,
+        emitted_tokens: Sequence[int],
+        *,
+        finish_reason: Optional[str] = None,
+    ) -> None:
+        if not self._s13_shadow_enabled:
+            return
+        emitted = [int(token) for token in emitted_tokens]
+        probes = self._s13_shadow_probes.get(str(req_id), [])
+        if not probes:
+            return
+        remaining: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
+        for probe in probes:
+            draft = [int(token) for token in probe["utility_draft_tokens"]]
+            future = [
+                int(token) for token in probe.get("observed_future_tokens", [])
+            ]
+            lcp = int(probe.get("utility_accept_len", 0))
+            exact = False
+            for token in emitted:
+                if len(future) >= len(draft):
+                    exact = True
+                    break
+                expected = int(draft[len(future)])
+                future.append(int(token))
+                if int(token) != expected:
+                    exact = True
+                    break
+                lcp += 1
+                if len(future) >= len(draft):
+                    exact = True
+                    break
+            if exact or finish_reason is not None:
+                events.append({
+                    "event": "counterfactual",
+                    "query_id": str(probe["query_id"]),
+                    "request_id": str(req_id),
+                    "prompt_id": str(probe["prompt_id"]),
+                    "decoded_len": int(probe["decoded_len"]),
+                    "active_table_version": int(probe["active_table_version"]),
+                    "utility_accept_len": int(lcp),
+                    "utility_drafted_len": int(len(draft)),
+                    "label_exact": bool(exact),
+                    "label_censored": bool(not exact),
+                    "observed_future_len": int(len(future)),
+                    "finish_reason": finish_reason,
+                    "observed_future_token_ids_sha256": hspec_s13_token_hash(future),
+                })
+            else:
+                probe["utility_accept_len"] = int(lcp)
+                probe["observed_future_tokens"] = future
+                remaining.append(probe)
+        if events:
+            record_hspec_s13_shadow_events(events)
+        if remaining:
+            self._s13_shadow_probes[str(req_id)] = remaining
+        else:
+            self._s13_shadow_probes.pop(str(req_id), None)
+
+    def _cancel_all_s13_shadow_state(self, reason: str) -> None:
+        if not self._s13_shadow_enabled:
+            return
+        events = [
+            {
+                "event": "counterfactual_cancellation",
+                "query_id": str(probe["query_id"]),
+                "request_id": str(req_id),
+                "prompt_id": str(probe["prompt_id"]),
+                "decoded_len": int(probe["decoded_len"]),
+                "active_table_version": int(probe["active_table_version"]),
+                "reason": str(reason),
+            }
+            for req_id, probes in self._s13_shadow_probes.items()
+            for probe in probes
+        ]
+        if events:
+            record_hspec_s13_shadow_events(events)
+        self._s13_shadow_probes.clear()
+
+    def _record_s13_shadow_batch(
+        self,
+        *,
+        results: List[List[int]],
+        req_ids: List[str],
+        prompt_ids: List[str],
+        decoded_lens: List[int],
+        active_batch_indices: List[int],
+        active_base_positions: List[int],
+        active_cached_tables: List[_CachedPromptTable],
+        raw_gate_hits: np.ndarray,
+        sims_cpu: np.ndarray,
+        candidate_scores_cpu: np.ndarray,
+        candidate_idxs_cpu: np.ndarray,
+        query_norms_cpu: np.ndarray,
+        r1_idxs_cpu: np.ndarray,
+        r1_rank_cpu: np.ndarray,
+        utility_idxs_cpu: np.ndarray,
+        utility_rank_cpu: np.ndarray,
+        utility_action_cpu: np.ndarray,
+        utility_value_cpu: np.ndarray,
+        utility_p1_cpu: np.ndarray,
+        utility_status_cpu: np.ndarray,
+    ) -> None:
+        """Record bounded counterfactuals only after the R1 draft is final."""
+        if not self._s13_shadow_enabled:
+            return
+        # Simulate the complete P3 arm, including row-local R1 fallbacks, so
+        # abstention in one request can correctly release prefix-fair budget
+        # to another.  Computing the budget over learned proposals alone would
+        # overstate the counterfactual draft length.
+        utility_windows: Dict[int, int] = {}
+        hypothetical_entry: Dict[int, int] = {}
+        hypothetical_rows: List[int] = []
+        for row in np.flatnonzero(raw_gate_hits).tolist():
+            status = int(utility_status_cpu[row])
+            learned_idx = int(utility_idxs_cpu[row])
+            if status == 0 and learned_idx < 0:
+                continue
+            entry_idx = learned_idx if status == 0 else int(r1_idxs_cpu[row])
+            if entry_idx < 0:
+                continue
+            cached = active_cached_tables[row]
+            matched_pos = int(cached.entry_offset[entry_idx]) - 1
+            safety_window = self._apply_abs_delta_cap(
+                window=min(
+                    cached.get_effective_window(entry_idx),
+                    int(self.max_draft_tokens),
+                ),
+                abs_delta=abs(matched_pos - int(active_base_positions[row])),
+                min_wnd=int(cached.min_wnd),
+            )
+            window, _ = _utility_action_window(
+                safety_window,
+                utility_action_cpu[row],
+                status,
+                learned_idx,
+                status == 0,
+            )
+            hypothetical_rows.append(row)
+            hypothetical_entry[row] = entry_idx
+            utility_windows[row] = cached.get_draft_token_count(entry_idx, window)
+        if self._max_draft_tokens_per_batch > 0 and hypothetical_rows:
+            caps = _prefix_fair_budget_caps(
+                [utility_windows[row] for row in hypothetical_rows],
+                self._max_draft_tokens_per_batch,
+            )
+            for row, cap in zip(hypothetical_rows, caps):
+                utility_windows[row] = min(utility_windows[row], int(cap))
+
+        events: List[Dict[str, Any]] = []
+        for row, batch_idx in enumerate(active_batch_indices):
+            if not raw_gate_hits[row]:
+                continue
+            status = int(utility_status_cpu[row])
+            req_id = str(req_ids[batch_idx])
+            prompt_id = str(prompt_ids[batch_idx])
+            query_id, sampled = hspec_s13_query_identity(
+                req_id,
+                prompt_id,
+                decoded_lens[batch_idx],
+                int(self._cache_version),
+            )
+            cached = active_cached_tables[row]
+            learned_idx = int(utility_idxs_cpu[row])
+            executed_idx = int(hypothetical_entry.get(row, -1))
+            utility_draft = (
+                cached.get_draft_tokens(
+                    executed_idx, int(utility_windows.get(row, 0))
+                )
+                if executed_idx >= 0 else []
+            )
+            baseline_draft = [int(token) for token in results[batch_idx]]
+            divergence = utility_draft != baseline_draft
+            if not sampled and not (
+                divergence and HSPEC_S13_CAPTURE_ALL_DIVERGENCE
+            ):
+                continue
+            events.append({
+                "event": "selection",
+                "query_id": query_id,
+                "request_id": req_id,
+                "prompt_id": prompt_id,
+                "decoded_len": int(decoded_lens[batch_idx]),
+                "active_table_version": int(self._cache_version),
+                "cache_generation": int(self._cache_generation),
+                "primary_sample": bool(sampled),
+                "captured_for_divergence": bool(divergence and not sampled),
+                "raw_gate_hit": True,
+                "raw_gate_score": float(sims_cpu[row]),
+                "candidate_entry_indices": [
+                    int(value) for value in candidate_idxs_cpu[row].tolist()
+                ],
+                "candidate_cosine_scores": [
+                    float(value) for value in candidate_scores_cpu[row].tolist()
+                ],
+                "query_norm": float(query_norms_cpu[row]),
+                "r1_entry_idx": int(r1_idxs_cpu[row]),
+                "r1_rank": int(r1_rank_cpu[row]),
+                "utility_entry_idx": learned_idx,
+                "utility_executed_entry_idx": executed_idx,
+                "utility_rank": int(utility_rank_cpu[row]),
+                "utility_action": (
+                    int(utility_action_cpu[row]) if status == 0 else None
+                ),
+                "utility_status": status,
+                "utility_row_fallback": bool(status != 0),
+                "utility_value": (
+                    float(utility_value_cpu[row])
+                    if np.isfinite(utility_value_cpu[row]) else None
+                ),
+                "utility_p1": (
+                    float(utility_p1_cpu[row])
+                    if np.isfinite(utility_p1_cpu[row]) else None
+                ),
+                "utility_abstain": bool(status == 0 and learned_idx < 0),
+                "utility_changed_vs_r1": bool(
+                    executed_idx != int(r1_idxs_cpu[row])
+                ),
+                "utility_draft_changed_vs_r1": bool(divergence),
+                "utility_draft_token_ids": [int(token) for token in utility_draft],
+                "r1_draft_token_ids": baseline_draft,
+                "utility_draft_sha256": hspec_s13_token_hash(utility_draft),
+                "r1_draft_sha256": hspec_s13_token_hash(baseline_draft),
+                "final_draft_sha256": hspec_s13_token_hash(results[batch_idx]),
+                "shadow_output_equal_r1": bool(
+                    results[batch_idx] == baseline_draft
+                    and int(r1_idxs_cpu[row]) >= 0
+                ),
+                "batch_budget_simulated": True,
+                "model_version": self._survival_config.model_version,
+                "model_sha256": self._survival_config.model_sha256,
+                "promotion_gate_sha256": self._survival_config.gate_sha256,
+            })
+            pending_meta = self._pending_verify_meta.get(req_id)
+            if pending_meta is not None:
+                pending_meta.update({
+                    "s13_shadow_query_id": query_id,
+                    "decoded_len_at_match": int(decoded_lens[batch_idx]),
+                    "active_table_version": int(self._cache_version),
+                })
+            if utility_draft:
+                self._s13_shadow_probes.setdefault(req_id, []).append({
+                    "query_id": query_id,
+                    "prompt_id": prompt_id,
+                    "decoded_len": int(decoded_lens[batch_idx]),
+                    "active_table_version": int(self._cache_version),
+                    "utility_draft_tokens": [int(token) for token in utility_draft],
+                    "utility_accept_len": 0,
+                    "observed_future_tokens": [],
+                })
+        if events:
+            record_hspec_s13_shadow_events(events)
 
     def _get_or_build_batched_table_cache(
         self,
@@ -2930,6 +3423,7 @@ class HSpecProposer(Proposer):
             cached.mean_cpu,
             cached.components_t_cpu,
             cached.keys_cpu,
+            cached.key_norm_cpu,
             cached.token_buffer,
             cached.rollout_token_offset,
             cached.rollout_token_len,
@@ -3315,10 +3809,20 @@ class HSpecProposer(Proposer):
 
         entry_bias = np.zeros((n_entries,), dtype=np.int8)
         entry_hits = np.zeros((n_entries,), dtype=np.uint16)
+        key_norm_cpu = None
+        if self._survival_config.enabled:
+            key_norm_cpu = np.ascontiguousarray(
+                np.linalg.norm(
+                    keys_np[:n_entries].astype(np.float32, copy=False), axis=1
+                ),
+                dtype=np.float32,
+            )
+            np.maximum(key_norm_cpu, np.float32(1.0e-12), out=key_norm_cpu)
         return _CachedPromptTable(
             mean_cpu=mean_np,
             components_t_cpu=components_t_cpu,
             keys_cpu=keys_np,
+            key_norm_cpu=key_norm_cpu,
             mean=mean,
             components=components,
             keys=keys,
@@ -3653,6 +4157,7 @@ class HSpecProposer(Proposer):
         # This exact reduction remains the default P0 decision and the R1 raw
         # absolute gate. R1 never substitutes a cosine threshold for it.
         raw_top1_scores, raw_top1_indices = sims.max(dim=1)
+        query_norm = None
         requested_k = max(int(topk), 1)
         if requested_k == 1 and sim_mode == "raw":
             ranking_scores = sims
@@ -3703,6 +4208,7 @@ class HSpecProposer(Proposer):
             candidate_indices=candidate_indices,
             raw_top1_scores=raw_top1_scores,
             raw_top1_indices=raw_top1_indices,
+            query_norms=query_norm,
             margins=margins,
         )
 
@@ -3875,6 +4381,15 @@ class HSpecProposer(Proposer):
                     ),
                 )
             s9_lifecycle_ms = _ns_to_ms(_now_ns() - s9_lifecycle_t0)
+        if self._s13_shadow_enabled:
+            for batch_idx, req_id in enumerate(req_ids):
+                self._s13_advance_request(
+                    req_id,
+                    (
+                        valid_sampled_token_ids[batch_idx]
+                        if batch_idx < len(valid_sampled_token_ids) else ()
+                    ),
+                )
 
         t0_extract = _now_ns() if gen_enabled else 0
         with (hspec_record_function("hspec/proposal/extract_anchor_hs")
@@ -4095,6 +4610,7 @@ class HSpecProposer(Proposer):
                 best_idxs = match_result.raw_top1_indices
                 candidate_scores = match_result.candidate_scores
                 candidate_idxs = match_result.candidate_indices
+                query_norms = match_result.query_norms
                 best_margins = match_result.margins
                 t1_sim = _now_ns() if observe_selector_clock else 0
 
@@ -4116,6 +4632,7 @@ class HSpecProposer(Proposer):
             best_margins = None
             candidate_scores = None
             candidate_idxs = None
+            query_norms = None
 
         if HSPEC_DEBUG:
             try:
@@ -4254,7 +4771,23 @@ class HSpecProposer(Proposer):
         with hspec_record_function("hspec/proposal/device_to_host_sync", use_npu_stream=True):
             t1_stack = _now_ns() if observe_selector_clock else 0
             t0_copy = _now_ns() if observe_selector_clock else 0
-            if self._r1_config.computes_topk:
+            if self._survival_config.enabled:
+                if query_norms is None:
+                    raise RuntimeError("topk_utility cosine query norm is unavailable")
+                (
+                    candidate_scores_cpu,
+                    candidate_idxs_cpu,
+                    sims_cpu,
+                    idxs_cpu,
+                    query_norms_cpu,
+                ) = self._copy_utility_selection_payload_to_host(
+                    candidate_scores,
+                    candidate_idxs,
+                    best_sims,
+                    best_idxs,
+                    query_norms,
+                )
+            elif self._r1_config.computes_topk:
                 (
                     candidate_scores_cpu,
                     candidate_idxs_cpu,
@@ -4266,11 +4799,13 @@ class HSpecProposer(Proposer):
                     best_sims,
                     best_idxs,
                 )
+                query_norms_cpu = np.ones_like(sims_cpu, dtype=np.float32)
             else:
                 sims_cpu = best_sims.cpu().numpy()
                 idxs_cpu = best_idxs.cpu().numpy()
                 candidate_scores_cpu = sims_cpu[:, None]
                 candidate_idxs_cpu = idxs_cpu[:, None]
+                query_norms_cpu = np.ones_like(sims_cpu, dtype=np.float32)
             margins_cpu = (
                 best_margins.float().cpu().numpy()
                 if best_margins is not None
@@ -4314,6 +4849,27 @@ class HSpecProposer(Proposer):
         )
         shadow_rank_cpu = np.full(
             (len(active_batch_indices),), -1, dtype=np.int16
+        )
+        utility_idxs_cpu = np.full(
+            (len(active_batch_indices),), -1, dtype=np.int64
+        )
+        utility_rank_cpu = np.full(
+            (len(active_batch_indices),), -1, dtype=np.int16
+        )
+        utility_action_cpu = np.zeros(
+            (len(active_batch_indices),), dtype=np.int16
+        )
+        utility_value_cpu = np.full(
+            (len(active_batch_indices),), float("nan"), dtype=np.float32
+        )
+        utility_p1_cpu = np.full(
+            (len(active_batch_indices),), float("nan"), dtype=np.float32
+        )
+        utility_suffix_cpu = np.zeros(
+            (len(active_batch_indices),), dtype=np.int16
+        )
+        utility_status_cpu = np.zeros(
+            (len(active_batch_indices),), dtype=np.int16
         )
         if self._r1_config.computes_topk:
             for row in np.flatnonzero(raw_gate_hits).tolist():
@@ -4359,31 +4915,139 @@ class HSpecProposer(Proposer):
         r1_cpu_rerank_ms = (
             _ns_to_ms(_now_ns() - r1_cpu_t0) if r1_cpu_t0 else 0.0
         )
-        if self._r1_config.executes_topk:
-            executed_mask = raw_gate_hits & (shadow_idxs_cpu >= 0)
-            changed_mask = executed_mask & (
-                shadow_idxs_cpu != np.asarray(idxs_cpu, dtype=np.int64)
+        utility_cpu_t0 = _now_ns() if selector_timing_enabled else 0
+        if self._survival_config.enabled:
+            for row in np.flatnonzero(raw_gate_hits).tolist():
+                batch_idx = active_batch_indices[row]
+                req_state = req_states[batch_idx]
+                current_tokens = (
+                    list(getattr(req_state, "output_token_ids", ()))
+                    if req_state is not None else []
+                )
+                try:
+                    (
+                        slot,
+                        action,
+                        utility,
+                        probability1,
+                        suffix,
+                        _,
+                        _,
+                        status,
+                    ) = self._score_survival_row(
+                        candidate_scores_cpu[row],
+                        candidate_idxs_cpu[row],
+                        active_cached_tables[row],
+                        current_tokens,
+                        float(query_norms_cpu[row]),
+                        active_base_positions[row],
+                        decoded_lens[batch_idx],
+                    )
+                except Exception:
+                    logger.warning(
+                        "HSpec utility row scoring failed; executing R1 for this query",
+                        exc_info=True,
+                    )
+                    self._record_proposer_metric(
+                        "selector_utility_query_fallback_count", 1
+                    )
+                    utility_status_cpu[row] = -1
+                    continue
+                utility_status_cpu[row] = int(status)
+                utility_value_cpu[row] = float(utility)
+                utility_p1_cpu[row] = float(probability1)
+                if status != 0:
+                    self._record_proposer_metric(
+                        (
+                            "selector_utility_width_fallback_count"
+                            if int(status) == 1
+                            else "selector_utility_invalid_row_fallback_count"
+                        ),
+                        1,
+                    )
+                    continue
+                if slot < 0:
+                    if not self._r1_config.shadow:
+                        if self._survival_config.executes_utility:
+                            selected_valid[row] = False
+                    continue
+                utility_idx = int(candidate_idxs_cpu[row, slot])
+                utility_idxs_cpu[row] = utility_idx
+                utility_rank_cpu[row] = int(slot)
+                utility_action_cpu[row] = int(action)
+                utility_suffix_cpu[row] = int(suffix)
+                if not self._r1_config.shadow:
+                    if self._survival_config.executes_utility:
+                        decision_idxs_cpu[row] = utility_idx
+                        decision_scores_cpu[row] = float(
+                            candidate_scores_cpu[row, slot]
+                        )
+                        selected_rank_cpu[row] = int(slot)
+                        selected_suffix_cpu[row] = int(suffix)
+                        selected_utility_cpu[row] = float(utility)
+        utility_cpu_score_ms = (
+            _ns_to_ms(_now_ns() - utility_cpu_t0) if utility_cpu_t0 else 0.0
+        )
+        if self._survival_config.enabled:
+            valid_utility = raw_gate_hits & (utility_status_cpu == 0)
+            proposed_utility = valid_utility & (utility_idxs_cpu >= 0)
+            abstained_utility = valid_utility & (utility_idxs_cpu < 0)
+            changed_vs_r1 = proposed_utility & (
+                utility_idxs_cpu != shadow_idxs_cpu
             )
-            self._record_proposer_metric("select_r1_execution_batches", 1)
+            prefix = (
+                "select_utility_execution"
+                if self._survival_config.executes_utility
+                else "select_utility_shadow"
+            )
+            self._record_proposer_metric(f"{prefix}_batches", 1)
             self._record_proposer_metric(
-                "select_r1_execution_queries", int(np.count_nonzero(executed_mask))
+                f"{prefix}_queries", int(np.count_nonzero(valid_utility))
             )
             self._record_proposer_metric(
-                "select_r1_changed_entry_count", int(np.count_nonzero(changed_mask))
+                f"{prefix}_proposed_count", int(np.count_nonzero(proposed_utility))
             )
             self._record_proposer_metric(
-                "select_r1_rank_one_based_sum",
-                int(np.sum(selected_rank_cpu[executed_mask].astype(np.int64) + 1)),
+                f"{prefix}_abstained_count", int(np.count_nonzero(abstained_utility))
             )
             self._record_proposer_metric(
-                "select_r1_suffix_sum",
-                int(np.sum(selected_suffix_cpu[executed_mask].astype(np.int64))),
+                f"{prefix}_changed_vs_r1_count", int(np.count_nonzero(changed_vs_r1))
+            )
+            self._record_proposer_metric(
+                f"{prefix}_action_sum",
+                int(np.sum(utility_action_cpu[proposed_utility].astype(np.int64))),
             )
             if selector_timing_enabled:
-                self._record_proposer_metric("select_r1_cpu_rerank_samples", 1)
+                self._record_proposer_metric("select_utility_cpu_score_samples", 1)
                 self._record_proposer_metric(
-                    hspec_r1_rerank_histogram_key(r1_cpu_rerank_ms), 1
+                    hspec_utility_score_histogram_key(utility_cpu_score_ms), 1
                 )
+        if self._r1_config.executes_topk:
+            if not self._survival_config.executes_utility:
+                executed_mask = raw_gate_hits & (shadow_idxs_cpu >= 0)
+                changed_mask = executed_mask & (
+                    shadow_idxs_cpu != np.asarray(idxs_cpu, dtype=np.int64)
+                )
+                self._record_proposer_metric("select_r1_execution_batches", 1)
+                self._record_proposer_metric(
+                    "select_r1_execution_queries", int(np.count_nonzero(executed_mask))
+                )
+                self._record_proposer_metric(
+                    "select_r1_changed_entry_count", int(np.count_nonzero(changed_mask))
+                )
+                self._record_proposer_metric(
+                    "select_r1_rank_one_based_sum",
+                    int(np.sum(selected_rank_cpu[executed_mask].astype(np.int64) + 1)),
+                )
+                self._record_proposer_metric(
+                    "select_r1_suffix_sum",
+                    int(np.sum(selected_suffix_cpu[executed_mask].astype(np.int64))),
+                )
+                if selector_timing_enabled:
+                    self._record_proposer_metric("select_r1_cpu_rerank_samples", 1)
+                    self._record_proposer_metric(
+                        hspec_r1_rerank_histogram_key(r1_cpu_rerank_ms), 1
+                    )
         s9_query_ids: Optional[List[str]] = None
         s9_primary_samples: Optional[List[bool]] = None
         s9_projected_cpu: Optional[np.ndarray] = None
@@ -4444,7 +5108,20 @@ class HSpecProposer(Proposer):
         )
         selector_stop_reasons: Dict[str, int] = {
             "score_gate": int(np.count_nonzero(~raw_gate_hits)),
-            "other": int(np.count_nonzero(raw_gate_hits & ~selected_valid)),
+            "utility_abstain": int(np.count_nonzero(
+                raw_gate_hits
+                & (utility_status_cpu == 0)
+                & (utility_idxs_cpu < 0)
+            )) if self._survival_config.executes_utility else 0,
+            "other": int(np.count_nonzero(
+                raw_gate_hits
+                & ~selected_valid
+                & ~(
+                    (utility_status_cpu == 0) & (utility_idxs_cpu < 0)
+                    if self._survival_config.executes_utility
+                    else np.zeros_like(selected_valid)
+                )
+            )),
         }
         selector_proposed_requests = 0
         selector_drafted_tokens = 0
@@ -4459,7 +5136,10 @@ class HSpecProposer(Proposer):
         # Plan available lengths without copying token values.  When enabled,
         # the prefix-fair batch budget bounds the number of target verification
         # rows while preserving shallow prefixes across all matched requests.
-        planned_windows: Dict[int, tuple[int, int, int]] = {}
+        # base -> absolute-delta safety cap -> utility action -> batch budget.
+        # Keep each intermediate value: merging them makes it impossible to
+        # attribute a shorter proposal to Patch 3A during the online A/B.
+        planned_windows: Dict[int, tuple[int, int, int, int, bool]] = {}
         budget_cap_by_row: Dict[int, int] = {}
         if self._max_draft_tokens_per_batch > 0:
             for j in hit_rows.tolist():
@@ -4472,10 +5152,17 @@ class HSpecProposer(Proposer):
                     cached.get_effective_window(matched_entry_idx),
                     int(self.max_draft_tokens),
                 )
-                effective_wnd = self._apply_abs_delta_cap(
+                safety_effective_wnd = self._apply_abs_delta_cap(
                     window=base_effective_wnd,
                     abs_delta=abs_delta,
                     min_wnd=int(cached.min_wnd),
+                )
+                effective_wnd, utility_action_applied = _utility_action_window(
+                    safety_effective_wnd,
+                    utility_action_cpu[j],
+                    utility_status_cpu[j],
+                    utility_idxs_cpu[j],
+                    self._survival_config.executes_utility,
                 )
                 if s7_caps is not None:
                     effective_wnd = min(
@@ -4486,12 +5173,14 @@ class HSpecProposer(Proposer):
                 )
                 planned_windows[j] = (
                     int(base_effective_wnd),
+                    int(safety_effective_wnd),
                     int(effective_wnd),
                     int(raw_draft_len),
+                    bool(utility_action_applied),
                 )
 
             raw_draft_lengths = [
-                planned_windows[j][2] for j in hit_rows.tolist()
+                planned_windows[j][3] for j in hit_rows.tolist()
             ]
             budget_caps = _prefix_fair_budget_caps(
                 raw_draft_lengths, self._max_draft_tokens_per_batch
@@ -4542,8 +5231,10 @@ class HSpecProposer(Proposer):
             if self._max_draft_tokens_per_batch > 0:
                 (
                     base_effective_wnd,
+                    safety_effective_wnd,
                     pre_budget_effective_wnd,
                     raw_draft_len,
+                    utility_action_applied,
                 ) = planned_windows[j]
                 effective_wnd = int(pre_budget_effective_wnd)
                 budget_cap = int(budget_cap_by_row[j])
@@ -4555,10 +5246,20 @@ class HSpecProposer(Proposer):
                     cached.get_effective_window(matched_entry_idx),
                     int(self.max_draft_tokens),
                 )
-                pre_budget_effective_wnd = self._apply_abs_delta_cap(
+                safety_effective_wnd = self._apply_abs_delta_cap(
                     window=base_effective_wnd,
                     abs_delta=abs_delta,
                     min_wnd=int(cached.min_wnd),
+                )
+                (
+                    pre_budget_effective_wnd,
+                    utility_action_applied,
+                ) = _utility_action_window(
+                    safety_effective_wnd,
+                    utility_action_cpu[j],
+                    utility_status_cpu[j],
+                    utility_idxs_cpu[j],
+                    self._survival_config.executes_utility,
                 )
                 if s7_caps is not None:
                     pre_budget_effective_wnd = min(
@@ -4616,6 +5317,15 @@ class HSpecProposer(Proposer):
                                 s9_cancel_ms += _ns_to_ms(
                                     _now_ns() - s9_cancel_t0
                                 )
+                    if self._s13_shadow_enabled:
+                        old_s13_query_id = old_meta.get("s13_shadow_query_id")
+                        if old_s13_query_id is not None:
+                            record_hspec_s13_shadow_events([{
+                                "event": "verification_cancellation",
+                                "query_id": str(old_s13_query_id),
+                                "request_id": str(req_id),
+                                "reason": "superseded_before_verification",
+                            }])
                     self._record_closed_selector_metrics(
                         self._selector_metric_tracker.record_cancellation(
                             int(old_meta.get("metric_window_id", -1))
@@ -4640,6 +5350,13 @@ class HSpecProposer(Proposer):
                     max_draft_tokens=self.max_draft_tokens,
                     batch_budget_cap_applied=batch_budget_cap_applied,
                 )
+                if (
+                    utility_action_applied
+                    and not batch_budget_cap_applied
+                    and int(effective_wnd) == int(utility_action_cpu[j])
+                    and len(draft) >= int(utility_action_cpu[j])
+                ):
+                    stop_reason = "utility_length"
                 selector_stop_reasons[stop_reason] = (
                     selector_stop_reasons.get(stop_reason, 0) + 1
                 )
@@ -4666,6 +5383,14 @@ class HSpecProposer(Proposer):
                         float(margins_cpu[j]) if margins_cpu is not None else None
                     ),
                     "predicted_accept_probability": None,
+                    "utility_action": (
+                        int(utility_action_cpu[j])
+                        if self._survival_config.executes_utility else None
+                    ),
+                    "utility_model_version": (
+                        self._survival_config.model_version
+                        if self._survival_config.enabled else None
+                    ),
                     "stop_reason": stop_reason,
                     "metric_window_id": int(selector_window_id),
                     "prompt_id": prompt_ids[i],
@@ -4686,7 +5411,10 @@ class HSpecProposer(Proposer):
                     "base_effective_wnd_at_match": int(base_effective_wnd),
                     "effective_wnd_at_match": int(effective_wnd),
                     "abs_delta_cap_applied": int(
-                        pre_budget_effective_wnd < base_effective_wnd
+                        safety_effective_wnd < base_effective_wnd
+                    ),
+                    "utility_action_cap_applied": int(
+                        utility_action_applied
                     ),
                     "batch_draft_budget_cap_applied": int(
                         batch_budget_cap_applied
@@ -4696,6 +5424,11 @@ class HSpecProposer(Proposer):
                     "min_wnd": int(cached.min_wnd),
                     "max_wnd": int(cached.max_wnd),
                 }
+                if self._survival_config.executes_utility:
+                    pending_meta["predicted_accept_probability"] = (
+                        float(utility_p1_cpu[j])
+                        if np.isfinite(utility_p1_cpu[j]) else None
+                    )
                 if s7_pattern is not None:
                     pending_meta["s7_verification_pattern"] = s7_pattern
                 if HSPEC_S4_TRACE_ENABLED:
@@ -4761,6 +5494,29 @@ class HSpecProposer(Proposer):
                     "draft_retrieve_ms": _ns_to_ms(t1_retrieve - t0_retrieve) if t0_retrieve else 0.0,
                 })
                 self._hspec_gen_timing = td
+
+        self._record_s13_shadow_batch(
+            results=results,
+            req_ids=req_ids,
+            prompt_ids=prompt_ids,
+            decoded_lens=decoded_lens,
+            active_batch_indices=active_batch_indices,
+            active_base_positions=active_base_positions,
+            active_cached_tables=active_cached_tables,
+            raw_gate_hits=raw_gate_hits,
+            sims_cpu=sims_cpu,
+            candidate_scores_cpu=candidate_scores_cpu,
+            candidate_idxs_cpu=candidate_idxs_cpu,
+            query_norms_cpu=query_norms_cpu,
+            r1_idxs_cpu=decision_idxs_cpu,
+            r1_rank_cpu=shadow_rank_cpu,
+            utility_idxs_cpu=utility_idxs_cpu,
+            utility_rank_cpu=utility_rank_cpu,
+            utility_action_cpu=utility_action_cpu,
+            utility_value_cpu=utility_value_cpu,
+            utility_p1_cpu=utility_p1_cpu,
+            utility_status_cpu=utility_status_cpu,
+        )
 
         if HSPEC_S4_TRACE_ENABLED:
             assert s4_trace_query_ids is not None
@@ -5082,6 +5838,7 @@ class HSpecProposer(Proposer):
                 "d2h_sync_ms": _ns_to_ms(t1_copy - t0_copy),
                 "shadow_trace_d2h_ms": float(s9_trace_d2h_ms),
                 "r1_cpu_rerank_ms": float(r1_cpu_rerank_ms),
+                "utility_cpu_score_ms": float(utility_cpu_score_ms),
                 "shadow_identity_ms": float(s9_identity_ms),
                 "shadow_cancel_ms": float(s9_cancel_ms),
                 "shadow_pending_meta_ms": float(s9_pending_meta_ms),
@@ -5469,6 +6226,27 @@ class HSpecProposer(Proposer):
                             observed_drafted_len != expected_drafted_len
                         ),
                     }])
+            if getattr(self, "_s13_shadow_enabled", False):
+                query_id = meta.get("s13_shadow_query_id")
+                if query_id is not None:
+                    record_hspec_s13_shadow_events([{
+                        "event": "verification",
+                        "query_id": str(query_id),
+                        "request_id": str(rid),
+                        "prompt_id": str(prompt_id),
+                        "decoded_len": int(meta.get("decoded_len_at_match", -1)),
+                        "active_table_version": int(
+                            meta.get("active_table_version", self._cache_version)
+                        ),
+                        "r1_accept_len": int(apl),
+                        "r1_drafted_len": int(expected_drafted_len),
+                        "observed_drafted_len": int(observed_drafted_len),
+                        "emitted_token_len": int(emitted_tokens),
+                        "emitted_token_ids_sha256": hspec_s13_token_hash(emitted_ids),
+                        "drafted_length_mismatch": bool(
+                            observed_drafted_len != expected_drafted_len
+                        ),
+                    }])
         return (accept_advan_count, reject_advan_count)
 
     def update_entry_verification_outcomes(
@@ -5502,6 +6280,15 @@ class HSpecProposer(Proposer):
                         "request_id": str(req_id),
                         "reason": str(reason),
                     }])
+            if getattr(self, "_s13_shadow_enabled", False):
+                query_id = meta.get("s13_shadow_query_id")
+                if query_id is not None:
+                    record_hspec_s13_shadow_events([{
+                        "event": "verification_cancellation",
+                        "query_id": str(query_id),
+                        "request_id": str(req_id),
+                        "reason": str(reason),
+                    }])
             self._record_closed_selector_metrics(
                 self._selector_metric_tracker.record_cancellation(
                     int(meta.get("metric_window_id", -1))
@@ -5521,6 +6308,10 @@ class HSpecProposer(Proposer):
                 req_id,
                 (),
                 finish_reason="request_finished",
+            )
+        if getattr(self, "_s13_shadow_enabled", False):
+            self._s13_advance_request(
+                req_id, (), finish_reason="request_finished"
             )
         self._cancel_pending_request(
             req_id,
@@ -5549,6 +6340,12 @@ class HSpecProposer(Proposer):
                     finish_reason=str(normalized_reason),
                 )
             flush_hspec_s9_shadow(str(normalized_reason))
+        if getattr(self, "_s13_shadow_enabled", False):
+            for req_id in tuple(self._s13_shadow_probes):
+                self._s13_advance_request(
+                    req_id, (), finish_reason=str(normalized_reason)
+                )
+            flush_hspec_s13_shadow(str(normalized_reason))
 
         # LLM.generate() has returned, so no request-local decode state may
         # cross this boundary even when a final scheduler cleanup callback was

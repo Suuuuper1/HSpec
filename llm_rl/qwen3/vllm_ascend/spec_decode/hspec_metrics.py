@@ -23,6 +23,8 @@ _STOP_REASONS = frozenset({
     "adaptive_window",
     "value_end",
     "max_draft_tokens",
+    "utility_abstain",
+    "utility_length",
     "other",
 })
 _TIMING_FIELDS = frozenset({
@@ -31,6 +33,7 @@ _TIMING_FIELDS = frozenset({
     "d2h_sync_ms",
     "cpu_retrieve_ms",
     "total_ms",
+    "utility_cpu_score_ms",
 })
 R1_RERANK_HISTOGRAM_US_BOUNDS = (
     50,
@@ -64,6 +67,43 @@ _R1_ONLINE_ADDITIVE_KEYS = frozenset({
 }) | frozenset(
     f"select_r1_cpu_rerank_us_le_{bound}"
     for bound in R1_RERANK_HISTOGRAM_US_BOUNDS
+)
+UTILITY_SCORE_HISTOGRAM_US_BOUNDS = (
+    25,
+    50,
+    100,
+    200,
+    300,
+    500,
+    750,
+    1000,
+    1500,
+    2000,
+    4000,
+    8000,
+)
+_UTILITY_ONLINE_ADDITIVE_KEYS = frozenset({
+    "selector_utility_model_fallback_count",
+    "selector_utility_runtime_fallback_count",
+    "selector_utility_query_fallback_count",
+    "selector_utility_width_fallback_count",
+    "selector_utility_invalid_row_fallback_count",
+    "select_utility_cpu_score_samples",
+    "select_utility_cpu_score_us_overflow",
+}) | frozenset(
+    f"select_utility_cpu_score_us_le_{bound}"
+    for bound in UTILITY_SCORE_HISTOGRAM_US_BOUNDS
+) | frozenset(
+    f"select_utility_{state}_{suffix}"
+    for state in ("shadow", "execution")
+    for suffix in (
+        "batches",
+        "queries",
+        "proposed_count",
+        "abstained_count",
+        "changed_vs_r1_count",
+        "action_sum",
+    )
 )
 _BASE_ADDITIVE_KEYS = frozenset({
     "select_metric_windows",
@@ -104,6 +144,7 @@ _BASE_ADDITIVE_KEYS = frozenset({
 SELECTOR_ADDITIVE_METRIC_KEYS = frozenset(
     set(_BASE_ADDITIVE_KEYS)
     | set(_R1_ONLINE_ADDITIVE_KEYS)
+    | set(_UTILITY_ONLINE_ADDITIVE_KEYS)
     | {f"select_stop_{reason}_count" for reason in _STOP_REASONS}
     | {f"select_{name}" for name in _TIMING_FIELDS}
     | {f"select_accept_len_{length}_count" for length in range(_MAX_ACCEPT_HISTOGRAM_BIN + 1)}
@@ -118,6 +159,15 @@ def hspec_r1_rerank_histogram_key(milliseconds: float) -> str:
         if microseconds <= float(bound):
             return f"select_r1_cpu_rerank_us_le_{bound}"
     return "select_r1_cpu_rerank_us_overflow"
+
+
+def hspec_utility_score_histogram_key(milliseconds: float) -> str:
+    """Map one batch-level utility score duration to one fixed bucket."""
+    microseconds = max(float(milliseconds) * 1000.0, 0.0)
+    for bound in UTILITY_SCORE_HISTOGRAM_US_BOUNDS:
+        if microseconds <= float(bound):
+            return f"select_utility_cpu_score_us_le_{bound}"
+    return "select_utility_cpu_score_us_overflow"
 
 
 def is_selector_additive_metric(key: str) -> bool:
