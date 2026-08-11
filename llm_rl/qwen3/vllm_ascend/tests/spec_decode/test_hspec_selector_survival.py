@@ -164,9 +164,9 @@ class TestSurvivalConfiguration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             gate_path = Path(temporary) / "shadow_gate.json"
             gate_path.write_text(json.dumps({
-                "schema_version": "hspec.s13.shadow-gate.v1",
+                "schema_version": "hspec.s13.functional-shadow-gate.v2",
                 "status": "PASS",
-                "decision": "READY_FOR_1P5B_ONLINE_AB",
+                "decision": "READY_FOR_1P5B_EXECUTION_SMOKE",
                 "checks": {"shadow_parity": True},
                 "model_sha256": _sha256(MODEL),
                 "entry_gate_sha256": _sha256(ENTRY_GATE),
@@ -196,6 +196,34 @@ class TestSurvivalConfiguration(unittest.TestCase):
             self.assertFalse(
                 HSpecSurvivalConfig.from_environment(bad_gate).enabled
             )
+
+    def test_performance_execute_requires_target_shadow_v2_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "execution_gate.json"
+            environment = _environment(shadow="0", allow_execute="1")
+            environment["HSPEC_SELECT_EXECUTION_LEVEL"] = "performance"
+            environment["HSPEC_SELECT_EXECUTION_GATE_PATH"] = str(path)
+
+            legacy = {
+                "schema_version": "hspec.s13.functional-gate.v1",
+                "status": "PASS",
+                "decision": "READY_FOR_30B_ONLINE_AB",
+                "checks": {"functional": True},
+                "model_sha256": _sha256(MODEL),
+                "entry_gate_sha256": _sha256(ENTRY_GATE),
+            }
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            environment["HSPEC_SELECT_EXECUTION_GATE_SHA256"] = _sha256(path)
+            rejected = HSpecSurvivalConfig.from_environment(environment)
+            self.assertFalse(rejected.enabled)
+
+            target = dict(legacy)
+            target["schema_version"] = "hspec.s13.target-shadow-gate.v2"
+            path.write_text(json.dumps(target), encoding="utf-8")
+            environment["HSPEC_SELECT_EXECUTION_GATE_SHA256"] = _sha256(path)
+            allowed = HSpecSurvivalConfig.from_environment(environment)
+            self.assertTrue(allowed.executes_utility, allowed.fallback_reason)
+            self.assertEqual(allowed.execution_level, "performance")
 
 
 class TestSurvivalFeaturesAndPolicy(unittest.TestCase):

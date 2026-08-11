@@ -200,11 +200,11 @@ class HSpecSurvivalConfig:
                 ).strip().lower()
                 expected_execution = {
                     "functional": (
-                        "hspec.s13.shadow-gate.v1",
-                        "READY_FOR_1P5B_ONLINE_AB",
+                        "hspec.s13.functional-shadow-gate.v2",
+                        "READY_FOR_1P5B_EXECUTION_SMOKE",
                     ),
                     "performance": (
-                        "hspec.s13.functional-gate.v1",
+                        "hspec.s13.target-shadow-gate.v2",
                         "READY_FOR_30B_ONLINE_AB",
                     ),
                 }.get(execution_level)
