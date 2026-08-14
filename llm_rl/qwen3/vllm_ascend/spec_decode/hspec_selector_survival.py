@@ -22,10 +22,12 @@ import numpy as np
 
 try:
     from numba import njit
+    from numba.typed import List as NumbaList
 
     HSPEC_SURVIVAL_NUMBA_AVAILABLE = True
 except Exception:  # pragma: no cover - optional on analysis hosts
     njit = None
+    NumbaList = None
     HSPEC_SURVIVAL_NUMBA_AVAILABLE = False
 
 
@@ -613,6 +615,113 @@ else:  # pragma: no cover
     score_utility_one_prompt_numba = None
 
 
+def _score_utility_batch_numba_impl(
+    candidate_scores: np.ndarray,
+    candidate_indices: np.ndarray,
+    table_rows: np.ndarray,
+    entry_rollout_idx_list,
+    entry_offset_list,
+    token_buffer_list,
+    rollout_offsets_list,
+    rollout_lens_list,
+    key_norms_list,
+    current_tails: np.ndarray,
+    current_tail_lens: np.ndarray,
+    query_norms: np.ndarray,
+    base_positions: np.ndarray,
+    decoded_lens: np.ndarray,
+    feature_mean: np.ndarray,
+    feature_scale: np.ndarray,
+    theta: np.ndarray,
+    depth_bias: np.ndarray,
+    actions: np.ndarray,
+    costs_ms: np.ndarray,
+    temperature: float,
+    utility_threshold: float,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Score one selection window with one dispatcher crossing.
+
+    Prompt tables have different extents, so their compact CPU arrays are
+    supplied as typed lists built with the prefetch batch cache. Only the
+    bounded response tail is copied into the dense per-window input.
+    """
+    rows = int(candidate_scores.shape[0])
+    slots = np.empty((rows,), dtype=np.int16)
+    selected_actions = np.empty((rows,), dtype=np.int16)
+    utilities = np.empty((rows,), dtype=np.float64)
+    probabilities1 = np.empty((rows,), dtype=np.float64)
+    suffixes = np.empty((rows,), dtype=np.int16)
+    abs_deltas = np.empty((rows,), dtype=np.int32)
+    remaining = np.empty((rows,), dtype=np.int32)
+    statuses = np.empty((rows,), dtype=np.int16)
+    tail_width = int(current_tails.shape[1])
+    for row in range(rows):
+        table_row = int(table_rows[row])
+        tail_len = int(current_tail_lens[row])
+        if tail_len < 0:
+            tail_len = 0
+        elif tail_len > tail_width:
+            tail_len = tail_width
+        result = score_utility_one_prompt_numba(
+            candidate_scores[row],
+            candidate_indices[row],
+            entry_rollout_idx_list[table_row],
+            entry_offset_list[table_row],
+            token_buffer_list[table_row],
+            rollout_offsets_list[table_row],
+            rollout_lens_list[table_row],
+            key_norms_list[table_row],
+            current_tails[row, tail_width - tail_len :],
+            float(query_norms[row]),
+            int(base_positions[row]),
+            int(decoded_lens[row]),
+            int(entry_rollout_idx_list[table_row].shape[0]),
+            feature_mean,
+            feature_scale,
+            theta,
+            depth_bias,
+            actions,
+            costs_ms,
+            float(temperature),
+            float(utility_threshold),
+        )
+        slots[row] = int(result[0])
+        selected_actions[row] = int(result[1])
+        utilities[row] = float(result[2])
+        probabilities1[row] = float(result[3])
+        suffixes[row] = int(result[4])
+        abs_deltas[row] = int(result[5])
+        remaining[row] = int(result[6])
+        statuses[row] = int(result[7])
+    return (
+        slots,
+        selected_actions,
+        utilities,
+        probabilities1,
+        suffixes,
+        abs_deltas,
+        remaining,
+        statuses,
+    )
+
+
+if HSPEC_SURVIVAL_NUMBA_AVAILABLE:
+    score_utility_batch_numba = njit(cache=True, nogil=True, fastmath=False)(
+        _score_utility_batch_numba_impl
+    )
+else:  # pragma: no cover
+    score_utility_batch_numba = None
+
+
 def warm_survival_selector() -> None:
     """Compile the production signature before the first decode call."""
     if score_utility_one_prompt_numba is None:
@@ -637,3 +746,33 @@ def warm_survival_selector() -> None:
         rollout_offsets, rollout_lens, key_norms, current, 1.0, 0, 1, 8,
         mean, scale, theta, bias, actions, costs, 1.0, 0.0,
     )
+    if score_utility_batch_numba is not None and NumbaList is not None:
+        def typed(values):
+            result = NumbaList()
+            result.append(values)
+            return result
+
+        score_utility_batch_numba(
+            scores[None, :],
+            indices[None, :],
+            np.zeros((1,), dtype=np.int32),
+            typed(rollout_idx),
+            typed(entry_offset),
+            typed(token_buffer),
+            typed(rollout_offsets),
+            typed(rollout_lens),
+            typed(key_norms),
+            current[None, :],
+            np.ones((1,), dtype=np.int16),
+            np.ones((1,), dtype=np.float32),
+            np.zeros((1,), dtype=np.int32),
+            np.ones((1,), dtype=np.int32),
+            mean,
+            scale,
+            theta,
+            bias,
+            actions,
+            costs,
+            1.0,
+            0.0,
+        )

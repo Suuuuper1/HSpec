@@ -162,6 +162,8 @@ export HSPEC_SELECT_D2H_STRATEGY="${HSPEC_SELECT_D2H_STRATEGY:-pinned_two_async}
 export HSPEC_SELECT_OBSERVE_MARGIN="${HSPEC_SELECT_OBSERVE_MARGIN:-0}"
 export HSPEC_SELECT_OBSERVE_TIMING="${HSPEC_SELECT_OBSERVE_TIMING:-0}"
 export HSPEC_SELECT_METADATA_SAMPLE_EVERY="${HSPEC_SELECT_METADATA_SAMPLE_EVERY:-0}"
+export HSPEC_SELECT_R1_COMPARE_EVERY_BATCHES="${HSPEC_SELECT_R1_COMPARE_EVERY_BATCHES:-0}"
+export HSPEC_S13_FASTPATH_VERSION="${HSPEC_S13_FASTPATH_VERSION:-}"
 export HSPEC_S9_SHADOW_DIR="${HSPEC_S9_SHADOW_DIR:-}"
 export HSPEC_S9_SAMPLE_EVERY="${HSPEC_S9_SAMPLE_EVERY:-1000}"
 export HSPEC_S9_TIMING_SAMPLE_EVERY="${HSPEC_S9_TIMING_SAMPLE_EVERY:-1}"
@@ -413,6 +415,8 @@ fi
     echo "hspec_select_execution_level=${HSPEC_SELECT_EXECUTION_LEVEL}"
     echo "hspec_select_allow_execute=${HSPEC_SELECT_ALLOW_EXECUTE}"
     echo "hspec_select_d2h_strategy=${HSPEC_SELECT_D2H_STRATEGY}"
+    echo "hspec_select_r1_compare_every_batches=${HSPEC_SELECT_R1_COMPARE_EVERY_BATCHES}"
+    echo "hspec_s13_fastpath_version=${HSPEC_S13_FASTPATH_VERSION}"
     echo "hspec_s9_shadow_dir=${HSPEC_S9_SHADOW_DIR}"
     echo "hspec_s9_sample_every=${HSPEC_S9_SAMPLE_EVERY}"
     echo "hspec_s9_timing_sample_every=${HSPEC_S9_TIMING_SAMPLE_EVERY}"
@@ -675,6 +679,8 @@ env \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SELECT_OBSERVE_MARGIN='"'"${HSPEC_SELECT_OBSERVE_MARGIN}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SELECT_OBSERVE_TIMING='"'"${HSPEC_SELECT_OBSERVE_TIMING}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SELECT_METADATA_SAMPLE_EVERY='"'"${HSPEC_SELECT_METADATA_SAMPLE_EVERY}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SELECT_R1_COMPARE_EVERY_BATCHES='"'"${HSPEC_SELECT_R1_COMPARE_EVERY_BATCHES}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_S13_FASTPATH_VERSION='"'"${HSPEC_S13_FASTPATH_VERSION}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_S9_SHADOW_DIR='"'"${HSPEC_S9_SHADOW_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_S9_SAMPLE_EVERY='"'"${HSPEC_S9_SAMPLE_EVERY}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_S9_TIMING_SAMPLE_EVERY='"'"${HSPEC_S9_TIMING_SAMPLE_EVERY}"'"' \

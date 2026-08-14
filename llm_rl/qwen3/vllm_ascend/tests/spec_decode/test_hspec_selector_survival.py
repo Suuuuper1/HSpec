@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from numba.typed import List as NumbaList
 
 from vllm_ascend.spec_decode.hspec_metrics import (
     hspec_utility_score_histogram_key,
@@ -16,6 +17,7 @@ from vllm_ascend.spec_decode.hspec_selector_survival import (
     HSPEC_SURVIVAL_ACTIONS,
     HSpecSurvivalConfig,
     extract_utility_features_python,
+    score_utility_batch_numba,
     score_utility_one_prompt_numba,
     score_utility_one_prompt_python,
 )
@@ -51,6 +53,23 @@ def _load_utility_action_window():
 
 
 UTILITY_ACTION_WINDOW = _load_utility_action_window()
+
+
+def _load_utility_r1_work_masks():
+    tree = ast.parse(PROPOSER.read_text(encoding="utf-8"))
+    node = next(
+        item
+        for item in tree.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "_utility_r1_work_masks"
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+    namespace = {"np": np}
+    exec(compile(module, str(PROPOSER), "exec"), namespace)
+    return namespace[node.name]
+
+
+UTILITY_R1_WORK_MASKS = _load_utility_r1_work_masks()
 
 
 def _sha256(path: Path) -> str:
@@ -307,6 +326,81 @@ class TestSurvivalFeaturesAndPolicy(unittest.TestCase):
         self.assertAlmostEqual(python_result[2], expected_utility, places=12)
         self.assertLessEqual(python_result[1], 15)
 
+    def test_batch_kernel_matches_individual_numba_decisions(self):
+        arrays = _table_arrays()
+        rows = 3
+
+        def typed(value):
+            result = NumbaList()
+            result.append(value)
+            result.append(value)
+            return result
+
+        current_tails = np.zeros((rows, 8), dtype=np.int32)
+        current_lens = np.asarray([4, 4, 3], dtype=np.int16)
+        current_tails[0, -4:] = arrays["current"]
+        current_tails[1, -4:] = [20, 21, 12, 13]
+        current_tails[2, -3:] = [11, 12, 13]
+        scores = np.repeat(arrays["scores"][None, :], rows, axis=0)
+        indices = np.repeat(arrays["indices"][None, :], rows, axis=0)
+        table_rows = np.asarray([0, 1, 0], dtype=np.int32)
+        query_norms = np.asarray([90.0, 91.0, 89.0], dtype=np.float32)
+        base_positions = np.asarray([3, 3, 3], dtype=np.int32)
+        decoded_lens = np.asarray([4, 4, 3], dtype=np.int32)
+        model = self.model
+        model_args = (
+            np.asarray(model["feature_mean"], dtype=np.float64),
+            np.asarray(model["feature_scale"], dtype=np.float64),
+            np.asarray(model["theta"], dtype=np.float64),
+            np.asarray(model["depth_bias"], dtype=np.float64),
+            np.asarray(model["length_actions"], dtype=np.int16),
+            np.asarray(
+                [model["costs_ms"][str(action)] for action in HSPEC_SURVIVAL_ACTIONS],
+                dtype=np.float64,
+            ),
+            float(model["temperature"]),
+            float(model["utility_threshold"]),
+        )
+        batch = score_utility_batch_numba(
+            scores,
+            indices,
+            table_rows,
+            typed(arrays["entry_rollout_idx"]),
+            typed(arrays["entry_offset"]),
+            typed(arrays["token_buffer"]),
+            typed(arrays["rollout_offsets"]),
+            typed(arrays["rollout_lens"]),
+            typed(arrays["key_norms"]),
+            current_tails,
+            current_lens,
+            query_norms,
+            base_positions,
+            decoded_lens,
+            *model_args,
+        )
+        for row in range(rows):
+            tail_len = int(current_lens[row])
+            expected = score_utility_one_prompt_numba(
+                scores[row],
+                indices[row],
+                arrays["entry_rollout_idx"],
+                arrays["entry_offset"],
+                arrays["token_buffer"],
+                arrays["rollout_offsets"],
+                arrays["rollout_lens"],
+                arrays["key_norms"],
+                current_tails[row, -tail_len:],
+                float(query_norms[row]),
+                int(base_positions[row]),
+                int(decoded_lens[row]),
+                8,
+                *model_args,
+            )
+            actual = tuple(values[row].item() for values in batch)
+            self.assertEqual(actual[0:2], expected[0:2])
+            np.testing.assert_allclose(actual[2:4], expected[2:4], rtol=0, atol=1e-12)
+            self.assertEqual(actual[4:], expected[4:])
+
     def test_abstain_and_out_of_contract_width_are_explicit(self):
         arrays = _table_arrays()
         abstain = _score(
@@ -358,6 +452,45 @@ class TestSurvivalFeaturesAndPolicy(unittest.TestCase):
         self.assertEqual(UTILITY_ACTION_WINDOW(15, 8, 0, 3, True), (8, True))
         self.assertEqual(UTILITY_ACTION_WINDOW(15, 8, 0, 3, False), (15, False))
 
+    def test_execute_p3_runs_r1_only_for_fallback_or_bounded_comparison(self):
+        raw = np.asarray([True, True, True, False])
+        status = np.asarray([0, 5, 0, 0], dtype=np.int16)
+        work, compare, sequence = UTILITY_R1_WORK_MASKS(
+            raw,
+            status,
+            utility_enabled=True,
+            executes_utility=True,
+            compare_every_batches=0,
+            execute_batch_sequence=0,
+        )
+        np.testing.assert_array_equal(work, [False, True, False, False])
+        self.assertFalse(np.any(compare))
+        self.assertEqual(sequence, 1)
+
+        work, compare, sequence = UTILITY_R1_WORK_MASKS(
+            raw,
+            status,
+            utility_enabled=True,
+            executes_utility=True,
+            compare_every_batches=2,
+            execute_batch_sequence=1,
+        )
+        np.testing.assert_array_equal(work, [True, True, False, False])
+        np.testing.assert_array_equal(compare, [True, False, False, False])
+        self.assertEqual(sequence, 2)
+
+        shadow_work, shadow_compare, shadow_sequence = UTILITY_R1_WORK_MASKS(
+            raw,
+            status,
+            utility_enabled=True,
+            executes_utility=False,
+            compare_every_batches=1,
+            execute_batch_sequence=9,
+        )
+        np.testing.assert_array_equal(shadow_work, raw)
+        self.assertFalse(np.any(shadow_compare))
+        self.assertEqual(shadow_sequence, 9)
+
 
 class TestSurvivalMetrics(unittest.TestCase):
     def test_utility_metrics_belong_to_fixed_additive_keyspace(self):
@@ -365,6 +498,10 @@ class TestSurvivalMetrics(unittest.TestCase):
             "selector_utility_model_fallback_count",
             "selector_utility_width_fallback_count",
             "selector_utility_invalid_row_fallback_count",
+            "selector_utility_batch_fallback_count",
+            "select_utility_batch_kernel_queries",
+            "select_utility_lazy_r1_fallback_queries",
+            "select_utility_r1_compare_queries",
             "select_utility_shadow_queries",
             "select_utility_execution_action_sum",
             hspec_utility_score_histogram_key(0.2),

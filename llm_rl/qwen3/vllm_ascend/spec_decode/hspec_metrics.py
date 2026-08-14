@@ -33,7 +33,10 @@ _TIMING_FIELDS = frozenset({
     "d2h_sync_ms",
     "cpu_retrieve_ms",
     "total_ms",
+    "r1_cpu_rerank_ms",
     "utility_cpu_score_ms",
+    "utility_tail_pack_ms",
+    "utility_batch_kernel_ms",
 })
 R1_RERANK_HISTOGRAM_US_BOUNDS = (
     50,
@@ -88,6 +91,11 @@ _UTILITY_ONLINE_ADDITIVE_KEYS = frozenset({
     "selector_utility_query_fallback_count",
     "selector_utility_width_fallback_count",
     "selector_utility_invalid_row_fallback_count",
+    "selector_utility_batch_fallback_count",
+    "select_utility_batch_kernel_batches",
+    "select_utility_batch_kernel_queries",
+    "select_utility_lazy_r1_fallback_queries",
+    "select_utility_r1_compare_queries",
     "select_utility_cpu_score_samples",
     "select_utility_cpu_score_us_overflow",
 }) | frozenset(

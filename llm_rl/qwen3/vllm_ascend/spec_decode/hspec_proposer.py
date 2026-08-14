@@ -60,6 +60,7 @@ from vllm_ascend.spec_decode.hspec_selector_survival import (
     HSPEC_SURVIVAL_MODE,
     HSPEC_SURVIVAL_NUMBA_AVAILABLE,
     HSpecSurvivalConfig,
+    score_utility_batch_numba,
     score_utility_one_prompt_numba,
     warm_survival_selector,
 )
@@ -204,6 +205,31 @@ def _utility_action_window(
         return window, False
     action_window = max(int(action), 0)
     return min(window, action_window), action_window < window
+
+
+def _utility_r1_work_masks(
+    raw_gate_hits: np.ndarray,
+    utility_status: np.ndarray,
+    *,
+    utility_enabled: bool,
+    executes_utility: bool,
+    compare_every_batches: int,
+    execute_batch_sequence: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Choose full R1, lazy fallback, and bounded comparison rows."""
+    work = np.zeros_like(raw_gate_hits, dtype=np.bool_)
+    compare = np.zeros_like(raw_gate_hits, dtype=np.bool_)
+    if not utility_enabled or not executes_utility:
+        return raw_gate_hits.copy(), compare, int(execute_batch_sequence)
+    sequence = int(execute_batch_sequence) + 1
+    work = raw_gate_hits & (utility_status != 0)
+    period = max(int(compare_every_batches), 0)
+    if period > 0 and sequence % period == 0:
+        comparable = np.flatnonzero(raw_gate_hits & (utility_status == 0))
+        if comparable.size > 0:
+            compare[int(comparable[0])] = True
+            work |= compare
+    return work, compare, sequence
 
 
 if _HSPEC_NUMBA_AVAILABLE:
@@ -506,6 +532,12 @@ class _BatchedPromptTableCache:
         "key_norm_batch",
         "key_lengths",
         "invalid_key_mask",
+        "utility_entry_rollout_idx_list",
+        "utility_entry_offset_list",
+        "utility_token_buffer_list",
+        "utility_rollout_offsets_list",
+        "utility_rollout_lens_list",
+        "utility_key_norms_list",
         "ready_event",
         "estimated_npu_bytes",
     )
@@ -524,6 +556,12 @@ class _BatchedPromptTableCache:
         key_norm_batch: Optional[torch.Tensor],
         key_lengths: torch.Tensor,
         invalid_key_mask: torch.Tensor,
+        utility_entry_rollout_idx_list=None,
+        utility_entry_offset_list=None,
+        utility_token_buffer_list=None,
+        utility_rollout_offsets_list=None,
+        utility_rollout_lens_list=None,
+        utility_key_norms_list=None,
         ready_event: Optional[Any] = None,
         estimated_npu_bytes: int = 0,
     ):
@@ -539,6 +577,12 @@ class _BatchedPromptTableCache:
         self.key_norm_batch = key_norm_batch
         self.key_lengths = key_lengths
         self.invalid_key_mask = invalid_key_mask
+        self.utility_entry_rollout_idx_list = utility_entry_rollout_idx_list
+        self.utility_entry_offset_list = utility_entry_offset_list
+        self.utility_token_buffer_list = utility_token_buffer_list
+        self.utility_rollout_offsets_list = utility_rollout_offsets_list
+        self.utility_rollout_lens_list = utility_rollout_lens_list
+        self.utility_key_norms_list = utility_key_norms_list
         self.ready_event = ready_event
         self.estimated_npu_bytes = int(estimated_npu_bytes)
 
@@ -734,6 +778,13 @@ class HSpecProposer(Proposer):
             "HSPEC_SELECT_METADATA_SAMPLE_EVERY", 0, 0
         )
         self._selector_metadata_sample_count = 0
+        # Execute-P3 does not need to compute its complete R1 fallback on every
+        # successful row.  A bounded comparison sample can be enabled for
+        # functional validation; performance profiles keep this at zero.
+        self._utility_r1_compare_every_batches = _get_env_int(
+            "HSPEC_SELECT_R1_COMPARE_EVERY_BATCHES", 0, 0
+        )
+        self._utility_execute_batch_sequence = 0
         self._r1_sample_counter = 0
         self._r1_host_scores: Optional[torch.Tensor] = None
         self._r1_host_indices: Optional[torch.Tensor] = None
@@ -2185,7 +2236,8 @@ class HSpecProposer(Proposer):
         assert config.actions is not None
         assert config.costs_ms is not None
         current = np.ascontiguousarray(
-            current_tokens[-8:] if current_tokens else (), dtype=np.int32
+            current_tokens[-8:] if len(current_tokens) > 0 else (),
+            dtype=np.int32,
         )
         return score_utility_one_prompt_numba(
             np.ascontiguousarray(candidate_scores, dtype=np.float32),
@@ -2210,6 +2262,88 @@ class HSpecProposer(Proposer):
             float(config.temperature),
             float(config.utility_threshold),
         )
+
+    def _score_survival_batch(
+        self,
+        candidate_scores: np.ndarray,
+        candidate_indices: np.ndarray,
+        batch_table_cache: _BatchedPromptTableCache,
+        active_table_rows: Sequence[int],
+        score_rows: np.ndarray,
+        req_states: Sequence[Any],
+        active_batch_indices: Sequence[int],
+        query_norms: np.ndarray,
+        active_base_positions: Sequence[int],
+        decoded_lens: Sequence[int],
+    ) -> tuple[tuple[np.ndarray, ...], float, float]:
+        """Score all eligible P3 rows with one compiled-kernel dispatch."""
+        config = self._survival_config
+        if score_utility_batch_numba is None:
+            raise RuntimeError("S13 batched survival scorer is unavailable")
+        ragged_lists = (
+            batch_table_cache.utility_entry_rollout_idx_list,
+            batch_table_cache.utility_entry_offset_list,
+            batch_table_cache.utility_token_buffer_list,
+            batch_table_cache.utility_rollout_offsets_list,
+            batch_table_cache.utility_rollout_lens_list,
+            batch_table_cache.utility_key_norms_list,
+        )
+        if any(items is None for items in ragged_lists):
+            raise RuntimeError("S13 batched compact prompt tables are unavailable")
+        assert config.feature_mean is not None
+        assert config.feature_scale is not None
+        assert config.theta is not None
+        assert config.depth_bias is not None
+        assert config.actions is not None
+        assert config.costs_ms is not None
+
+        rows = np.ascontiguousarray(score_rows, dtype=np.int64)
+        count = int(rows.shape[0])
+        tail_pack_t0 = _now_ns()
+        current_tails = np.zeros((count, 8), dtype=np.int32)
+        current_tail_lens = np.zeros((count,), dtype=np.int16)
+        table_rows = np.empty((count,), dtype=np.int32)
+        base_positions = np.empty((count,), dtype=np.int32)
+        batch_decoded_lens = np.empty((count,), dtype=np.int32)
+        for output_row, active_row_value in enumerate(rows):
+            active_row = int(active_row_value)
+            batch_idx = int(active_batch_indices[active_row])
+            req_state = req_states[batch_idx]
+            tokens = (
+                getattr(req_state, "output_token_ids", ())
+                if req_state is not None else ()
+            )
+            tail_len = min(len(tokens), 8)
+            if tail_len > 0:
+                current_tails[output_row, 8 - tail_len :] = tokens[-tail_len:]
+            current_tail_lens[output_row] = tail_len
+            table_rows[output_row] = int(active_table_rows[active_row])
+            base_positions[output_row] = int(active_base_positions[active_row])
+            batch_decoded_lens[output_row] = int(decoded_lens[batch_idx])
+        tail_pack_ms = _ns_to_ms(_now_ns() - tail_pack_t0)
+
+        kernel_t0 = _now_ns()
+        outputs = score_utility_batch_numba(
+            np.ascontiguousarray(candidate_scores[rows], dtype=np.float32),
+            np.ascontiguousarray(candidate_indices[rows], dtype=np.int64),
+            table_rows,
+            *ragged_lists,
+            current_tails,
+            current_tail_lens,
+            np.ascontiguousarray(query_norms[rows], dtype=np.float32),
+            base_positions,
+            batch_decoded_lens,
+            config.feature_mean,
+            config.feature_scale,
+            config.theta,
+            config.depth_bias,
+            config.actions,
+            config.costs_ms,
+            float(config.temperature),
+            float(config.utility_threshold),
+        )
+        kernel_ms = _ns_to_ms(_now_ns() - kernel_t0)
+        return outputs, tail_pack_ms, kernel_ms
 
     def _sample_r1_metadata(self) -> bool:
         rate = float(self._r1_config.sample_log_rate)
@@ -3057,6 +3191,9 @@ class HSpecProposer(Proposer):
             }
 
         with hspec_record_function("hspec/proposal/build_cached"):
+            utility_lists = self._build_utility_table_lists(
+                selected_cached_tables
+            )
             cached = _BatchedPromptTableCache(
                 req_ids=req_ids_tuple,
                 prompt_ids=prompt_ids_tuple,
@@ -3070,6 +3207,12 @@ class HSpecProposer(Proposer):
                 key_norm_batch=key_norm_batch,
                 key_lengths=key_lengths,
                 invalid_key_mask=invalid_key_mask,
+                utility_entry_rollout_idx_list=utility_lists[0],
+                utility_entry_offset_list=utility_lists[1],
+                utility_token_buffer_list=utility_lists[2],
+                utility_rollout_offsets_list=utility_lists[3],
+                utility_rollout_lens_list=utility_lists[4],
+                utility_key_norms_list=utility_lists[5],
                 ready_event=ready_event,
                 estimated_npu_bytes=estimated_npu_bytes,
             )
@@ -4138,6 +4281,33 @@ class HSpecProposer(Proposer):
             invalid_key_mask,
         )
 
+    def _build_utility_table_lists(
+        self,
+        cached_tables: List[_CachedPromptTable],
+    ) -> tuple[Any, Any, Any, Any, Any, Any]:
+        """Build typed ragged CPU views once with the prefetch batch cache."""
+        if (
+            not self._survival_config.enabled
+            or score_utility_batch_numba is None
+            or not cached_tables
+            or any(cached.key_norm_cpu is None for cached in cached_tables)
+        ):
+            return (None, None, None, None, None, None)
+        arrays = (
+            [cached.entry_rollout_idx for cached in cached_tables],
+            [cached.entry_offset for cached in cached_tables],
+            [cached.token_buffer for cached in cached_tables],
+            [cached.rollout_token_offset for cached in cached_tables],
+            [cached.rollout_token_len for cached in cached_tables],
+            [cached.key_norm_cpu for cached in cached_tables],
+        )
+        typed_lists = tuple(
+            _hspec_make_numba_array_list(items) for items in arrays
+        )
+        if any(items is None for items in typed_lists):
+            return (None, None, None, None, None, None)
+        return typed_lists
+
     def _match_projected_batch(
         self,
         z_batch: torch.Tensor,
@@ -4214,7 +4384,7 @@ class HSpecProposer(Proposer):
 
     @staticmethod
     def _has_same_histo_ngram(
-        current_tokens: List[int],
+        current_tokens: Sequence[int],
         matched_seq: np.ndarray,
         matched_pos: int,
     ) -> bool:
@@ -4834,7 +5004,6 @@ class HSpecProposer(Proposer):
         raw_gate_hits = sims_cpu >= self.similarity_threshold
         decision_idxs_cpu = np.asarray(idxs_cpu, dtype=np.int64).copy()
         decision_scores_cpu = np.asarray(sims_cpu, dtype=np.float32).copy()
-        r1_cpu_t0 = _now_ns() if selector_timing_enabled else 0
         selected_rank_cpu = np.zeros((len(active_batch_indices),), dtype=np.int16)
         selected_suffix_cpu = np.zeros((len(active_batch_indices),), dtype=np.int16)
         selected_utility_cpu = np.full(
@@ -4871,88 +5040,104 @@ class HSpecProposer(Proposer):
         utility_status_cpu = np.zeros(
             (len(active_batch_indices),), dtype=np.int16
         )
-        if self._r1_config.computes_topk:
-            for row in np.flatnonzero(raw_gate_hits).tolist():
-                batch_idx = active_batch_indices[row]
-                req_state = req_states[batch_idx]
-                current_tokens = (
-                    list(getattr(req_state, "output_token_ids", ()))
-                    if req_state is not None else []
-                )
-                try:
-                    slot, suffix, utility, _, _ = self._rerank_r1_row(
-                        candidate_scores_cpu[row],
-                        candidate_idxs_cpu[row],
-                        active_cached_tables[row],
-                        current_tokens,
-                        active_base_positions[row],
-                    )
-                except Exception:
-                    logger.warning(
-                        "HSpec R1 row rerank failed; using hardmax for this query",
-                        exc_info=True,
-                    )
-                    self._record_proposer_metric(
-                        "selector_runtime_query_fallback_count", 1
-                    )
-                    continue
-                if slot < 0:
-                    if not self._r1_config.shadow:
-                        selected_valid[row] = False
-                    continue
-                r1_idx = int(candidate_idxs_cpu[row, slot])
-                shadow_idxs_cpu[row] = r1_idx
-                shadow_rank_cpu[row] = int(slot)
-                r1_scores_cpu[row] = float(candidate_scores_cpu[row, slot])
-                selected_suffix_cpu[row] = int(suffix)
-                selected_utility_cpu[row] = float(utility)
-                if not self._r1_config.shadow:
-                    decision_idxs_cpu[row] = r1_idx
-                    decision_scores_cpu[row] = float(
-                        candidate_scores_cpu[row, slot]
-                    )
-                    selected_rank_cpu[row] = int(slot)
-        r1_cpu_rerank_ms = (
-            _ns_to_ms(_now_ns() - r1_cpu_t0) if r1_cpu_t0 else 0.0
-        )
         utility_cpu_t0 = _now_ns() if selector_timing_enabled else 0
+        utility_tail_pack_ms = 0.0
+        utility_batch_kernel_ms = 0.0
+        raw_rows = np.flatnonzero(raw_gate_hits)
         if self._survival_config.enabled:
-            for row in np.flatnonzero(raw_gate_hits).tolist():
-                batch_idx = active_batch_indices[row]
-                req_state = req_states[batch_idx]
-                current_tokens = (
-                    list(getattr(req_state, "output_token_ids", ()))
-                    if req_state is not None else []
-                )
+            batch_outputs: Optional[tuple[np.ndarray, ...]] = None
+            if raw_rows.size > 0 and batch_table_cache is not None:
                 try:
                     (
-                        slot,
-                        action,
-                        utility,
-                        probability1,
-                        suffix,
-                        _,
-                        _,
-                        status,
-                    ) = self._score_survival_row(
-                        candidate_scores_cpu[row],
-                        candidate_idxs_cpu[row],
-                        active_cached_tables[row],
-                        current_tokens,
-                        float(query_norms_cpu[row]),
-                        active_base_positions[row],
-                        decoded_lens[batch_idx],
+                        batch_outputs,
+                        utility_tail_pack_ms,
+                        utility_batch_kernel_ms,
+                    ) = self._score_survival_batch(
+                        candidate_scores=candidate_scores_cpu,
+                        candidate_indices=candidate_idxs_cpu,
+                        batch_table_cache=batch_table_cache,
+                        active_table_rows=active_table_rows,
+                        score_rows=raw_rows,
+                        req_states=req_states,
+                        active_batch_indices=active_batch_indices,
+                        query_norms=query_norms_cpu,
+                        active_base_positions=active_base_positions,
+                        decoded_lens=decoded_lens,
                     )
                 except Exception:
                     logger.warning(
-                        "HSpec utility row scoring failed; executing R1 for this query",
+                        "HSpec utility batch scoring failed; using row scorer",
                         exc_info=True,
                     )
                     self._record_proposer_metric(
-                        "selector_utility_query_fallback_count", 1
+                        "selector_utility_batch_fallback_count", 1
                     )
-                    utility_status_cpu[row] = -1
-                    continue
+            if batch_outputs is not None:
+                self._record_proposer_metric(
+                    "select_utility_batch_kernel_batches", 1
+                )
+                self._record_proposer_metric(
+                    "select_utility_batch_kernel_queries", int(raw_rows.size)
+                )
+                (
+                    batch_slots,
+                    batch_actions,
+                    batch_utilities,
+                    batch_probabilities1,
+                    batch_suffixes,
+                    _,
+                    _,
+                    batch_statuses,
+                ) = batch_outputs
+            else:
+                batch_slots = np.full(raw_rows.shape, -1, dtype=np.int16)
+                batch_actions = np.zeros(raw_rows.shape, dtype=np.int16)
+                batch_utilities = np.full(raw_rows.shape, np.nan, dtype=np.float64)
+                batch_probabilities1 = np.full(raw_rows.shape, np.nan, dtype=np.float64)
+                batch_suffixes = np.zeros(raw_rows.shape, dtype=np.int16)
+                batch_statuses = np.full(raw_rows.shape, -1, dtype=np.int16)
+                for output_row, row_value in enumerate(raw_rows):
+                    row = int(row_value)
+                    batch_idx = active_batch_indices[row]
+                    req_state = req_states[batch_idx]
+                    current_tokens = (
+                        getattr(req_state, "output_token_ids", ())
+                        if req_state is not None else ()
+                    )
+                    try:
+                        result = self._score_survival_row(
+                            candidate_scores_cpu[row],
+                            candidate_idxs_cpu[row],
+                            active_cached_tables[row],
+                            current_tokens,
+                            float(query_norms_cpu[row]),
+                            active_base_positions[row],
+                            decoded_lens[batch_idx],
+                        )
+                    except Exception:
+                        logger.warning(
+                            "HSpec utility row scoring failed; executing R1 for this query",
+                            exc_info=True,
+                        )
+                        self._record_proposer_metric(
+                            "selector_utility_query_fallback_count", 1
+                        )
+                        continue
+                    batch_slots[output_row] = int(result[0])
+                    batch_actions[output_row] = int(result[1])
+                    batch_utilities[output_row] = float(result[2])
+                    batch_probabilities1[output_row] = float(result[3])
+                    batch_suffixes[output_row] = int(result[4])
+                    batch_statuses[output_row] = int(result[7])
+
+            for output_row, row_value in enumerate(raw_rows):
+                row = int(row_value)
+                slot = int(batch_slots[output_row])
+                action = int(batch_actions[output_row])
+                utility = float(batch_utilities[output_row])
+                probability1 = float(batch_probabilities1[output_row])
+                suffix = int(batch_suffixes[output_row])
+                status = int(batch_statuses[output_row])
                 utility_status_cpu[row] = int(status)
                 utility_value_cpu[row] = float(utility)
                 utility_p1_cpu[row] = float(probability1)
@@ -4988,12 +5173,97 @@ class HSpecProposer(Proposer):
         utility_cpu_score_ms = (
             _ns_to_ms(_now_ns() - utility_cpu_t0) if utility_cpu_t0 else 0.0
         )
+
+        # P3 is a complete decision for every status==0 row. Compute R1 only
+        # where fail-closed fallback needs it, or on a bounded validation
+        # sample. Shadow mode still computes R1 for all raw-gate hits.
+        r1_rows_mask = np.zeros_like(raw_gate_hits, dtype=np.bool_)
+        r1_compare_mask = np.zeros_like(raw_gate_hits, dtype=np.bool_)
+        if self._r1_config.computes_topk:
+            (
+                r1_rows_mask,
+                r1_compare_mask,
+                self._utility_execute_batch_sequence,
+            ) = _utility_r1_work_masks(
+                raw_gate_hits,
+                utility_status_cpu,
+                utility_enabled=self._survival_config.enabled,
+                executes_utility=self._survival_config.executes_utility,
+                compare_every_batches=self._utility_r1_compare_every_batches,
+                execute_batch_sequence=self._utility_execute_batch_sequence,
+            )
+
+        r1_cpu_t0 = _now_ns() if selector_timing_enabled else 0
+        for row_value in np.flatnonzero(r1_rows_mask):
+            row = int(row_value)
+            batch_idx = active_batch_indices[row]
+            req_state = req_states[batch_idx]
+            current_tokens = (
+                getattr(req_state, "output_token_ids", ())
+                if req_state is not None else ()
+            )
+            r1_executes_row = bool(
+                not self._survival_config.enabled
+                or not self._survival_config.executes_utility
+                or utility_status_cpu[row] != 0
+            )
+            try:
+                slot, suffix, utility, _, _ = self._rerank_r1_row(
+                    candidate_scores_cpu[row],
+                    candidate_idxs_cpu[row],
+                    active_cached_tables[row],
+                    current_tokens,
+                    active_base_positions[row],
+                )
+            except Exception:
+                logger.warning(
+                    "HSpec R1 row rerank failed; using hardmax for this query",
+                    exc_info=True,
+                )
+                self._record_proposer_metric(
+                    "selector_runtime_query_fallback_count", 1
+                )
+                continue
+            if slot < 0:
+                if not self._r1_config.shadow:
+                    if r1_executes_row:
+                        selected_valid[row] = False
+                continue
+            r1_idx = int(candidate_idxs_cpu[row, slot])
+            shadow_idxs_cpu[row] = r1_idx
+            shadow_rank_cpu[row] = int(slot)
+            r1_scores_cpu[row] = float(candidate_scores_cpu[row, slot])
+            if not self._r1_config.shadow:
+                if r1_executes_row:
+                    selected_suffix_cpu[row] = int(suffix)
+                    selected_utility_cpu[row] = float(utility)
+                    decision_idxs_cpu[row] = r1_idx
+                    decision_scores_cpu[row] = float(
+                        candidate_scores_cpu[row, slot]
+                    )
+                    selected_rank_cpu[row] = int(slot)
+        r1_cpu_rerank_ms = (
+            _ns_to_ms(_now_ns() - r1_cpu_t0) if r1_cpu_t0 else 0.0
+        )
+        if self._survival_config.executes_utility:
+            fallback_queries = int(np.count_nonzero(
+                raw_gate_hits & (utility_status_cpu != 0)
+            ))
+            compare_queries = int(np.count_nonzero(r1_compare_mask))
+            self._record_proposer_metric(
+                "select_utility_lazy_r1_fallback_queries", fallback_queries
+            )
+            self._record_proposer_metric(
+                "select_utility_r1_compare_queries", compare_queries
+            )
         if self._survival_config.enabled:
             valid_utility = raw_gate_hits & (utility_status_cpu == 0)
             proposed_utility = valid_utility & (utility_idxs_cpu >= 0)
             abstained_utility = valid_utility & (utility_idxs_cpu < 0)
-            changed_vs_r1 = proposed_utility & (
-                utility_idxs_cpu != shadow_idxs_cpu
+            changed_vs_r1 = (
+                proposed_utility
+                & (shadow_idxs_cpu >= 0)
+                & (utility_idxs_cpu != shadow_idxs_cpu)
             )
             prefix = (
                 "select_utility_execution"
@@ -5333,7 +5603,10 @@ class HSpecProposer(Proposer):
                     )
                 matched_rollout_idx = int(cached.entry_rollout_idx[matched_entry_idx])
                 req_state = req_states[i]
-                current_tokens = list(getattr(req_state, "output_token_ids", [])) if req_state is not None else []
+                current_tokens = (
+                    getattr(req_state, "output_token_ids", ())
+                    if req_state is not None else ()
+                )
                 entry_bias, entry_hits = cached.get_entry_state(matched_entry_idx)
                 histo_ngram_match = self._has_same_histo_ngram(
                     current_tokens,
@@ -5839,6 +6112,8 @@ class HSpecProposer(Proposer):
                 "shadow_trace_d2h_ms": float(s9_trace_d2h_ms),
                 "r1_cpu_rerank_ms": float(r1_cpu_rerank_ms),
                 "utility_cpu_score_ms": float(utility_cpu_score_ms),
+                "utility_tail_pack_ms": float(utility_tail_pack_ms),
+                "utility_batch_kernel_ms": float(utility_batch_kernel_ms),
                 "shadow_identity_ms": float(s9_identity_ms),
                 "shadow_cancel_ms": float(s9_cancel_ms),
                 "shadow_pending_meta_ms": float(s9_pending_meta_ms),
