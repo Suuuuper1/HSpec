@@ -47,6 +47,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm_ascend.spec_decode.hspec_metrics import (
     HSpecSelectionMetricTracker,
     hspec_r1_rerank_histogram_key,
+    hspec_s14_score_histogram_key,
     hspec_utility_score_histogram_key,
 )
 from vllm_ascend.spec_decode.hspec_selector_r1 import (
@@ -60,9 +61,19 @@ from vllm_ascend.spec_decode.hspec_selector_survival import (
     HSPEC_SURVIVAL_MODE,
     HSPEC_SURVIVAL_NUMBA_AVAILABLE,
     HSpecSurvivalConfig,
+    score_utility_candidates_one_prompt_numba,
     score_utility_batch_numba,
     score_utility_one_prompt_numba,
     warm_survival_selector,
+)
+from vllm_ascend.spec_decode.hspec_selector_online import (
+    HSpecContinuationState,
+    HSpecS14Config,
+    continuation_candidate_slot,
+    make_verified_continuation,
+    rollout_posterior_signal,
+    saturating_rollout_feedback_update,
+    select_s14_candidate,
 )
 from vllm_ascend.spec_decode.hspec_s7_benchmark import (
     S7VerificationPatternController,
@@ -92,6 +103,13 @@ from vllm_ascend.spec_decode.hspec_s13_shadow import (
     hspec_s13_query_identity,
     hspec_s13_token_hash,
     record_hspec_s13_shadow_events,
+)
+from vllm_ascend.spec_decode.hspec_s14_trace import (
+    HSPEC_S14_TRACE_ENABLED,
+    flush_hspec_s14_trace,
+    hspec_s14_request_sampled,
+    hspec_s14_query_id,
+    record_hspec_s14_trace_events,
 )
 from vllm_ascend.spec_decode.hspec_table import GlobalHSpecTableGroup, get_hspec_tables
 from vllm_ascend.spec_decode.hspec_table_store import (
@@ -329,6 +347,10 @@ class _CachedPromptTable:
         "entry_hits",
         "entry_blend_horizon",
         "max_entry_bias",
+        "rollout_trials",
+        "rollout_first_accepts",
+        "rollout_accept_sum",
+        "rollout_draft_sum",
     )
 
     def __init__(
@@ -358,6 +380,10 @@ class _CachedPromptTable:
         entry_hits: np.ndarray | None = None,
         entry_blend_horizon: int = 4,
         max_entry_bias: int = 8,
+        rollout_trials: np.ndarray | None = None,
+        rollout_first_accepts: np.ndarray | None = None,
+        rollout_accept_sum: np.ndarray | None = None,
+        rollout_draft_sum: np.ndarray | None = None,
     ):
         self.mean_cpu = mean_cpu                      # (D,) float32, CPU
         self.components_t_cpu = components_t_cpu      # (D,K) float32, CPU
@@ -392,6 +418,23 @@ class _CachedPromptTable:
         )
         self.entry_blend_horizon = max(int(entry_blend_horizon), 1)
         self.max_entry_bias = max(int(max_entry_bias), 0)
+        n_rollouts = int(self.rollout_token_len.shape[0])
+        self.rollout_trials = (
+            rollout_trials if rollout_trials is not None
+            else np.zeros((n_rollouts,), dtype=np.uint16)
+        )
+        self.rollout_first_accepts = (
+            rollout_first_accepts if rollout_first_accepts is not None
+            else np.zeros((n_rollouts,), dtype=np.uint16)
+        )
+        self.rollout_accept_sum = (
+            rollout_accept_sum if rollout_accept_sum is not None
+            else np.zeros((n_rollouts,), dtype=np.uint32)
+        )
+        self.rollout_draft_sum = (
+            rollout_draft_sum if rollout_draft_sum is not None
+            else np.zeros((n_rollouts,), dtype=np.uint32)
+        )
 
     def get_draft_tokens(self, entry_idx: int, max_tokens: int) -> List[int]:
         """O(1) draft lookup, using lazy token refs by default."""
@@ -753,6 +796,22 @@ class HSpecProposer(Proposer):
             self._survival_config = HSpecSurvivalConfig.disabled(
                 "topk_utility requires the sequential Numba survival scorer"
             )
+        self._s14_config = HSpecS14Config.from_environment()
+        self._s14_requested = (
+            str(os.environ.get("HSPEC_S14_MODE", "off")).strip().lower()
+            != "off"
+        )
+        if self._s14_config.enabled and not self._survival_config.executes_utility:
+            self._s14_config = HSpecS14Config.disabled(
+                "S14 requires the frozen S13 P3A selector in execution mode"
+            )
+        if (
+            self._s14_config.enabled
+            and score_utility_candidates_one_prompt_numba is None
+        ):
+            self._s14_config = HSpecS14Config.disabled(
+                "S14 requires the Numba candidate-utility scorer"
+            )
         self._selector_mode = (
             HSPEC_SURVIVAL_MODE
             if self._survival_config.enabled
@@ -825,6 +884,15 @@ class HSpecProposer(Proposer):
                 "shadow model; S13 observation is disabled"
             )
         self._s13_shadow_probes: Dict[str, List[Dict[str, Any]]] = {}
+        self._s14_request_state: Dict[str, HSpecContinuationState] = {}
+        self._s14_query_sequence = 0
+        self._s14_trace_enabled = bool(
+            HSPEC_S14_TRACE_ENABLED and self._s14_config.enabled
+        )
+        if HSPEC_S14_TRACE_ENABLED and not self._s14_trace_enabled:
+            logger.warning(
+                "HSPEC_S14_TRACE_DIR requires an authorized S14 mode; trace disabled"
+            )
 
         self.hspec_tables: GlobalHSpecTableGroup = get_hspec_tables(
             similarity_threshold=self.similarity_threshold,
@@ -1011,6 +1079,12 @@ class HSpecProposer(Proposer):
                 "HSpec S13 utility selector disabled; executing R1 fallback: %s",
                 self._survival_config.fallback_reason,
             )
+        if self._s14_requested and not self._s14_config.enabled:
+            self._record_proposer_metric("selector_s14_config_fallback_count", 1)
+            logger.warning(
+                "HSpec S14 disabled; executing frozen P3A: %s",
+                self._s14_config.fallback_reason,
+            )
         self._last_log_t = time.time()
         self._log_every_calls = int(os.environ.get("HSPEC_LOG_EVERY_CALLS", "200"))
         self._log_every_s = float(os.environ.get("HSPEC_LOG_EVERY_S", "10"))
@@ -1046,7 +1120,8 @@ class HSpecProposer(Proposer):
             "position_mode=%s shadow=%s d2h=%s fallback=%r margin=%s timing=%s "
             "metadata_sample_every=%d s2_baseline_audit=%s tp_draft_sync=%s "
             "max_draft_tokens_per_batch=%d utility_model=%s utility_shadow=%s "
-            "utility_execute=%s utility_fallback=%r",
+            "utility_execute=%s utility_fallback=%r s14_mode=%s "
+            "s14_execute=%s s14_fallback=%r",
             self._selector_mode,
             self._selector_topk,
             self._r1_config.sim_mode,
@@ -1066,6 +1141,9 @@ class HSpecProposer(Proposer):
             self._survival_config.shadow,
             self._survival_config.executes_utility,
             self._survival_config.fallback_reason,
+            self._s14_config.mode,
+            self._s14_config.executes,
+            self._s14_config.fallback_reason,
         )
 
         tp_group = self._get_tp_draft_sync_group()
@@ -1167,6 +1245,10 @@ class HSpecProposer(Proposer):
                 self._survival_config = HSpecSurvivalConfig.disabled(
                     f"utility initialization failed: {exc!r}"
                 )
+                self._s14_config = HSpecS14Config.disabled(
+                    "S13 utility initialization failed"
+                )
+                self._s14_trace_enabled = False
                 self._selector_mode = self._r1_config.mode
                 self._s13_shadow_enabled = False
                 self._record_proposer_metric(
@@ -1605,6 +1687,12 @@ class HSpecProposer(Proposer):
 
         if cache_mutated:
             self._cache_generation += 1
+            if self._s14_request_state:
+                self._record_proposer_metric(
+                    "select_s14_state_generation_invalidations",
+                    len(self._s14_request_state),
+                )
+                self._s14_request_state.clear()
             self._batched_table_cache = None
 
     def _poll_pending_governed(
@@ -1843,6 +1931,12 @@ class HSpecProposer(Proposer):
 
         if cache_mutated:
             self._cache_generation += 1
+            if self._s14_request_state:
+                self._record_proposer_metric(
+                    "select_s14_state_generation_invalidations",
+                    len(self._s14_request_state),
+                )
+                self._s14_request_state.clear()
             self._batched_table_cache = None
 
     def _fire_prefetch_async(
@@ -2344,6 +2438,55 @@ class HSpecProposer(Proposer):
         )
         kernel_ms = _ns_to_ms(_now_ns() - kernel_t0)
         return outputs, tail_pack_ms, kernel_ms
+
+    def _score_s14_candidates_row(
+        self,
+        candidate_scores: np.ndarray,
+        candidate_indices: np.ndarray,
+        cached: _CachedPromptTable,
+        current_tokens: Sequence[int],
+        query_norm: float,
+        base_pos: int,
+        decoded_len: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+        config = self._survival_config
+        if (
+            score_utility_candidates_one_prompt_numba is None
+            or cached.key_norm_cpu is None
+        ):
+            raise RuntimeError("S14 candidate scorer is unavailable")
+        assert config.feature_mean is not None
+        assert config.feature_scale is not None
+        assert config.theta is not None
+        assert config.depth_bias is not None
+        assert config.actions is not None
+        assert config.costs_ms is not None
+        current = np.ascontiguousarray(
+            current_tokens[-8:] if len(current_tokens) > 0 else (),
+            dtype=np.int32,
+        )
+        return score_utility_candidates_one_prompt_numba(
+            np.ascontiguousarray(candidate_scores, dtype=np.float32),
+            np.ascontiguousarray(candidate_indices, dtype=np.int64),
+            cached.entry_rollout_idx,
+            cached.entry_offset,
+            cached.token_buffer,
+            cached.rollout_token_offset,
+            cached.rollout_token_len,
+            cached.key_norm_cpu,
+            current,
+            float(query_norm),
+            int(base_pos),
+            int(decoded_len),
+            int(cached.n_entries),
+            config.feature_mean,
+            config.feature_scale,
+            config.theta,
+            config.depth_bias,
+            config.actions,
+            config.costs_ms,
+            float(config.temperature),
+        )
 
     def _sample_r1_metadata(self) -> bool:
         rate = float(self._r1_config.sample_log_rate)
@@ -3578,6 +3721,10 @@ class HSpecProposer(Proposer):
             cached.rollout_entry_lens,
             cached.entry_bias,
             cached.entry_hits,
+            cached.rollout_trials,
+            cached.rollout_first_accepts,
+            cached.rollout_accept_sum,
+            cached.rollout_draft_sum,
         ):
             add_array(arr)
         for seq in cached.rollout_seqs or ():
@@ -3645,6 +3792,12 @@ class HSpecProposer(Proposer):
 
     def _clear_prompt_cache(self) -> None:
         self._cache.clear()
+        if getattr(self, "_s14_request_state", None):
+            self._record_proposer_metric(
+                "select_s14_state_generation_invalidations",
+                len(self._s14_request_state),
+            )
+            self._s14_request_state.clear()
         self._cache_prompt_bytes.clear()
         self._cache_cpu_bytes = 0
         self._cache_npu_bytes = 0
@@ -4532,6 +4685,15 @@ class HSpecProposer(Proposer):
         with (hspec_record_function("hspec/proposal/prompt_id") if prof_enabled else nullcontext()):
             prompt_ids = self._get_prompt_ids_for_batch(req_ids)
         t1_pid = _now_ns() if gen_enabled else 0
+        # A verified continuation is valid for exactly the immediately next
+        # decode decision. Consume it even if cache/anchor readiness later
+        # prevents a proposal, so it can never stick across an unobserved step.
+        s14_continuation_snapshot: Dict[str, HSpecContinuationState] = {}
+        if self._s14_config.enabled:
+            for req_id in req_ids:
+                state = self._s14_request_state.pop(str(req_id), None)
+                if state is not None:
+                    s14_continuation_snapshot[str(req_id)] = state
 
         decoded_lens = [
             len(getattr(req_state, "output_token_ids", [])) if req_state is not None else 0
@@ -5170,6 +5332,192 @@ class HSpecProposer(Proposer):
                         selected_rank_cpu[row] = int(slot)
                         selected_suffix_cpu[row] = int(suffix)
                         selected_utility_cpu[row] = float(utility)
+        # S14 is constrained by the complete P3 decision: it cannot turn an
+        # abstention into a proposal and cannot introduce a candidate outside
+        # the retrieved top-8.  Observation mode computes evidence only.
+        p3_action_cpu = utility_action_cpu.copy()
+        s14_row_evidence: Dict[int, Dict[str, Any]] = {}
+        s14_cpu_t0 = _now_ns() if selector_timing_enabled else 0
+        if self._s14_config.enabled:
+            s14_changed = 0
+            s14_continuation_available = 0
+            s14_continuation_selected = 0
+            s14_posterior_mature = 0
+            s14_scored = 0
+            for row_value in raw_rows:
+                row = int(row_value)
+                base_slot = int(utility_rank_cpu[row])
+                if utility_status_cpu[row] != 0 or base_slot < 0:
+                    continue
+                batch_idx = int(active_batch_indices[row])
+                req_id = str(req_ids[batch_idx])
+                prompt_id = str(prompt_ids[batch_idx])
+                cached = active_cached_tables[row]
+                req_state = req_states[batch_idx]
+                current_tokens = (
+                    getattr(req_state, "output_token_ids", ())
+                    if req_state is not None else ()
+                )
+                try:
+                    (
+                        candidate_actions,
+                        candidate_utilities,
+                        candidate_p1,
+                        candidate_suffixes,
+                        candidate_remaining,
+                        candidate_status,
+                    ) = self._score_s14_candidates_row(
+                        candidate_scores_cpu[row],
+                        candidate_idxs_cpu[row],
+                        cached,
+                        current_tokens,
+                        float(query_norms_cpu[row]),
+                        active_base_positions[row],
+                        decoded_lens[batch_idx],
+                    )
+                    if int(candidate_status) != 0:
+                        raise RuntimeError(
+                            f"candidate scorer status={candidate_status}"
+                        )
+                    continuation_slot = continuation_candidate_slot(
+                        s14_continuation_snapshot.get(req_id),
+                        prompt_id=prompt_id,
+                        table_version=int(self._cache_version),
+                        cache_generation=int(self._cache_generation),
+                        candidate_indices=candidate_idxs_cpu[row],
+                        entry_rollout_idx=cached.entry_rollout_idx,
+                        entry_offset=cached.entry_offset,
+                    )
+                    selected_slot, adjusted, posterior_signals = select_s14_candidate(
+                        base_slot=base_slot,
+                        utilities=candidate_utilities,
+                        candidate_indices=candidate_idxs_cpu[row],
+                        entry_rollout_idx=cached.entry_rollout_idx,
+                        continuation_slot=continuation_slot,
+                        rollout_trials=cached.rollout_trials,
+                        rollout_first_accepts=cached.rollout_first_accepts,
+                        rollout_accept_sum=cached.rollout_accept_sum,
+                        rollout_draft_sum=cached.rollout_draft_sum,
+                        utility_threshold=float(
+                            self._survival_config.utility_threshold
+                        ),
+                        mode=self._s14_config.mode,
+                        continuation_weight=float(
+                            self._s14_config.continuation_weight
+                        ),
+                        posterior_weight=float(
+                            self._s14_config.posterior_weight
+                        ),
+                        posterior_min_trials=int(
+                            self._s14_config.posterior_min_trials
+                        ),
+                    )
+                except Exception:
+                    self._record_proposer_metric(
+                        "selector_s14_query_fallback_count", 1
+                    )
+                    logger.warning(
+                        "HSpec S14 row failed; preserving frozen P3A decision",
+                        exc_info=True,
+                    )
+                    continue
+
+                s14_scored += 1
+                s14_continuation_available += int(continuation_slot >= 0)
+                candidate_rollouts = np.asarray([
+                    int(cached.entry_rollout_idx[int(entry_idx)])
+                    for entry_idx in candidate_idxs_cpu[row]
+                ], dtype=np.int32)
+                candidate_trials = np.asarray([
+                    int(cached.rollout_trials[int(rollout)])
+                    for rollout in candidate_rollouts
+                ], dtype=np.int32)
+                s14_posterior_mature += int(np.any(
+                    candidate_trials >= int(self._s14_config.posterior_min_trials)
+                ))
+                executed_slot = base_slot
+                if not self._r1_config.shadow:
+                    if self._s14_config.executes:
+                        executed_slot = int(selected_slot)
+                        if executed_slot != base_slot:
+                            s14_changed += 1
+                        s14_continuation_selected += int(
+                            continuation_slot >= 0
+                            and executed_slot == continuation_slot
+                        )
+                        selected_idx = int(
+                            candidate_idxs_cpu[row, executed_slot]
+                        )
+                        decision_idxs_cpu[row] = selected_idx
+                        decision_scores_cpu[row] = float(
+                            candidate_scores_cpu[row, executed_slot]
+                        )
+                        selected_rank_cpu[row] = executed_slot
+                        selected_suffix_cpu[row] = int(
+                            candidate_suffixes[executed_slot]
+                        )
+                        selected_utility_cpu[row] = float(
+                            candidate_utilities[executed_slot]
+                        )
+                        utility_action_cpu[row] = int(
+                            candidate_actions[executed_slot]
+                        )
+                        utility_p1_cpu[row] = float(
+                            candidate_p1[executed_slot]
+                        )
+
+                query_id = None
+                if self._s14_trace_enabled and hspec_s14_request_sampled(
+                    prompt_id, req_id
+                ):
+                    self._s14_query_sequence += 1
+                    query_id = hspec_s14_query_id(
+                        req_id, prompt_id, decoded_lens[batch_idx],
+                        int(self._cache_version),
+                        int(self._cache_generation),
+                        int(self._s14_query_sequence),
+                    )
+                s14_row_evidence[row] = {
+                    "query_id": query_id,
+                    "base_slot": base_slot,
+                    "counterfactual_slot": int(selected_slot),
+                    "executed_slot": int(executed_slot),
+                    "continuation_slot": int(continuation_slot),
+                    "candidate_actions": candidate_actions,
+                    "candidate_utilities": candidate_utilities,
+                    "candidate_p1": candidate_p1,
+                    "candidate_suffixes": candidate_suffixes,
+                    "candidate_remaining": candidate_remaining,
+                    "candidate_adjusted": adjusted,
+                    "candidate_posterior_signals": posterior_signals,
+                    "candidate_rollouts": candidate_rollouts,
+                    "candidate_trials": candidate_trials,
+                    "continuation_state": s14_continuation_snapshot.get(req_id),
+                }
+            self._record_proposer_metric("select_s14_batches", 1)
+            self._record_proposer_metric("select_s14_scored_queries", s14_scored)
+            self._record_proposer_metric(
+                "select_s14_changed_vs_p3_count", s14_changed
+            )
+            self._record_proposer_metric(
+                "select_s14_continuation_available_count",
+                s14_continuation_available,
+            )
+            self._record_proposer_metric(
+                "select_s14_continuation_selected_count",
+                s14_continuation_selected,
+            )
+            self._record_proposer_metric(
+                "select_s14_posterior_mature_query_count", s14_posterior_mature
+            )
+        s14_cpu_rerank_ms = (
+            _ns_to_ms(_now_ns() - s14_cpu_t0) if s14_cpu_t0 else 0.0
+        )
+        if self._s14_config.enabled and selector_timing_enabled:
+            self._record_proposer_metric("select_s14_cpu_score_samples", 1)
+            self._record_proposer_metric(
+                hspec_s14_score_histogram_key(s14_cpu_rerank_ms), 1
+            )
         utility_cpu_score_ms = (
             _ns_to_ms(_now_ns() - utility_cpu_t0) if utility_cpu_t0 else 0.0
         )
@@ -5285,7 +5633,7 @@ class HSpecProposer(Proposer):
             )
             self._record_proposer_metric(
                 f"{prefix}_action_sum",
-                int(np.sum(utility_action_cpu[proposed_utility].astype(np.int64))),
+                int(np.sum(p3_action_cpu[proposed_utility].astype(np.int64))),
             )
             if selector_timing_enabled:
                 self._record_proposer_metric("select_utility_cpu_score_samples", 1)
@@ -5596,6 +5944,14 @@ class HSpecProposer(Proposer):
                                 "request_id": str(req_id),
                                 "reason": "superseded_before_verification",
                             }])
+                    old_s14_query_id = old_meta.get("s14_query_id")
+                    if old_s14_query_id is not None:
+                        record_hspec_s14_trace_events([{
+                            "event": "verification_cancellation",
+                            "query_id": str(old_s14_query_id),
+                            "request_id": str(req_id),
+                            "reason": "superseded_before_verification",
+                        }])
                     self._record_closed_selector_metrics(
                         self._selector_metric_tracker.record_cancellation(
                             int(old_meta.get("metric_window_id", -1))
@@ -5702,6 +6058,177 @@ class HSpecProposer(Proposer):
                         float(utility_p1_cpu[j])
                         if np.isfinite(utility_p1_cpu[j]) else None
                     )
+                s14_evidence = s14_row_evidence.get(j)
+                if s14_evidence is not None:
+                    pending_meta.update({
+                        "s14_query_id": s14_evidence.get("query_id"),
+                        "s14_mode": str(self._s14_config.mode),
+                        "s14_table_version": int(self._cache_version),
+                        "s14_cache_generation": int(self._cache_generation),
+                        "s14_p3_entry_idx": int(
+                            candidate_idxs_cpu[j, int(s14_evidence["base_slot"])]
+                        ),
+                        "s14_continuation_available": bool(
+                            int(s14_evidence["continuation_slot"]) >= 0
+                        ),
+                    })
+                    query_id = s14_evidence.get("query_id")
+                    if query_id is not None:
+                        candidate_actions = s14_evidence["candidate_actions"]
+                        continuation_state = s14_evidence[
+                            "continuation_state"
+                        ]
+                        continuation_historical_segment: List[int] = []
+                        if continuation_state is not None:
+                            continuation_rollout = cached.get_rollout_tokens(
+                                continuation_state.rollout_idx
+                            )
+                            continuation_start = (
+                                continuation_state.source_matched_pos + 1
+                            )
+                            continuation_historical_segment = [
+                                int(token) for token in continuation_rollout[
+                                    continuation_start:
+                                    continuation_start
+                                    + len(continuation_state.emitted_token_ids)
+                                ].tolist()
+                            ]
+                        candidate_tokens = []
+                        for slot in range(int(candidate_idxs_cpu.shape[1])):
+                            candidate_entry = int(candidate_idxs_cpu[j, slot])
+                            candidate_pos = int(
+                                cached.entry_offset[candidate_entry]
+                            ) - 1
+                            candidate_safety = self._apply_abs_delta_cap(
+                                window=min(
+                                    cached.get_effective_window(candidate_entry),
+                                    int(self.max_draft_tokens),
+                                ),
+                                abs_delta=abs(
+                                    candidate_pos - int(active_base_positions[j])
+                                ),
+                                min_wnd=int(cached.min_wnd),
+                            )
+                            candidate_tokens.append(cached.get_draft_tokens(
+                                candidate_entry,
+                                min(
+                                    int(candidate_actions[slot]),
+                                    int(candidate_safety),
+                                ),
+                            ))
+                        record_hspec_s14_trace_events([{
+                            "event": "selection",
+                            "query_id": str(query_id),
+                            "request_id": str(req_id),
+                            "prompt_id": str(prompt_ids[i]),
+                            "decoded_len": int(decoded_lens[i]),
+                            "table_version": int(self._cache_version),
+                            "cache_generation": int(self._cache_generation),
+                            "mode": str(self._s14_config.mode),
+                            "candidate_entry_indices": [
+                                int(value) for value in candidate_idxs_cpu[j].tolist()
+                            ],
+                            "candidate_rollout_indices": [
+                                int(value) for value in
+                                s14_evidence["candidate_rollouts"].tolist()
+                            ],
+                            "candidate_matched_positions": [
+                                int(cached.entry_offset[int(value)]) - 1
+                                for value in candidate_idxs_cpu[j].tolist()
+                            ],
+                            "candidate_utilities": [
+                                float(value) if math.isfinite(float(value)) else None
+                                for value in s14_evidence["candidate_utilities"].tolist()
+                            ],
+                            "candidate_actions": [
+                                int(value) for value in candidate_actions.tolist()
+                            ],
+                            "candidate_p1": [
+                                float(value) for value in
+                                s14_evidence["candidate_p1"].tolist()
+                            ],
+                            "candidate_posterior_signals": [
+                                float(value) for value in
+                                s14_evidence["candidate_posterior_signals"].tolist()
+                            ],
+                            "candidate_rollout_trials": [
+                                int(value) for value in
+                                s14_evidence["candidate_trials"].tolist()
+                            ],
+                            "candidate_draft_token_ids": candidate_tokens,
+                            "utility_threshold": float(
+                                self._survival_config.utility_threshold
+                            ),
+                            "p3_slot": int(s14_evidence["base_slot"]),
+                            "counterfactual_slot": int(
+                                s14_evidence["counterfactual_slot"]
+                            ),
+                            "executed_slot": int(s14_evidence["executed_slot"]),
+                            "continuation_slot": int(
+                                s14_evidence["continuation_slot"]
+                            ),
+                            "continuation_state_present": bool(
+                                continuation_state is not None
+                            ),
+                            "continuation_prompt_id": (
+                                str(continuation_state.prompt_id)
+                                if continuation_state is not None else None
+                            ),
+                            "continuation_table_version": (
+                                int(continuation_state.table_version)
+                                if continuation_state is not None else None
+                            ),
+                            "continuation_cache_generation": (
+                                int(continuation_state.cache_generation)
+                                if continuation_state is not None else None
+                            ),
+                            "continuation_rollout_idx": (
+                                int(continuation_state.rollout_idx)
+                                if continuation_state is not None else None
+                            ),
+                            "continuation_source_matched_pos": (
+                                int(continuation_state.source_matched_pos)
+                                if continuation_state is not None else None
+                            ),
+                            "continuation_expected_matched_pos": (
+                                int(continuation_state.expected_matched_pos)
+                                if continuation_state is not None else None
+                            ),
+                            "continuation_source_drafted_len": (
+                                int(continuation_state.drafted_len)
+                                if continuation_state is not None else None
+                            ),
+                            "continuation_source_accepted_len": (
+                                int(continuation_state.accepted_len)
+                                if continuation_state is not None else None
+                            ),
+                            "continuation_verified_emitted_token_ids": (
+                                [int(token) for token in
+                                 continuation_state.emitted_token_ids]
+                                if continuation_state is not None else []
+                            ),
+                            "continuation_historical_segment_token_ids": (
+                                continuation_historical_segment
+                            ),
+                            "forced_continuation_draft_token_ids": (
+                                [int(token) for token in cached.get_rollout_tokens(
+                                    continuation_state.rollout_idx
+                                )[
+                                    continuation_state.expected_matched_pos + 1:
+                                    continuation_state.expected_matched_pos + 1
+                                    + int(candidate_actions[int(s14_evidence["base_slot"])])
+                                ].tolist()]
+                                if continuation_state is not None
+                                else []
+                            ),
+                            "executed_drafted_len": int(len(draft)),
+                            "executed_draft_token_ids": [
+                                int(token) for token in draft
+                            ],
+                            "previous_step_emitted_token_ids": [
+                                int(token) for token in valid_sampled_token_ids[i]
+                            ],
+                        }])
                 if s7_pattern is not None:
                     pending_meta["s7_verification_pattern"] = s7_pattern
                 if HSPEC_S4_TRACE_ENABLED:
@@ -6114,6 +6641,7 @@ class HSpecProposer(Proposer):
                 "utility_cpu_score_ms": float(utility_cpu_score_ms),
                 "utility_tail_pack_ms": float(utility_tail_pack_ms),
                 "utility_batch_kernel_ms": float(utility_batch_kernel_ms),
+                "s14_cpu_rerank_ms": float(s14_cpu_rerank_ms),
                 "shadow_identity_ms": float(s9_identity_ms),
                 "shadow_cancel_ms": float(s9_cancel_ms),
                 "shadow_pending_meta_ms": float(s9_pending_meta_ms),
@@ -6454,6 +6982,107 @@ class HSpecProposer(Proposer):
                 accepted_prefix_len=apl,
                 emitted_tokens=emitted_tokens,
             )
+            if self._s14_config.enabled:
+                cached = self._cache.get(prompt_id)
+                state_valid = bool(
+                    cached is not None
+                    and int(meta.get("s14_table_version", -1))
+                    == int(self._cache_version)
+                    and int(meta.get("s14_cache_generation", -1))
+                    == int(self._cache_generation)
+                )
+                rollout_idx = int(meta.get("matched_rollout_idx", -1))
+                if state_valid and self._s14_config.uses_posterior:
+                    assert cached is not None
+                    if saturating_rollout_feedback_update(
+                        rollout_idx,
+                        apl,
+                        expected_drafted_len,
+                        cached.rollout_trials,
+                        cached.rollout_first_accepts,
+                        cached.rollout_accept_sum,
+                        cached.rollout_draft_sum,
+                    ):
+                        self._record_proposer_metric(
+                            "select_s14_rollout_feedback_updates", 1
+                        )
+                continuation = None
+                if state_valid and self._s14_config.uses_continuation:
+                    assert cached is not None
+                    continuation = make_verified_continuation(
+                        prompt_id=prompt_id,
+                        table_version=int(self._cache_version),
+                        cache_generation=int(self._cache_generation),
+                        rollout_idx=rollout_idx,
+                        matched_pos=int(meta.get("matched_pos", -1)),
+                        emitted_token_ids=emitted_ids,
+                        rollout_tokens=cached.get_rollout_tokens(rollout_idx),
+                        drafted_len=expected_drafted_len,
+                        accepted_len=apl,
+                    )
+                if continuation is not None:
+                    self._s14_request_state[str(rid)] = continuation
+                    self._record_proposer_metric(
+                        "select_s14_continuation_validated_count", 1
+                    )
+                else:
+                    self._s14_request_state.pop(str(rid), None)
+                    if self._s14_config.uses_continuation:
+                        self._record_proposer_metric(
+                            (
+                                "select_s14_state_generation_invalidations"
+                                if not state_valid
+                                else "select_s14_continuation_mismatch_count"
+                            ),
+                            1,
+                        )
+                s14_query_id = meta.get("s14_query_id")
+                if s14_query_id is not None:
+                    signal = p_first = p_token = reliability = 0.0
+                    trials_after = 0
+                    if state_valid and cached is not None and 0 <= rollout_idx < int(
+                        cached.rollout_trials.shape[0]
+                    ):
+                        trials_after = int(cached.rollout_trials[rollout_idx])
+                        signal, p_first, p_token, reliability = (
+                            rollout_posterior_signal(
+                                trials_after,
+                                int(cached.rollout_first_accepts[rollout_idx]),
+                                int(cached.rollout_accept_sum[rollout_idx]),
+                                int(cached.rollout_draft_sum[rollout_idx]),
+                                min_trials=int(
+                                    self._s14_config.posterior_min_trials
+                                ),
+                            )
+                        )
+                    record_hspec_s14_trace_events([{
+                        "event": "verification",
+                        "query_id": str(s14_query_id),
+                        "request_id": str(rid),
+                        "prompt_id": str(prompt_id),
+                        "table_version": int(
+                            meta.get("s14_table_version", -1)
+                        ),
+                        "cache_generation": int(
+                            meta.get("s14_cache_generation", -1)
+                        ),
+                        "accepted_prefix_len": int(apl),
+                        "drafted_len": int(expected_drafted_len),
+                        "observed_drafted_len": int(observed_drafted_len),
+                        "emitted_token_ids": emitted_ids,
+                        "emitted_token_len": int(emitted_tokens),
+                        "rollout_idx": int(rollout_idx),
+                        "matched_pos": int(meta.get("matched_pos", -1)),
+                        "state_valid": bool(state_valid),
+                        "continuation_validated": bool(
+                            continuation is not None
+                        ),
+                        "rollout_trials_after": int(trials_after),
+                        "posterior_signal_after": float(signal),
+                        "posterior_p_first_after": float(p_first),
+                        "posterior_p_token_after": float(p_token),
+                        "posterior_reliability_after": float(reliability),
+                    }])
             if HSPEC_S4_TRACE_ENABLED:
                 trace_query_id = meta.get("s4_trace_query_id")
                 if trace_query_id is not None:
@@ -6564,12 +7193,23 @@ class HSpecProposer(Proposer):
                         "request_id": str(req_id),
                         "reason": str(reason),
                     }])
+            s14_query_id = meta.get("s14_query_id")
+            if s14_query_id is not None:
+                record_hspec_s14_trace_events([{
+                    "event": "verification_cancellation",
+                    "query_id": str(s14_query_id),
+                    "request_id": str(req_id),
+                    "reason": str(reason),
+                }])
             self._record_closed_selector_metrics(
                 self._selector_metric_tracker.record_cancellation(
                     int(meta.get("metric_window_id", -1))
                 )
             )
         self._req_prompt_ids.pop(req_id, None)
+        s14_request_state = getattr(self, "_s14_request_state", None)
+        if s14_request_state is not None:
+            s14_request_state.pop(str(req_id), None)
         if req_id in self._cached_batch_req_ids:
             self._cached_batch_req_ids = ()
             self._cached_batch_prompt_ids = []
@@ -6621,12 +7261,20 @@ class HSpecProposer(Proposer):
                     req_id, (), finish_reason=str(normalized_reason)
                 )
             flush_hspec_s13_shadow(str(normalized_reason))
+        s14_config = getattr(self, "_s14_config", None)
+        s14_request_state = getattr(self, "_s14_request_state", None)
+        if s14_config is not None and s14_config.enabled:
+            if s14_request_state is not None:
+                s14_request_state.clear()
+            flush_hspec_s14_trace(str(normalized_reason))
 
         # LLM.generate() has returned, so no request-local decode state may
         # cross this boundary even when a final scheduler cleanup callback was
         # omitted. Prompt tables and their adaptive state remain untouched.
         self._accept_lengths.clear()
         self._req_prompt_ids.clear()
+        if s14_request_state is not None:
+            s14_request_state.clear()
         self._cached_batch_req_ids = ()
         self._cached_batch_prompt_ids = []
         self._batched_table_cache = None

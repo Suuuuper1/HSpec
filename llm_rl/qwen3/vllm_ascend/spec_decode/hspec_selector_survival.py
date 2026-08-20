@@ -606,13 +606,106 @@ def _score_utility_one_prompt_python_impl(
 extract_utility_features_python = _extract_features_python_impl
 score_utility_one_prompt_python = _score_utility_one_prompt_python_impl
 
+
+def _score_utility_candidates_one_prompt_python_impl(
+    candidate_scores: np.ndarray,
+    candidate_indices: np.ndarray,
+    entry_rollout_idx: np.ndarray,
+    entry_offset: np.ndarray,
+    token_buffer: np.ndarray,
+    rollout_offsets: np.ndarray,
+    rollout_lens: np.ndarray,
+    key_norms: np.ndarray,
+    current_tokens: np.ndarray,
+    query_norm: float,
+    base_pos: int,
+    decoded_len: int,
+    n_entries: int,
+    feature_mean: np.ndarray,
+    feature_scale: np.ndarray,
+    theta: np.ndarray,
+    depth_bias: np.ndarray,
+    actions: np.ndarray,
+    costs_ms: np.ndarray,
+    temperature: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """Score every frozen top-8 candidate for S14 constrained reranking.
+
+    This is deliberately separate from the promoted S13 selector.  S13 keeps
+    its exact single-winner ABI and behavior; S14 may inspect these per-slot
+    values only after S13 has produced a valid, non-abstaining decision.
+    """
+    features, suffixes, abs_deltas, remaining, status = _extract_features_for_scorer(
+        candidate_scores,
+        candidate_indices,
+        entry_rollout_idx,
+        entry_offset,
+        token_buffer,
+        rollout_offsets,
+        rollout_lens,
+        key_norms,
+        current_tokens,
+        query_norm,
+        base_pos,
+        decoded_len,
+        n_entries,
+    )
+    width = int(candidate_scores.shape[0])
+    selected_actions = np.zeros((width,), dtype=np.int16)
+    utilities = np.full((width,), -math.inf, dtype=np.float64)
+    probabilities1 = np.zeros((width,), dtype=np.float64)
+    if status != 0:
+        return selected_actions, utilities, probabilities1, suffixes, remaining, status
+
+    base_cost = float(costs_ms[0])
+    for slot in range(width):
+        base_logit = 0.0
+        for feature in range(features.shape[1]):
+            standardized = (
+                float(features[slot, feature]) - float(feature_mean[feature])
+            ) / float(feature_scale[feature])
+            standardized = min(max(standardized, -12.0), 12.0)
+            base_logit += standardized * float(theta[feature])
+        usable_depth = min(int(remaining[slot]), int(depth_bias.shape[0]))
+        survival = np.zeros((depth_bias.shape[0],), dtype=np.float64)
+        for depth in range(usable_depth):
+            survival[depth] = _sigmoid_for_scorer(
+                (base_logit + float(depth_bias[depth])) / float(temperature)
+            )
+        probabilities1[slot] = survival[0] if usable_depth > 0 else 0.0
+        best_utility = -math.inf
+        best_action = 0
+        for action_index in range(1, int(actions.shape[0])):
+            action = int(actions[action_index])
+            usable = min(action, usable_depth)
+            expected = 0.0
+            for depth in range(usable):
+                expected += survival[depth]
+            penalty = (float(costs_ms[action_index]) - base_cost) / base_cost
+            utility = expected - penalty
+            if utility > best_utility:
+                best_utility = utility
+                best_action = action
+        selected_actions[slot] = best_action
+        utilities[slot] = best_utility
+    return selected_actions, utilities, probabilities1, suffixes, remaining, 0
+
+
+score_utility_candidates_one_prompt_python = (
+    _score_utility_candidates_one_prompt_python_impl
+)
+
 if HSPEC_SURVIVAL_NUMBA_AVAILABLE:
     score_utility_one_prompt_numba = njit(cache=True, nogil=True, fastmath=False)(
         _score_utility_one_prompt_python_impl
     )
+    score_utility_candidates_one_prompt_numba = njit(
+        cache=True, nogil=True, fastmath=False
+    )(_score_utility_candidates_one_prompt_python_impl)
 else:  # pragma: no cover
     extract_utility_features_numba = None
     score_utility_one_prompt_numba = None
+    score_utility_candidates_one_prompt_numba = None
 
 
 def _score_utility_batch_numba_impl(
@@ -745,6 +838,11 @@ def warm_survival_selector() -> None:
         scores, indices, rollout_idx, entry_offset, token_buffer,
         rollout_offsets, rollout_lens, key_norms, current, 1.0, 0, 1, 8,
         mean, scale, theta, bias, actions, costs, 1.0, 0.0,
+    )
+    score_utility_candidates_one_prompt_numba(
+        scores, indices, rollout_idx, entry_offset, token_buffer,
+        rollout_offsets, rollout_lens, key_norms, current, 1.0, 0, 1, 8,
+        mean, scale, theta, bias, actions, costs, 1.0,
     )
     if score_utility_batch_numba is not None and NumbaList is not None:
         def typed(values):

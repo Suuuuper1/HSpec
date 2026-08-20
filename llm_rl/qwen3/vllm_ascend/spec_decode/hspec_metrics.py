@@ -37,6 +37,7 @@ _TIMING_FIELDS = frozenset({
     "utility_cpu_score_ms",
     "utility_tail_pack_ms",
     "utility_batch_kernel_ms",
+    "s14_cpu_rerank_ms",
 })
 R1_RERANK_HISTOGRAM_US_BOUNDS = (
     50,
@@ -85,6 +86,9 @@ UTILITY_SCORE_HISTOGRAM_US_BOUNDS = (
     4000,
     8000,
 )
+S14_SCORE_HISTOGRAM_US_BOUNDS = (
+    25, 50, 100, 200, 300, 500, 750, 1000, 1500, 2000, 4000, 8000,
+)
 _UTILITY_ONLINE_ADDITIVE_KEYS = frozenset({
     "selector_utility_model_fallback_count",
     "selector_utility_runtime_fallback_count",
@@ -112,6 +116,25 @@ _UTILITY_ONLINE_ADDITIVE_KEYS = frozenset({
         "changed_vs_r1_count",
         "action_sum",
     )
+)
+_S14_ONLINE_ADDITIVE_KEYS = frozenset({
+    "selector_s14_config_fallback_count",
+    "selector_s14_query_fallback_count",
+    "select_s14_batches",
+    "select_s14_scored_queries",
+    "select_s14_changed_vs_p3_count",
+    "select_s14_continuation_available_count",
+    "select_s14_continuation_selected_count",
+    "select_s14_posterior_mature_query_count",
+    "select_s14_rollout_feedback_updates",
+    "select_s14_continuation_validated_count",
+    "select_s14_continuation_mismatch_count",
+    "select_s14_state_generation_invalidations",
+    "select_s14_cpu_score_samples",
+    "select_s14_cpu_score_us_overflow",
+}) | frozenset(
+    f"select_s14_cpu_score_us_le_{bound}"
+    for bound in S14_SCORE_HISTOGRAM_US_BOUNDS
 )
 _BASE_ADDITIVE_KEYS = frozenset({
     "select_metric_windows",
@@ -153,6 +176,7 @@ SELECTOR_ADDITIVE_METRIC_KEYS = frozenset(
     set(_BASE_ADDITIVE_KEYS)
     | set(_R1_ONLINE_ADDITIVE_KEYS)
     | set(_UTILITY_ONLINE_ADDITIVE_KEYS)
+    | set(_S14_ONLINE_ADDITIVE_KEYS)
     | {f"select_stop_{reason}_count" for reason in _STOP_REASONS}
     | {f"select_{name}" for name in _TIMING_FIELDS}
     | {f"select_accept_len_{length}_count" for length in range(_MAX_ACCEPT_HISTOGRAM_BIN + 1)}
@@ -176,6 +200,14 @@ def hspec_utility_score_histogram_key(milliseconds: float) -> str:
         if microseconds <= float(bound):
             return f"select_utility_cpu_score_us_le_{bound}"
     return "select_utility_cpu_score_us_overflow"
+
+
+def hspec_s14_score_histogram_key(milliseconds: float) -> str:
+    microseconds = max(float(milliseconds) * 1000.0, 0.0)
+    for bound in S14_SCORE_HISTOGRAM_US_BOUNDS:
+        if microseconds <= float(bound):
+            return f"select_s14_cpu_score_us_le_{bound}"
+    return "select_s14_cpu_score_us_overflow"
 
 
 def is_selector_additive_metric(key: str) -> bool:
@@ -263,6 +295,22 @@ def derive_selector_metrics(counters: Mapping[str, float]) -> Dict[str, float]:
         ),
         "select_funnel_end_to_end_eligible_ratio": _safe_ratio(
             funnel_eligible, funnel_decode
+        ),
+        "select_s14_change_rate": _safe_ratio(
+            float(counters.get("select_s14_changed_vs_p3_count", 0.0)),
+            float(counters.get("select_s14_scored_queries", 0.0)),
+        ),
+        "select_s14_continuation_availability_rate": _safe_ratio(
+            float(counters.get("select_s14_continuation_available_count", 0.0)),
+            float(counters.get("select_s14_scored_queries", 0.0)),
+        ),
+        "select_s14_continuation_selection_rate": _safe_ratio(
+            float(counters.get("select_s14_continuation_selected_count", 0.0)),
+            float(counters.get("select_s14_continuation_available_count", 0.0)),
+        ),
+        "select_s14_posterior_mature_rate": _safe_ratio(
+            float(counters.get("select_s14_posterior_mature_query_count", 0.0)),
+            float(counters.get("select_s14_scored_queries", 0.0)),
         ),
     }
     for field_name in _TIMING_FIELDS:
