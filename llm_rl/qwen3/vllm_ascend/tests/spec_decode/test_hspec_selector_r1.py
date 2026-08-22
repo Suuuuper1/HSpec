@@ -151,9 +151,18 @@ def _rerank(fn, scores, indices, arrays, **overrides):
 
 
 class TestR1Configuration(unittest.TestCase):
-    def test_default_is_exact_hardmax_and_frozen_r1_is_explicit(self):
+    def test_s18_default_is_frozen_r1_and_hardmax_is_explicit(self):
         default = selector.HSpecR1Config.from_environment({})
         self.assertEqual((default.mode, default.topk, default.sim_mode), (
+            "topk_position", 8, "cosine"
+        ))
+        self.assertTrue(default.executes_topk)
+        rollback = selector.HSpecR1Config.from_environment({
+            "HSPEC_SELECT_MODE": "hardmax",
+            "HSPEC_SELECT_TOPK": "1",
+            "HSPEC_SELECT_SIM_MODE": "raw",
+        })
+        self.assertEqual((rollback.mode, rollback.topk, rollback.sim_mode), (
             "hardmax", 1, "raw"
         ))
         r1 = selector.HSpecR1Config.from_environment({
@@ -173,6 +182,7 @@ class TestR1Configuration(unittest.TestCase):
             "HSPEC_SELECT_SIM_MODE": "cosine",
         })
         self.assertEqual(config.mode, "hardmax")
+        self.assertEqual((config.topk, config.sim_mode), (1, "raw"))
         self.assertIsNotNone(config.fallback_reason)
         uncalibrated = selector.HSpecR1Config.from_environment({
             "HSPEC_SELECT_MODE": "topk_position",
@@ -449,7 +459,7 @@ class TestR1IntegrationContracts(unittest.TestCase):
         np.testing.assert_array_equal(raw_i, raw_indices.numpy())
         self.assertEqual((event.record_count, event.sync_count), (1, 1))
 
-    def test_all_launchers_default_off_and_forward_r1_configuration(self):
+    def test_all_launchers_use_s18_default_and_forward_r1_configuration(self):
         scripts = (
             PROJECT_ROOT / "scripts/train_grpo_qwen2.5_1.5b_hspec.sh",
             PROJECT_ROOT / "scripts/train_grpo_qwen3_30b_hspec.sh",
@@ -467,17 +477,21 @@ class TestR1IntegrationContracts(unittest.TestCase):
         )
         for script in scripts:
             source = script.read_text(encoding="utf-8")
+            self.assertIn("hspec_apply_selector_profile", source)
             self.assertIn(
-                'export HSPEC_SELECT_MODE="${HSPEC_SELECT_MODE:-hardmax}"',
+                'export HSPEC_SELECT_MODE="${HSPEC_SELECT_MODE:-topk_position}"',
                 source,
             )
             self.assertIn(
-                'export HSPEC_SELECT_TOPK="${HSPEC_SELECT_TOPK:-1}"',
+                'export HSPEC_SELECT_TOPK="${HSPEC_SELECT_TOPK:-8}"',
                 source,
             )
             self.assertIn(
-                'export HSPEC_SELECT_SIM_MODE="${HSPEC_SELECT_SIM_MODE:-raw}"',
+                'export HSPEC_SELECT_SIM_MODE="${HSPEC_SELECT_SIM_MODE:-cosine}"',
                 source,
+            )
+            self.assertIn(
+                "runtime_env.env_vars.HSPEC_SELECTOR_PROFILE=", source
             )
             for suffix in required:
                 self.assertIn(

@@ -154,7 +154,7 @@ class TestHardmaxEquivalence(unittest.TestCase):
             )
         )
 
-    def test_topk_one_contract_is_the_default_signature(self):
+    def test_hardmax_function_contract_and_s18_release_default_are_explicit(self):
         signature = inspect.signature(self.method)
         self.assertEqual(signature.parameters["topk"].default, 1)
         self.assertEqual(signature.parameters["sim_mode"].default, "raw")
@@ -162,8 +162,10 @@ class TestHardmaxEquivalence(unittest.TestCase):
         source = (
             PROJECT_ROOT / "vllm_ascend" / "spec_decode" / "hspec_proposer.py"
         ).read_text(encoding="utf-8")
-        self.assertIn('os.environ.get("HSPEC_SELECT_MODE", "hardmax")', source)
-        self.assertIn('_get_env_int("HSPEC_SELECT_TOPK", 1, 1)', source)
+        self.assertIn(
+            'os.environ.get("HSPEC_SELECT_MODE", "topk_position")', source
+        )
+        self.assertIn('_get_env_int("HSPEC_SELECT_TOPK", 8, 1)', source)
         self.assertIn(
             "raw_top1_scores, raw_top1_indices = sims.max(dim=1)", source
         )

@@ -8,6 +8,7 @@ set -euo pipefail
 HOME=$(pwd)
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+source "${SCRIPT_DIR}/hspec_selector_profiles.sh"
 CUSTOM_OPP_PATH="${PROJECT_ROOT}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend"
 CUSTOM_OP_API_LIB="${CUSTOM_OPP_PATH}/op_api/lib"
 RUN_NAME="${RUN_NAME:-qwen25_15b_hspec}"
@@ -131,9 +132,10 @@ export HSPEC_ALIGN_DEBUG_MAX_LOGS="${HSPEC_ALIGN_DEBUG_MAX_LOGS:-256}"
 export HSPEC_ALIGN_DEBUG_PREVIEW="${HSPEC_ALIGN_DEBUG_PREVIEW:-8}"
 export HSPEC_ENTRY="${HSPEC_ENTRY:-0}"
 export MATCH_WND="${MATCH_WND:-16}"
-export HSPEC_SELECT_MODE="${HSPEC_SELECT_MODE:-hardmax}"
-export HSPEC_SELECT_TOPK="${HSPEC_SELECT_TOPK:-1}"
-export HSPEC_SELECT_SIM_MODE="${HSPEC_SELECT_SIM_MODE:-raw}"
+hspec_apply_selector_profile
+export HSPEC_SELECT_MODE="${HSPEC_SELECT_MODE:-topk_position}"
+export HSPEC_SELECT_TOPK="${HSPEC_SELECT_TOPK:-8}"
+export HSPEC_SELECT_SIM_MODE="${HSPEC_SELECT_SIM_MODE:-cosine}"
 export HSPEC_SELECT_RELATIVE_RADIUS="${HSPEC_SELECT_RELATIVE_RADIUS:-0.0001}"
 export HSPEC_SELECT_SUFFIX_CAP="${HSPEC_SELECT_SUFFIX_CAP:-8}"
 export HSPEC_SELECT_POSITION_MODE="${HSPEC_SELECT_POSITION_MODE:-none}"
@@ -255,6 +257,11 @@ LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/logs}"
 export OUT="${OUT:-/workspace/cann-recipes-train/llm_rl/qwen3/output/train_grpo_hspec-1.5b-64-debug3.txt}"
 mkdir -p "${LOG_DIR}" "$(dirname "${OUT}")"
 hspec_maybe_clean_store_dirs
+export HSPEC_LAUNCHER_METADATA_PATH="${HSPEC_LAUNCHER_METADATA_PATH:-${OUT}.${HSPEC_RUN_UID}.launcher_metadata.json}"
+export TRAIN_FILE TEST_FILE DATASET_FRACTION GPU_MEMORY_UTILIZATION
+export MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH MAX_NUM_SEQS ROLLOUT_N TRAIN_BATCH_SIZE
+python3 "${SCRIPT_DIR}/write_hspec_launcher_metadata.py" \
+    --output "${HSPEC_LAUNCHER_METADATA_PATH}" --launcher-script "${BASH_SOURCE[0]}"
 
 {
     echo
@@ -343,6 +350,8 @@ hspec_maybe_clean_store_dirs
     echo "hspec_proposer_keys_cpu_dtype=${HSPEC_PROPOSER_KEYS_CPU_DTYPE}"
     echo "hspec_proposer_keys_device_dtype=${HSPEC_PROPOSER_KEYS_DEVICE_DTYPE}"
     echo "hspec_select_mode=${HSPEC_SELECT_MODE}"
+    echo "hspec_selector_profile=${HSPEC_SELECTOR_PROFILE}"
+    echo "hspec_launcher_metadata_path=${HSPEC_LAUNCHER_METADATA_PATH}"
     echo "hspec_select_topk=${HSPEC_SELECT_TOPK}"
     echo "hspec_select_sim_mode=${HSPEC_SELECT_SIM_MODE}"
     echo "hspec_select_relative_radius=${HSPEC_SELECT_RELATIVE_RADIUS}"
@@ -505,6 +514,7 @@ python -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROPOSER_KEYS_CPU_DTYPE='"'"${HSPEC_PROPOSER_KEYS_CPU_DTYPE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROPOSER_KEYS_DEVICE_DTYPE='"'"${HSPEC_PROPOSER_KEYS_DEVICE_DTYPE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SELECT_MODE='"'"${HSPEC_SELECT_MODE}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SELECTOR_PROFILE='"'"${HSPEC_SELECTOR_PROFILE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SELECT_TOPK='"'"${HSPEC_SELECT_TOPK}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SELECT_SIM_MODE='"'"${HSPEC_SELECT_SIM_MODE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SELECT_RELATIVE_RADIUS='"'"${HSPEC_SELECT_RELATIVE_RADIUS}"'"' \

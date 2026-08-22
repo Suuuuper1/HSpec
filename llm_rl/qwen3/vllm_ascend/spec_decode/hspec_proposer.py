@@ -755,13 +755,13 @@ class HSpecProposer(Proposer):
         self.min_match_len: int = getattr(spec_config, "hspec_min_match_len", 1)
         self.n_components: int = getattr(spec_config, "hspec_n_components", 64)
         self.max_entries_per_prompt: int = getattr(spec_config, "hspec_max_entries_per_prompt", 10_000)
-        # Keep the default source-level contract visible to historical Patch 0
-        # audits while delegating all Patch 1 validation to one init-only parser.
-        os.environ.get("HSPEC_SELECT_MODE", "hardmax")
-        _get_env_int("HSPEC_SELECT_TOPK", 1, 1)
+        # S18 promotes the S17-selected R1 configuration.  The parser still
+        # converts any invalid configuration to exact hardmax at init time.
+        os.environ.get("HSPEC_SELECT_MODE", "topk_position")
+        _get_env_int("HSPEC_SELECT_TOPK", 8, 1)
         self._survival_config = HSpecSurvivalConfig.from_environment()
         requested_selector_mode = str(
-            os.environ.get("HSPEC_SELECT_MODE", "hardmax")
+            os.environ.get("HSPEC_SELECT_MODE", "topk_position")
         ).strip().lower()
         self._survival_requested = requested_selector_mode == HSPEC_SURVIVAL_MODE
         if requested_selector_mode == HSPEC_SURVIVAL_MODE:

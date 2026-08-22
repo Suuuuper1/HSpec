@@ -57,9 +57,11 @@ def _parse_float(env: Mapping[str, str], name: str, default: float) -> float:
 class HSpecR1Config:
     """Worker-local selector configuration, parsed exactly once at init."""
 
-    mode: str = "hardmax"
-    topk: int = 1
-    sim_mode: str = "raw"
+    # S18 production default selected by the final S17 30B gate.  Explicit
+    # hardmax remains the fail-closed and operator rollback configuration.
+    mode: str = "topk_position"
+    topk: int = 8
+    sim_mode: str = "cosine"
     relative_radius: float = 0.0001
     suffix_cap: int = 8
     position_mode: str = "none"
@@ -101,11 +103,15 @@ class HSpecR1Config:
     ) -> "HSpecR1Config":
         source = os.environ if env is None else env
         try:
-            mode = str(source.get("HSPEC_SELECT_MODE", "hardmax")).strip().lower()
+            mode = str(
+                source.get("HSPEC_SELECT_MODE", "topk_position")
+            ).strip().lower()
             if mode not in _VALID_MODES:
                 raise ValueError(f"unsupported HSPEC_SELECT_MODE={mode!r}")
-            topk = _parse_int(source, "HSPEC_SELECT_TOPK", 1)
-            sim_mode = str(source.get("HSPEC_SELECT_SIM_MODE", "raw")).strip().lower()
+            topk = _parse_int(source, "HSPEC_SELECT_TOPK", 8)
+            sim_mode = str(
+                source.get("HSPEC_SELECT_SIM_MODE", "cosine")
+            ).strip().lower()
             if sim_mode not in _VALID_SIM_MODES:
                 raise ValueError(f"unsupported HSPEC_SELECT_SIM_MODE={sim_mode!r}")
             relative_radius = _parse_float(
@@ -186,7 +192,17 @@ class HSpecR1Config:
                 d2h_strategy=d2h_strategy,
             )
         except ValueError as exc:
-            return cls(fallback_reason=str(exc))
+            # Invalid release/custom configuration must never inherit the R1
+            # dataclass default accidentally.  This is the decode-safe P0
+            # rollback required by the S18 merge contract.
+            return cls(
+                mode="hardmax",
+                topk=1,
+                sim_mode="raw",
+                position_mode="none",
+                shadow=False,
+                fallback_reason=str(exc),
+            )
 
 
 def _rerank_one_prompt_python_impl(
