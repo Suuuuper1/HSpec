@@ -57,8 +57,8 @@ def _parse_float(env: Mapping[str, str], name: str, default: float) -> float:
 class HSpecR1Config:
     """Worker-local selector configuration, parsed exactly once at init."""
 
-    # S18 production default selected by the final S17 30B gate.  Explicit
-    # hardmax remains the fail-closed and operator rollback configuration.
+    # Model-free first rollback below the S18 P3A launcher profile. Explicit
+    # hardmax remains the artifact-free fail-closed configuration.
     mode: str = "topk_position"
     topk: int = 8
     sim_mode: str = "cosine"

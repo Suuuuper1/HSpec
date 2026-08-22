@@ -755,8 +755,8 @@ class HSpecProposer(Proposer):
         self.min_match_len: int = getattr(spec_config, "hspec_min_match_len", 1)
         self.n_components: int = getattr(spec_config, "hspec_n_components", 64)
         self.max_entries_per_prompt: int = getattr(spec_config, "hspec_max_entries_per_prompt", 10_000)
-        # S18 promotes the S17-selected R1 configuration.  The parser still
-        # converts any invalid configuration to exact hardmax at init time.
+        # R1 is the model-free fallback below the S18 P3A production profile.
+        # Invalid R1 configuration still converts to exact hardmax at init.
         os.environ.get("HSPEC_SELECT_MODE", "topk_position")
         _get_env_int("HSPEC_SELECT_TOPK", 8, 1)
         self._survival_config = HSpecSurvivalConfig.from_environment()
