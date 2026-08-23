@@ -23,25 +23,17 @@ if [ -d "${CUSTOM_OP_API_LIB}" ]; then
     export LD_LIBRARY_PATH="${CUSTOM_OP_API_LIB}:${LD_LIBRARY_PATH:-}"
 fi
 
-# AIV is the performance default for the established PIECEWISE experiments,
-# but MC2 collectives captured by a full ACLGraph can deadlock on first replay.
-# Full-graph MoE launchers opt in to the safe default non-AIV HCCL path before
-# Ray or any distributed process is created.
-VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE="${VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE:-0}"
-case "${VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE}" in
-    0)
-        export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
-        ;;
-    1)
-        unset HCCL_OP_EXPANSION_MODE
-        export HSPEC_FULL_GRAPH_COMM_MODE="DEFAULT_NON_AIV"
-        ;;
-    *)
-        echo "ERROR: VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE must be 0 or 1, got ${VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE}" >&2
-        exit 2
-        ;;
-esac
-export VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE
+# Qwen3 MoE/EP uses MC2 dispatch/combine during decode. On this CANN stack the
+# AIV expansion path is required by the graph-captured MC2 kernels; selecting
+# the default non-AIV path can make MoeDistributeCombineV2 access invalid
+# workspace addresses at replay. Replay ordering itself is handled in
+# vllm_ascend/compilation/acl_graph.py by synchronizing only the graph stream.
+if [ "${VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE:-0}" != "0" ]; then
+    echo "ERROR: VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE is obsolete: the non-AIV full-graph path is unsafe for Qwen3 MoE/MC2 on this stack. Use HCCL_OP_EXPANSION_MODE=AIV." >&2
+    exit 2
+fi
+unset VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE
+export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 
 # HSpec system data-plane switches.

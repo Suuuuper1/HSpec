@@ -30,7 +30,8 @@ _CUDAGRAPH_MODES = frozenset(
     }
 )
 _MODE_ENV = "VERL_VLLM_CUDAGRAPH_MODE"
-_FULL_GRAPH_MOE_SAFE_ENV = "VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE"
+_FULL_GRAPH_MOE_REQUIRE_AIV_ENV = "VLLM_ASCEND_FULL_GRAPH_MOE_REQUIRE_AIV"
+_FULL_GRAPH_MODES = frozenset({"FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"})
 
 
 def _normalize_mode(value: Any, source: str) -> str | None:
@@ -115,22 +116,20 @@ def resolve_vllm_cudagraph_kwargs(
         )
     effective_mode = requested_mode or engine_mode
 
-    # On the 30B MoE/EP rollout path, decode selects MC2. Capturing MC2 while
-    # HCCL expands collectives as AIV can produce a graph that captures
-    # successfully but deadlocks at its first replay. The experiment launcher
-    # removes HCCL_OP_EXPANSION_MODE before process creation; retain this check
-    # in every Ray worker so an inherited or externally injected AIV setting
-    # cannot silently reintroduce the unsafe combination.
+    # The 30B full-graph experiment explicitly requires AIV for its Qwen3
+    # MoE/MC2 decode kernels. Enforce the launcher contract in each Ray worker:
+    # an inherited environment must not silently switch to the default non-AIV
+    # path, which can make graph-captured MoeDistributeCombineV2 replay with an
+    # invalid workspace layout on the validated CANN stack.
     if (
-        effective_mode in {"FULL", "FULL_DECODE_ONLY"}
-        and _env_flag(env, _FULL_GRAPH_MOE_SAFE_ENV)
-        and str(env.get("HCCL_OP_EXPANSION_MODE", "")).strip().upper() == "AIV"
+        effective_mode in _FULL_GRAPH_MODES
+        and _env_flag(env, _FULL_GRAPH_MOE_REQUIRE_AIV_ENV)
+        and str(env.get("HCCL_OP_EXPANSION_MODE", "")).strip().upper() != "AIV"
     ):
         raise RuntimeError(
-            "Unsafe full-graph MoE communication configuration: "
-            "HCCL_OP_EXPANSION_MODE=AIV can deadlock MC2 collectives during "
-            "ACLGraph replay. Unset HCCL_OP_EXPANSION_MODE before launching "
-            "Ray workers."
+            "Full-graph MoE communication contract violation: "
+            "HCCL_OP_EXPANSION_MODE=AIV is required for Qwen3 MoE/MC2 ACLGraph "
+            "replay on this validated stack. Set it before launching Ray workers."
         )
 
     requested_sizes = _normalize_sizes(

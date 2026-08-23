@@ -1,9 +1,11 @@
+import inspect
 from types import SimpleNamespace
 
 import pytest
 from vllm.config import CUDAGraphMode
 from vllm.config.compilation import CompilationMode
 
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -29,3 +31,10 @@ def test_aclgraph_enablement_matches_full_vs_piecewise_semantics(
         model_config=SimpleNamespace(enforce_eager=enforce_eager),
     )
     assert NPUModelRunner._use_aclgraph(runner) is expected
+
+
+def test_aclgraph_replay_synchronizes_only_the_current_stream():
+    source = inspect.getsource(ACLGraphWrapper.__call__)
+    assert "torch.npu.current_stream().synchronize()" in source
+    assert "torch.npu.synchronize()" not in source
+    assert "ACLGraph replay synchronization scope: current_stream" in source

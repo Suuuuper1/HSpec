@@ -201,7 +201,11 @@ class ACLGraphWrapper:
             else False
         )
         if self.runtime_mode != CUDAGraphMode.FULL or not forward_context.is_draft_model or not use_eagle:
-            torch.npu.synchronize()
+            # Only the replay stream needs ordering against its previous
+            # iteration. A device-wide barrier can wait on unrelated HCCL
+            # send/recv streams and deadlock a full graph containing MoE/MC2.
+            logger.info_once("ACLGraph replay synchronization scope: current_stream")
+            torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
         return entry.output
 

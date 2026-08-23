@@ -430,13 +430,13 @@ class vLLMRollout(BaseRollout):
             logger.warning("Resolved vLLM compilation_config: %s", resolved_compilation_config)
             if resolved_compilation_config and str(
                 resolved_compilation_config.get("cudagraph_mode", "")
-            ).upper() in {"FULL", "FULL_DECODE_ONLY"}:
+            ).upper() in {"FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"}:
                 hccl_expansion = os.environ.get("HCCL_OP_EXPANSION_MODE")
                 logger.warning(
                     "Resolved full-graph communication contract: "
-                    "HCCL_OP_EXPANSION_MODE=%s moe_comm_safe=%s",
-                    hccl_expansion if hccl_expansion else "<unset:default-non-AIV>",
-                    os.environ.get("VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE", "0"),
+                    "HCCL_OP_EXPANSION_MODE=%s moe_comm_require_aiv=%s",
+                    hccl_expansion if hccl_expansion else "<unset>",
+                    os.environ.get("VLLM_ASCEND_FULL_GRAPH_MOE_REQUIRE_AIV", "0"),
                 )
 
         self.dynamic_eplb = int(os.environ.get("VLLM_ENABLE_EPLB", "0")) == 1

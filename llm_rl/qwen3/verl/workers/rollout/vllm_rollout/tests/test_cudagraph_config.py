@@ -89,33 +89,34 @@ def test_full_graph_rejects_eager_execution():
         )
 
 
-def test_full_graph_moe_safe_contract_rejects_aiv():
-    with pytest.raises(RuntimeError, match="can deadlock MC2 collectives"):
+@pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
+def test_full_graph_moe_contract_rejects_missing_aiv(mode):
+    with pytest.raises(RuntimeError, match="HCCL_OP_EXPANSION_MODE=AIV is required"):
         resolve_vllm_cudagraph_kwargs(
-            _config(cudagraph_mode="FULL_DECODE_ONLY"),
+            _config(cudagraph_mode=mode),
             {},
-            {
-                "VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE": "1",
-                "HCCL_OP_EXPANSION_MODE": "AIV",
-            },
+            {"VLLM_ASCEND_FULL_GRAPH_MOE_REQUIRE_AIV": "1"},
         )
 
 
-def test_full_graph_moe_safe_contract_accepts_default_hccl_path():
+def test_full_graph_moe_contract_accepts_aiv():
     kwargs = resolve_vllm_cudagraph_kwargs(
         _config(cudagraph_mode="FULL_DECODE_ONLY"),
         {},
-        {"VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE": "1"},
+        {
+            "VLLM_ASCEND_FULL_GRAPH_MOE_REQUIRE_AIV": "1",
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+        },
     )
     assert kwargs["compilation_config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
 
 
-def test_invalid_full_graph_moe_safe_flag_fails_closed():
+def test_invalid_full_graph_moe_require_aiv_flag_fails_closed():
     with pytest.raises(ValueError, match="must be a boolean flag"):
         resolve_vllm_cudagraph_kwargs(
             _config(cudagraph_mode="FULL_DECODE_ONLY"),
             {},
-            {"VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE": "sometimes"},
+            {"VLLM_ASCEND_FULL_GRAPH_MOE_REQUIRE_AIV": "sometimes"},
         )
 
 
