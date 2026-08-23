@@ -116,6 +116,11 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
         if entry.aclgraph is None:
+            logger.info_once(
+                "Capturing aclgraph: runtime_mode=%s batch_descriptor=%s",
+                self.runtime_mode.name,
+                entry.batch_descriptor,
+            )
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every

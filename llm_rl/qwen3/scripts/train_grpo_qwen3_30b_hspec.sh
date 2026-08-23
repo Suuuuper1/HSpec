@@ -23,7 +23,25 @@ if [ -d "${CUSTOM_OP_API_LIB}" ]; then
     export LD_LIBRARY_PATH="${CUSTOM_OP_API_LIB}:${LD_LIBRARY_PATH:-}"
 fi
 
-export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
+# AIV is the performance default for the established PIECEWISE experiments,
+# but MC2 collectives captured by a full ACLGraph can deadlock on first replay.
+# Full-graph MoE launchers opt in to the safe default non-AIV HCCL path before
+# Ray or any distributed process is created.
+VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE="${VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE:-0}"
+case "${VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE}" in
+    0)
+        export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
+        ;;
+    1)
+        unset HCCL_OP_EXPANSION_MODE
+        export HSPEC_FULL_GRAPH_COMM_MODE="DEFAULT_NON_AIV"
+        ;;
+    *)
+        echo "ERROR: VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE must be 0 or 1, got ${VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE}" >&2
+        exit 2
+        ;;
+esac
+export VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE
 export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
 
 # HSpec system data-plane switches.
@@ -114,8 +132,9 @@ export HSPEC_TABLE_EVICT_REWARD_WEIGHT="${HSPEC_TABLE_EVICT_REWARD_WEIGHT:-0.5}"
 export HSPEC_TABLE_EVICT_HIT_WEIGHT="${HSPEC_TABLE_EVICT_HIT_WEIGHT:-0.5}"
 export HSPEC_TABLE_ACCESS_REPORT_INTERVAL_STEPS="${HSPEC_TABLE_ACCESS_REPORT_INTERVAL_STEPS:-16}"
 
-# capture graph
-# export VERL_VLLM_CUDAGRAPH_MODE="${VERL_VLLM_CUDAGRAPH_MODE:-FULL}"
+# Compatibility fallback for actor_rollout_ref.rollout.cudagraph_mode.
+# FULL_DECODE_ONLY captures uniform decode and leaves prefill/mixed batches eager.
+# export VERL_VLLM_CUDAGRAPH_MODE="${VERL_VLLM_CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
 
 # HSpec debug / tracing / profiling switches.
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"

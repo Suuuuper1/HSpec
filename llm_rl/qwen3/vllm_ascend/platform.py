@@ -269,8 +269,15 @@ class NPUPlatform(Platform):
                 compilation_config.cudagraph_capture_sizes = sp_aclgraph_sizes
                 update_cudagraph_capture_sizes(vllm_config, sp_aclgraph_sizes)
 
-        # TODO: Full graph is fully supported later, and the default value will be set to full graph.
+        # Ascend supports explicit FULL_DECODE_ONLY/FULL. The combined vLLM
+        # default still requires a piecewise fallback that is not supported by
+        # the current ACLGraph integration, so preserve the historical
+        # PIECEWISE default unless users explicitly request a full mode.
         if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
+            logger.info(
+                "FULL_AND_PIECEWISE is not supported on NPU; using PIECEWISE. "
+                "Set cudagraph_mode=FULL_DECODE_ONLY to enable full decode graphs."
+            )
             compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
         # encoder-decoder models currently only support piecewise mode
@@ -310,7 +317,8 @@ class NPUPlatform(Platform):
             or compilation_config.cudagraph_mode == CUDAGraphMode.FULL
         ):
             logger.info(
-                "FULL_DECODE_ONLY compilation enabled on NPU. use_inductor not supported - using only ACL Graph mode"
+                "%s compilation enabled on NPU. use_inductor is disabled; using ACL Graph mode",
+                compilation_config.cudagraph_mode.name,
             )
             compilation_config.use_inductor = False
             compilation_config.splitting_ops = []

@@ -46,6 +46,10 @@ from verl.workers.config import HFModelConfig, RewardModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_free_port, run_unvicorn
 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
+from verl.workers.rollout.vllm_rollout.cudagraph_config import (
+    resolve_vllm_cudagraph_kwargs,
+    serialize_vllm_cli_value,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -189,8 +193,11 @@ class vLLMHttpServer:
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if self.config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
-        if self.config.cudagraph_capture_sizes:
-            engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
+        engine_kwargs = resolve_vllm_cudagraph_kwargs(self.config, engine_kwargs)
+        logger.info(
+            "Resolved vLLM compilation_config: %s",
+            engine_kwargs.get("compilation_config"),
+        )
 
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
@@ -246,6 +253,7 @@ class vLLMHttpServer:
 
         server_args = ["serve", self.model_config.local_path]
         for k, v in args.items():
+            v = serialize_vllm_cli_value(k, v)
             if isinstance(v, bool):
                 if v:
                     server_args.append(f"--{k}")

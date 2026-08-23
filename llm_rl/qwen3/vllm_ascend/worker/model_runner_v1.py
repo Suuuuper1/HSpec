@@ -785,7 +785,16 @@ class NPUModelRunner(GPUModelRunner):
         return accepted_prefix_lengths
 
     def _use_aclgraph(self) -> bool:
-        return self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.compilation_config.mode == CompilationMode.VLLM_COMPILE and not self.model_config.enforce_eager
+        graph_mode = self.compilation_config.cudagraph_mode
+        if graph_mode == CUDAGraphMode.NONE or self.model_config.enforce_eager:
+            return False
+        # PIECEWISE graphs are produced by the vLLM compilation backend. Full
+        # graphs wrap the complete model forward and are orthogonal to
+        # piecewise compilation, matching vLLM 0.14 CompilationConfig semantics.
+        return (
+            self.compilation_config.mode == CompilationMode.VLLM_COMPILE
+            or graph_mode.has_full_cudagraphs()
+        )
 
     def _skip_all_reduce_across_dp_group(self, is_draft_model=False) -> bool:
         """
@@ -3734,8 +3743,46 @@ class NPUModelRunner(GPUModelRunner):
         attention_backends: list[set[type[AttentionBackend]]],
         kv_cache_groups: list[KVCacheGroupSpec],
     ) -> None:
+        requested_mode = self.compilation_config.cudagraph_mode
         super()._check_and_update_cudagraph_mode(attention_backends,
                                                  kv_cache_groups)
+
+        resolved_mode = self.compilation_config.cudagraph_mode
+        resolved_capture_sizes = getattr(self, "cudagraph_batch_sizes", [])
+        strict_full_graph = os.environ.get(
+            "VLLM_ASCEND_STRICT_FULL_GRAPH", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if (
+            strict_full_graph
+            and requested_mode is not None
+            and requested_mode.has_full_cudagraphs()
+            and resolved_mode != requested_mode
+        ):
+            raise RuntimeError(
+                "Strict full-graph mode rejected an automatic ACLGraph "
+                f"downgrade: requested={requested_mode.name}, "
+                f"resolved={resolved_mode.name}."
+            )
+        if (
+            strict_full_graph
+            and resolved_mode.has_full_cudagraphs()
+            and not resolved_capture_sizes
+        ):
+            raise RuntimeError("Strict full-graph mode resolved no ACLGraph capture sizes")
+        if strict_full_graph and resolved_mode.has_full_cudagraphs() and not self.use_aclgraph:
+            raise RuntimeError(
+                "Strict full-graph mode resolved FULL but the ACLGraph model wrapper is disabled"
+            )
+
+        logger.info(
+            "Resolved ACLGraph configuration: requested_mode=%s resolved_mode=%s "
+            "uniform_decode_query_len=%d capture_sizes=%s strict_full_graph=%s",
+            requested_mode.name if requested_mode is not None else None,
+            resolved_mode.name,
+            self.uniform_decode_query_len,
+            resolved_capture_sizes,
+            strict_full_graph,
+        )
 
         # NOTE: Since aclgraph_batch_sizes cannot be determined until here,
         # we set the graph params right before initializing the keys.

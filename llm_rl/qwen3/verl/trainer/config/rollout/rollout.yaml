@@ -37,6 +37,12 @@ ignore_eos: False
 # Whether to disable CUDA graph. Default False to best performance.
 enforce_eager: False
 
+# vLLM graph mode. null keeps the engine/platform default. FULL_DECODE_ONLY
+# captures full graphs for uniform decode batches and runs prefill/mixed batches
+# without graphs. Require enforce_eager: False.
+# supported engines: vllm
+cudagraph_mode: null
+
 # batch size of cudagraph to capture. Require enforce_eager: False to use this option
 # Since cudagraph in inference engine can not be offloaded during update policy,
 # you can use smaller batch size to save memory used in cuda graph, eg: [1 ,2, 4, 8, 16, 32]

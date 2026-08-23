@@ -66,9 +66,10 @@ hspec_apply_selector_profile() {
             export HSPEC_S13_FASTPATH_VERSION=
             export HSPEC_S14_MODE=off
             ;;
-        hardmax_rollback)
-            # P0 is independent of learned artifacts and remains the emergency
-            # rollback even when a selector/model/schema validation fails.
+        p0_performance|hardmax_rollback)
+            # Both profiles execute P0 hard-max. The performance profile keeps
+            # the 30B verification-row budget shared by the R1/P3A studies;
+            # hardmax_rollback remains the unbounded emergency rollback.
             export HSPEC_SELECT_MODE=hardmax
             export HSPEC_SELECT_TOPK=1
             export HSPEC_SELECT_SIM_MODE=raw
@@ -84,7 +85,11 @@ hspec_apply_selector_profile() {
             export HSPEC_SELECT_EXECUTION_LEVEL=
             export HSPEC_SELECT_ALLOW_EXECUTE=0
             export HSPEC_SELECT_R1_COMPARE_EVERY_BATCHES=0
-            export HSPEC_MAX_DRAFT_TOKENS_PER_BATCH=0
+            if [ "${profile}" = "p0_performance" ]; then
+                export HSPEC_MAX_DRAFT_TOKENS_PER_BATCH=384
+            else
+                export HSPEC_MAX_DRAFT_TOKENS_PER_BATCH=0
+            fi
             export HSPEC_S13_FASTPATH_VERSION=
             export HSPEC_S14_MODE=off
             ;;

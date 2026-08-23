@@ -83,6 +83,9 @@ from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.vllm_rollout.cudagraph_config import (
+    resolve_vllm_cudagraph_kwargs,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -100,6 +103,7 @@ logging.getLogger("torch._dynamo").setLevel(logging.CRITICAL)
 
 # Print resolved speculative config once per process.
 _PRINTED_VLLM_SPEC_CONFIG = False
+_PRINTED_VLLM_COMPILATION_CONFIG = False
 _PRINTED_HSPEC_PHASE3_RUNTIME = False
 _HSPEC_ALIGN_DEBUG = os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
 _HSPEC_ALIGN_DEBUG_PREVIEW = int(os.getenv("HSPEC_ALIGN_DEBUG_PREVIEW", "8"))
@@ -415,16 +419,25 @@ class vLLMRollout(BaseRollout):
             _PRINTED_VLLM_SPEC_CONFIG = True
             logger.warning("Resolved vLLM speculative_config: %s", speculative_config)
 
-        compilation_config = {}
-
-        cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
-        # enforce_eager must be False to use cudagraph
-        if not config.enforce_eager and cudagraph_capture_sizes:
+        engine_kwargs = resolve_vllm_cudagraph_kwargs(config, engine_kwargs)
+        resolved_compilation_config = engine_kwargs.get("compilation_config")
+        if not config.enforce_eager and resolved_compilation_config:
             torch._dynamo.config.log_compilation_metrics = False
-            compilation_config["compilation_config"] = {
-                "cudagraph_capture_sizes": cudagraph_capture_sizes,
-                "cudagraph_mode": "PIECEWISE",
-            }
+
+        global _PRINTED_VLLM_COMPILATION_CONFIG
+        if not _PRINTED_VLLM_COMPILATION_CONFIG:
+            _PRINTED_VLLM_COMPILATION_CONFIG = True
+            logger.warning("Resolved vLLM compilation_config: %s", resolved_compilation_config)
+            if resolved_compilation_config and str(
+                resolved_compilation_config.get("cudagraph_mode", "")
+            ).upper() in {"FULL", "FULL_DECODE_ONLY"}:
+                hccl_expansion = os.environ.get("HCCL_OP_EXPANSION_MODE")
+                logger.warning(
+                    "Resolved full-graph communication contract: "
+                    "HCCL_OP_EXPANSION_MODE=%s moe_comm_safe=%s",
+                    hccl_expansion if hccl_expansion else "<unset:default-non-AIV>",
+                    os.environ.get("VLLM_ASCEND_FULL_GRAPH_MOE_COMM_SAFE", "0"),
+                )
 
         self.dynamic_eplb = int(os.environ.get("VLLM_ENABLE_EPLB", "0")) == 1
         self.inference_engine = LLM(
@@ -463,7 +476,6 @@ class vLLMRollout(BaseRollout):
                     "enable_static_kernel": eval(os.environ.get("NPUGRAPH_EX_ENABLE_STATIC_KERNEL", "False"))
                 }
             },
-            **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,
         )
