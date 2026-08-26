@@ -21,6 +21,7 @@ LAUNCHER_FIELDS = {
     "max_num_seqs": "MAX_NUM_SEQS",
     "rollout_n": "ROLLOUT_N",
     "train_batch_size": "TRAIN_BATCH_SIZE",
+    "task_queue_enable": "TASK_QUEUE_ENABLE",
 }
 
 
