@@ -366,6 +366,31 @@ class VllmConfig:
             or not self.parallel_config.data_parallel_external_lb
         )
 
+    @property
+    def num_speculative_tokens(self) -> int:
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.num_speculative_tokens is not None
+        ):
+            return self.speculative_config.num_speculative_tokens
+        return 0
+
+    @property
+    def num_lookahead_tokens(self) -> int:
+        """KV slots reserved beyond the target's currently scheduled query.
+
+        Parallel-block layouts delegate to SpeculativeConfig so DSpark's
+        anchor and compatibility layouts cannot drift from proposer geometry.
+        """
+        speculative_config = self.speculative_config
+        if speculative_config is None:
+            return 0
+        if speculative_config.uses_parallel_block_drafter():
+            return speculative_config.parallel_query_count
+        if speculative_config.use_eagle():
+            return self.num_speculative_tokens
+        return 0
+
     def enable_trace_function_call_for_thread(self) -> None:
         """
         Set up function tracing for the current thread,
@@ -543,6 +568,17 @@ class VllmConfig:
             self.parallel_config.is_moe_model = self.model_config.is_moe
 
         self.cache_config.verify_with_parallel_config(self.parallel_config)
+
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.uses_parallel_block_drafter()
+        ):
+            if self.cache_config.enable_prefix_caching:
+                raise ValueError(
+                    "DFlash/DSpark Phase 0-3 requires enable_prefix_caching=False"
+                )
+            if self.lora_config is not None:
+                raise ValueError("DFlash/DSpark Phase 0-3 does not support LoRA")
 
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)

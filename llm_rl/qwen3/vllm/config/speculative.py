@@ -8,6 +8,7 @@ from pydantic import Field, SkipValidation, model_validator
 from pydantic.dataclasses import dataclass
 from typing_extensions import Self
 
+from vllm.config.load import LoadConfig
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config
@@ -40,6 +41,7 @@ MTPModelTypes = Literal[
     "pangu_ultra_moe_mtp",
 ]
 EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
+ParallelBlockModelTypes = Literal["dflash", "dspark"]
 SpeculativeMethod = Literal[
     "ngram",
     "medusa",
@@ -48,8 +50,11 @@ SpeculativeMethod = Literal[
     "suffix",
     "sam",
     "hspec",
+    ParallelBlockModelTypes,
     EagleModelTypes,
 ]
+DraftSampleMethod = Literal["greedy", "probabilistic"]
+RejectionSampleMethod = Literal["legacy", "standard"]
 
 
 @config
@@ -101,6 +106,16 @@ class SpeculativeConfig:
     """The specific revision to use for the draft model code on Hugging Face
     Hub. It can be a branch name, a tag name, or a commit id. If unspecified,
     will use the default version."""
+    draft_load_config: LoadConfig | None = None
+    """Independent draft-weight loader. Parallel-block drafters must not
+    inherit Verl's target-side dummy loader."""
+    draft_sample_method: DraftSampleMethod = "greedy"
+    """Draft-token sampling mode. The first certified scope is greedy."""
+    rejection_sample_method: RejectionSampleMethod | None = None
+    """Verifier mode. Unset retains the historical mode for old methods and
+    resolves to standard rejection for DFlash/DSpark."""
+    sample_from_anchor: bool | None = None
+    """DSpark layout override. If unset, the checkpoint value is authoritative."""
 
     # Advanced control
     disable_by_batch_size: int | None = Field(default=None, ge=2)
@@ -156,6 +171,20 @@ class SpeculativeConfig:
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_parallel_block_k_early(cls, values: Any) -> Any:
+        """Give explicit-method users the certified NPU K error before Field parsing."""
+        kwargs = getattr(values, "kwargs", values)
+        if isinstance(kwargs, dict) and kwargs.get("method") in ("dflash", "dspark"):
+            k = kwargs.get("num_speculative_tokens")
+            if not isinstance(k, int) or not 1 <= k <= 15:
+                raise ValueError(
+                    "DFlash/DSpark Ascend NPU certified range requires "
+                    "1 <= num_speculative_tokens <= 15"
+                )
+        return values
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -168,10 +197,29 @@ class SpeculativeConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        factors: list[Any] = []
-        # Eagle3 affects the computation graph because it returns intermediate
-        # hidden states in addition to the final hidden state.
-        factors.append(self.method == "eagle3")
+        if not self.uses_parallel_block_drafter():
+            # Preserve the 0.14.2 hash exactly for all existing methods.
+            factors: list[Any] = [self.method == "eagle3"]
+            return safe_hash(
+                str(factors).encode(), usedforsecurity=False
+            ).hexdigest()
+
+        factors = [
+            self.method,
+            self.num_speculative_tokens,
+            self.parallel_query_count,
+            self.sample_from_anchor,
+            self.needs_aux_hidden_states(),
+        ]
+        if self.draft_model_config is not None:
+            factors.append(self.draft_model_config.compute_hash())
+            layer_ids = getattr(
+                self.draft_model_config.hf_config,
+                "eagle_aux_hidden_state_layer_ids",
+                None,
+            )
+            if layer_ids is not None:
+                factors.append(tuple(layer_ids))
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -288,6 +336,10 @@ class SpeculativeConfig:
                 self.model = "suffix"
             elif self.method == "sam":
                 self.model = "sam"
+            elif self.method in ("dflash", "dspark"):
+                raise ValueError(
+                    f"{self.method} requires an independent draft checkpoint model path"
+                )
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
@@ -374,7 +426,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3"):
+                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -384,6 +436,19 @@ class SpeculativeConfig:
                     self.method = "eagle"
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
+                elif (
+                    "DFlashDraftModel" in self.draft_model_config.architectures
+                    or "dflash" in self.draft_model_config.model.lower()
+                ):
+                    self.method = "dflash"
+                elif (
+                    any(
+                        arch in self.draft_model_config.architectures
+                        for arch in ("Qwen3DSparkModel", "DSparkDraftModel")
+                    )
+                    or "dspark" in self.draft_model_config.model.lower()
+                ):
+                    self.method = "dspark"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
@@ -417,8 +482,11 @@ class SpeculativeConfig:
                         "eagle, or mtp."
                     )
 
-                # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3"):
+                if self.uses_parallel_block_drafter():
+                    self._validate_parallel_block_checkpoint()
+
+                # Replace hf_config for EAGLE and DFlash draft models.
+                if self.method in ("eagle", "eagle3", "dflash"):
                     from vllm.transformers_utils.configs import SpeculatorsConfig
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
 
@@ -437,6 +505,17 @@ class SpeculativeConfig:
                         self.draft_model_config.model_arch_config = (
                             self.draft_model_config.get_model_arch_config()
                         )
+
+                if (
+                    self.method == "dspark"
+                    and "DSparkDraftModel" in self.draft_model_config.architectures
+                ):
+                    self.draft_model_config.hf_config.architectures = [
+                        "Qwen3DSparkModel"
+                    ]
+                    self.draft_model_config.model_arch_config = (
+                        self.draft_model_config.get_model_arch_config()
+                    )
 
                 if self.num_speculative_tokens is not None and hasattr(
                     self.draft_model_config.hf_config, "num_lookahead_tokens"
@@ -495,7 +574,188 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
+                if self.uses_parallel_block_drafter():
+                    self._resolve_parallel_block_options()
         return self
+
+    def _validate_parallel_block_checkpoint(self) -> None:
+        if self.target_model_config is None or self.draft_model_config is None:
+            raise ValueError(f"{self.method} requires target and draft model configs")
+
+        target = self.target_model_config
+        draft = self.draft_model_config
+        target_type = getattr(target.hf_text_config, "model_type", None)
+        draft_type = getattr(draft.hf_text_config, "model_type", None)
+        if target_type not in ("qwen3", "qwen3_moe") or draft_type != "qwen3":
+            raise ValueError(
+                f"{self.method} Phase 0 only supports Qwen3/Qwen3-MoE targets "
+                f"with a Qwen3 draft; got target={target_type!r}, draft={draft_type!r}"
+            )
+
+        architectures = set(draft.architectures)
+        allowed = (
+            {"DFlashDraftModel"}
+            if self.use_dflash()
+            else {"Qwen3DSparkModel", "DSparkDraftModel"}
+        )
+        if not architectures.intersection(allowed):
+            raise ValueError(
+                f"Unsupported {self.method} draft architecture {sorted(architectures)}; "
+                f"expected one of {sorted(allowed)}"
+            )
+
+        target_vocab = target.get_vocab_size()
+        draft_vocab = draft.get_vocab_size()
+        if target_vocab != draft_vocab:
+            raise ValueError(
+                f"{self.method} requires full equal vocabularies; "
+                f"target={target_vocab}, draft={draft_vocab}"
+            )
+
+        for field in (
+            "hidden_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "rope_theta",
+            "rope_scaling",
+        ):
+            target_value = getattr(target.hf_text_config, field, None)
+            draft_value = getattr(draft.hf_text_config, field, None)
+            if target_value != draft_value:
+                raise ValueError(
+                    f"{self.method} target/draft {field} mismatch: "
+                    f"{target_value!r} != {draft_value!r}"
+                )
+
+        for token_name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            target_id = getattr(target.hf_text_config, token_name, None)
+            draft_id = getattr(draft.hf_text_config, token_name, None)
+            if target_id is not None and draft_id is not None and target_id != draft_id:
+                raise ValueError(
+                    f"{self.method} target/draft {token_name} mismatch: "
+                    f"{target_id} != {draft_id}"
+                )
+
+        layer_types = getattr(draft.hf_text_config, "layer_types", None) or []
+        if any(layer_type != "full_attention" for layer_type in layer_types):
+            raise ValueError(
+                f"{self.method} Phase 0 only supports uniform full attention; "
+                f"got layer_types={layer_types}"
+            )
+        if getattr(draft.hf_text_config, "sliding_window", None) is not None:
+            raise ValueError(f"{self.method} Phase 0 does not support sliding window")
+
+        if self.use_dflash():
+            raw_config = getattr(draft.hf_text_config, "dflash_config", {}) or {}
+            if not isinstance(raw_config, dict):
+                raise ValueError("dflash_config must be a mapping")
+            layer_ids = raw_config.get("target_layer_ids")
+            if not layer_ids:
+                raise ValueError("DFlash checkpoint is missing dflash_config.target_layer_ids")
+            mask_token_id = raw_config.get("mask_token_id")
+            if (
+                not isinstance(mask_token_id, int)
+                or mask_token_id < 0
+                or mask_token_id >= draft_vocab
+            ):
+                raise ValueError(
+                    f"DFlash mask_token_id must be in [0, {draft_vocab}); "
+                    f"got {mask_token_id!r}"
+                )
+            draft.hf_text_config.eagle_aux_hidden_state_layer_ids = list(layer_ids)
+        else:
+            layer_ids = getattr(
+                draft.hf_text_config, "dspark_target_layer_ids", None
+            ) or getattr(draft.hf_text_config, "target_layer_ids", None)
+            if not layer_ids:
+                raise ValueError("DSpark checkpoint is missing target aux layer ids")
+            draft.hf_text_config.eagle_aux_hidden_state_layer_ids = list(layer_ids)
+
+        target_num_layers = getattr(target.hf_text_config, "num_hidden_layers", None)
+        if (
+            not isinstance(target_num_layers, int)
+            or any(
+                not isinstance(layer_id, int)
+                or layer_id < 0
+                or layer_id >= target_num_layers
+                for layer_id in layer_ids
+            )
+        ):
+            raise ValueError(
+                f"{self.method} aux layer ids {layer_ids!r} are outside the "
+                f"target layer range [0, {target_num_layers})"
+            )
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError(f"{self.method} aux layer ids must be unique")
+        if list(layer_ids) != sorted(layer_ids):
+            raise ValueError(
+                f"{self.method} aux layer ids must be in strictly increasing order"
+            )
+        draft_target_layers = getattr(
+            draft.hf_text_config, "num_target_layers", None
+        )
+        if draft_target_layers not in (None, target_num_layers):
+            raise ValueError(
+                f"{self.method} num_target_layers mismatch: "
+                f"{draft_target_layers} != {target_num_layers}"
+            )
+
+    def _resolve_parallel_block_options(self) -> None:
+        assert self.draft_model_config is not None
+        if self.num_speculative_tokens is None or not 1 <= self.num_speculative_tokens <= 15:
+            raise ValueError(
+                "DFlash/DSpark requires 1 <= num_speculative_tokens <= 15"
+            )
+        hspec_fields = {
+            name: getattr(self, name)
+            for name in (
+                "hspec_similarity_threshold",
+                "hspec_min_match_len",
+                "hspec_n_components",
+                "hspec_max_entries_per_prompt",
+            )
+            if getattr(self, name) is not None
+        }
+        if hspec_fields:
+            raise ValueError(
+                f"HSpec and {self.method} configuration are mutually exclusive; "
+                f"remove {sorted(hspec_fields)}"
+            )
+        if self.draft_sample_method != "greedy":
+            raise ValueError(
+                "DFlash/DSpark probabilistic draft sampling is not implemented "
+                "in the Phase 0-3 old-ABI path; use draft_sample_method='greedy'"
+            )
+        if self.rejection_sample_method is None:
+            self.rejection_sample_method = "standard"
+        if self.rejection_sample_method != "standard":
+            raise ValueError(
+                "DFlash/DSpark requires rejection_sample_method='standard'; "
+                "the legacy verifier is not valid for random RL rollout"
+            )
+
+        if self.draft_load_config is None:
+            self.draft_load_config = LoadConfig(load_format="auto")
+        load_format = str(self.draft_load_config.load_format).lower()
+        if "dummy" in load_format:
+            raise ValueError("DFlash/DSpark draft_load_config cannot use dummy weights")
+
+        checkpoint_anchor = getattr(
+            self.draft_model_config.hf_text_config, "sample_from_anchor", None
+        )
+        if self.use_dflash():
+            if self.sample_from_anchor is True or checkpoint_anchor is True:
+                raise ValueError("DFlash does not support sample_from_anchor=True")
+            self.sample_from_anchor = False
+        else:
+            if self.sample_from_anchor is None:
+                self.sample_from_anchor = (
+                    True if checkpoint_anchor is None else bool(checkpoint_anchor)
+                )
+            self.draft_model_config.hf_text_config.sample_from_anchor = (
+                self.sample_from_anchor
+            )
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():
@@ -647,6 +907,52 @@ class SpeculativeConfig:
                 self.draft_parallel_config
             )
 
+        if self.uses_parallel_block_drafter():
+            assert self.target_model_config is not None
+            assert self.draft_model_config is not None
+            if self.target_model_config.is_multimodal_model:
+                raise ValueError("DFlash/DSpark Phase 0 does not support multimodal models")
+            if self.disable_padded_drafter_batch:
+                raise ValueError("DFlash/DSpark requires the padded drafter path")
+            if self.target_model_config.tokenizer != self.draft_model_config.tokenizer:
+                raise ValueError("DFlash/DSpark target and draft tokenizers must match")
+            if self.use_dspark() and (
+                self.draft_model_config.model == self.target_model_config.model
+            ):
+                raise ValueError(
+                    "Qwen3 DSpark requires an independent draft checkpoint path"
+                )
+            parallel = self.target_parallel_config
+            unsupported_parallel = {
+                "pipeline_parallel_size": parallel.pipeline_parallel_size,
+                "prefill_context_parallel_size": parallel.prefill_context_parallel_size,
+                "decode_context_parallel_size": parallel.decode_context_parallel_size,
+            }
+            enabled = {name: value for name, value in unsupported_parallel.items() if value > 1}
+            if enabled:
+                raise ValueError(
+                    f"DFlash/DSpark Phase 0 does not support PP/PCP/DCP: {enabled}"
+                )
+            if self.parallel_query_count > self.draft_model_config.max_model_len:
+                raise ValueError(
+                    "parallel query block is larger than the draft max model length"
+                )
+        else:
+            if self.draft_load_config is not None:
+                raise ValueError("draft_load_config is only supported for DFlash/DSpark")
+            if self.rejection_sample_method is not None:
+                raise ValueError(
+                    "rejection_sample_method is only supported for DFlash/DSpark "
+                    "in the old-ABI implementation"
+                )
+            if self.draft_sample_method != "greedy":
+                raise ValueError(
+                    "draft_sample_method is only supported for DFlash/DSpark "
+                    "in the old-ABI implementation"
+                )
+            if self.sample_from_anchor is not None:
+                raise ValueError("sample_from_anchor is only supported for DSpark")
+
         if self.disable_by_batch_size is not None and self.disable_by_batch_size < 2:
             raise ValueError(
                 "Expect the batch size threshold of disabling "
@@ -671,7 +977,57 @@ class SpeculativeConfig:
         return self
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp")
+        # Historical name: downstream uses this as "needs target hidden state".
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+
+    def use_dflash(self) -> bool:
+        return self.method == "dflash"
+
+    def use_dspark(self) -> bool:
+        return self.method == "dspark"
+
+    def uses_parallel_block_drafter(self) -> bool:
+        return self.method in ("dflash", "dspark")
+
+    def uses_neural_drafter(self) -> bool:
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+
+    def needs_aux_hidden_states(self) -> bool:
+        return self.method in ("eagle3", "dflash", "dspark")
+
+    @property
+    def parallel_query_count(self) -> int:
+        """Number of draft-model queries per request (Q)."""
+        if not self.uses_parallel_block_drafter():
+            return 0
+        k = self.num_speculative_tokens or 0
+        if self.use_dspark() and self.sample_from_anchor is True:
+            return k
+        return k + 1
+
+    @property
+    def draft_sample_offset(self) -> int:
+        """First query row sampled into the K-token draft result."""
+        return 0 if self.use_dspark() and self.sample_from_anchor is True else 1
+
+    @property
+    def max_num_new_slots_for_drafting(self) -> int:
+        """Additional KV slots after the scheduler's existing query slot."""
+        if not self.uses_parallel_block_drafter():
+            return 0
+        return max(0, self.parallel_query_count - 1)
+
+    def parallel_window_fits(self, sequence_length: int) -> bool:
+        """Whether a complete fixed-K query block fits the draft window."""
+        if sequence_length < 0:
+            raise ValueError("sequence_length must be non-negative")
+        if not self.uses_parallel_block_drafter():
+            return True
+        assert self.draft_model_config is not None
+        return (
+            sequence_length + self.parallel_query_count
+            <= self.draft_model_config.max_model_len
+        )
 
     def __repr__(self) -> str:
         method = self.method

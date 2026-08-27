@@ -444,6 +444,10 @@ _MULTIMODAL_MODELS = {
 }
 
 _SPECULATIVE_DECODING_MODELS = {
+    "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
+    "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
+    # Some DSpark Qwen checkpoints use the generic architecture name.
+    "DSparkDraftModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "MiMoMTPModel": ("mimo_mtp", "MiMoMTP"),
     "EagleLlamaForCausalLM": ("llama_eagle", "EagleLlamaForCausalLM"),
     "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
