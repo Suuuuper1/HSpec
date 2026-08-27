@@ -133,3 +133,58 @@ def test_manifest_pass_fail_and_missing_method(tmp_path):
         "tokenizer hash mismatch" in error
         for error in tokenizer_mismatch["compatibility"]["dflash"]["errors"]
     )
+
+
+def test_manifest_normalizes_transformers_5_rope_parameters(tmp_path):
+    target_path = tmp_path / "target"
+    dspark_path = tmp_path / "dspark"
+    _write_checkpoint(target_path, "Qwen3ForCausalLM")
+    _write_checkpoint(dspark_path, "Qwen3DSparkModel", method="dspark")
+    _write_tokenizer(target_path)
+
+    config_path = dspark_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config.pop("rope_theta")
+    config["rope_parameters"] = {
+        "rope_theta": 10000,
+        "rope_type": "default",
+    }
+    config_path.write_text(json.dumps(config))
+
+    manifest = build_migration_manifest(
+        target_path=target_path,
+        tokenizer_path=target_path,
+        draft_paths={"dspark": dspark_path},
+        pair_ids={"dspark": "published-qwen3-pair"},
+        num_speculative_tokens=7,
+        target_tp=1,
+        draft_tp=1,
+    )
+    assert manifest["compatibility"]["dspark"]["status"] == "PASS"
+    assert manifest["drafts"]["dspark"]["rope_theta"] == 10000
+
+
+def test_manifest_rejects_k_larger_than_checkpoint_block(tmp_path):
+    target_path = tmp_path / "target"
+    dflash_path = tmp_path / "dflash"
+    _write_checkpoint(target_path, "Qwen3ForCausalLM")
+    _write_checkpoint(dflash_path, "DFlashDraftModel", method="dflash")
+    _write_tokenizer(target_path)
+
+    config_path = dflash_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["block_size"] = 4
+    config_path.write_text(json.dumps(config))
+
+    manifest = build_migration_manifest(
+        target_path=target_path,
+        tokenizer_path=target_path,
+        draft_paths={"dflash": dflash_path},
+        pair_ids={"dflash": "published-qwen3-pair"},
+        num_speculative_tokens=7,
+        target_tp=1,
+        draft_tp=1,
+    )
+    result = manifest["compatibility"]["dflash"]
+    assert result["status"] == "FAIL"
+    assert any("block_size" in error for error in result["errors"])

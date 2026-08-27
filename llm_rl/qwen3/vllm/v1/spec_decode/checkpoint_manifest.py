@@ -134,6 +134,16 @@ def _resolve_layer_causality(
     return ["sliding" in str(layer_type).lower() for layer_type in layer_types]
 
 
+def _resolve_rope_theta(config: dict[str, Any]) -> Any:
+    """Normalize Transformers 4.x and 5.x Qwen RoPE config layouts."""
+    if config.get("rope_theta") is not None:
+        return config["rope_theta"]
+    rope_parameters = config.get("rope_parameters")
+    if isinstance(rope_parameters, dict):
+        return rope_parameters.get("rope_theta")
+    return None
+
+
 def build_checkpoint_manifest(
     checkpoint: str | Path,
     *,
@@ -176,7 +186,7 @@ def build_checkpoint_manifest(
         "num_attention_heads": config.get("num_attention_heads"),
         "num_key_value_heads": config.get("num_key_value_heads"),
         "head_dim": config.get("head_dim"),
-        "rope_theta": config.get("rope_theta"),
+        "rope_theta": _resolve_rope_theta(config),
         "rope_scaling": config.get("rope_scaling"),
         "is_neox_style": config.get("is_neox_style"),
         "layer_types": layer_types,
@@ -205,6 +215,7 @@ def build_checkpoint_manifest(
         "sample_from_anchor": config.get(
             "sample_from_anchor", True if method == "dspark" else False
         ),
+        "block_size": config.get("block_size"),
         "tokenizer": tokenizer_info,
         "weights": weight_info,
     }
@@ -286,6 +297,14 @@ def compare_checkpoint_pair(
         errors.append("first scope requires uniform full-attention draft layers")
     if draft.get("sliding_window") is not None:
         errors.append("first scope does not support sliding-window draft layers")
+    trained_block_size = draft.get("block_size")
+    if isinstance(trained_block_size, int) and (
+        trained_block_size < 1 or num_speculative_tokens > trained_block_size
+    ):
+        errors.append(
+            "K exceeds the draft checkpoint block_size: "
+            f"K={num_speculative_tokens}, block_size={trained_block_size}"
+        )
 
     aux_ids = draft.get("aux_layer_ids") or []
     target_layers = target.get("num_hidden_layers")

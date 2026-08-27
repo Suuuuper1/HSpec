@@ -198,7 +198,7 @@ class SpeculativeConfig:
         the final hidden states.
         """
         if not self.uses_parallel_block_drafter():
-            # Preserve the 0.14.2 hash exactly for all existing methods.
+            # Preserve the pre-migration hash exactly for all existing methods.
             factors: list[Any] = [self.method == "eagle3"]
             return safe_hash(
                 str(factors).encode(), usedforsecurity=False
