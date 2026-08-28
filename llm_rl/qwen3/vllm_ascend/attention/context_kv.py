@@ -10,6 +10,8 @@ from vllm_ascend.device.device_op import DeviceOperator
 
 PAD_SLOT_ID = -1
 
+ContextKVCache = tuple[torch.Tensor, torch.Tensor]
+
 
 def _async_assert(condition: torch.Tensor, message: str) -> None:
     assert condition.numel() == 1
@@ -19,22 +21,75 @@ def _async_assert(condition: torch.Tensor, message: str) -> None:
         torch._assert(condition, message)
 
 
-def store_context_kv(
+def _resolve_context_kv_cache(
+    attn_layer: Attention,
+    virtual_engine: int,
+) -> ContextKVCache:
+    """Return the physical K/V tensors from the old runner cache ABI.
+
+    Ascend's V1 runner binds ``Attention.kv_cache`` as ``[(K, V)]``.  A
+    packed ``[2, blocks, block, n_kv, head]`` tensor is also accepted for
+    compatibility with vLLM backends that retain the upstream representation.
+    """
+    if virtual_engine < 0 or virtual_engine >= len(attn_layer.kv_cache):
+        raise ValueError(f"Invalid virtual_engine={virtual_engine}")
+
+    storage = attn_layer.kv_cache[virtual_engine]
+    if isinstance(storage, torch.Tensor):
+        if storage.numel() == 0:
+            raise RuntimeError(
+                f"DFlash cache for {attn_layer.layer_name!r} is not bound; "
+                "the Attention placeholder is still installed"
+            )
+        if storage.ndim != 5 or storage.shape[0] != 2:
+            raise ValueError(
+                "Packed DFlash cache must be "
+                f"[2,blocks,block,nkv,d], got {tuple(storage.shape)}"
+            )
+        key_cache, value_cache = storage[0], storage[1]
+    elif isinstance(storage, (tuple, list)):
+        if len(storage) != 2 or not all(
+            isinstance(cache, torch.Tensor) for cache in storage
+        ):
+            raise ValueError(
+                "Ascend DFlash cache must contain exactly two tensors (K,V), "
+                f"got {type(storage).__name__} with length={len(storage)}"
+            )
+        key_cache, value_cache = storage
+    else:
+        raise TypeError(
+            f"Unsupported DFlash cache storage for {attn_layer.layer_name!r}: "
+            f"{type(storage).__name__}"
+        )
+
+    if key_cache.ndim != 4 or value_cache.ndim != 4:
+        raise ValueError(
+            "DFlash K/V caches must both be [blocks,block,nkv,d], got "
+            f"{tuple(key_cache.shape)} and {tuple(value_cache.shape)}"
+        )
+    if key_cache.shape != value_cache.shape:
+        raise ValueError(
+            f"DFlash K/V cache shapes differ: {tuple(key_cache.shape)} != "
+            f"{tuple(value_cache.shape)}"
+        )
+    if key_cache.dtype != value_cache.dtype or key_cache.device != value_cache.device:
+        raise ValueError(
+            "DFlash K/V cache dtype/device differ: "
+            f"{key_cache.dtype}/{key_cache.device} != "
+            f"{value_cache.dtype}/{value_cache.device}"
+        )
+    return key_cache, value_cache
+
+
+def _store_context_kv_pair(
     attn_layer: Attention,
     key: torch.Tensor,
     value: torch.Tensor,
     slot_mapping: torch.Tensor,
+    cache_pair: ContextKVCache,
     *,
-    virtual_engine: int = 0,
-    validate_slot_range: bool = True,
+    validate_slot_range: bool,
 ) -> None:
-    """Write K/V to one drafter cache without running attention.
-
-    Slot validation remains device-side so rejected/PAD handling adds no host
-    synchronization to the proposal hot path.
-    """
-    if not isinstance(attn_layer, Attention):
-        raise TypeError(f"Expected vLLM Attention, got {type(attn_layer).__name__}")
     if key.ndim != 3 or value.shape != key.shape:
         raise ValueError(
             f"Context K/V must both be [T,nkv,d], got {key.shape} and {value.shape}"
@@ -49,18 +104,8 @@ def store_context_kv(
         raise ValueError("slot_mapping must be contiguous")
     if key.device != value.device or key.device != slot_mapping.device:
         raise ValueError("Context K/V and slot mapping must be on the same device")
-    if virtual_engine < 0 or virtual_engine >= len(attn_layer.kv_cache):
-        raise ValueError(f"Invalid virtual_engine={virtual_engine}")
 
-    kv_cache = attn_layer.kv_cache[virtual_engine]
-    if not isinstance(kv_cache, torch.Tensor) or kv_cache.ndim != 5:
-        raise RuntimeError(
-            f"DFlash cache for {attn_layer.layer_name!r} is not bound: "
-            f"shape={getattr(kv_cache, 'shape', None)}"
-        )
-    if kv_cache.shape[0] != 2:
-        raise ValueError(f"Expected [2,blocks,block,nkv,d] cache, got {kv_cache.shape}")
-    key_cache, value_cache = kv_cache[0], kv_cache[1]
+    key_cache, value_cache = cache_pair
     if key.dtype != key_cache.dtype or value.dtype != value_cache.dtype:
         raise TypeError(
             f"Context/cache dtype mismatch: key={key.dtype}, value={value.dtype}, "
@@ -91,6 +136,32 @@ def store_context_kv(
     )
 
 
+def store_context_kv(
+    attn_layer: Attention,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    virtual_engine: int = 0,
+    validate_slot_range: bool = True,
+) -> None:
+    """Write K/V to one drafter cache without running attention.
+
+    Slot validation remains device-side so rejected/PAD handling adds no host
+    synchronization to the proposal hot path.
+    """
+    if not isinstance(attn_layer, Attention):
+        raise TypeError(f"Expected vLLM Attention, got {type(attn_layer).__name__}")
+    _store_context_kv_pair(
+        attn_layer,
+        key,
+        value,
+        slot_mapping,
+        _resolve_context_kv_cache(attn_layer, virtual_engine),
+        validate_slot_range=validate_slot_range,
+    )
+
+
 def store_all_context_kv(
     attn_layers: Sequence[Attention],
     all_key: torch.Tensor,
@@ -105,25 +176,34 @@ def store_all_context_kv(
     per_layer_slots = isinstance(slot_mapping, (list, tuple))
     if per_layer_slots and len(slot_mapping) != len(attn_layers):
         raise ValueError("Per-layer slot mapping count does not match DFlash layers")
-    uniform_cache_shape = None
+    cache_pairs = [
+        _resolve_context_kv_cache(attn_layer, virtual_engine=0)
+        for attn_layer in attn_layers
+    ]
     if not per_layer_slots:
-        for attn_layer in attn_layers:
-            if not attn_layer.kv_cache or not isinstance(attn_layer.kv_cache[0], torch.Tensor):
-                raise RuntimeError(f"DFlash cache for {attn_layer.layer_name!r} is not bound")
-            cache_shape = tuple(attn_layer.kv_cache[0].shape)
-            if uniform_cache_shape is None:
-                uniform_cache_shape = cache_shape
-            elif cache_shape != uniform_cache_shape:
-                raise ValueError(
-                    "Phase 1 DFlash requires uniform physical cache shapes, got "
-                    f"{uniform_cache_shape} and {cache_shape}"
-                )
-    for layer_idx, attn_layer in enumerate(attn_layers):
+        layouts = [
+            (
+                tuple(key_cache.shape),
+                tuple(value_cache.shape),
+                key_cache.dtype,
+                key_cache.device,
+            )
+            for key_cache, value_cache in cache_pairs
+        ]
+        if any(layout != layouts[0] for layout in layouts[1:]):
+            raise ValueError(
+                "Phase 1 DFlash requires uniform physical cache layouts, got "
+                f"{layouts}"
+            )
+    for layer_idx, (attn_layer, cache_pair) in enumerate(
+        zip(attn_layers, cache_pairs)
+    ):
         slots = slot_mapping[layer_idx] if per_layer_slots else slot_mapping
-        store_context_kv(
+        _store_context_kv_pair(
             attn_layer,
             all_key[layer_idx].contiguous(),
             all_value[layer_idx].contiguous(),
             slots,
+            cache_pair,
             validate_slot_range=per_layer_slots or layer_idx == 0,
         )

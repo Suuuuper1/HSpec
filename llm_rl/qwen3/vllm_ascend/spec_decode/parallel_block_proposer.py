@@ -131,7 +131,11 @@ class ParallelBlockProposer(EagleProposer):
             self.vllm_config, AttentionLayerBase
         )
         discovered = sorted(set(all_layers) - target_layer_names)
-        explicit = sorted(self.model.get_draft_kv_cache_layer_names())
+        model_layers = tuple(self.model.get_context_kv_attention_layers())
+        explicit_by_name = {layer.layer_name: layer for layer in model_layers}
+        if len(explicit_by_name) != len(model_layers):
+            raise RuntimeError("DFlash model contains duplicate attention layer names")
+        explicit = sorted(explicit_by_name)
         if discovered != explicit:
             raise RuntimeError(
                 "DFlash draft attention discovery mismatch: "
@@ -139,6 +143,16 @@ class ParallelBlockProposer(EagleProposer):
             )
         if not discovered:
             raise RuntimeError("DFlash model registered no attention layers")
+        identity_mismatches = [
+            layer_name
+            for layer_name in discovered
+            if all_layers[layer_name] is not explicit_by_name[layer_name]
+        ]
+        if identity_mismatches:
+            raise RuntimeError(
+                "DFlash draft Attention registry identity mismatch: "
+                f"{identity_mismatches}"
+            )
         return discovered
 
     def prepare_parallel_inputs_padded(

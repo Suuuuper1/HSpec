@@ -13,7 +13,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionState,
     AscendMetadata,
 )
-from vllm_ascend.attention.context_kv import store_context_kv
+from vllm_ascend.attention.context_kv import store_all_context_kv, store_context_kv
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.sample.rejection_sampler import (
     AscendRejectionSampler,
@@ -33,7 +33,7 @@ def _require_npu() -> None:
         pytest.skip(f"NPU runtime unavailable: {type(error).__name__}: {error}")
 
 
-def _bare_attention(cache: torch.Tensor) -> Attention:
+def _bare_attention(cache: object) -> Attention:
     attention = Attention.__new__(Attention)
     nn.Module.__init__(attention)
     attention.layer_name = "model.layers.36.self_attn.attn"
@@ -43,18 +43,19 @@ def _bare_attention(cache: torch.Tensor) -> Attention:
 
 def test_direct_context_store_changes_only_selected_slots():
     _require_npu()
-    cache = torch.full(
-        (2, 3, 128, 2, 4), -19.0, dtype=torch.float16, device="npu"
+    key_cache = torch.full(
+        (3, 128, 2, 4), -19.0, dtype=torch.float16, device="npu"
     )
-    attention = _bare_attention(cache)
+    value_cache = torch.full_like(key_cache, -19.0)
+    attention = _bare_attention((key_cache, value_cache))
     slots = torch.tensor([0, 129, -1, 255], dtype=torch.int32, device="npu")
     key = torch.arange(32, dtype=torch.float16, device="npu").view(4, 2, 4)
     value = key + 100
     store_context_kv(attention, key, value, slots)
     torch.npu.synchronize()
 
-    flat_key = cache[0].view(-1, 2, 4).cpu()
-    flat_value = cache[1].view(-1, 2, 4).cpu()
+    flat_key = key_cache.view(-1, 2, 4).cpu()
+    flat_value = value_cache.view(-1, 2, 4).cpu()
     assert torch.equal(flat_key[0], key[0].cpu())
     assert torch.equal(flat_key[129], key[1].cpu())
     assert torch.equal(flat_key[255], key[3].cpu())
@@ -73,10 +74,77 @@ def test_direct_context_store_changes_only_selected_slots():
 def test_direct_context_store_validates_layout_before_device_operator(
     key, slots, error
 ):
-    cache = torch.zeros(2, 1, 128, 2, 4)
-    attention = _bare_attention(cache)
+    cache = torch.zeros(1, 128, 2, 4)
+    attention = _bare_attention((cache, cache.clone()))
     with pytest.raises((TypeError, ValueError), match=error):
         store_context_kv(attention, key, key, slots)
+
+
+def test_direct_context_store_uses_old_ascend_tuple_cache_abi(monkeypatch):
+    import vllm_ascend.attention.context_kv as context_kv_module
+
+    calls = []
+
+    def fake_reshape_and_cache(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        context_kv_module,
+        "DeviceOperator",
+        SimpleNamespace(reshape_and_cache=fake_reshape_and_cache),
+    )
+    key_cache = torch.zeros(2, 128, 2, 4)
+    value_cache = torch.zeros_like(key_cache)
+    attention = _bare_attention((key_cache, value_cache))
+    key = torch.ones(3, 2, 4)
+    value = torch.full_like(key, 2)
+    slots = torch.tensor([0, 129, -1], dtype=torch.int32)
+
+    store_context_kv(attention, key, value, slots)
+
+    assert len(calls) == 1
+    assert calls[0]["key_cache"] is key_cache
+    assert calls[0]["value_cache"] is value_cache
+    assert calls[0]["key"] is key
+    assert calls[0]["value"] is value
+
+
+def test_direct_context_store_distinguishes_unbound_placeholder():
+    attention = _bare_attention(torch.tensor([]))
+    with pytest.raises(RuntimeError, match="placeholder is still installed"):
+        store_context_kv(
+            attention,
+            torch.zeros(1, 2, 4),
+            torch.zeros(1, 2, 4),
+            torch.zeros(1, dtype=torch.int32),
+        )
+
+
+def test_all_context_store_accepts_runner_tuple_cache_for_every_layer(monkeypatch):
+    import vllm_ascend.attention.context_kv as context_kv_module
+
+    calls = []
+    monkeypatch.setattr(
+        context_kv_module,
+        "DeviceOperator",
+        SimpleNamespace(reshape_and_cache=lambda **kwargs: calls.append(kwargs)),
+    )
+    cache_pairs = tuple(
+        (torch.zeros(2, 128, 2, 4), torch.zeros(2, 128, 2, 4))
+        for _ in range(2)
+    )
+    attentions = tuple(_bare_attention(cache_pair) for cache_pair in cache_pairs)
+    attentions[1].layer_name = "model.layers.37.self_attn.attn"
+    keys = torch.ones(2, 3, 2, 4)
+    values = torch.full_like(keys, 2)
+    slots = torch.tensor([0, 129, -1], dtype=torch.int32)
+
+    store_all_context_kv(attentions, keys, values, slots)
+
+    assert len(calls) == 2
+    for layer_index, call in enumerate(calls):
+        assert call["key_cache"] is cache_pairs[layer_index][0]
+        assert call["value_cache"] is cache_pairs[layer_index][1]
 
 
 @pytest.mark.parametrize("causal", [False, True])

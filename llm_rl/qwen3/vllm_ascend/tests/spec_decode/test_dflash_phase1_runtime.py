@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm_ascend.spec_decode.parallel_block_proposer as parallel_module
 from vllm_ascend.spec_decode.dflash_proposer import DFlashProposer
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.parallel_block_proposer import ParallelBlockProposer
@@ -74,6 +75,31 @@ def test_old_and_parallel_padded_abis_remain_separate():
     ).return_annotation
     assert str(old).count("torch.Tensor") == 2
     assert str(new).count("torch.Tensor") == 3
+
+
+def test_draft_attention_discovery_requires_registry_object_identity(monkeypatch):
+    registry_layer = SimpleNamespace(layer_name="model.layers.36.self_attn.attn")
+    detached_layer = SimpleNamespace(layer_name=registry_layer.layer_name)
+    proposer = ParallelBlockProposer.__new__(ParallelBlockProposer)
+    proposer.vllm_config = SimpleNamespace()
+    proposer.model = SimpleNamespace(
+        get_context_kv_attention_layers=lambda: (detached_layer,)
+    )
+    monkeypatch.setattr(
+        parallel_module,
+        "get_layers_from_vllm_config",
+        lambda *_: {registry_layer.layer_name: registry_layer},
+    )
+
+    with pytest.raises(RuntimeError, match="registry identity mismatch"):
+        proposer._discover_draft_attention_layers(set())
+
+    proposer.model = SimpleNamespace(
+        get_context_kv_attention_layers=lambda: (registry_layer,)
+    )
+    assert proposer._discover_draft_attention_layers(set()) == [
+        registry_layer.layer_name
+    ]
 
 
 def test_phase1_hot_paths_have_no_host_sync_or_step_weight_concatenation():
