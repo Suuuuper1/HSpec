@@ -100,6 +100,8 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
+from vllm_ascend.spec_decode.dflash_proposer import DFlashProposer
+from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.hspec_parity import (
     HSPEC_S1_PARITY_ENABLED,
@@ -449,7 +451,7 @@ class NPUModelRunner(GPUModelRunner):
         # decode stretches for RL rollout batches with request refill.
         self.speculative_auto_bs_thre = int(os.environ.get('VLLM_SPECULATIVE_BATCH_SIZE_THRE', "-1"))
         self.speculative_decoding_active = bool(self.speculative_config)
-        self.drafter: Optional[Union[NgramProposer, EagleProposer, MtpProposer,
+        self.drafter: Optional[Union[NgramProposer, EagleProposer, DFlashProposer, MtpProposer,
                                      SuffixDecodingProposer, MedusaProposer,
                                      HSpecProposer]] = None
         self.actual_seq_lengths_q: list[int] = []
@@ -464,7 +466,14 @@ class NPUModelRunner(GPUModelRunner):
                     assert isinstance(self.drafter, EagleProposer)
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state)
-                self.rejection_sampler = RejectionSampler(self.sampler)
+                elif self.speculative_config.needs_aux_hidden_states():
+                    self.use_aux_hidden_state_outputs = True
+                verifier_mode = (
+                    self.speculative_config.rejection_sample_method or "legacy"
+                )
+                self.rejection_sampler = AscendRejectionSampler(
+                    self.sampler, verifier_mode
+                )
             self.actual_seq_lengths_q = list(
                 range(self.decode_token_per_req, self.max_num_tokens + 1,
                       self.decode_token_per_req))
@@ -1711,7 +1720,10 @@ class NPUModelRunner(GPUModelRunner):
                 draft_token_ids = self.drafter.generate_token_ids(
                     valid_sampled_token_ids, sampling_metadata,
                     spec_decode_metadata, sample_hidden_states)
-            elif self.speculative_config.use_eagle():
+            elif (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_parallel_block_drafter()
+            ):
                 common_attn_metadata = self.spec_decode_common_attn_metadata
                 sampled_token_ids = valid_sampled_token_ids
 
@@ -1779,11 +1791,17 @@ class NPUModelRunner(GPUModelRunner):
                                                               num_scheduled_tokens]
                         target_positions = self._get_positions(num_scheduled_tokens)
                         if self.use_aux_hidden_state_outputs:
-                            target_hidden_states = torch.cat([
-                                h[:num_scheduled_tokens]
-                                for h in aux_hidden_states
-                            ],
-                                                             dim=-1)
+                            if self.speculative_config.uses_parallel_block_drafter():
+                                target_hidden_states = self.drafter.pack_aux_hidden_states(
+                                    aux_hidden_states,
+                                    None,
+                                    num_scheduled_tokens,
+                                )
+                            else:
+                                target_hidden_states = torch.cat([
+                                    h[:num_scheduled_tokens]
+                                    for h in aux_hidden_states
+                                ], dim=-1)
                         else:
                             target_hidden_states = hidden_states[:
                                                                  num_scheduled_tokens]
@@ -1806,12 +1824,24 @@ class NPUModelRunner(GPUModelRunner):
                                 spec_decode_metadata.num_draft_tokens)
                     else:
                         assert self.drafter is not None
-                        common_attn_metadata, token_indices, \
-                            token_indices_to_sample =\
-                                self.drafter.prepare_inputs_padded(
-                                    common_attn_metadata,
-                                    spec_decode_metadata,
-                                    valid_sampled_tokens_count)
+                        if self.speculative_config.uses_parallel_block_drafter():
+                            (
+                                common_attn_metadata,
+                                token_indices,
+                                token_indices_to_sample,
+                                num_rejected_tokens_gpu,
+                            ) = self.drafter.prepare_parallel_inputs_padded(
+                                common_attn_metadata,
+                                spec_decode_metadata,
+                                valid_sampled_tokens_count,
+                            )
+                        else:
+                            common_attn_metadata, token_indices, \
+                                token_indices_to_sample =\
+                                    self.drafter.prepare_inputs_padded(
+                                        common_attn_metadata,
+                                        spec_decode_metadata,
+                                        valid_sampled_tokens_count)
                     if self.pcp_size > 1:
                         target_token_ids = input_ids_pcp_full[token_indices]
                         target_positions = positions
@@ -1820,9 +1850,16 @@ class NPUModelRunner(GPUModelRunner):
                         target_token_ids = self.input_ids.gpu[token_indices]
                         target_positions = self._get_positions(token_indices)
                         if self.use_aux_hidden_state_outputs:
-                            target_hidden_states = torch.cat(
-                                [h[token_indices] for h in aux_hidden_states],
-                                dim=-1)
+                            if self.speculative_config.uses_parallel_block_drafter():
+                                target_hidden_states = self.drafter.pack_aux_hidden_states(
+                                    aux_hidden_states,
+                                    token_indices,
+                                    token_indices.shape[0],
+                                )
+                            else:
+                                target_hidden_states = torch.cat(
+                                    [h[token_indices] for h in aux_hidden_states],
+                                    dim=-1)
                         else:
                             target_hidden_states = hidden_states[token_indices]
                 assert self.drafter is not None
@@ -1840,6 +1877,12 @@ class NPUModelRunner(GPUModelRunner):
                     num_decode_reqs=num_decode_reqs,
                     scheduler_output=scheduler_output,
                     num_scheduled_tokens=num_scheduled_tokens,
+                    num_rejected_tokens_gpu=(
+                        num_rejected_tokens_gpu
+                        if spec_decode_metadata is not None
+                        and self.speculative_config.uses_parallel_block_drafter()
+                        else None
+                    ),
                 )
 
             else:
@@ -2323,6 +2366,21 @@ class NPUModelRunner(GPUModelRunner):
         draft_output = super().take_draft_token_ids()
         if draft_output is None:
             return None
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.uses_parallel_block_drafter()
+        ):
+            # Parallel proposers preserve a fixed [B,K] device ABI. Rows whose
+            # complete query window does not fit are marked with -1 on device;
+            # remove those sentinels at the existing CPU handoff so scheduler
+            # state receives an empty draft rather than an invalid token id.
+            draft_output = DraftTokenIds(
+                draft_output.req_ids,
+                [
+                    [token_id for token_id in row if token_id >= 0]
+                    for row in draft_output.draft_token_ids
+                ],
+            )
         if _hspec_trace_enabled() and self.input_batch.num_reqs > 0:
             di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1)
             try:
@@ -3134,8 +3192,23 @@ class NPUModelRunner(GPUModelRunner):
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
                 if self.use_aux_hidden_state_outputs:
-                    self.model.set_aux_hidden_state_layers(
-                        self.model.get_eagle3_aux_hidden_state_layers())
+                    if hasattr(self.drafter, "get_aux_hidden_state_layer_ids"):
+                        aux_layers = self.drafter.get_aux_hidden_state_layer_ids()
+                    else:
+                        aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
+                    if not aux_layers or tuple(aux_layers) != tuple(sorted(set(aux_layers))):
+                        raise ValueError(
+                            f"Invalid target auxiliary capture layers: {aux_layers!r}"
+                        )
+                    target_num_layers = self.model_config.get_num_layers(
+                        self.parallel_config
+                    )
+                    if any(layer <= 0 or layer >= target_num_layers for layer in aux_layers):
+                        raise ValueError(
+                            f"Auxiliary capture layers {aux_layers!r} are outside "
+                            f"old-Qwen capture range [1, {target_num_layers})"
+                        )
+                    self.model.set_aux_hidden_state_layers(tuple(aux_layers))
 
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config,

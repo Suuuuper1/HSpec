@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator, Literal, Optional
 
 import torch
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (GREEDY_TEMPERATURE, MAX_SPEC_LEN,
                                               PLACEHOLDER_TOKEN_ID,
+                                              RejectionSampler,
                                               generate_uniform_probs)
 
 from vllm_ascend.ops.triton.reject_sample import (
@@ -14,6 +17,34 @@ from vllm_ascend.ops.triton.reject_sample import (
     rejection_random_sample_block_verify_kernel,
     rejection_random_sample_kernel, sample_recovered_tokens_kernel)
 from vllm_ascend.sample.sampler import apply_top_k_top_p
+
+VerifierMode = Literal["standard", "block", "legacy"]
+_VERIFIER_MODE: ContextVar[VerifierMode] = ContextVar(
+    "ascend_speculative_verifier_mode", default="legacy"
+)
+
+
+@contextmanager
+def verifier_mode(mode: VerifierMode) -> Iterator[None]:
+    token = _VERIFIER_MODE.set(mode)
+    try:
+        yield
+    finally:
+        _VERIFIER_MODE.reset(token)
+
+
+class AscendRejectionSampler(RejectionSampler):
+    """Bind verifier semantics to one runner without changing the old ABI."""
+
+    def __init__(self, sampler, mode: VerifierMode = "legacy") -> None:
+        if mode not in ("standard", "block", "legacy"):
+            raise ValueError(f"Unknown speculative verifier mode: {mode!r}")
+        super().__init__(sampler)
+        self.verifier_mode = mode
+
+    def forward(self, *args, **kwargs):
+        with verifier_mode(self.verifier_mode):
+            return super().forward(*args, **kwargs)
 
 
 def apply_sampling_constraints(
@@ -105,8 +136,10 @@ def rejection_sample(
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
 
-    # When num_speculative_tokens>=3, using block verify.
-    using_block_verify = max_spec_len >= 3
+    mode = _VERIFIER_MODE.get()
+    # ``legacy`` exactly preserves the old Ascend K>=3 behavior. New methods
+    # select ``standard`` explicitly; ``block`` remains an opt-in experiment.
+    using_block_verify = max_spec_len >= 3 and mode in ("block", "legacy")
 
     # Create output buffer.
     output_token_ids = torch.empty(

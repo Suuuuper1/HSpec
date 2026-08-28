@@ -23,6 +23,7 @@ from vllm_ascend.spec_decode.ngram_proposer import NgramProposer
 from vllm_ascend.spec_decode.suffix_proposer import SuffixDecodingProposer
 from patches.vllm_ascend.spec_decode.sam_proposer import SAMDecodingProposer
 from vllm_ascend.spec_decode.hspec_proposer import HSpecProposer
+from vllm_ascend.spec_decode.dflash_proposer import DFlashProposer
 
 
 def get_spec_decode_method(method, vllm_config, device, runner):
@@ -40,6 +41,8 @@ def get_spec_decode_method(method, vllm_config, device, runner):
         return SAMDecodingProposer(vllm_config, device, runner)
     elif method == 'hspec':
         return HSpecProposer(vllm_config, device, runner)
+    elif method == "dflash":
+        return DFlashProposer(vllm_config, device, runner)
     else:
         raise ValueError("Unknown speculative decoding method: "
                          f"{method}")

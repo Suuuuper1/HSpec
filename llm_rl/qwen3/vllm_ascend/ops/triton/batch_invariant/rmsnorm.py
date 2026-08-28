@@ -131,6 +131,38 @@ def rms_norm(
     return output.reshape(original_shape)
 
 
+def rms_norm_into(
+    output: torch.Tensor,
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    """Allocation-free RMSNorm used by eager parallel-draft Context KV."""
+    if output.shape != input_.shape or output.dtype != input_.dtype:
+        raise ValueError("RMSNorm output must match input shape and dtype")
+    if input_.shape[-1] != weight.numel():
+        raise ValueError("RMSNorm weight width does not match input")
+    if not input_.is_contiguous() or not output.is_contiguous() or not weight.is_contiguous():
+        raise ValueError("Allocation-free RMSNorm requires contiguous tensors")
+    input_2d = input_.view(-1, input_.shape[-1])
+    output_2d = output.view_as(input_2d)
+    n_rows, n_cols = input_2d.shape
+    max_grid_size = driver.active.utils.get_device_properties(
+        torch.npu.current_device()
+    )["num_vectorcore"]
+    _rms_norm_kernel[(max(1, min(n_rows, max_grid_size)),)](
+        input_2d,
+        weight,
+        output_2d,
+        input_2d.stride(0),
+        output_2d.stride(0),
+        n_rows,
+        n_cols,
+        eps,
+        BLOCK_SIZE=1024,
+    )
+
+
 def rms_norm_batch_invariant(
     input_: torch.Tensor,
     weight: torch.Tensor,

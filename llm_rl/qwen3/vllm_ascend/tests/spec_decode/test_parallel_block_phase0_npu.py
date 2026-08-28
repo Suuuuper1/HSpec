@@ -196,6 +196,7 @@ def test_sanitize_and_expand_kernels_match_cpu(method, anchor, k, rejected):
         geometry.num_queries,
         k,
         3,
+        256,
         PAD_SLOT_ID=PAD_SLOT_ID,
         HAS_NULL_BLOCK=True,
         SAMPLE_FROM_ANCHOR=anchor,
@@ -218,3 +219,48 @@ def test_sanitize_and_expand_kernels_match_cpu(method, anchor, k, rejected):
         sample_indices_guard[3 * k :],
     ):
         assert torch.all(guard == -31337)
+
+
+def test_expand_kernel_pads_query_slots_when_fixed_window_does_not_fit():
+    _require_npu()
+    q = 4
+    batch = 2
+    starts = torch.tensor([0, 2, 4], dtype=torch.int32, device="npu")
+    positions = torch.tensor([10, 11, 20, 21], dtype=torch.int32, device="npu")
+    seq_lens = torch.tensor([12, 14], dtype=torch.int32, device="npu")
+    rejected = torch.zeros(batch, dtype=torch.int32, device="npu")
+    block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32, device="npu")
+    query_ids = torch.empty(batch * q, dtype=torch.int64, device="npu")
+    query_positions = torch.empty(batch * q, dtype=torch.int32, device="npu")
+    query_slots = torch.empty(batch * q, dtype=torch.int32, device="npu")
+    sample_indices = torch.empty(batch * (q - 1), dtype=torch.int32, device="npu")
+    expand_parallel_queries_kernel[(1,)](
+        torch.tensor([101, 102], dtype=torch.int64, device="npu"),
+        positions,
+        query_ids,
+        query_positions,
+        query_slots,
+        sample_indices,
+        block_table,
+        block_table.stride(0),
+        block_table.shape[1],
+        starts,
+        seq_lens,
+        rejected,
+        127,
+        8,
+        0,
+        q,
+        q - 1,
+        batch,
+        16,
+        PAD_SLOT_ID=PAD_SLOT_ID,
+        HAS_NULL_BLOCK=False,
+        SAMPLE_FROM_ANCHOR=False,
+        TILE_SIZE=32,
+    )
+    torch.npu.synchronize()
+    assert query_positions[:q].cpu().tolist() == [12, 13, 14, 15]
+    assert (query_slots[:q] >= 0).all()
+    assert query_positions[q:].cpu().tolist() == [0, 0, 0, 0]
+    assert query_slots[q:].cpu().tolist() == [PAD_SLOT_ID] * q

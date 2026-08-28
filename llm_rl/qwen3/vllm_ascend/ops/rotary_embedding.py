@@ -53,6 +53,54 @@ _cos_slice: torch.Tensor = None
 _sin_slice: torch.Tensor = None
 
 
+def rotary_embedding_into(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox_style: bool,
+) -> None:
+    """Apply Context-KV RoPE without target-runner global cos/sin slices."""
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"RoPE positions must be integer, got {positions.dtype}")
+    if query.ndim != 2 or key.ndim != 2:
+        raise ValueError(
+            f"RoPE query/key must both have [T,H] shape, got "
+            f"{query.shape} and {key.shape}"
+        )
+    if (
+        not positions.is_contiguous()
+        or not query.is_contiguous()
+        or not key.is_contiguous()
+    ):
+        raise ValueError("Context RoPE inputs must be contiguous")
+    if (
+        query.shape[0] != positions.numel()
+        or key.shape[0] != positions.numel()
+        or query.shape[1] % head_size
+        or key.shape[1] % head_size
+    ):
+        raise ValueError("Context RoPE token/head geometry is inconsistent")
+    if not (
+        query.device == key.device == positions.device == cos_sin_cache.device
+    ):
+        raise ValueError("Context RoPE inputs/cache must be on the same device")
+    if query.dtype != key.dtype or cos_sin_cache.dtype != query.dtype:
+        raise TypeError(
+            f"Context RoPE dtype mismatch: query={query.dtype}, "
+            f"key={key.dtype}, cache={cos_sin_cache.dtype}"
+        )
+    torch_npu._npu_rotary_embedding(
+        positions,
+        query,
+        key,
+        head_size,
+        cos_sin_cache,
+        is_neox_style,
+    )
+
+
 def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype,
                     device):
     global _cos_mla

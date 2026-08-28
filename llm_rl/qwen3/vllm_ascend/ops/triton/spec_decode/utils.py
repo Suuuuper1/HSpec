@@ -145,6 +145,7 @@ def expand_parallel_queries_kernel(
     num_query_per_req,
     num_speculative_tokens,
     batch_size,
+    max_model_len,
     PAD_SLOT_ID: tl.constexpr,
     HAS_NULL_BLOCK: tl.constexpr,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
@@ -167,16 +168,17 @@ def expand_parallel_queries_kernel(
     valid_context_end = context_end - rejected
     sequence_length = tl.load(seq_lens_ptr + request_index)
     effective_sequence_length = sequence_length - rejected
+    request_fits = effective_sequence_length + num_query_per_req <= max_model_len
     last_position = tl.load(target_positions_ptr + valid_context_end - 1)
     tl.store(
         out_query_positions_ptr + safe_offsets,
-        last_position + 1 + query_index,
+        tl.where(request_fits, last_position + 1 + query_index, 0),
         mask=mask,
     )
 
     linear_slot_position = effective_sequence_length + query_index
     block_index = linear_slot_position // block_size
-    block_mask = mask & (block_index < max_blocks_per_req)
+    block_mask = mask & request_fits & (block_index < max_blocks_per_req)
     safe_block_index = tl.where(block_mask, block_index, 0)
     block_id = tl.load(
         block_table_ptr

@@ -663,7 +663,12 @@ class SpeculativeConfig:
                     f"DFlash mask_token_id must be in [0, {draft_vocab}); "
                     f"got {mask_token_id!r}"
                 )
-            draft.hf_text_config.eagle_aux_hidden_state_layer_ids = list(layer_ids)
+            # The checkpoint ids address target *layer outputs*. The old Qwen
+            # model records auxiliary states immediately before a layer, so
+            # output i is captured at old-runner point i + 1.
+            draft.hf_text_config.eagle_aux_hidden_state_layer_ids = [
+                layer_id + 1 for layer_id in layer_ids
+            ]
         else:
             layer_ids = getattr(
                 draft.hf_text_config, "dspark_target_layer_ids", None
