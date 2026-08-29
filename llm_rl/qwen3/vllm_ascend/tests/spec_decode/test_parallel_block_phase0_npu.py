@@ -55,8 +55,14 @@ def test_compute_rejected_tokens_kernel_matches_cpu():
     cumulative = torch.tensor(cumulative_values, dtype=torch.int32, device="npu")
     valid = torch.tensor(valid_values, dtype=torch.int32, device="npu")
     output = torch.empty_like(cumulative)
-    compute_rejected_tokens_kernel[(1,)](
-        cumulative, valid, output, len(cumulative_values), BLOCK_SIZE=256
+    block_size = 32
+    grid = (triton.cdiv(len(cumulative_values), block_size),)
+    compute_rejected_tokens_kernel[grid](
+        cumulative,
+        valid,
+        output,
+        len(cumulative_values),
+        BLOCK_SIZE=block_size,
     )
     torch.npu.synchronize()
     expected = compute_rejected_counts(cumulative_values, valid_values)

@@ -147,6 +147,35 @@ def test_all_context_store_accepts_runner_tuple_cache_for_every_layer(monkeypatc
         assert call["value_cache"] is cache_pairs[layer_index][1]
 
 
+def test_all_context_store_can_skip_redundant_hot_path_range_assert(monkeypatch):
+    import vllm_ascend.attention.context_kv as context_kv_module
+
+    monkeypatch.setattr(
+        context_kv_module,
+        "DeviceOperator",
+        SimpleNamespace(reshape_and_cache=lambda **_: None),
+    )
+
+    def fail_on_range_assert(*_):
+        raise AssertionError("unexpected range assert")
+
+    monkeypatch.setattr(
+        context_kv_module,
+        "_async_assert",
+        fail_on_range_assert,
+    )
+    cache = torch.zeros(2, 128, 2, 4)
+    attention = _bare_attention((cache, cache.clone()))
+
+    store_all_context_kv(
+        (attention,),
+        torch.ones(1, 3, 2, 4),
+        torch.ones(1, 3, 2, 4),
+        torch.tensor([0, 129, -1], dtype=torch.int32),
+        validate_slot_range=False,
+    )
+
+
 @pytest.mark.parametrize("causal", [False, True])
 def test_decoder_fia_selects_causality_from_metadata(monkeypatch, causal):
     import vllm_ascend.attention.attention_v1 as attention_module

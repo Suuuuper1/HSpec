@@ -113,6 +113,15 @@ def test_phase1_hot_paths_have_no_host_sync_or_step_weight_concatenation():
     for forbidden in (".item(", ".tolist(", "synchronize(", "torch.cat("):
         assert forbidden not in source
     assert source.count("_run_parallel_backbone(") == 1
+    assert "validate_slot_range=False" in inspect.getsource(DFlashProposer._propose)
+
+
+def test_rejected_count_launch_scales_past_one_tile():
+    source = inspect.getsource(
+        ParallelBlockProposer.prepare_parallel_inputs_padded
+    )
+    assert "triton.cdiv(num_reqs, block_size)" in source
+    assert "compute_rejected_tokens_kernel[grid]" in source
 
 
 def test_parallel_backbone_samples_exactly_k_rows_from_one_forward():

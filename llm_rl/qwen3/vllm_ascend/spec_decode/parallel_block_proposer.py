@@ -15,6 +15,7 @@ from vllm.config import (
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
+from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
@@ -169,7 +170,8 @@ class ParallelBlockProposer(EagleProposer):
         num_reqs = metadata.num_reqs
         rejected = self._num_rejected_tokens[:num_reqs]
         block_size = 128
-        compute_rejected_tokens_kernel[(1,)](
+        grid = (max(1, triton.cdiv(num_reqs, block_size)),)
+        compute_rejected_tokens_kernel[grid](
             spec_decode_metadata.cu_num_draft_tokens,
             valid_sampled_tokens_count,
             rejected,

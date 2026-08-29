@@ -167,8 +167,15 @@ def store_all_context_kv(
     all_key: torch.Tensor,
     all_value: torch.Tensor,
     slot_mapping: torch.Tensor | Sequence[torch.Tensor],
+    *,
+    validate_slot_range: bool = True,
 ) -> None:
-    """Store layer-major ``[L,T,nkv,d]`` K/V into drafter-owned caches."""
+    """Store layer-major ``[L,T,nkv,d]`` K/V into drafter-owned caches.
+
+    ``validate_slot_range=False`` is reserved for engine-produced slot maps
+    that have already passed the block-table layout kernels. Public callers
+    retain device-side validation by default.
+    """
     if all_key.ndim != 4 or all_value.shape != all_key.shape:
         raise ValueError("all_key/all_value must have identical [L,T,nkv,d] shape")
     if len(attn_layers) != all_key.shape[0]:
@@ -205,5 +212,6 @@ def store_all_context_kv(
             all_value[layer_idx].contiguous(),
             slots,
             cache_pair,
-            validate_slot_range=per_layer_slots or layer_idx == 0,
+            validate_slot_range=validate_slot_range
+            and (per_layer_slots or layer_idx == 0),
         )

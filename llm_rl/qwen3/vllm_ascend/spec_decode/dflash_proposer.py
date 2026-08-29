@@ -324,6 +324,12 @@ class DFlashProposer(ParallelBlockProposer):
             all_key,
             all_value,
             context_slots,
+            # Slots originate from the engine-owned block table and the layout
+            # kernels convert every rejected/out-of-window row to PAD. Repeating
+            # torch._assert_async here falls back to CPU on Ascend and inserts a
+            # host operation into every proposal step; direct-store tests retain
+            # range validation at the public adapter boundary.
+            validate_slot_range=False,
         )
 
         metadata = self.build_parallel_attention_metadata(
