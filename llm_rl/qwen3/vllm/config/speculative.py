@@ -675,7 +675,28 @@ class SpeculativeConfig:
             ) or getattr(draft.hf_text_config, "target_layer_ids", None)
             if not layer_ids:
                 raise ValueError("DSpark checkpoint is missing target aux layer ids")
-            draft.hf_text_config.eagle_aux_hidden_state_layer_ids = list(layer_ids)
+            # Dense DSpark ids address target layer outputs. The old Qwen model
+            # captures immediately before a layer, so output i is point i + 1.
+            draft.hf_text_config.eagle_aux_hidden_state_layer_ids = [
+                layer_id + 1 for layer_id in layer_ids
+            ]
+            mask_token_id = getattr(draft.hf_text_config, "mask_token_id", None)
+            if (
+                not isinstance(mask_token_id, int)
+                or mask_token_id < 0
+                or mask_token_id >= draft_vocab
+            ):
+                raise ValueError(
+                    f"DSpark mask_token_id must be in [0, {draft_vocab}); "
+                    f"got {mask_token_id!r}"
+                )
+            markov_rank = getattr(draft.hf_text_config, "markov_rank", None)
+            if not isinstance(markov_rank, int) or markov_rank <= 0:
+                raise ValueError(
+                    f"DSpark checkpoint has invalid markov_rank={markov_rank!r}"
+                )
+            if getattr(draft.hf_text_config, "markov_head_type", "vanilla") != "vanilla":
+                raise ValueError("Phase 2 DSpark only supports markov_head_type='vanilla'")
 
         target_num_layers = getattr(target.hf_text_config, "num_hidden_layers", None)
         if (
@@ -696,6 +717,11 @@ class SpeculativeConfig:
         if list(layer_ids) != sorted(layer_ids):
             raise ValueError(
                 f"{self.method} aux layer ids must be in strictly increasing order"
+            )
+        if any(layer_id + 1 >= target_num_layers for layer_id in layer_ids):
+            raise ValueError(
+                f"{self.method} aux layer ids {layer_ids!r} cannot be represented "
+                f"by the old-Qwen pre-layer capture range [1, {target_num_layers})"
             )
         draft_target_layers = getattr(
             draft.hf_text_config, "num_target_layers", None

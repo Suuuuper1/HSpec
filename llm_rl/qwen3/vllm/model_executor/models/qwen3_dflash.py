@@ -50,6 +50,25 @@ _ALLOWED_DFLASH_CONFIG_FIELDS = {
 }
 
 
+def _validate_parallel_attention_surface(
+    config: Qwen3Config, method: str
+) -> None:
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None or len(layer_types) != config.num_hidden_layers:
+        raise ValueError(
+            f"{method} requires one layer_types entry per draft transformer layer"
+        )
+    if any(layer_type != _FULL_ATTENTION for layer_type in layer_types):
+        raise NotImplementedError(
+            f"Phase 1/2 {method} supports one uniform full-attention KV group "
+            f"only; got layer_types={layer_types!r}"
+        )
+    if getattr(config, "sliding_window", None) is not None:
+        raise NotImplementedError(
+            f"Phase 1/2 {method} does not support sliding attention"
+        )
+
+
 def _missing_packed_shards(
     parameter_names: Iterable[str],
     loaded_shards: dict[str, set[str | int]],
@@ -75,6 +94,16 @@ def dflash_aux_capture_layer_ids(config: Qwen3Config) -> tuple[int, ...]:
     layer_ids = raw.get("target_layer_ids")
     if not isinstance(layer_ids, (list, tuple)) or not layer_ids:
         raise ValueError("DFlash requires dflash_config.target_layer_ids")
+    return tuple(int(layer_id) + 1 for layer_id in layer_ids)
+
+
+def dspark_aux_capture_layer_ids(config: Qwen3Config) -> tuple[int, ...]:
+    """Translate dense-DSpark target outputs to old-Qwen capture points."""
+    layer_ids = getattr(config, "dspark_target_layer_ids", None)
+    if layer_ids is None:
+        layer_ids = getattr(config, "target_layer_ids", None)
+    if not isinstance(layer_ids, (list, tuple)) or not layer_ids:
+        raise ValueError("DSpark requires target_layer_ids")
     return tuple(int(layer_id) + 1 for layer_id in layer_ids)
 
 
@@ -125,18 +154,7 @@ def _validate_dflash_attention_config(config: Qwen3Config) -> None:
             "DFlash target_layer_ids must be a non-empty ordered set of "
             f"non-negative integers, got {layer_ids!r}"
         )
-    layer_types = getattr(config, "layer_types", None)
-    if layer_types is None or len(layer_types) != config.num_hidden_layers:
-        raise ValueError(
-            "DFlash requires one layer_types entry per draft transformer layer"
-        )
-    if any(layer_type != _FULL_ATTENTION for layer_type in layer_types):
-        raise NotImplementedError(
-            "Phase 1 DFlash supports one uniform full-attention KV group only; "
-            f"got layer_types={layer_types!r}"
-        )
-    if getattr(config, "sliding_window", None) is not None:
-        raise NotImplementedError("Phase 1 DFlash does not support sliding attention")
+    _validate_parallel_attention_surface(config, "DFlash")
     causal = raw.get("causal", False)
     if not isinstance(causal, bool):
         raise ValueError(f"dflash_config.causal must be bool, got {causal!r}")
@@ -144,6 +162,48 @@ def _validate_dflash_attention_config(config: Qwen3Config) -> None:
         raise NotImplementedError(
             "Phase 1 certifies the checkpoint-authored non-causal DFlash path only"
         )
+
+
+def _validate_dspark_attention_config(config: Qwen3Config) -> None:
+    mask_token_id = getattr(config, "mask_token_id", None)
+    if not isinstance(mask_token_id, int) or not 0 <= mask_token_id < config.vocab_size:
+        raise ValueError(
+            f"DSpark mask_token_id must be inside [0, {config.vocab_size}), "
+            f"got {mask_token_id!r}"
+        )
+    layer_ids = getattr(config, "dspark_target_layer_ids", None)
+    if layer_ids is None:
+        layer_ids = getattr(config, "target_layer_ids", None)
+    if (
+        not isinstance(layer_ids, (list, tuple))
+        or not layer_ids
+        or tuple(layer_ids) != tuple(sorted(set(layer_ids)))
+        or any(not isinstance(layer_id, int) or layer_id < 0 for layer_id in layer_ids)
+    ):
+        raise ValueError(
+            "DSpark target_layer_ids must be a non-empty ordered set of "
+            f"non-negative integers, got {layer_ids!r}"
+        )
+    markov_rank = getattr(config, "markov_rank", None)
+    if not isinstance(markov_rank, int) or markov_rank <= 0:
+        raise ValueError(f"DSpark markov_rank must be positive, got {markov_rank!r}")
+    markov_head_type = getattr(config, "markov_head_type", "vanilla")
+    if markov_head_type != "vanilla":
+        raise NotImplementedError(
+            f"Phase 2 only supports DSpark markov_head_type='vanilla', got "
+            f"{markov_head_type!r}"
+        )
+    for field in ("enable_confidence_head", "confidence_head_with_markov"):
+        value = getattr(config, field, False)
+        if not isinstance(value, bool):
+            raise ValueError(f"DSpark {field} must be bool, got {value!r}")
+    draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
+    if draft_vocab_size != config.vocab_size:
+        raise NotImplementedError(
+            "Phase 2 DSpark requires an equal full vocabulary; reduced-vocab "
+            "mapping is deferred with probabilistic proposal"
+        )
+    _validate_parallel_attention_surface(config, "DSpark")
 
 
 class DFlashQwen3Attention(nn.Module):
@@ -295,6 +355,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
     dynamic_arg_dims={"input_ids": 0, "positions": -1, "inputs_embeds": 0}
 )
 class DFlashQwen3Model(nn.Module):
+    parallel_draft_method = "dflash"
+
     def __init__(
         self,
         *,
@@ -307,19 +369,30 @@ class DFlashQwen3Model(nn.Module):
         if spec_config is None or spec_config.draft_model_config is None:
             raise ValueError("DFlash model construction requires speculative draft config")
         self.config = spec_config.draft_model_config.hf_config
-        _validate_dflash_attention_config(self.config)
+        if self.parallel_draft_method == "dspark":
+            _validate_dspark_attention_config(self.config)
+        else:
+            _validate_dflash_attention_config(self.config)
         self.quant_config = get_draft_quant_config(vllm_config)
         if self.quant_config is not None:
             raise NotImplementedError(
                 "Phase 1 fused Context KV requires an unquantized DFlash checkpoint"
             )
         self.vocab_size = self.config.vocab_size
-        self.aux_capture_layer_ids = dflash_aux_capture_layer_ids(self.config)
+        self.aux_capture_layer_ids = (
+            dspark_aux_capture_layer_ids(self.config)
+            if self.parallel_draft_method == "dspark"
+            else dflash_aux_capture_layer_ids(self.config)
+        )
         # The certified checkpoint intentionally omits target-owned vocabulary
         # weights. Avoid allocating large random placeholders before sharing.
         self.embed_tokens = PPMissingLayer()
         raw_dflash = getattr(self.config, "dflash_config", None) or {}
-        self.mask_token_id = raw_dflash.get("mask_token_id")
+        self.mask_token_id = (
+            getattr(self.config, "mask_token_id", None)
+            if self.parallel_draft_method == "dspark"
+            else raw_dflash.get("mask_token_id")
+        )
         self.mask_embedding = nn.Parameter(
             torch.zeros(self.config.hidden_size, dtype=vllm_config.model_config.dtype),
             requires_grad=False,

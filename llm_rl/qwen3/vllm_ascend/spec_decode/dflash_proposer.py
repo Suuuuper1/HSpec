@@ -31,12 +31,17 @@ _TILE_SIZE = 128
 
 
 class DFlashProposer(ParallelBlockProposer):
+    method = "dflash"
+    expected_model_type = DFlashQwen3ForCausalLM
+
     def __init__(
         self, vllm_config: VllmConfig, device: torch.device, runner=None
     ) -> None:
         super().__init__(vllm_config, device, runner)
-        if not self.speculative_config.use_dflash():
-            raise ValueError("DFlashProposer requires method='dflash'")
+        if self.speculative_config.method != self.method:
+            raise ValueError(
+                f"{type(self).__name__} requires method={self.method!r}"
+            )
         max_context_tokens = self.max_num_tokens
         self._context_positions = torch.empty(
             max_context_tokens, dtype=torch.int32, device=device
@@ -72,19 +77,47 @@ class DFlashProposer(ParallelBlockProposer):
         self.speculative_config.draft_model_config.hf_config.is_neox_style = rope_style
         with self.maybe_eager_context:
             self.model = self._load_draft_model()
-        if not isinstance(self.model, DFlashQwen3ForCausalLM):
-            raise TypeError(f"Registry loaded unexpected DFlash class {type(self.model)}")
+        if not isinstance(self.model, self.expected_model_type):
+            raise TypeError(
+                f"Registry loaded unexpected {self.method} class {type(self.model)}"
+            )
         self.model.set_context_rms_norm_impl(rms_norm_into)
         self.model.set_context_rope_impl(rotary_embedding_into)
         self.attn_layer_names = self._discover_draft_attention_layers(target_names)
         if self.model.get_draft_attn_causal() != [False] * len(self.attn_layer_names):
-            raise RuntimeError("Phase 1 DFlash draft layers must all be non-causal")
+            raise RuntimeError(
+                f"Phase 1/2 {self.method} draft layers must all be non-causal"
+            )
 
         target_language_model = (
             target_model.get_language_model()
             if hasattr(target_model, "get_language_model")
             else target_model
         )
+        self._configure_vocabulary(target_language_model)
+        self.aux_hidden_state_layer_ids = self.model.aux_capture_layer_ids
+        if self.model.model.fc.input_size != (
+            len(self.aux_hidden_state_layer_ids) * self.hidden_size
+        ):
+            raise ValueError(
+                f"{self.method} FC width does not match target aux layer count: "
+                f"fc={self.model.model.fc.input_size}, layers="
+                f"{self.aux_hidden_state_layer_ids}, hidden={self.hidden_size}"
+            )
+        self._aux_hidden_buffer = torch.empty(
+            (self.max_num_tokens, self.model.model.fc.input_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        logger.info(
+            "Loaded %s draft: layers=%s aux_capture_layers=%s rope_neox=%s",
+            "DFlash" if self.method == "dflash" else "DSpark",
+            self.attn_layer_names,
+            self.aux_hidden_state_layer_ids,
+            rope_style,
+        )
+
+    def _configure_vocabulary(self, target_language_model: nn.Module) -> None:
         if not hasattr(target_language_model, "model") or not hasattr(
             target_language_model.model, "embed_tokens"
         ):
@@ -107,26 +140,6 @@ class DFlashProposer(ParallelBlockProposer):
             )
         self.model.model.embed_tokens = target_embedding
         self.model.lm_head = target_lm_head
-        self.aux_hidden_state_layer_ids = self.model.aux_capture_layer_ids
-        if self.model.model.fc.input_size != (
-            len(self.aux_hidden_state_layer_ids) * self.hidden_size
-        ):
-            raise ValueError(
-                "DFlash FC width does not match target aux layer count: "
-                f"fc={self.model.model.fc.input_size}, layers="
-                f"{self.aux_hidden_state_layer_ids}, hidden={self.hidden_size}"
-            )
-        self._aux_hidden_buffer = torch.empty(
-            (self.max_num_tokens, self.model.model.fc.input_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        logger.info(
-            "Loaded DFlash draft: layers=%s aux_capture_layers=%s rope_neox=%s",
-            self.attn_layer_names,
-            self.aux_hidden_state_layer_ids,
-            rope_style,
-        )
 
     def get_aux_hidden_state_layer_ids(self) -> tuple[int, ...]:
         return tuple(self.aux_hidden_state_layer_ids)
@@ -256,7 +269,7 @@ class DFlashProposer(ParallelBlockProposer):
             self.speculative_config.draft_model_config.max_model_len,
             PAD_SLOT_ID=PAD_SLOT_ID,
             HAS_NULL_BLOCK=False,
-            SAMPLE_FROM_ANCHOR=False,
+            SAMPLE_FROM_ANCHOR=(self.speculative_config.sample_from_anchor is True),
             TILE_SIZE=_TILE_SIZE,
         )
         return (
@@ -349,7 +362,10 @@ class DFlashProposer(ParallelBlockProposer):
             is_draft_model=True,
         ):
             draft_token_ids = self._run_parallel_backbone(
-                query_ids, query_positions, sample_indices
+                query_ids,
+                query_positions,
+                sample_indices,
+                next_token_ids[:batch_size],
             )
         draft_token_ids.masked_fill_(
             self._cannot_speculate[:batch_size, None], PAD_SLOT_ID

@@ -40,9 +40,11 @@ class ParallelBlockProposer(EagleProposer):
     ) -> None:
         super().__init__(vllm_config, device, runner)
         if vllm_config.parallel_config.data_parallel_size > 1:
-            raise NotImplementedError("Phase 1 DFlash certifies DP=1 only")
+            raise NotImplementedError("Phase 1/2 parallel drafters certify DP=1 only")
         if vllm_config.scheduler_config.async_scheduling:
-            raise NotImplementedError("Phase 1 DFlash requires async_scheduling=False")
+            raise NotImplementedError(
+                "Phase 1/2 parallel drafters require async_scheduling=False"
+            )
         # Full graph still hard-codes causal FIA arguments in this ABI.
         self.use_cuda_graph = False
         self._runnable = self._run_parallel_backbone
@@ -87,7 +89,7 @@ class ParallelBlockProposer(EagleProposer):
             )
             * self.num_queries
             + torch.remainder(dummy_sample_rows, self.num_speculative_tokens)
-            + 1
+            + self.speculative_config.draft_sample_offset
         )
 
     def _draft_vllm_config(self) -> VllmConfig:
@@ -232,9 +234,18 @@ class ParallelBlockProposer(EagleProposer):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         sample_indices: torch.Tensor,
+        anchor_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids=input_ids, positions=positions)
         sample_hidden_states = hidden_states[sample_indices]
+        return self._select_draft_tokens(sample_hidden_states, anchor_token_ids)
+
+    def _select_draft_tokens(
+        self,
+        sample_hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del anchor_token_ids
         logits = self.model.compute_logits(sample_hidden_states)
         return logits.argmax(dim=-1).view(-1, self.num_speculative_tokens)
 
@@ -291,5 +302,5 @@ class ParallelBlockProposer(EagleProposer):
             sample_hidden = hidden[
                 self._parallel_dummy_sample_indices[:sample_count]
             ]
-            logits = self.model.compute_logits(sample_hidden)
-            logits.argmax(dim=-1)
+            anchor_tokens = self.input_ids[:query_tokens:self.num_queries]
+            self._select_draft_tokens(sample_hidden, anchor_tokens)

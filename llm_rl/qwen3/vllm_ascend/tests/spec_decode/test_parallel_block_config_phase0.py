@@ -70,7 +70,7 @@ def checkpoint_paths(tmp_path):
             "num_target_layers": 4,
             "layer_types": ["full_attention", "full_attention"],
             "dflash_config": {
-                "target_layer_ids": [0, 3],
+                "target_layer_ids": [0, 2],
                 "mask_token_id": 127,
             },
         }
@@ -83,7 +83,9 @@ def checkpoint_paths(tmp_path):
         {
             "num_target_layers": 4,
             "layer_types": ["full_attention", "full_attention"],
-            "target_layer_ids": [0, 3],
+            "target_layer_ids": [0, 2],
+            "mask_token_id": 127,
+            "markov_rank": 8,
             "sample_from_anchor": True,
         }
     )
@@ -257,7 +259,7 @@ def test_architecture_detection_hash_and_registry_skeleton(checkpoint_paths):
 
     for architecture, expected_name, is_placeholder in (
         ("DFlashDraftModel", "DFlashQwen3ForCausalLM", False),
-        ("Qwen3DSparkModel", "Qwen3DSparkForCausalLM", True),
+        ("Qwen3DSparkModel", "Qwen3DSparkForCausalLM", False),
     ):
         model_config = detected.draft_model_config
         cls, _ = ModelRegistry.resolve_model_cls([architecture], model_config)
@@ -305,7 +307,7 @@ def test_parallelism_and_checkpoint_mismatch_fail_closed(
         {
             "num_target_layers": 4,
             "layer_types": ["full_attention", "full_attention"],
-            "dflash_config": {"target_layer_ids": [0, 3], "mask_token_id": 127},
+            "dflash_config": {"target_layer_ids": [0, 2], "mask_token_id": 127},
         }
     )
     (bad / "config.json").write_text(json.dumps(config))

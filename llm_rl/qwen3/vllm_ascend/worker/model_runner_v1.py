@@ -101,6 +101,7 @@ from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import DFlashProposer
+from vllm_ascend.spec_decode.dspark_proposer import DSparkProposer
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.hspec_parity import (
@@ -451,7 +452,7 @@ class NPUModelRunner(GPUModelRunner):
         # decode stretches for RL rollout batches with request refill.
         self.speculative_auto_bs_thre = int(os.environ.get('VLLM_SPECULATIVE_BATCH_SIZE_THRE', "-1"))
         self.speculative_decoding_active = bool(self.speculative_config)
-        self.drafter: Optional[Union[NgramProposer, EagleProposer, DFlashProposer, MtpProposer,
+        self.drafter: Optional[Union[NgramProposer, EagleProposer, DFlashProposer, DSparkProposer, MtpProposer,
                                      SuffixDecodingProposer, MedusaProposer,
                                      HSpecProposer]] = None
         self.actual_seq_lengths_q: list[int] = []
