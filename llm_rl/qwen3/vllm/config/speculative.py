@@ -13,6 +13,7 @@ from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_effective_rope_parameters
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
 
@@ -617,8 +618,6 @@ class SpeculativeConfig:
             "num_attention_heads",
             "num_key_value_heads",
             "head_dim",
-            "rope_theta",
-            "rope_scaling",
         ):
             target_value = getattr(target.hf_text_config, field, None)
             draft_value = getattr(draft.hf_text_config, field, None)
@@ -627,6 +626,14 @@ class SpeculativeConfig:
                     f"{self.method} target/draft {field} mismatch: "
                     f"{target_value!r} != {draft_value!r}"
                 )
+
+        target_rope = get_effective_rope_parameters(target.hf_text_config)
+        draft_rope = get_effective_rope_parameters(draft.hf_text_config)
+        if target_rope != draft_rope:
+            raise ValueError(
+                f"{self.method} target/draft effective RoPE parameters mismatch: "
+                f"{target_rope!r} != {draft_rope!r}"
+            )
 
         for token_name in ("bos_token_id", "eos_token_id", "pad_token_id"):
             target_id = getattr(target.hf_text_config, token_name, None)

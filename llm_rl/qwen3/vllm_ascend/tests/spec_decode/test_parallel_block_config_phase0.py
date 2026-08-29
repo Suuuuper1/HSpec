@@ -18,6 +18,7 @@ from vllm.config.scheduler import SchedulerConfig
 from vllm.config.load import LoadConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models import ModelRegistry
+from vllm.transformers_utils.config import get_effective_rope_parameters
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.parallel_block_proposer import ParallelBlockProposer
@@ -42,7 +43,7 @@ def _base_config(architecture, *, hidden_size=32, num_layers=4):
         "num_key_value_heads": 2,
         "rms_norm_eps": 1e-6,
         "rope_scaling": None,
-        "rope_theta": 10000,
+        "rope_theta": 1_000_000,
         "sliding_window": None,
         "tie_word_embeddings": False,
         "torch_dtype": "bfloat16",
@@ -89,6 +90,13 @@ def checkpoint_paths(tmp_path):
             "sample_from_anchor": True,
         }
     )
+    # The released DSpark checkpoint uses the Transformers-v5 representation
+    # and intentionally omits the legacy top-level rope_theta.
+    dspark_config.pop("rope_theta")
+    dspark_config["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": 1_000_000,
+    }
     (dspark / "config.json").write_text(json.dumps(dspark_config))
     return target, dflash, dspark
 
@@ -141,6 +149,33 @@ def test_config_geometry_and_independent_loader(
     assert spec.rejection_sample_method == "standard"
     assert spec.parallel_window_fits(128 - q)
     assert not spec.parallel_window_fits(129 - q)
+
+
+def test_dspark_modern_rope_parameters_survive_transformers_v4_defaults(
+    checkpoint_paths,
+):
+    spec = _spec(checkpoint_paths, "dspark")
+    target = spec.target_model_config.hf_text_config
+    draft = spec.draft_model_config.hf_text_config
+    expected = {"rope_type": "default", "rope_theta": 1_000_000}
+
+    assert draft.rope_theta == 1_000_000
+    assert draft.rope_parameters == expected
+    assert get_effective_rope_parameters(target) == expected
+    assert get_effective_rope_parameters(draft) == expected
+
+
+def test_dspark_effective_rope_mismatch_fails_before_weight_load(
+    checkpoint_paths,
+):
+    _, _, dspark = checkpoint_paths
+    config_path = dspark / "config.json"
+    config = json.loads(config_path.read_text())
+    config["rope_parameters"]["rope_theta"] = 123_456
+    config_path.write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="effective RoPE parameters mismatch"):
+        _spec(checkpoint_paths, "dspark")
 
 
 @pytest.mark.parametrize("method", ["dflash", "dspark"])

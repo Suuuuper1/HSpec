@@ -321,6 +321,40 @@ def set_default_rope_theta(config: PretrainedConfig, default_theta: float) -> No
         config.rope_parameters["rope_theta"] = default_theta
 
 
+def get_effective_rope_parameters(config: PretrainedConfig) -> dict[str, Any] | None:
+    """Return the RoPE configuration actually consumed by ``get_rope``.
+
+    ``rope_parameters`` is the modern representation.  On Transformers v4,
+    model config constructors can still materialize a legacy ``rope_theta``
+    default even when the checkpoint only authored ``rope_parameters``.  The
+    constructor default must not override that explicit modern value.
+    """
+
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters is None:
+        rope_parameters = getattr(config, "rope_scaling", None)
+    rope_theta = getattr(config, "rope_theta", None)
+
+    def normalize(parameters: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(parameters)
+        legacy_type = normalized.pop("type", None)
+        normalized.setdefault("rope_type", legacy_type or "default")
+        if "rope_theta" not in normalized and rope_theta is not None:
+            normalized["rope_theta"] = rope_theta
+        return normalized
+
+    if rope_parameters:
+        if is_rope_parameters_nested(rope_parameters):
+            return {
+                layer_type: normalize(parameters)
+                for layer_type, parameters in rope_parameters.items()
+            }
+        return normalize(rope_parameters)
+    if rope_theta is not None:
+        return {"rope_type": "default", "rope_theta": rope_theta}
+    return None
+
+
 def patch_rope_parameters(config: PretrainedConfig) -> None:
     """Provide backwards compatibility for RoPE."""
     from vllm.config.utils import getattr_iter
@@ -343,13 +377,29 @@ def patch_rope_parameters(config: PretrainedConfig) -> None:
             or ompe is not None
         ) and not getattr(config, "rope_parameters", None):
             config.rope_parameters = {"rope_type": "default"}
-        # Patch legacy fields into rope_parameters
-        if rope_theta is not None:
-            config.rope_parameters["rope_theta"] = rope_theta
-        if partial_rotary_factor is not None:
-            config.rope_parameters["partial_rotary_factor"] = partial_rotary_factor
-        if ompe is not None:
-            config.rope_parameters["original_max_position_embeddings"] = ompe
+        # Modern rope_parameters are checkpoint-authored, whereas a legacy
+        # top-level value can be only a Transformers constructor default. Keep
+        # modern values authoritative and synchronize flat legacy attributes so
+        # old model code observes the same effective positional space.
+        rope_parameters = config.rope_parameters
+        if is_rope_parameters_nested(rope_parameters):
+            parameter_sets = rope_parameters.values()
+        else:
+            parameter_sets = (rope_parameters,)
+        for parameters in parameter_sets:
+            if rope_theta is not None:
+                parameters.setdefault("rope_theta", rope_theta)
+            if partial_rotary_factor is not None:
+                parameters.setdefault("partial_rotary_factor", partial_rotary_factor)
+            if ompe is not None:
+                parameters.setdefault("original_max_position_embeddings", ompe)
+        if not is_rope_parameters_nested(rope_parameters):
+            if "rope_theta" in rope_parameters:
+                config.rope_theta = rope_parameters["rope_theta"]
+            if "partial_rotary_factor" in rope_parameters:
+                config.partial_rotary_factor = rope_parameters[
+                    "partial_rotary_factor"
+                ]
     elif rope_theta is not None or getattr(config, "rope_parameters", None):
         # Transformers v5 installed
         # Patch these fields in case they used non-standard names
