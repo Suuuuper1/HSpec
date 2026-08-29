@@ -30,6 +30,7 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
+from verl.workers.config.rollout import resolve_rollout_speculative_method
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -39,7 +40,15 @@ def main(config):
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
-    run_ppo(config)
+    try:
+        run_ppo(config)
+    finally:
+        # A Phase-3 evidence suite launches four local Ray jobs serially. Make
+        # ownership explicit so a completed/failed arm cannot retain the local
+        # cluster while the next arm starts. Normal training keeps its existing
+        # process-lifetime behavior unless this opt-in flag is set.
+        if config.ray_kwargs.get("shutdown_on_exit", False) and ray.is_initialized():
+            ray.shutdown()
 
 
 # Define a function to run the PPO-like training process
@@ -65,7 +74,7 @@ def run_ppo(config) -> None:
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
-    if config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+    if resolve_rollout_speculative_method(config.actor_rollout_ref.rollout) == "hspec":
         from vllm_ascend.spec_decode.hspec_table import (
             hspec_allow_legacy_table_prefetch_enabled,
             hspec_zmq_query_enabled,

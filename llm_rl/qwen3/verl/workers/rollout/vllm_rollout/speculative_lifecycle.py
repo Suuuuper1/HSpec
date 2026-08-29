@@ -151,6 +151,7 @@ class SpeculativeLifecycleAudit:
         self._draft_reference: str | None = None
         self._target_sync_reference: str | None = None
         self._kv_pointer_reference: str | None = None
+        self._terminal_request_ids: set[str] = set()
         self.path: Path | None = None
         if not self.enabled:
             return
@@ -202,6 +203,16 @@ class SpeculativeLifecycleAudit:
             target_checksum = None
             draft_checksum = None
         input_batch = getattr(runner, "input_batch", None)
+        runner_request_ids = sorted(
+            str(req_id) for req_id in getattr(runner, "requests", {})
+        )
+        raw_input_batch_request_ids = getattr(input_batch, "req_ids", None)
+        request_identities_available = raw_input_batch_request_ids is not None
+        input_batch_request_ids = (
+            sorted(str(req_id) for req_id in raw_input_batch_request_ids if req_id is not None)
+            if request_identities_available
+            else []
+        )
         llm_engine = inference_engine.llm_engine
         target_model_config = getattr(getattr(runner, "vllm_config", None), "model_config", None)
         compilation = getattr(runner, "compilation_config", None) or getattr(
@@ -222,8 +233,11 @@ class SpeculativeLifecycleAudit:
             "target_cudagraph_mode": getattr(cudagraph_mode, "name", str(cudagraph_mode)),
             "draft_uses_graph": getattr(drafter, "use_cuda_graph", None),
             "unfinished_requests": int(llm_engine.get_num_unfinished_requests()),
-            "runner_request_count": len(getattr(runner, "requests", {})),
+            "runner_request_count": len(runner_request_ids),
+            "runner_request_ids": runner_request_ids,
             "input_batch_num_reqs": int(getattr(input_batch, "num_reqs", 0)),
+            "input_batch_request_ids": input_batch_request_ids,
+            "request_identities_available": request_identities_available,
             "hspec_collection_enabled": bool(getattr(runner, "_hspec_collect", False)),
             "allocator": _allocator_summary(),
             **extra,
@@ -235,14 +249,51 @@ class SpeculativeLifecycleAudit:
         value = record.get(name)
         return value.get("sha256") if isinstance(value, dict) else None
 
-    def _require_clean(self, record: dict[str, Any], event: str) -> None:
-        dirty = {
-            name: record[name]
-            for name in ("unfinished_requests", "runner_request_count", "input_batch_num_reqs")
-            if record[name] != 0
-        }
-        if self.strict and dirty:
-            raise RuntimeError(f"Phase-3 {event} request state is not clean: {dirty}")
+    def _request_ids(self, record: dict[str, Any], event: str) -> set[str]:
+        if not self.strict:
+            return set(record.get("runner_request_ids", []))
+        if record["unfinished_requests"] != 0:
+            raise RuntimeError(
+                f"Phase-3 {event} has unfinished engine requests: "
+                f"{record['unfinished_requests']}"
+            )
+        if not record.get("request_identities_available", False):
+            if record["runner_request_count"] or record["input_batch_num_reqs"]:
+                raise RuntimeError(
+                    f"Phase-3 {event} cannot audit non-empty request identities"
+                )
+            return set()
+
+        runner_ids = set(record["runner_request_ids"])
+        input_batch_ids = set(record["input_batch_request_ids"])
+        if record["runner_request_count"] != len(runner_ids):
+            raise RuntimeError(f"Phase-3 {event} has duplicate runner request IDs")
+        if record["input_batch_num_reqs"] != len(input_batch_ids):
+            raise RuntimeError(
+                f"Phase-3 {event} input-batch count does not match its request IDs"
+            )
+        if runner_ids != input_batch_ids:
+            raise RuntimeError(
+                f"Phase-3 {event} runner/input-batch request IDs diverged"
+            )
+        return runner_ids
+
+    def _require_quiescent_terminal_cache(
+        self, record: dict[str, Any], event: str
+    ) -> None:
+        """Accept old-vLLM's terminal cache, but never partial or active state.
+
+        V1 reports the final outputs before the model runner receives the next
+        ``finished_req_ids`` update. Consequently ``LLM.generate()`` can return
+        with a quiescent persistent batch containing only the just-finished
+        request IDs. The next scheduler update must retire all of those IDs.
+        """
+        request_ids = self._request_ids(record, event)
+        if self.strict and request_ids not in (set(), self._terminal_request_ids):
+            raise RuntimeError(
+                f"Phase-3 {event} contains request IDs outside the previous "
+                "terminal cache"
+            )
 
     def _check_parallel_draft(self, record: dict[str, Any]) -> None:
         if self.method not in {"dflash", "dspark"}:
@@ -269,7 +320,7 @@ class SpeculativeLifecycleAudit:
             return
         record = self._snapshot(inference_engine, "after_load")
         self._check_parallel_draft(record)
-        self._require_clean(record, "after_load")
+        self._require_quiescent_terminal_cache(record, "after_load")
         self._write(record)
 
     def after_wake(self, inference_engine, tags: list[str]) -> None:
@@ -283,6 +334,7 @@ class SpeculativeLifecycleAudit:
             tags=list(tags),
         )
         self._check_parallel_draft(record)
+        self._require_quiescent_terminal_cache(record, event)
         if event == "after_wake_kv":
             allocator = record["allocator"]
             signature = allocator.get("kv_pointer_sha256") if allocator.get("available") else None
@@ -298,6 +350,7 @@ class SpeculativeLifecycleAudit:
         self.target_updates += 1
         record = self._snapshot(inference_engine, "after_target_update")
         self._check_parallel_draft(record)
+        self._require_quiescent_terminal_cache(record, "after_target_update")
         digest = self._digest(record, "target_checksum")
         if self.strict and self._target_sync_reference == digest:
             raise RuntimeError("target checksum did not change after an actor update")
@@ -316,7 +369,7 @@ class SpeculativeLifecycleAudit:
             inference_engine, "before_rollout", checksum_weights=False
         )
         self._check_parallel_draft(record)
-        self._require_clean(record, "before_rollout")
+        self._require_quiescent_terminal_cache(record, "before_rollout")
         self._write(record)
 
     def after_rollout(self, inference_engine) -> None:
@@ -324,7 +377,14 @@ class SpeculativeLifecycleAudit:
             return
         record = self._snapshot(inference_engine, "after_rollout")
         self._check_parallel_draft(record)
-        self._require_clean(record, "after_rollout")
+        request_ids = self._request_ids(record, "after_rollout")
+        leaked = request_ids & self._terminal_request_ids
+        if self.strict and leaked:
+            raise RuntimeError(
+                "Phase-3 scheduler did not retire previous terminal request IDs: "
+                f"{sorted(leaked)}"
+            )
+        self._terminal_request_ids = request_ids
         self._write(record)
         self.rollouts += 1
 

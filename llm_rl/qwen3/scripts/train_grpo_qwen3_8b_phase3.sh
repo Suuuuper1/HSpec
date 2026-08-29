@@ -23,8 +23,9 @@ TRAIN_FILE="${PHASE3_TRAIN_FILE:-/home/xy/gsm8k/train.parquet}"
 VAL_FILE="${PHASE3_VAL_FILE:-/home/xy/gsm8k/test.parquet}"
 TOTAL_STEPS="${PHASE3_TOTAL_STEPS:-3}"
 LIFECYCLE_DIR="${ARM_DIR}/lifecycle"
+RAY_TMPDIR="${PHASE3_RAY_TMPDIR:-/dev/shm/dflash_dspark_phase3_ray/${ARM}}"
 
-mkdir -p "${ARM_DIR}" "${LIFECYCLE_DIR}"
+mkdir -p "${ARM_DIR}" "${LIFECYCLE_DIR}" "${RAY_TMPDIR}"
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export HYDRA_FULL_ERROR=1
 export VLLM_USE_V1=1
@@ -33,6 +34,7 @@ export VLLM_ASCEND_ENABLE_NZ=0
 export VLLM_ASCEND_STRICT_FULL_GRAPH=1
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export RAY_DEDUP_LOGS=0
+export RAY_TMPDIR
 export VERL_SPECULATIVE_LIFECYCLE_DIR="${LIFECYCLE_DIR}"
 
 CUSTOM_OPP_PATH="${PROJECT_ROOT}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend"
@@ -172,6 +174,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=3 \
     trainer.total_training_steps="${TOTAL_STEPS}" \
     +ray_kwargs.ray_init.address=local \
+    +ray_kwargs.shutdown_on_exit=True \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECULATIVE_LIFECYCLE_DIR="${LIFECYCLE_DIR}" \
     "${RAY_ENV_ARGS[@]}"
 
