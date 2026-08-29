@@ -10,7 +10,10 @@ fi
 ARM="$1"
 ARM_DIR="$2"
 case "${ARM}" in
-    baseline|hspec|dflash|dspark) ;;
+    baseline) ARM_CODE="b" ;;
+    dflash) ARM_CODE="f" ;;
+    dspark) ARM_CODE="s" ;;
+    hspec) ARM_CODE="h" ;;
     *) echo "unsupported Phase-3 arm: ${ARM}" >&2; exit 2 ;;
 esac
 
@@ -23,7 +26,18 @@ TRAIN_FILE="${PHASE3_TRAIN_FILE:-/home/xy/gsm8k/train.parquet}"
 VAL_FILE="${PHASE3_VAL_FILE:-/home/xy/gsm8k/test.parquet}"
 TOTAL_STEPS="${PHASE3_TOTAL_STEPS:-3}"
 LIFECYCLE_DIR="${ARM_DIR}/lifecycle"
-RAY_TMPDIR="${PHASE3_RAY_TMPDIR:-/dev/shm/dflash_dspark_phase3_ray/${ARM}}"
+RAY_TMPDIR="${PHASE3_RAY_TMPDIR:-/dev/shm/p3r3/manual/${ARM_CODE}}"
+RAY_TMPDIR_MAX_BYTES="${PHASE3_RAY_TMPDIR_MAX_BYTES:-31}"
+RAY_TMPDIR_BYTES=$(LC_ALL=C printf '%s' "${RAY_TMPDIR}" | wc -c)
+if ! [[ "${RAY_TMPDIR_MAX_BYTES}" =~ ^[0-9]+$ ]]; then
+    echo "PHASE3_RAY_TMPDIR_MAX_BYTES must be a non-negative integer" >&2
+    exit 2
+fi
+if (( RAY_TMPDIR_BYTES > RAY_TMPDIR_MAX_BYTES )); then
+    echo "Phase-3 RAY_TMPDIR is ${RAY_TMPDIR_BYTES} bytes, exceeding the "\
+         "${RAY_TMPDIR_MAX_BYTES}-byte Ray AF_UNIX-safe budget: ${RAY_TMPDIR}" >&2
+    exit 2
+fi
 
 mkdir -p "${ARM_DIR}" "${LIFECYCLE_DIR}" "${RAY_TMPDIR}"
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -96,6 +110,7 @@ else
 fi
 
 echo "PHASE3_ARM_BEGIN arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS}"
+echo "PHASE3_RAY_TMPDIR path=${RAY_TMPDIR} bytes=${RAY_TMPDIR_BYTES} max_bytes=${RAY_TMPDIR_MAX_BYTES}"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
