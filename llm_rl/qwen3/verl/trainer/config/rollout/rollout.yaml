@@ -7,6 +7,9 @@ name: ???
 # sync: LLM, async: AsyncLLM
 mode: sync
 
+# Deterministic vLLM sampling seed for controlled comparisons.
+seed: 0
+
 # Sampling temperature for rollout.
 temperature: 1.0
 
@@ -309,3 +312,21 @@ hspec_similarity_threshold: 0.9
 hspec_min_match_len: 1
 hspec_n_components: 64
 hspec_max_entries_per_prompt: 10000
+
+# Unified Phase-3 speculative decoding contract. The legacy
+# use_hspec_decode switch remains supported, but must not be combined with
+# speculative_method.
+speculative_method: null
+speculative_model: null
+num_speculative_tokens: 7
+draft_tensor_parallel_size: 1
+draft_sample_method: greedy
+draft_load_format: auto
+rejection_sample_method: standard
+speculative_enforce_eager: true
+
+# Bounded lifecycle evidence collection. This is disabled in normal runs and
+# enabled only by the Phase-3 validation matrix.
+speculative_lifecycle_audit: false
+speculative_lifecycle_strict: true
+speculative_lifecycle_samples_per_parameter: 8

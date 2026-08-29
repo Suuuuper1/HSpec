@@ -28,7 +28,34 @@ __all__ = [
     "TraceConfig",
     "ServerConfig",
     "RolloutConfig",
+    "resolve_rollout_speculative_method",
 ]
+
+
+_ROLLOUT_SPECULATIVE_METHODS = {"hspec", "dflash", "dspark"}
+
+
+def resolve_rollout_speculative_method(config) -> Optional[str]:
+    """Resolve the unified Phase-3 method, including the legacy HSpec switch.
+
+    Keeping this pure helper in the config layer gives the trainer and rollout
+    worker exactly the same interpretation without importing vLLM.
+    """
+    explicit = config.get("speculative_method", None)
+    if isinstance(explicit, str):
+        explicit = explicit.strip().lower() or None
+    if explicit not in _ROLLOUT_SPECULATIVE_METHODS | {None}:
+        raise ValueError(
+            "speculative_method must be one of null, hspec, dflash or dspark; "
+            f"got {explicit!r}"
+        )
+    legacy_hspec = bool(config.get("use_hspec_decode", False))
+    if legacy_hspec and explicit is not None:
+        raise ValueError(
+            "use_hspec_decode and speculative_method are mutually exclusive; "
+            "remove the legacy switch when using the unified field"
+        )
+    return "hspec" if legacy_hspec else explicit
 
 
 @dataclass
@@ -97,6 +124,7 @@ class RolloutConfig(BaseConfig):
 
     name: Optional[str] = MISSING
     mode: str = "sync"
+    seed: int = 0
     skip_tokenizer_init: bool = True
 
     temperature: float = 1.0
@@ -189,8 +217,90 @@ class RolloutConfig(BaseConfig):
     hspec_n_components: int = 64
     hspec_max_entries_per_prompt: int = 10000
 
+    # Unified speculative decoding contract. ``use_hspec_decode`` remains a
+    # compatibility-only alias and cannot be combined with these methods.
+    speculative_method: Optional[str] = None
+    speculative_model: Optional[str] = None
+    num_speculative_tokens: int = 7
+    draft_tensor_parallel_size: int = 1
+    draft_sample_method: str = "greedy"
+    draft_load_format: str = "auto"
+    rejection_sample_method: str = "standard"
+    speculative_enforce_eager: bool = True
+
+    # Disabled by default. The Phase-3 evidence run enables this to emit a
+    # bounded sampled checksum and state-machine record at lifecycle edges.
+    speculative_lifecycle_audit: bool = False
+    speculative_lifecycle_strict: bool = True
+    speculative_lifecycle_samples_per_parameter: int = 8
+
     def __post_init__(self):
         """Validate the rollout config"""
+        method = resolve_rollout_speculative_method(self)
+        if not 1 <= self.num_speculative_tokens <= 15:
+            raise ValueError("num_speculative_tokens must be in [1, 15]")
+        if not 1 <= self.speculative_lifecycle_samples_per_parameter <= 64:
+            raise ValueError(
+                "speculative_lifecycle_samples_per_parameter must be in [1, 64]"
+            )
+        if method is None and self.speculative_model is not None:
+            raise ValueError(
+                "speculative_model requires speculative_method=dflash or dspark"
+            )
+        if method == "hspec" and self.speculative_model is not None:
+            raise ValueError("HSpec does not accept speculative_model")
+        if method in {"dflash", "dspark"}:
+            if not self.speculative_model:
+                raise ValueError(f"{method} requires speculative_model")
+            if self.name != "vllm" or self.mode != "sync":
+                raise ValueError(
+                    f"{method} Phase-3 support requires name=vllm and mode=sync"
+                )
+            if self.tensor_model_parallel_size < 1:
+                raise ValueError("target tensor parallel size must be positive")
+            if self.draft_tensor_parallel_size != 1:
+                raise NotImplementedError(
+                    "Phase-3 DFlash/DSpark supports draft_tensor_parallel_size=1 only"
+                )
+            if self.pipeline_model_parallel_size != 1 or self.data_parallel_size != 1:
+                raise NotImplementedError(
+                    "Phase-3 DFlash/DSpark supports vLLM PP=1 and DP=1 only"
+                )
+            if self.draft_sample_method != "greedy":
+                raise NotImplementedError(
+                    "Phase-3 DFlash/DSpark supports greedy draft proposal only"
+                )
+            if self.rejection_sample_method != "standard":
+                raise NotImplementedError(
+                    "Phase-3 DFlash/DSpark requires standard rejection sampling"
+                )
+            if self.draft_load_format.lower() != "auto":
+                raise NotImplementedError(
+                    "Phase-3 DFlash/DSpark certifies draft_load_format=auto only"
+                )
+            if not self.speculative_enforce_eager:
+                raise ValueError("DFlash/DSpark draft execution must remain eager")
+            if self.enforce_eager:
+                raise ValueError(
+                    "Phase-3 DFlash/DSpark keeps the target graph enabled; "
+                    "set rollout.enforce_eager=false"
+                )
+            if self.enable_prefix_caching:
+                raise ValueError(
+                    "Phase-3 DFlash/DSpark requires enable_prefix_caching=false"
+                )
+            if not self.free_cache_engine:
+                raise ValueError(
+                    "Phase-3 lifecycle certification requires free_cache_engine=true"
+                )
+            async_scheduling = (
+                self.engine_kwargs.get("vllm", {}).get("async_scheduling", False)
+                if self.engine_kwargs
+                else False
+            )
+            if async_scheduling:
+                raise ValueError("Phase-3 DFlash/DSpark requires async_scheduling=false")
+
         if self.expert_parallel_size > 1:
             assert self.expert_parallel_size == (self.tensor_model_parallel_size * self.data_parallel_size), (
                 "expert_parallel_size must be equal to tensor_model_parallel_size * data_parallel_size"

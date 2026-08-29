@@ -86,6 +86,12 @@ from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.cudagraph_config import (
     resolve_vllm_cudagraph_kwargs,
 )
+from verl.workers.rollout.vllm_rollout.speculative_config import (
+    resolve_rollout_speculation,
+)
+from verl.workers.rollout.vllm_rollout.speculative_lifecycle import (
+    SpeculativeLifecycleAudit,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -388,36 +394,18 @@ class vLLMRollout(BaseRollout):
                 "hybrid-engine training only if actor weights are synchronized before generation."
             )
 
-        # copy it to avoid secretly modifying the engine config
-        engine_kwargs = config.get("engine_kwargs", {}).get("vllm", {}) or {}
-
-        # For each vLLM engine parameter,
-        # - `None` means not setting it, so we pop it, and leave it to vLLM default value
-        #    (which can vary across different vLLM versions);
-        # - Otherwise it's the desired value we want to explicitly set.
-        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        self._resolved_speculation = resolve_rollout_speculation(config)
+        engine_kwargs = dict(self._resolved_speculation.engine_kwargs)
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
-
-        if self.config.get("use_hspec_decode", False):
-            speculative_config = {
-                "method": "hspec",
-                "num_speculative_tokens": self.config.get("hspec_num_speculative_tokens", 5),
-                "hspec_similarity_threshold": self.config.get("hspec_similarity_threshold", 0.9),
-                "hspec_min_match_len": self.config.get("hspec_min_match_len", 1),
-                "hspec_n_components": self.config.get("hspec_n_components", 64),
-                "hspec_max_entries_per_prompt": self.config.get("hspec_max_entries_per_prompt", 10000),
-            }
-        else:
-            speculative_config = None
-
-        if speculative_config is not None:
-            engine_kwargs["speculative_config"] = speculative_config
 
         global _PRINTED_VLLM_SPEC_CONFIG
         if not _PRINTED_VLLM_SPEC_CONFIG:
             _PRINTED_VLLM_SPEC_CONFIG = True
-            logger.warning("Resolved vLLM speculative_config: %s", speculative_config)
+            logger.warning(
+                "Resolved Verl speculative manifest: %s",
+                self._resolved_speculation.manifest,
+            )
 
         engine_kwargs = resolve_vllm_cudagraph_kwargs(config, engine_kwargs)
         resolved_compilation_config = engine_kwargs.get("compilation_config")
@@ -513,6 +501,10 @@ class vLLMRollout(BaseRollout):
         self.pad_token_id = tokenizer.pad_token_id
         self._hspec_align_debug = _HSPEC_ALIGN_DEBUG
         self._hspec_align_debug_preview = _HSPEC_ALIGN_DEBUG_PREVIEW
+        self._lifecycle_audit = SpeculativeLifecycleAudit(
+            config, self._resolved_speculation
+        )
+        self._lifecycle_audit.after_load(self.inference_engine)
 
         self.eplb_end()
 
@@ -588,7 +580,7 @@ class vLLMRollout(BaseRollout):
         batch_size = idx.size(0)
         global_step = prompts.meta_info.get("global_steps")
         hspec_epoch = prompts.meta_info.get("hspec_epoch", -1)
-        use_hspec = self.config.get("use_hspec_decode", False)
+        use_hspec = self._resolved_speculation.uses_hspec
         is_validate = prompts.meta_info.get("validate", False)
         do_sample = prompts.meta_info.get("do_sample", True)
         collect_hspec = use_hspec and not is_validate and bool(do_sample)
@@ -742,6 +734,13 @@ class vLLMRollout(BaseRollout):
                             vllm_inputs,
                             max_num_seqs=int(self.config.max_num_seqs),
                         )
+                self._lifecycle_audit.before_rollout(self.inference_engine)
+                if self._lifecycle_audit.enabled:
+                    logger.warning(
+                        "PHASE3_ROLLOUT_BEGIN method=%s round=%d",
+                        self._resolved_speculation.method,
+                        self._lifecycle_audit.rollouts,
+                    )
                 with hspec_record_function("hspec/rollout/engine_generate", use_npu_stream=True):
                     outputs = self.inference_engine.generate(
                         prompts=vllm_inputs,
@@ -755,6 +754,13 @@ class vLLMRollout(BaseRollout):
                             "hspec_finalize_rollout_round",
                             args=(),
                         )
+                self._lifecycle_audit.after_rollout(self.inference_engine)
+                if self._lifecycle_audit.enabled:
+                    logger.warning(
+                        "PHASE3_ROLLOUT_END method=%s round=%d",
+                        self._resolved_speculation.method,
+                        self._lifecycle_audit.rollouts - 1,
+                    )
 
                 hs_store: dict = {}
                 hs_store_index: tuple[dict[str, Any], dict[str, Any]] = ({}, {})
@@ -1200,15 +1206,19 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.wake_up(tags=tags)
         else:
             self.inference_engine.wake_up()
+        self._lifecycle_audit.after_wake(self.inference_engine, list(tags))
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
-        self.inference_engine.reset_prefix_cache()
+        reset_succeeded = bool(self.inference_engine.reset_prefix_cache())
 
         if not self.config.free_cache_engine:
             return
 
         self.inference_engine.sleep(level=self.sleep_level)
+        self._lifecycle_audit.after_sleep(
+            reset_prefix_cache_succeeded=reset_succeeded
+        )
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """Update the weights of the rollout model.
@@ -1256,6 +1266,7 @@ class vLLMRollout(BaseRollout):
                     "vLLM rollout weight synchronization loaded 0 parameters. "
                     "Generation would continue with dummy/random weights."
                 )
+        self._lifecycle_audit.after_target_update(self.inference_engine)
 
 
 # https://github.com/vllm-project/vllm/issues/13175

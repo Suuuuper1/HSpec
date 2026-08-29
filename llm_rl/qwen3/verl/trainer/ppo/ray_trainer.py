@@ -2038,6 +2038,7 @@ class RayPPOTrainer:
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
+        from verl.workers.config.rollout import resolve_rollout_speculative_method
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -2046,7 +2047,13 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False) and self.async_rollout_mode:
+        use_hspec_decode = (
+            resolve_rollout_speculative_method(
+                self.config.actor_rollout_ref.rollout
+            )
+            == "hspec"
+        )
+        if use_hspec_decode and self.async_rollout_mode:
             raise NotImplementedError(
                 "HSpec rollout collection is only implemented for sync vLLM rollout in the current migration."
             )
@@ -2086,7 +2093,7 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
-        if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+        if use_hspec_decode:
             from vllm_ascend.spec_decode.hspec_table import get_hspec_tables
 
             similarity_threshold = self.config.actor_rollout_ref.rollout.get(
@@ -2289,7 +2296,7 @@ class RayPPOTrainer:
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
-                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                    if use_hspec_decode:
                         with marked_timer("update_hspec_tables", timing_raw, color="teal"):
                             self._poll_hspec_builds_nonblocking(metrics)
                             force_hspec_phase4_metrics = bool(
@@ -2764,7 +2771,7 @@ class RayPPOTrainer:
                     )
 
                 if is_last_step:
-                    if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+                    if use_hspec_decode:
                         barrier_metrics = self._wait_hspec_epoch_builds(epoch, timing_raw)
                         swap_metrics = self._publish_hspec_epoch_tables_after_barrier(epoch)
                         if swap_metrics:
@@ -2785,7 +2792,7 @@ class RayPPOTrainer:
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
 
-            if self.config.actor_rollout_ref.rollout.get("use_hspec_decode", False):
+            if use_hspec_decode:
                 barrier_metrics = self._wait_hspec_epoch_builds(epoch, timing_raw)
                 swap_metrics = self._publish_hspec_epoch_tables_after_barrier(epoch)
                 if swap_metrics:

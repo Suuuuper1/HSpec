@@ -39,6 +39,7 @@ class ParallelBlockProposer(EagleProposer):
         self, vllm_config: VllmConfig, device: torch.device, runner=None
     ) -> None:
         super().__init__(vllm_config, device, runner)
+        self._checkpoint_load_count = 0
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise NotImplementedError("Phase 1/2 parallel drafters certify DP=1 only")
         if vllm_config.scheduler_config.async_scheduling:
@@ -121,11 +122,18 @@ class ParallelBlockProposer(EagleProposer):
         )
 
     def _load_draft_model(self) -> nn.Module:
+        if self._checkpoint_load_count != 0:
+            raise RuntimeError(
+                f"{type(self).__name__} draft checkpoint reload is forbidden; "
+                "the draft is immutable across the Verl RL lifecycle"
+            )
         draft_vllm_config = self._draft_vllm_config()
-        return get_model(
+        model = get_model(
             vllm_config=draft_vllm_config,
             model_config=draft_vllm_config.model_config,
         )
+        self._checkpoint_load_count = 1
+        return model
 
     def _discover_draft_attention_layers(
         self, target_layer_names: set[str]

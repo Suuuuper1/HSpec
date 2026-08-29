@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+    echo "usage: $0 <baseline|hspec|dflash|dspark> <arm-output-dir>" >&2
+    exit 2
+fi
+
+ARM="$1"
+ARM_DIR="$2"
+case "${ARM}" in
+    baseline|hspec|dflash|dspark) ;;
+    *) echo "unsupported Phase-3 arm: ${ARM}" >&2; exit 2 ;;
+esac
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+MODEL_PATH="${PHASE3_TARGET_MODEL:-/home/data/Qwen3-8B}"
+DFLASH_MODEL="${PHASE3_DFLASH_MODEL:-/home/data/Qwen3-8B-dflash}"
+DSPARK_MODEL="${PHASE3_DSPARK_MODEL:-/home/data/Qwen3-8B-dspark}"
+TRAIN_FILE="${PHASE3_TRAIN_FILE:-/home/xy/gsm8k/train.parquet}"
+VAL_FILE="${PHASE3_VAL_FILE:-/home/xy/gsm8k/test.parquet}"
+TOTAL_STEPS="${PHASE3_TOTAL_STEPS:-3}"
+LIFECYCLE_DIR="${ARM_DIR}/lifecycle"
+
+mkdir -p "${ARM_DIR}" "${LIFECYCLE_DIR}"
+export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export HYDRA_FULL_ERROR=1
+export VLLM_USE_V1=1
+export VLLM_LOG_STATS_INTERVAL="${VLLM_LOG_STATS_INTERVAL:-0.1}"
+export VLLM_ASCEND_ENABLE_NZ=0
+export VLLM_ASCEND_STRICT_FULL_GRAPH=1
+export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
+export RAY_DEDUP_LOGS=0
+export VERL_SPECULATIVE_LIFECYCLE_DIR="${LIFECYCLE_DIR}"
+
+CUSTOM_OPP_PATH="${PROJECT_ROOT}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend"
+if [[ -d "${CUSTOM_OPP_PATH}" ]]; then
+    export ASCEND_CUSTOM_OPP_PATH="${CUSTOM_OPP_PATH}:${ASCEND_CUSTOM_OPP_PATH:-}"
+    export LD_LIBRARY_PATH="${CUSTOM_OPP_PATH}/op_api/lib:${LD_LIBRARY_PATH:-}"
+fi
+
+METHOD="null"
+DRAFT_MODEL="null"
+RAY_ENV_ARGS=()
+if [[ "${ARM}" == "dflash" ]]; then
+    METHOD="dflash"
+    DRAFT_MODEL="${DFLASH_MODEL}"
+elif [[ "${ARM}" == "dspark" ]]; then
+    METHOD="dspark"
+    DRAFT_MODEL="${DSPARK_MODEL}"
+elif [[ "${ARM}" == "hspec" ]]; then
+    METHOD="hspec"
+    export HSPEC_RUN_UID="phase3_${ARM}_$(date -u '+%Y%m%dT%H%M%SZ')_$$"
+    export HSPEC_STORE_DIR="${ARM_DIR}/hspec/raw"
+    export HSPEC_TABLE_STORE_DIR="${ARM_DIR}/hspec/table"
+    export HSPEC_INFER_TP=1
+    export HSPEC_NUM_SHARDS=1
+    export HSPEC_SINGLE_NODE_ONLY=1
+    export HSPEC_TOPOLOGY_STRICT=1
+    export HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS=1
+    export HSPEC_LEGACY_DATAPROTO_HS=0
+    export HSPEC_STRICT_DESCRIPTOR_MODE=1
+    export HSPEC_STRICT_PROMPT_ID_ON_SEAL=1
+    export HSPEC_TABLE_PREFETCH_MODE=descriptor
+    export HSPEC_FULL_BATCH_PREFETCH=1
+    export HSPEC_ASYNC_HS_COPY_STREAM=1
+    export HSPEC_PINNED_POOL_BYTES=268435456
+    export HSPEC_CLEAN_STORE_ON_START=1
+    export HSPEC_CLEAN_RAW_STORE_ON_START=1
+    export HSPEC_CLEAN_TABLE_STORE_ON_START=1
+    mkdir -p "${HSPEC_STORE_DIR}" "${HSPEC_TABLE_STORE_DIR}"
+    RAY_ENV_ARGS=(
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RUN_UID=${HSPEC_RUN_UID}"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DIR=${HSPEC_STORE_DIR}"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TABLE_STORE_DIR=${HSPEC_TABLE_STORE_DIR}"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_INFER_TP=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUM_SHARDS=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SINGLE_NODE_ONLY=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TOPOLOGY_STRICT=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LEGACY_DATAPROTO_HS=0"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STRICT_DESCRIPTOR_MODE=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STRICT_PROMPT_ID_ON_SEAL=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TABLE_PREFETCH_MODE=descriptor"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_FULL_BATCH_PREFETCH=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_COPY_STREAM=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_BYTES=268435456"
+    )
+else
+    # Neural and baseline arms must not create or consume HSpec stores.
+    unset HSPEC_STORE_DIR HSPEC_TABLE_STORE_DIR HSPEC_RUN_UID HSPEC_NUM_SHARDS
+fi
+
+echo "PHASE3_ARM_BEGIN arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS}"
+
+python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
+    data.train_files="${TRAIN_FILE}" \
+    data.val_files="${VAL_FILE}" \
+    data.train_batch_size=8 \
+    data.max_prompt_length=512 \
+    data.max_response_length=128 \
+    data.filter_overlong_prompts=True \
+    data.truncation=error \
+    data.shuffle=False \
+    +data.seed=20260829 \
+    actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.use_remove_padding=False \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.optim.lr=5e-7 \
+    actor_rollout_ref.actor.entropy_coeff=0.001 \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.mode=sync \
+    actor_rollout_ref.rollout.seed=20260829 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.pipeline_model_parallel_size=1 \
+    actor_rollout_ref.rollout.data_parallel_size=1 \
+    actor_rollout_ref.rollout.load_format=dummy \
+    actor_rollout_ref.rollout.free_cache_engine=True \
+    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.cudagraph_mode=FULL_DECODE_ONLY \
+    actor_rollout_ref.rollout.enable_prefix_caching=False \
+    actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    actor_rollout_ref.rollout.disable_log_stats=False \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.72 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=640 \
+    actor_rollout_ref.rollout.max_num_seqs=16 \
+    actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.temperature=0.9 \
+    actor_rollout_ref.rollout.top_k=-1 \
+    actor_rollout_ref.rollout.top_p=1.0 \
+    actor_rollout_ref.rollout.ignore_eos=False \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.use_hspec_decode=False \
+    actor_rollout_ref.rollout.speculative_method="${METHOD}" \
+    actor_rollout_ref.rollout.speculative_model="${DRAFT_MODEL}" \
+    actor_rollout_ref.rollout.num_speculative_tokens=7 \
+    actor_rollout_ref.rollout.draft_tensor_parallel_size=1 \
+    actor_rollout_ref.rollout.draft_sample_method=greedy \
+    actor_rollout_ref.rollout.draft_load_format=auto \
+    actor_rollout_ref.rollout.rejection_sample_method=standard \
+    actor_rollout_ref.rollout.speculative_enforce_eager=True \
+    actor_rollout_ref.rollout.speculative_lifecycle_audit=True \
+    actor_rollout_ref.rollout.speculative_lifecycle_strict=True \
+    actor_rollout_ref.rollout.speculative_lifecycle_samples_per_parameter=8 \
+    actor_rollout_ref.rollout.hspec_similarity_threshold=0.85 \
+    actor_rollout_ref.rollout.hspec_min_match_len=1 \
+    actor_rollout_ref.rollout.hspec_n_components=64 \
+    actor_rollout_ref.rollout.hspec_max_entries_per_prompt=10000 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    trainer.device=npu \
+    trainer.critic_warmup=0 \
+    trainer.logger=console \
+    trainer.project_name=dflash_dspark_phase3 \
+    trainer.experiment_name="qwen3_8b_${ARM}" \
+    trainer.val_before_train=False \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=1 \
+    trainer.save_freq=-1 \
+    trainer.test_freq=-1 \
+    trainer.total_epochs=3 \
+    trainer.total_training_steps="${TOTAL_STEPS}" \
+    +ray_kwargs.ray_init.address=local \
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECULATIVE_LIFECYCLE_DIR="${LIFECYCLE_DIR}" \
+    "${RAY_ENV_ARGS[@]}"
+
+echo "PHASE3_ARM_END arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS}"

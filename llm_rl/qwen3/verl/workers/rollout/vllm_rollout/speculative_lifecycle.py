@@ -1,0 +1,351 @@
+# Copyright 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+"""Bounded evidence recorder for the Phase-3 Verl speculative lifecycle."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+
+
+def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
+    storage = tensor.untyped_storage()
+    return storage.data_ptr(), storage.nbytes()
+
+
+def module_storage_keys(module: torch.nn.Module | None) -> set[tuple[int, int]]:
+    if module is None:
+        return set()
+    return {_storage_key(parameter) for parameter in module.parameters()}
+
+
+def _sample_indices(numel: int, count: int) -> list[int]:
+    if numel <= count:
+        return list(range(numel))
+    if count == 1:
+        return [numel // 2]
+    return sorted({round(index * (numel - 1) / (count - 1)) for index in range(count)})
+
+
+def _unravel(index: int, shape: tuple[int, ...]) -> tuple[int, ...]:
+    coordinates: list[int] = []
+    for size in reversed(shape):
+        coordinates.append(index % size)
+        index //= size
+    return tuple(reversed(coordinates))
+
+
+@torch.no_grad()
+def sampled_parameter_checksum(
+    module: torch.nn.Module | None,
+    *,
+    samples_per_parameter: int,
+    excluded_storage_keys: set[tuple[int, int]] | None = None,
+    max_parameters: int = 64,
+) -> dict[str, Any] | None:
+    """Hash a bounded, deterministic sample without flattening large tensors."""
+    if module is None:
+        return None
+    excluded = excluded_storage_keys or set()
+    parameters = [
+        (name, parameter)
+        for name, parameter in module.named_parameters()
+        if parameter.numel() and _storage_key(parameter) not in excluded
+    ]
+    if not parameters:
+        return {
+            "sha256": hashlib.sha256(b"").hexdigest(),
+            "parameter_count": 0,
+            "sampled_parameter_count": 0,
+            "sample_count": 0,
+            "excluded_parameter_count": sum(
+                1
+                for parameter in module.parameters()
+                if _storage_key(parameter) in excluded
+            ),
+        }
+    chosen_positions = _sample_indices(len(parameters), min(max_parameters, len(parameters)))
+    chosen = [parameters[index] for index in chosen_positions]
+    values: list[torch.Tensor] = []
+    metadata: list[str] = []
+    for name, parameter in chosen:
+        shape = tuple(parameter.shape)
+        indices = _sample_indices(parameter.numel(), samples_per_parameter)
+        metadata.append(f"{name}|{shape}|{parameter.dtype}|{indices}")
+        values.extend(parameter[_unravel(index, shape)] for index in indices)
+    # One bounded D2H synchronization per checksum, independent of model size.
+    sample = torch.stack(values).to(dtype=torch.float32, device="cpu")
+    digest = hashlib.sha256()
+    digest.update("\n".join(metadata).encode("utf-8"))
+    digest.update(sample.numpy().tobytes())
+    return {
+        "sha256": digest.hexdigest(),
+        "parameter_count": len(parameters),
+        "sampled_parameter_count": len(chosen),
+        "sample_count": sample.numel(),
+        "excluded_parameter_count": sum(
+            1
+            for parameter in module.parameters()
+            if _storage_key(parameter) in excluded
+        ),
+    }
+
+
+def _driver_worker(inference_engine):
+    return inference_engine.llm_engine.model_executor.driver_worker.worker
+
+
+def _models(inference_engine):
+    runner = _driver_worker(inference_engine).model_runner
+    target = runner.get_model()
+    drafter = getattr(runner, "drafter", None)
+    draft = getattr(drafter, "model", None)
+    return runner, target, drafter, draft
+
+
+def _allocator_summary() -> dict[str, Any]:
+    try:
+        from vllm_ascend.device_allocator.camem import CaMemAllocator
+
+        allocator = CaMemAllocator.get_instance()
+    except Exception as error:
+        return {"available": False, "error": f"{type(error).__name__}: {error}"}
+    by_tag: dict[str, dict[str, int]] = {}
+    pointer_rows: list[str] = []
+    for pointer, data in allocator.pointer_to_data.items():
+        size = int(data.handle[1])
+        row = by_tag.setdefault(data.tag, {"allocations": 0, "bytes": 0, "backed_bytes": 0})
+        row["allocations"] += 1
+        row["bytes"] += size
+        if data.cpu_backup_tensor is not None:
+            row["backed_bytes"] += int(
+                data.cpu_backup_tensor.numel() * data.cpu_backup_tensor.element_size()
+            )
+        pointer_rows.append(f"{data.tag}:{pointer}:{size}")
+    kv_rows = sorted(row for row in pointer_rows if row.startswith("kv_cache:"))
+    return {
+        "available": True,
+        "by_tag": by_tag,
+        "kv_pointer_sha256": hashlib.sha256("\n".join(kv_rows).encode()).hexdigest(),
+        "kv_allocation_count": len(kv_rows),
+    }
+
+
+class SpeculativeLifecycleAudit:
+    """Fail-fast state-machine checker and append-only JSONL recorder."""
+
+    def __init__(self, config, resolved) -> None:
+        self.enabled = bool(config.get("speculative_lifecycle_audit", False))
+        self.strict = bool(config.get("speculative_lifecycle_strict", True))
+        self.method = resolved.method
+        self.manifest = dict(resolved.manifest)
+        self.samples = int(config.get("speculative_lifecycle_samples_per_parameter", 8))
+        self.sequence = 0
+        self.target_updates = 0
+        self.rollouts = 0
+        self._draft_reference: str | None = None
+        self._target_sync_reference: str | None = None
+        self._kv_pointer_reference: str | None = None
+        self.path: Path | None = None
+        if not self.enabled:
+            return
+        output = os.environ.get("VERL_SPECULATIVE_LIFECYCLE_DIR")
+        if not output:
+            raise RuntimeError(
+                "speculative_lifecycle_audit requires "
+                "VERL_SPECULATIVE_LIFECYCLE_DIR"
+            )
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        directory = Path(output)
+        directory.mkdir(parents=True, exist_ok=True)
+        self.path = directory / f"lifecycle_rank{rank:05d}_pid{os.getpid()}.jsonl"
+        if self.path.exists():
+            raise FileExistsError(f"refusing to append to existing lifecycle audit {self.path}")
+        self._write({"event": "manifest", "manifest": self.manifest, "rank": rank})
+
+    def _write(self, record: dict[str, Any]) -> None:
+        if not self.enabled or self.path is None:
+            return
+        value = {
+            "schema_version": "dflash-dspark.phase3-lifecycle.v1",
+            "sequence": self.sequence,
+            "time_ns": time.time_ns(),
+            "method": self.method,
+            **record,
+        }
+        self.sequence += 1
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(value, sort_keys=True, ensure_ascii=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def _snapshot(
+        self, inference_engine, event: str, *, checksum_weights: bool = True, **extra
+    ) -> dict[str, Any]:
+        runner, target, drafter, draft = _models(inference_engine)
+        if checksum_weights:
+            target_storage = module_storage_keys(target)
+            target_checksum = sampled_parameter_checksum(
+                target, samples_per_parameter=self.samples
+            )
+            draft_checksum = sampled_parameter_checksum(
+                draft,
+                samples_per_parameter=self.samples,
+                excluded_storage_keys=target_storage,
+            )
+        else:
+            target_checksum = None
+            draft_checksum = None
+        input_batch = getattr(runner, "input_batch", None)
+        llm_engine = inference_engine.llm_engine
+        target_model_config = getattr(getattr(runner, "vllm_config", None), "model_config", None)
+        compilation = getattr(runner, "compilation_config", None) or getattr(
+            getattr(runner, "vllm_config", None), "compilation_config", None
+        )
+        cudagraph_mode = getattr(compilation, "cudagraph_mode", None)
+        record = {
+            "event": event,
+            "target_updates": self.target_updates,
+            "rollouts": self.rollouts,
+            "target_checksum": target_checksum,
+            "draft_checksum": draft_checksum,
+            "draft_checkpoint_load_count": getattr(
+                drafter, "_checkpoint_load_count", None
+            ),
+            "drafter_type": type(drafter).__name__ if drafter is not None else None,
+            "target_enforce_eager": getattr(target_model_config, "enforce_eager", None),
+            "target_cudagraph_mode": getattr(cudagraph_mode, "name", str(cudagraph_mode)),
+            "draft_uses_graph": getattr(drafter, "use_cuda_graph", None),
+            "unfinished_requests": int(llm_engine.get_num_unfinished_requests()),
+            "runner_request_count": len(getattr(runner, "requests", {})),
+            "input_batch_num_reqs": int(getattr(input_batch, "num_reqs", 0)),
+            "hspec_collection_enabled": bool(getattr(runner, "_hspec_collect", False)),
+            "allocator": _allocator_summary(),
+            **extra,
+        }
+        return record
+
+    @staticmethod
+    def _digest(record: dict[str, Any], name: str) -> str | None:
+        value = record.get(name)
+        return value.get("sha256") if isinstance(value, dict) else None
+
+    def _require_clean(self, record: dict[str, Any], event: str) -> None:
+        dirty = {
+            name: record[name]
+            for name in ("unfinished_requests", "runner_request_count", "input_batch_num_reqs")
+            if record[name] != 0
+        }
+        if self.strict and dirty:
+            raise RuntimeError(f"Phase-3 {event} request state is not clean: {dirty}")
+
+    def _check_parallel_draft(self, record: dict[str, Any]) -> None:
+        if self.method not in {"dflash", "dspark"}:
+            return
+        if self.strict and record["draft_checkpoint_load_count"] != 1:
+            raise RuntimeError(
+                "Phase-3 draft must be loaded exactly once; got "
+                f"{record['draft_checkpoint_load_count']!r}"
+            )
+        if self.strict and record["hspec_collection_enabled"]:
+            raise RuntimeError(f"HSpec collection leaked into {self.method}")
+        digest = self._digest(record, "draft_checksum")
+        if digest is None:
+            return
+        if self._draft_reference is None:
+            self._draft_reference = digest
+        elif self.strict and digest != self._draft_reference:
+            raise RuntimeError(
+                f"{self.method} immutable draft checksum changed across the RL lifecycle"
+            )
+
+    def after_load(self, inference_engine) -> None:
+        if not self.enabled:
+            return
+        record = self._snapshot(inference_engine, "after_load")
+        self._check_parallel_draft(record)
+        self._require_clean(record, "after_load")
+        self._write(record)
+
+    def after_wake(self, inference_engine, tags: list[str]) -> None:
+        if not self.enabled:
+            return
+        event = "after_wake_weights" if "weights" in tags else "after_wake_kv"
+        record = self._snapshot(
+            inference_engine,
+            event,
+            checksum_weights=event == "after_wake_weights",
+            tags=list(tags),
+        )
+        self._check_parallel_draft(record)
+        if event == "after_wake_kv":
+            allocator = record["allocator"]
+            signature = allocator.get("kv_pointer_sha256") if allocator.get("available") else None
+            if self._kv_pointer_reference is None:
+                self._kv_pointer_reference = signature
+            elif self.strict and signature != self._kv_pointer_reference:
+                raise RuntimeError("KV virtual allocation identity changed across wake cycles")
+        self._write(record)
+
+    def after_target_update(self, inference_engine) -> None:
+        if not self.enabled:
+            return
+        self.target_updates += 1
+        record = self._snapshot(inference_engine, "after_target_update")
+        self._check_parallel_draft(record)
+        digest = self._digest(record, "target_checksum")
+        if self.strict and self._target_sync_reference == digest:
+            raise RuntimeError("target checksum did not change after an actor update")
+        self._target_sync_reference = digest
+        self._write(record)
+
+    def before_rollout(self, inference_engine) -> None:
+        if not self.enabled:
+            return
+        if self.strict and self.target_updates != self.rollouts + 1:
+            raise RuntimeError(
+                "Phase-3 lifecycle must synchronize target weights exactly once "
+                "before each rollout"
+            )
+        record = self._snapshot(
+            inference_engine, "before_rollout", checksum_weights=False
+        )
+        self._check_parallel_draft(record)
+        self._require_clean(record, "before_rollout")
+        self._write(record)
+
+    def after_rollout(self, inference_engine) -> None:
+        if not self.enabled:
+            return
+        record = self._snapshot(inference_engine, "after_rollout")
+        self._check_parallel_draft(record)
+        self._require_clean(record, "after_rollout")
+        self._write(record)
+        self.rollouts += 1
+
+    def after_sleep(self, *, reset_prefix_cache_succeeded: bool) -> None:
+        if not self.enabled:
+            return
+        allocator = _allocator_summary()
+        weights = allocator.get("by_tag", {}).get("weights", {})
+        kv_cache = allocator.get("by_tag", {}).get("kv_cache", {})
+        record = {
+            "event": "after_sleep",
+            "target_updates": self.target_updates,
+            "rollouts": self.rollouts,
+            "reset_prefix_cache_succeeded": bool(reset_prefix_cache_succeeded),
+            "allocator": allocator,
+        }
+        if self.strict and not reset_prefix_cache_succeeded:
+            raise RuntimeError("prefix/request cache reset failed before sleep")
+        if self.strict and self.method in {"dflash", "dspark"}:
+            if weights.get("bytes", 0) and weights.get("backed_bytes", 0) != weights.get("bytes", 0):
+                raise RuntimeError("sleep did not back all weight-tag allocations")
+            if kv_cache.get("backed_bytes", 0) != 0:
+                raise RuntimeError("KV cache was copied to CPU instead of discarded")
+        self._write(record)
