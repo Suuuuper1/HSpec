@@ -66,6 +66,13 @@ fi
 
 METHOD="null"
 DRAFT_MODEL="null"
+# Phase-3 is a frozen certification launcher.  Remove caller leftovers before
+# selecting an arm so neural/baseline jobs cannot inherit HSpec behavior and
+# the HSpec job uses only the explicitly declared configuration below.
+for PHASE3_ENV_NAME in "${!HSPEC_@}"; do
+    unset "${PHASE3_ENV_NAME}"
+done
+unset PHASE3_ENV_NAME
 RAY_ENV_ARGS=(
     "+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_LEVEL=INFO"
     "+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOG_STATS_INTERVAL='0.1'"
@@ -103,22 +110,26 @@ elif [[ "${ARM}" == "hspec" ]]; then
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RUN_UID=${HSPEC_RUN_UID}"
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DIR=${HSPEC_STORE_DIR}"
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TABLE_STORE_DIR=${HSPEC_TABLE_STORE_DIR}"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_INFER_TP=1"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUM_SHARDS=1"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SINGLE_NODE_ONLY=1"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TOPOLOGY_STRICT=1"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS=1"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LEGACY_DATAPROTO_HS=0"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STRICT_DESCRIPTOR_MODE=1"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STRICT_PROMPT_ID_ON_SEAL=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_INFER_TP='1'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUM_SHARDS='1'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_SINGLE_NODE_ONLY='1'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TOPOLOGY_STRICT='1'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_REQUIRE_EXPLICIT_NUM_SHARDS='1'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LEGACY_DATAPROTO_HS='0'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STRICT_DESCRIPTOR_MODE='1'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STRICT_PROMPT_ID_ON_SEAL='1'"
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TABLE_PREFETCH_MODE=descriptor"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_FULL_BATCH_PREFETCH=1"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_COPY_STREAM=1"
-        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_BYTES=268435456"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_FULL_BATCH_PREFETCH='1'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_COPY_STREAM='1'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_BYTES='268435456'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_CLEAN_STORE_ON_START='1'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_CLEAN_RAW_STORE_ON_START='1'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_CLEAN_TABLE_STORE_ON_START='1'"
     )
 else
-    # Neural and baseline arms must not create or consume HSpec stores.
-    unset HSPEC_STORE_DIR HSPEC_TABLE_STORE_DIR HSPEC_RUN_UID HSPEC_NUM_SHARDS
+    # Neural and baseline arms must not create or consume HSpec stores.  All
+    # caller-provided HSPEC_* values were removed before arm selection.
+    :
 fi
 
 echo "PHASE3_ARM_BEGIN arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS}"

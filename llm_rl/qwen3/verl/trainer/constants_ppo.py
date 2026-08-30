@@ -14,6 +14,8 @@
 
 import json
 import os
+from collections.abc import Mapping
+from typing import Any
 
 from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
 
@@ -50,3 +52,49 @@ def get_ppo_ray_runtime_env():
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
     return runtime_env
+
+
+def normalize_ray_runtime_env(runtime_env: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize Hydra scalars at Ray's string-only environment ABI.
+
+    Hydra preserves unquoted CLI values as Python scalars, while Ray requires
+    every runtime environment variable key and value to be a string.  Numeric
+    and boolean scalars have an unambiguous shell representation; structured
+    values and null remain configuration errors.
+    """
+    if not isinstance(runtime_env, Mapping):
+        raise TypeError(
+            "Ray runtime_env must be a mapping, "
+            f"got {type(runtime_env).__name__}"
+        )
+
+    normalized = dict(runtime_env)
+    raw_env_vars = normalized.get("env_vars")
+    if raw_env_vars is None:
+        return normalized
+    if not isinstance(raw_env_vars, Mapping):
+        raise TypeError(
+            "Ray runtime_env.env_vars must be a mapping, "
+            f"got {type(raw_env_vars).__name__}"
+        )
+
+    env_vars: dict[str, str] = {}
+    for key, value in raw_env_vars.items():
+        if not isinstance(key, str):
+            raise TypeError(
+                "Ray runtime_env.env_vars keys must be strings, "
+                f"got {key!r} ({type(key).__name__})"
+            )
+        if isinstance(value, str):
+            env_vars[key] = value
+        elif isinstance(value, bool):
+            env_vars[key] = "1" if value else "0"
+        elif isinstance(value, (int, float)):
+            env_vars[key] = str(value)
+        else:
+            raise TypeError(
+                "Ray runtime_env.env_vars values must be string-compatible "
+                f"scalars; {key} has {type(value).__name__}"
+            )
+    normalized["env_vars"] = env_vars
+    return normalized

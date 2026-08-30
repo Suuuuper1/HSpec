@@ -23,7 +23,10 @@ import ray
 from omegaconf import OmegaConf
 
 from verl.experimental.dataset.sampler import AbstractSampler
-from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+from verl.trainer.constants_ppo import (
+    get_ppo_ray_runtime_env,
+    normalize_ray_runtime_env,
+)
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
@@ -71,8 +74,12 @@ def run_ppo(config) -> None:
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = OmegaConf.to_container(ray_init_kwargs)
+        ray_init_kwargs["runtime_env"] = normalize_ray_runtime_env(
+            ray_init_kwargs["runtime_env"]
+        )
         print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray.init(**ray_init_kwargs)
 
     if resolve_rollout_speculative_method(config.actor_rollout_ref.rollout) == "hspec":
         from vllm_ascend.spec_decode.hspec_table import (
