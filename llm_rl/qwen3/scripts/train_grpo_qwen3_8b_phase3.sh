@@ -43,7 +43,14 @@ mkdir -p "${ARM_DIR}" "${LIFECYCLE_DIR}" "${RAY_TMPDIR}"
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export HYDRA_FULL_ERROR=1
 export VLLM_USE_V1=1
-export VLLM_LOG_STATS_INTERVAL="${VLLM_LOG_STATS_INTERVAL:-0.1}"
+# R3 consumes vLLM's native INFO-level draft-load and speculative counters.
+# Force the frozen values here and in Ray runtime_env so Verl's WARN default,
+# or a stale caller environment, cannot silently disable the evidence path.
+export VLLM_LOGGING_LEVEL=INFO
+export VLLM_LOG_STATS_INTERVAL=0.1
+export VLLM_CONFIGURE_LOGGING=1
+export VLLM_LOGGING_STREAM='ext://sys.stdout'
+unset VLLM_LOGGING_CONFIG_PATH
 export VLLM_ASCEND_ENABLE_NZ=0
 export VLLM_ASCEND_STRICT_FULL_GRAPH=1
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
@@ -59,7 +66,12 @@ fi
 
 METHOD="null"
 DRAFT_MODEL="null"
-RAY_ENV_ARGS=()
+RAY_ENV_ARGS=(
+    "+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_LEVEL=INFO"
+    "+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOG_STATS_INTERVAL='0.1'"
+    "+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_CONFIGURE_LOGGING='1'"
+    "+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_STREAM=ext://sys.stdout"
+)
 if [[ "${ARM}" == "dflash" ]]; then
     METHOD="dflash"
     DRAFT_MODEL="${DFLASH_MODEL}"
@@ -87,7 +99,7 @@ elif [[ "${ARM}" == "hspec" ]]; then
     export HSPEC_CLEAN_RAW_STORE_ON_START=1
     export HSPEC_CLEAN_TABLE_STORE_ON_START=1
     mkdir -p "${HSPEC_STORE_DIR}" "${HSPEC_TABLE_STORE_DIR}"
-    RAY_ENV_ARGS=(
+    RAY_ENV_ARGS+=(
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_RUN_UID=${HSPEC_RUN_UID}"
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_STORE_DIR=${HSPEC_STORE_DIR}"
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TABLE_STORE_DIR=${HSPEC_TABLE_STORE_DIR}"
@@ -111,6 +123,7 @@ fi
 
 echo "PHASE3_ARM_BEGIN arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS}"
 echo "PHASE3_RAY_TMPDIR path=${RAY_TMPDIR} bytes=${RAY_TMPDIR_BYTES} max_bytes=${RAY_TMPDIR_MAX_BYTES}"
+echo "PHASE3_OBSERVABILITY VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL} VLLM_LOG_STATS_INTERVAL=${VLLM_LOG_STATS_INTERVAL} VLLM_CONFIGURE_LOGGING=${VLLM_CONFIGURE_LOGGING} VLLM_LOGGING_CONFIG_PATH=${VLLM_LOGGING_CONFIG_PATH:-none} VLLM_LOGGING_STREAM=stdout ray_runtime_override=INFO"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
