@@ -102,6 +102,15 @@ elif [[ "${ARM}" == "hspec" ]]; then
     export HSPEC_FULL_BATCH_PREFETCH=1
     export HSPEC_ASYNC_HS_COPY_STREAM=1
     export HSPEC_PINNED_POOL_BYTES=268435456
+    # Keep fp16 table storage, but materialize proposer keys as fp32 before
+    # Numba packing, matching the production HSpec launchers.
+    export HSPEC_TABLE_KEYS_DTYPE=float16
+    export HSPEC_PROPOSER_KEYS_CPU_DTYPE=float32
+    export HSPEC_PROPOSER_KEYS_DEVICE_DTYPE=float32
+    export HSPEC_DISABLE_NUMBA_REBUILD=0
+    export HSPEC_NUMBA_REBUILD_MIN_ROWS=0
+    export HSPEC_NUMBA_REBUILD_MIN_ELEMS=0
+    export HSPEC_LOG_LEVEL=INFO
     export HSPEC_CLEAN_STORE_ON_START=1
     export HSPEC_CLEAN_RAW_STORE_ON_START=1
     export HSPEC_CLEAN_TABLE_STORE_ON_START=1
@@ -122,6 +131,13 @@ elif [[ "${ARM}" == "hspec" ]]; then
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_FULL_BATCH_PREFETCH='1'"
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_COPY_STREAM='1'"
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PINNED_POOL_BYTES='268435456'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_TABLE_KEYS_DTYPE=float16"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROPOSER_KEYS_CPU_DTYPE=float32"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_PROPOSER_KEYS_DEVICE_DTYPE=float32"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_DISABLE_NUMBA_REBUILD='0'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUMBA_REBUILD_MIN_ROWS='0'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_NUMBA_REBUILD_MIN_ELEMS='0'"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_LOG_LEVEL=INFO"
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_CLEAN_STORE_ON_START='1'"
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_CLEAN_RAW_STORE_ON_START='1'"
         "+ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_CLEAN_TABLE_STORE_ON_START='1'"

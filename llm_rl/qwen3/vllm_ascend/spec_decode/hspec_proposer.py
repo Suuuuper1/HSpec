@@ -278,12 +278,61 @@ if _HSPEC_NUMBA_AVAILABLE:
             key_lengths_cpu[row] = m_i
 
 
+_HSPEC_NUMBA_ARRAY_DTYPES = frozenset(
+    np.dtype(dtype)
+    for dtype in (
+        np.bool_,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.float32,
+        np.float64,
+    )
+)
+
+
+def _hspec_numba_array_list_compatible(arrays: Sequence[np.ndarray]) -> bool:
+    """Return whether arrays share a Numba typed-list-compatible ABI.
+
+    Numba exposes ``float16`` as a scalar type but cannot lower NumPy arrays
+    containing it. HSpec tables intentionally use fp16 on disk, so reject the
+    unsupported layout before typed-list construction and let callers use the
+    exact NumPy packing path.
+    """
+    if not _HSPEC_NUMBA_AVAILABLE or NumbaList is None or not arrays:
+        return False
+    first = arrays[0]
+    if not isinstance(first, np.ndarray):
+        return False
+    signature = (first.dtype, first.ndim, bool(first.flags.writeable))
+    if first.dtype not in _HSPEC_NUMBA_ARRAY_DTYPES or not first.flags.c_contiguous:
+        return False
+    return all(
+        isinstance(array, np.ndarray)
+        and array.dtype in _HSPEC_NUMBA_ARRAY_DTYPES
+        and (array.dtype, array.ndim, bool(array.flags.writeable)) == signature
+        and array.flags.c_contiguous
+        for array in arrays[1:]
+    )
+
+
 def _hspec_make_numba_array_list(arrays: List[np.ndarray]):
-    if not _HSPEC_NUMBA_AVAILABLE or NumbaList is None:
+    if not _hspec_numba_array_list_compatible(arrays):
         return None
-    typed_list = NumbaList()
-    for arr in arrays:
-        typed_list.append(arr)
+    try:
+        typed_list = NumbaList()
+        for arr in arrays:
+            typed_list.append(arr)
+    except Exception:
+        # Numba is an optional packing accelerator. A version-specific typing
+        # or lowering limitation must not make speculative decoding fail.
+        logger.debug("HSpec: Numba array-list construction failed", exc_info=True)
+        return None
     return typed_list
 
 
@@ -4388,14 +4437,29 @@ class HSpecProposer(Proposer):
                 keys_list = _hspec_make_numba_array_list(
                     [cached.keys_cpu[:cached.n_entries] for cached in cached_tables])
                 if comp_list is not None and keys_list is not None:
-                    _hspec_fill_batched_components_keys_numba(
-                        comp_list,
-                        keys_list,
-                        components_t_batch_cpu,
-                        keys_batch_cpu,
-                        key_lengths_cpu,
-                    )
+                    try:
+                        _hspec_fill_batched_components_keys_numba(
+                            comp_list,
+                            keys_list,
+                            components_t_batch_cpu,
+                            keys_batch_cpu,
+                            key_lengths_cpu,
+                        )
+                    except Exception:
+                        # Fail open to the equivalent NumPy slice-copy path and
+                        # avoid retrying a broken optional accelerator.
+                        logger.warning(
+                            "HSpec: Numba batch rebuild failed; disabling it "
+                            "for this proposer",
+                            exc_info=True,
+                        )
+                        self._record_proposer_metric(
+                            "numba_rebuild_runtime_fallback_count", 1)
+                        self._use_numba_rebuild = False
+                        use_numba = False
                 else:
+                    self._record_proposer_metric(
+                        "numba_rebuild_dtype_fallback_count", 1)
                     use_numba = False
             if not use_numba:
                 for row, cached in enumerate(cached_tables):
