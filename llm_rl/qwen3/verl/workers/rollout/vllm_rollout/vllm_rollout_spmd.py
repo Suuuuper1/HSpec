@@ -754,6 +754,15 @@ class vLLMRollout(BaseRollout):
                             "hspec_finalize_rollout_round",
                             args=(),
                         )
+                if (
+                    self._resolved_speculation.method in {"dflash", "dspark"}
+                    and self._resolved_speculation.manifest.get("draft_sample_method")
+                    == "probabilistic"
+                ):
+                    self.inference_engine.llm_engine.collective_rpc(
+                        "clear_draft_probability_cache",
+                        args=(),
+                    )
                 self._lifecycle_audit.after_rollout(self.inference_engine)
                 if self._lifecycle_audit.enabled:
                     logger.warning(

@@ -224,6 +224,7 @@ class RolloutConfig(BaseConfig):
     num_speculative_tokens: int = 7
     draft_tensor_parallel_size: int = 1
     draft_sample_method: str = "greedy"
+    draft_probability_max_memory_mb: int = 2048
     draft_load_format: str = "auto"
     rejection_sample_method: str = "standard"
     speculative_enforce_eager: bool = True
@@ -262,14 +263,25 @@ class RolloutConfig(BaseConfig):
                 raise NotImplementedError(
                     "Phase-3 DFlash/DSpark supports draft_tensor_parallel_size=1 only"
                 )
+            if (
+                self.draft_sample_method == "probabilistic"
+                and self.tensor_model_parallel_size != 1
+            ):
+                raise NotImplementedError(
+                    "DFlash/DSpark probabilistic proposal requires target "
+                    "tensor_model_parallel_size=1 until cross-rank RNG/proposal "
+                    "equivalence is certified"
+                )
             if self.pipeline_model_parallel_size != 1 or self.data_parallel_size != 1:
                 raise NotImplementedError(
                     "Phase-3 DFlash/DSpark supports vLLM PP=1 and DP=1 only"
                 )
-            if self.draft_sample_method != "greedy":
+            if self.draft_sample_method not in {"greedy", "probabilistic"}:
                 raise NotImplementedError(
-                    "Phase-3 DFlash/DSpark supports greedy draft proposal only"
+                    "DFlash/DSpark draft_sample_method must be greedy or probabilistic"
                 )
+            if self.draft_probability_max_memory_mb <= 0:
+                raise ValueError("draft_probability_max_memory_mb must be positive")
             if self.rejection_sample_method != "standard":
                 raise NotImplementedError(
                     "Phase-3 DFlash/DSpark requires standard rejection sampling"

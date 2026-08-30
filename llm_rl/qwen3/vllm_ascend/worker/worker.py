@@ -20,7 +20,7 @@
 import copy
 import gc
 from types import NoneType
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -403,6 +403,12 @@ class NPUWorker(WorkerBase):
                 "trace_orphans": 0,
             }
         return self.model_runner.hspec_finalize_rollout_round(reason)
+
+    def clear_draft_probability_cache(self) -> dict[str, Any] | None:
+        """Drop terminal proposal probabilities at a completed rollout boundary."""
+        if not hasattr(self.model_runner, "clear_draft_probability_cache"):
+            return None
+        return self.model_runner.clear_draft_probability_cache()
 
     def shutdown(self) -> None:
         try:

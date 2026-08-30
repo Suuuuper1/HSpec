@@ -219,6 +219,11 @@ class SpeculativeLifecycleAudit:
             getattr(runner, "vllm_config", None), "compilation_config", None
         )
         cudagraph_mode = getattr(compilation, "cudagraph_mode", None)
+        probability_cache = (
+            runner.draft_probability_cache_snapshot()
+            if hasattr(runner, "draft_probability_cache_snapshot")
+            else None
+        )
         record = {
             "event": event,
             "target_updates": self.target_updates,
@@ -239,6 +244,7 @@ class SpeculativeLifecycleAudit:
             "input_batch_request_ids": input_batch_request_ids,
             "request_identities_available": request_identities_available,
             "hspec_collection_enabled": bool(getattr(runner, "_hspec_collect", False)),
+            "draft_probability_cache": probability_cache,
             "allocator": _allocator_summary(),
             **extra,
         }
@@ -305,6 +311,21 @@ class SpeculativeLifecycleAudit:
             )
         if self.strict and record["hspec_collection_enabled"]:
             raise RuntimeError(f"HSpec collection leaked into {self.method}")
+        probability_cache = record.get("draft_probability_cache")
+        if (
+            self.strict
+            and self.manifest.get("draft_sample_method") == "probabilistic"
+            and (
+                not isinstance(probability_cache, dict)
+                or not probability_cache.get("enabled", False)
+                or probability_cache.get("current_bytes") != 0
+                or probability_cache.get("cached_request_count") != 0
+            )
+        ):
+            raise RuntimeError(
+                "Phase-4 probabilistic q cache is unavailable or non-empty at "
+                f"lifecycle event {record['event']}"
+            )
         digest = self._digest(record, "draft_checksum")
         if digest is None:
             return

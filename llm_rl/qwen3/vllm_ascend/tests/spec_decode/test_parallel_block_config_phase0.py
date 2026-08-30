@@ -193,6 +193,35 @@ def test_certified_k_boundaries_fail_with_npu_limit(
         _spec(checkpoint_paths, method, num_speculative_tokens=k)
 
 
+@pytest.mark.parametrize("method", ["dflash", "dspark"])
+def test_probabilistic_config_requires_explicit_memory_budget(checkpoint_paths, method):
+    with pytest.raises(ValueError, match="explicit.*budget"):
+        _spec(checkpoint_paths, method, draft_sample_method="probabilistic")
+    spec = _spec(
+        checkpoint_paths,
+        method,
+        draft_sample_method="probabilistic",
+        draft_probability_max_bytes=64 * 1024 * 1024,
+    )
+    assert spec.draft_sample_method == "probabilistic"
+    assert spec.draft_probability_max_bytes == 64 * 1024 * 1024
+    with pytest.raises(ValueError, match="only valid"):
+        _spec(checkpoint_paths, method, draft_probability_max_bytes=1024)
+
+
+@pytest.mark.parametrize("method", ["dflash", "dspark"])
+def test_probabilistic_config_rejects_uncertified_cross_rank_rng(checkpoint_paths, method):
+    with pytest.raises(NotImplementedError, match="target TP=1 and draft TP=1"):
+        _spec(
+            checkpoint_paths,
+            method,
+            draft_sample_method="probabilistic",
+            draft_probability_max_bytes=64 * 1024 * 1024,
+            draft_tensor_parallel_size=1,
+            target_parallel_config=ParallelConfig(tensor_parallel_size=2),
+        )
+
+
 def test_vllm_scope_gates_and_geometry(checkpoint_paths):
     target, _, _ = checkpoint_paths
     target_config = _target(target)

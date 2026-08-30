@@ -121,6 +121,7 @@ from vllm_ascend.spec_decode.hspec_utils import hspec_record_function
 from vllm_ascend.spec_decode.interface import SpecDcodeType
 from vllm_ascend.spec_decode.medusa_proposer import MedusaProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
+from vllm_ascend.spec_decode.probabilistic import DraftProbabilityCache
 from vllm_ascend.utils import (AscendDeviceType, ProfileExecuteDuration,
                                enable_sp, get_ascend_device_type,
                                is_drafter_moe_model, is_moe_model,
@@ -478,6 +479,27 @@ class NPUModelRunner(GPUModelRunner):
             self.actual_seq_lengths_q = list(
                 range(self.decode_token_per_req, self.max_num_tokens + 1,
                       self.decode_token_per_req))
+        probabilistic = bool(
+            self.speculative_config is not None
+            and self.speculative_config.uses_parallel_block_drafter()
+            and self.speculative_config.draft_sample_method == "probabilistic"
+        )
+        probability_k = (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config is not None
+            and self.speculative_config.uses_parallel_block_drafter()
+            else 1
+        )
+        probability_vocab = (
+            self.speculative_config.draft_model_config.get_vocab_size()
+            if probabilistic
+            else 1
+        )
+        self._draft_probability_cache = DraftProbabilityCache(
+            enabled=probabilistic,
+            num_speculative_tokens=probability_k,
+            vocab_size=probability_vocab,
+        )
         self._hspec_collect = (
             self.speculative_config is not None
             and getattr(self.speculative_config, "method", "") == "hspec"
@@ -1663,6 +1685,8 @@ class NPUModelRunner(GPUModelRunner):
         aux_hidden_states: torch.Tensor = None,
         sample_hidden_states: torch.Tensor = None
     ) -> Optional[list[list[int]]]:
+        if self._draft_probability_cache.enabled:
+            self._draft_probability_cache.begin_proposal()
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -1885,6 +1909,30 @@ class NPUModelRunner(GPUModelRunner):
                         else None
                     ),
                 )
+                if (
+                    self.speculative_config.uses_parallel_block_drafter()
+                    and self._draft_probability_cache.enabled
+                ):
+                    probabilities = self.drafter.take_last_draft_probs()
+                    should_publish = (
+                        not sampling_metadata.all_greedy
+                    )
+                    if should_publish:
+                        self._draft_probability_cache.publish(
+                            probabilities,
+                            self.input_batch.req_ids[: draft_token_ids.shape[0]],
+                        )
+                        snapshot = self._draft_probability_cache.snapshot()
+                        if snapshot["generation"] == 1 or snapshot["generation"] % 128 == 0:
+                            logger.info(
+                                "PHASE4_Q_PUBLISH method=%s generation=%d requests=%d "
+                                "bytes=%d validation_syncs=%d",
+                                self.speculative_config.method,
+                                snapshot["generation"],
+                                snapshot["cached_request_count"],
+                                snapshot["current_bytes"],
+                                snapshot["validation_sync_count"],
+                            )
 
             else:
                 raise ValueError("Unknown speculative decoding method: "
@@ -2404,6 +2452,8 @@ class NPUModelRunner(GPUModelRunner):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
+            if self._draft_probability_cache.enabled:
+                self._draft_probability_cache.begin_proposal()
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[:self.input_batch.num_reqs]
             return self.sampler(
@@ -2422,9 +2472,30 @@ class NPUModelRunner(GPUModelRunner):
                 "hspec/verification/rejection_sampler", use_npu_stream=True
             ),
         ):
+            require_probabilities = (
+                self._draft_probability_cache.enabled
+                and not sampling_metadata.all_greedy
+            )
+            draft_probs = None
+            if self._draft_probability_cache.enabled:
+                draft_probs = self._draft_probability_cache.consume(
+                    self.input_batch.req_ids,
+                    spec_decode_metadata.num_draft_tokens,
+                    require_probabilities=require_probabilities,
+                )
+            if require_probabilities:
+                generation = self._draft_probability_cache.generation
+                if generation == 1 or generation % 128 == 0:
+                    logger.info(
+                        "PHASE4_Q_CONSUME method=%s generation=%d rows=%d vocab=%d",
+                        self.speculative_config.method,
+                        generation,
+                        0 if draft_probs is None else draft_probs.shape[0],
+                        0 if draft_probs is None else draft_probs.shape[1],
+                    )
             sampler_output = self.rejection_sampler(
                 spec_decode_metadata,
-                None,  # draft_probs
+                draft_probs,
                 logits,
                 sampling_metadata,
             )
@@ -2453,6 +2524,13 @@ class NPUModelRunner(GPUModelRunner):
             self._update_states_after_model_execute(
                 sampler_output.sampled_token_ids)
         return sampler_output
+
+    def draft_probability_cache_snapshot(self) -> dict[str, Any]:
+        return self._draft_probability_cache.snapshot()
+
+    def clear_draft_probability_cache(self) -> dict[str, Any]:
+        self._draft_probability_cache.begin_proposal()
+        return self._draft_probability_cache.snapshot()
 
     # TODO: remove this func after eagle_proposer is refactored and
     #  _bookkeeping_sync is moved after propose_draft_token_ids

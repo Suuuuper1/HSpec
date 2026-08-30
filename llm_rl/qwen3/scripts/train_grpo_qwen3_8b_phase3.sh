@@ -25,12 +25,22 @@ DSPARK_MODEL="${PHASE3_DSPARK_MODEL:-/home/data/Qwen3-8B-dspark}"
 TRAIN_FILE="${PHASE3_TRAIN_FILE:-/home/xy/gsm8k/train.parquet}"
 VAL_FILE="${PHASE3_VAL_FILE:-/home/xy/gsm8k/test.parquet}"
 TOTAL_STEPS="${PHASE3_TOTAL_STEPS:-3}"
+DRAFT_SAMPLE_METHOD="${PHASE3_DRAFT_SAMPLE_METHOD:-greedy}"
+DRAFT_PROBABILITY_MAX_MEMORY_MB="${PHASE3_DRAFT_PROBABILITY_MAX_MEMORY_MB:-2048}"
 LIFECYCLE_DIR="${ARM_DIR}/lifecycle"
 RAY_TMPDIR="${PHASE3_RAY_TMPDIR:-/dev/shm/p3r3/manual/${ARM_CODE}}"
 RAY_TMPDIR_MAX_BYTES="${PHASE3_RAY_TMPDIR_MAX_BYTES:-31}"
 RAY_TMPDIR_BYTES=$(LC_ALL=C printf '%s' "${RAY_TMPDIR}" | wc -c)
 if ! [[ "${RAY_TMPDIR_MAX_BYTES}" =~ ^[0-9]+$ ]]; then
     echo "PHASE3_RAY_TMPDIR_MAX_BYTES must be a non-negative integer" >&2
+    exit 2
+fi
+if [[ "${DRAFT_SAMPLE_METHOD}" != "greedy" && "${DRAFT_SAMPLE_METHOD}" != "probabilistic" ]]; then
+    echo "PHASE3_DRAFT_SAMPLE_METHOD must be greedy or probabilistic" >&2
+    exit 2
+fi
+if ! [[ "${DRAFT_PROBABILITY_MAX_MEMORY_MB}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PHASE3_DRAFT_PROBABILITY_MAX_MEMORY_MB must be a positive integer" >&2
     exit 2
 fi
 if (( RAY_TMPDIR_BYTES > RAY_TMPDIR_MAX_BYTES )); then
@@ -148,7 +158,7 @@ else
     :
 fi
 
-echo "PHASE3_ARM_BEGIN arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS}"
+echo "PHASE3_ARM_BEGIN arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS} draft_sample_method=${DRAFT_SAMPLE_METHOD}"
 echo "PHASE3_RAY_TMPDIR path=${RAY_TMPDIR} bytes=${RAY_TMPDIR_BYTES} max_bytes=${RAY_TMPDIR_MAX_BYTES}"
 echo "PHASE3_OBSERVABILITY VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL} VLLM_LOG_STATS_INTERVAL=${VLLM_LOG_STATS_INTERVAL} VLLM_CONFIGURE_LOGGING=${VLLM_CONFIGURE_LOGGING} VLLM_LOGGING_CONFIG_PATH=${VLLM_LOGGING_CONFIG_PATH:-none} VLLM_LOGGING_STREAM=stdout ray_runtime_override=INFO"
 
@@ -202,7 +212,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.speculative_model="${DRAFT_MODEL}" \
     actor_rollout_ref.rollout.num_speculative_tokens=7 \
     actor_rollout_ref.rollout.draft_tensor_parallel_size=1 \
-    actor_rollout_ref.rollout.draft_sample_method=greedy \
+    actor_rollout_ref.rollout.draft_sample_method="${DRAFT_SAMPLE_METHOD}" \
+    actor_rollout_ref.rollout.draft_probability_max_memory_mb="${DRAFT_PROBABILITY_MAX_MEMORY_MB}" \
     actor_rollout_ref.rollout.draft_load_format=auto \
     actor_rollout_ref.rollout.rejection_sample_method=standard \
     actor_rollout_ref.rollout.speculative_enforce_eager=True \
@@ -233,4 +244,4 @@ python3 -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECULATIVE_LIFECYCLE_DIR="${LIFECYCLE_DIR}" \
     "${RAY_ENV_ARGS[@]}"
 
-echo "PHASE3_ARM_END arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS}"
+echo "PHASE3_ARM_END arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS} draft_sample_method=${DRAFT_SAMPLE_METHOD}"

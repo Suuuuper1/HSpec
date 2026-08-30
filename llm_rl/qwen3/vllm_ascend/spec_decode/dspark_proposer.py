@@ -5,8 +5,10 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
+from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_ascend.spec_decode.dflash_proposer import DFlashProposer
+from vllm_ascend.spec_decode.probabilistic import sample_draft_logits
 
 
 def dspark_markov_greedy(
@@ -63,6 +65,73 @@ def dspark_markov_greedy(
             out=tokens[:, position + 1],
         )
     return model.map_draft_to_target(tokens[:, 1:])
+
+
+def dspark_markov_probabilistic(
+    model: Qwen3DSparkForCausalLM,
+    sample_hidden_states: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    num_speculative_tokens: int,
+    token_buffer: torch.Tensor,
+    embedding_buffer: torch.Tensor,
+    corrected_logits_buffer: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Apply sequential Markov feedback and preserve every sampled q row."""
+    batch_size = anchor_token_ids.numel()
+    if sample_hidden_states.shape[0] != batch_size * num_speculative_tokens:
+        raise ValueError(
+            "DSpark sampled hidden row count must be B*K: "
+            f"{sample_hidden_states.shape[0]} != {batch_size}*{num_speculative_tokens}"
+        )
+    if sampling_metadata.temperature is None:
+        raise RuntimeError("DSpark probabilistic proposal requires temperatures")
+    tokens = token_buffer[:batch_size, : num_speculative_tokens + 1]
+    tokens[:, 0].copy_(anchor_token_ids)
+    embedding = embedding_buffer[:batch_size]
+    corrected = corrected_logits_buffer[:batch_size]
+    base_logits = model.compute_draft_logits(sample_hidden_states)
+    vocab_size = corrected.shape[1]
+    if tuple(base_logits.shape) != (
+        batch_size * num_speculative_tokens,
+        vocab_size,
+    ):
+        raise ValueError(
+            "DSpark base logits/probability vocabulary mismatch: "
+            f"{tuple(base_logits.shape)}"
+        )
+    base_logits = base_logits.view(batch_size, num_speculative_tokens, vocab_size)
+    probabilities = (
+        None
+        if sampling_metadata.all_greedy
+        else torch.empty(
+            batch_size,
+            num_speculative_tokens,
+            vocab_size,
+            dtype=torch.float32,
+            device=base_logits.device,
+        )
+    )
+    for position in range(num_speculative_tokens):
+        model.markov_embed_into(tokens[:, position], embedding)
+        model.markov_bias_into(embedding, corrected)
+        corrected.add_(base_logits[:, position])
+        token_ids, step_probabilities = sample_draft_logits(
+            corrected,
+            sampling_metadata.temperature,
+            rows_per_request=1,
+            all_greedy=sampling_metadata.all_greedy,
+            all_random=sampling_metadata.all_random,
+            generators=sampling_metadata.generators,
+        )
+        tokens[:, position + 1].copy_(token_ids)
+        if probabilities is not None:
+            if step_probabilities is None:
+                raise RuntimeError(
+                    "DSpark probabilistic Markov step produced no probabilities"
+                )
+            probabilities[:, position].copy_(step_probabilities)
+    return model.map_draft_to_target(tokens[:, 1:]), probabilities
 
 
 class DSparkProposer(DFlashProposer):
@@ -126,10 +195,22 @@ class DSparkProposer(DFlashProposer):
         self,
         sample_hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor | None,
+        sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor:
         if anchor_token_ids is None:
             raise ValueError("DSpark Markov proposal requires anchor token ids")
-        return dspark_markov_greedy(
+        if not getattr(self, "_probabilistic", False) or sampling_metadata is None:
+            self._last_draft_probs = None
+            return dspark_markov_greedy(
+                self.model,
+                sample_hidden_states,
+                anchor_token_ids,
+                self.num_speculative_tokens,
+                self._dspark_token_buffer,
+                self._dspark_embedding_buffer,
+                self._dspark_corrected_logits_buffer,
+            )
+        tokens, self._last_draft_probs = dspark_markov_probabilistic(
             self.model,
             sample_hidden_states,
             anchor_token_ids,
@@ -137,4 +218,6 @@ class DSparkProposer(DFlashProposer):
             self._dspark_token_buffer,
             self._dspark_embedding_buffer,
             self._dspark_corrected_logits_buffer,
+            sampling_metadata,
         )
+        return tokens

@@ -107,6 +107,7 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
             ),
         }
     elif method in {"dflash", "dspark"}:
+        draft_sample_method = str(config.get("draft_sample_method", "greedy"))
         speculative_config = {
             "model": str(config.get("speculative_model")),
             "method": method,
@@ -114,7 +115,7 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
             "draft_tensor_parallel_size": int(
                 config.get("draft_tensor_parallel_size", 1)
             ),
-            "draft_sample_method": str(config.get("draft_sample_method", "greedy")),
+            "draft_sample_method": draft_sample_method,
             "draft_load_config": LoadConfig(
                 load_format=str(config.get("draft_load_format", "auto"))
             ),
@@ -123,6 +124,10 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
             ),
             "enforce_eager": bool(config.get("speculative_enforce_eager", True)),
         }
+        if draft_sample_method == "probabilistic":
+            speculative_config["draft_probability_max_bytes"] = int(
+                config.get("draft_probability_max_memory_mb", 2048)
+            ) * 1024 * 1024
 
     if speculative_config is not None:
         engine_kwargs["speculative_config"] = speculative_config
@@ -159,6 +164,12 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
         "draft_sample_method": (
             str(config.get("draft_sample_method", "greedy"))
             if method in {"dflash", "dspark"}
+            else None
+        ),
+        "draft_probability_max_memory_mb": (
+            int(config.get("draft_probability_max_memory_mb", 2048))
+            if method in {"dflash", "dspark"}
+            and str(config.get("draft_sample_method", "greedy")) == "probabilistic"
             else None
         ),
         "rejection_sample_method": (

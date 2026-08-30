@@ -303,7 +303,6 @@ class DFlashProposer(ParallelBlockProposer):
         del (
             target_token_ids,
             last_token_indices,
-            sampling_metadata,
             req_scheduled_tokens,
             long_seq_metadata,
             num_prefill_reqs,
@@ -311,6 +310,7 @@ class DFlashProposer(ParallelBlockProposer):
             scheduler_output,
             num_scheduled_tokens,
         )
+        self._last_draft_probs = None
         batch_size = common_attn_metadata.num_reqs
         rejected = self._num_rejected_tokens[:batch_size]
         if num_rejected_tokens_gpu is None:
@@ -366,6 +366,7 @@ class DFlashProposer(ParallelBlockProposer):
                 query_positions,
                 sample_indices,
                 next_token_ids[:batch_size],
+                sampling_metadata,
             )
         draft_token_ids.masked_fill_(
             self._cannot_speculate[:batch_size, None], PAD_SLOT_ID

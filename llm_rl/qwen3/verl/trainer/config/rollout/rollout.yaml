@@ -321,6 +321,7 @@ speculative_model: null
 num_speculative_tokens: 7
 draft_tensor_parallel_size: 1
 draft_sample_method: greedy
+draft_probability_max_memory_mb: 2048
 draft_load_format: auto
 rejection_sample_method: standard
 speculative_enforce_eager: true

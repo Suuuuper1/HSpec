@@ -111,7 +111,11 @@ class SpeculativeConfig:
     """Independent draft-weight loader. Parallel-block drafters must not
     inherit Verl's target-side dummy loader."""
     draft_sample_method: DraftSampleMethod = "greedy"
-    """Draft-token sampling mode. The first certified scope is greedy."""
+    """Draft-token sampling mode."""
+    draft_probability_max_bytes: int | None = Field(default=None, ge=1)
+    """Explicit upper bound for the probabilistic draft working set. Required
+    for DFlash/DSpark probabilistic proposal so an oversized [B,K,V] q buffer is
+    rejected at proposer startup instead of failing inside a rollout."""
     rejection_sample_method: RejectionSampleMethod | None = None
     """Verifier mode. Unset retains the historical mode for old methods and
     resolves to standard rejection for DFlash/DSpark."""
@@ -212,6 +216,8 @@ class SpeculativeConfig:
             self.sample_from_anchor,
             self.needs_aux_hidden_states(),
         ]
+        if self.uses_parallel_block_drafter():
+            factors.append(self.draft_sample_method)
         if self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
             layer_ids = getattr(
@@ -760,10 +766,30 @@ class SpeculativeConfig:
                 f"HSpec and {self.method} configuration are mutually exclusive; "
                 f"remove {sorted(hspec_fields)}"
             )
-        if self.draft_sample_method != "greedy":
+        if self.draft_sample_method not in ("greedy", "probabilistic"):
             raise ValueError(
-                "DFlash/DSpark probabilistic draft sampling is not implemented "
-                "in the Phase 0-3 old-ABI path; use draft_sample_method='greedy'"
+                "DFlash/DSpark draft_sample_method must be 'greedy' or "
+                "'probabilistic'"
+            )
+        if self.draft_sample_method == "probabilistic":
+            if self.draft_probability_max_bytes is None:
+                raise ValueError(
+                    "DFlash/DSpark probabilistic proposal requires an explicit "
+                    "draft_probability_max_bytes startup budget"
+                )
+            if (
+                self.target_parallel_config.tensor_parallel_size != 1
+                or self.draft_parallel_config.tensor_parallel_size != 1
+            ):
+                raise NotImplementedError(
+                    "DFlash/DSpark probabilistic proposal requires target TP=1 "
+                    "and draft TP=1 until cross-rank RNG/proposal equivalence is "
+                    "certified"
+                )
+        elif self.draft_probability_max_bytes is not None:
+            raise ValueError(
+                "draft_probability_max_bytes is only valid with "
+                "draft_sample_method='probabilistic'"
             )
         if self.rejection_sample_method is None:
             self.rejection_sample_method = "standard"
@@ -987,6 +1013,11 @@ class SpeculativeConfig:
                 raise ValueError(
                     "draft_sample_method is only supported for DFlash/DSpark "
                     "in the old-ABI implementation"
+                )
+            if self.draft_probability_max_bytes is not None:
+                raise ValueError(
+                    "draft_probability_max_bytes is only supported for "
+                    "DFlash/DSpark"
                 )
             if self.sample_from_anchor is not None:
                 raise ValueError("sample_from_anchor is only supported for DSpark")

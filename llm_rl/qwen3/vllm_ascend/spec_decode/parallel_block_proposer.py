@@ -15,8 +15,10 @@ from vllm.config import (
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
+from vllm.logger import logger
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.attention.attention_v1 import (
@@ -25,6 +27,10 @@ from vllm_ascend.attention.attention_v1 import (
 )
 from vllm_ascend.ops.triton.spec_decode.utils import compute_rejected_tokens_kernel
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
+from vllm_ascend.spec_decode.probabilistic import (
+    estimate_draft_probability_bytes,
+    sample_draft_logits,
+)
 
 
 class ParallelBlockProposer(EagleProposer):
@@ -52,6 +58,39 @@ class ParallelBlockProposer(EagleProposer):
         self.max_batch_size = runner.max_num_reqs
         self.num_queries = self.speculative_config.parallel_query_count
         self.max_query_tokens = self.max_batch_size * self.num_queries
+        self._probabilistic = (
+            self.speculative_config.draft_sample_method == "probabilistic"
+        )
+        self._last_draft_probs: torch.Tensor | None = None
+        self._draft_probability_memory: dict[str, int] | None = None
+        if self._probabilistic:
+            vocab_size = self.speculative_config.draft_model_config.get_vocab_size()
+            estimate = estimate_draft_probability_bytes(
+                self.max_batch_size,
+                self.num_speculative_tokens,
+                vocab_size,
+                method=self.speculative_config.method,
+            )
+            budget = self.speculative_config.draft_probability_max_bytes
+            if budget is None or estimate["peak_bytes"] > budget:
+                raise MemoryError(
+                    "probabilistic draft working set exceeds the explicit startup "
+                    f"budget: estimate={estimate['peak_bytes']} bytes, budget={budget}, "
+                    f"B={self.max_batch_size}, K={self.num_speculative_tokens}, "
+                    f"V={vocab_size}"
+                )
+            self._draft_probability_memory = {**estimate, "budget_bytes": budget}
+            logger.info(
+                "PHASE4_Q_MEMORY method=%s B=%d K=%d V=%d q_bytes=%d "
+                "peak_bytes=%d budget_bytes=%d",
+                self.speculative_config.method,
+                self.max_batch_size,
+                self.num_speculative_tokens,
+                vocab_size,
+                estimate["probability_bytes"],
+                estimate["peak_bytes"],
+                budget,
+            )
         self._num_rejected_tokens = torch.zeros(
             self.max_batch_size, dtype=torch.int32, device=device
         )
@@ -243,19 +282,58 @@ class ParallelBlockProposer(EagleProposer):
         positions: torch.Tensor,
         sample_indices: torch.Tensor,
         anchor_token_ids: torch.Tensor | None = None,
+        sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids=input_ids, positions=positions)
         sample_hidden_states = hidden_states[sample_indices]
-        return self._select_draft_tokens(sample_hidden_states, anchor_token_ids)
+        return self._select_draft_tokens(
+            sample_hidden_states, anchor_token_ids, sampling_metadata
+        )
 
     def _select_draft_tokens(
         self,
         sample_hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor | None,
+        sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor:
         del anchor_token_ids
         logits = self.model.compute_logits(sample_hidden_states)
-        return logits.argmax(dim=-1).view(-1, self.num_speculative_tokens)
+        if not getattr(self, "_probabilistic", False) or sampling_metadata is None:
+            self._last_draft_probs = None
+            token_ids = logits.argmax(dim=-1)
+        else:
+            if sampling_metadata.temperature is None:
+                raise RuntimeError(
+                    "probabilistic draft proposal requires per-request temperature"
+                )
+            token_ids, probabilities = sample_draft_logits(
+                logits,
+                sampling_metadata.temperature,
+                rows_per_request=self.num_speculative_tokens,
+                all_greedy=sampling_metadata.all_greedy,
+                all_random=sampling_metadata.all_random,
+                generators=sampling_metadata.generators,
+            )
+            self._last_draft_probs = (
+                None
+                if probabilities is None
+                else probabilities.view(
+                    -1, self.num_speculative_tokens, probabilities.shape[-1]
+                ).contiguous()
+            )
+        return token_ids.view(-1, self.num_speculative_tokens)
+
+    def take_last_draft_probs(self) -> torch.Tensor | None:
+        probabilities = self._last_draft_probs
+        self._last_draft_probs = None
+        return probabilities
+
+    def probability_memory_manifest(self) -> dict[str, int] | None:
+        return (
+            None
+            if self._draft_probability_memory is None
+            else dict(self._draft_probability_memory)
+        )
 
     @torch.inference_mode()
     def dummy_run(
@@ -311,4 +389,4 @@ class ParallelBlockProposer(EagleProposer):
                 self._parallel_dummy_sample_indices[:sample_count]
             ]
             anchor_tokens = self.input_ids[:query_tokens:self.num_queries]
-            self._select_draft_tokens(sample_hidden, anchor_tokens)
+            self._select_draft_tokens(sample_hidden, anchor_tokens, None)
