@@ -1220,7 +1220,9 @@ class vLLMRollout(BaseRollout):
         else:
             self.inference_engine.wake_up()
         if observe_wake:
-            logger.info(
+            # Ray keeps this Verl worker logger at WARNING in the certified
+            # runtime; INFO would make the required evidence unreachable.
+            logger.warning(
                 "PHASE5_WAKE_METRIC metric=%s method=%s tags=%s value_ms=%.6f",
                 "spec/draft_weight_wake_ms" if "weights" in tags else "spec/draft_kv_wake_ms",
                 self._resolved_speculation.method,
@@ -1416,7 +1418,8 @@ class vLLMAsyncRollout(BaseRollout):
             wake_start_ns = time.perf_counter_ns() if observe_wake else 0
             self.inference_engine.wake_up(tags=tags)
             if observe_wake:
-                logger.info(
+                # Keep the async path under the same worker evidence contract.
+                logger.warning(
                     "PHASE5_WAKE_METRIC metric=%s method=%s tags=%s value_ms=%.6f",
                     "spec/draft_weight_wake_ms" if "weights" in tags else "spec/draft_kv_wake_ms",
                     getattr(getattr(self, "_resolved_speculation", None), "method", None),
