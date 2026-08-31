@@ -121,6 +121,18 @@ class SpeculativeConfig:
     resolves to standard rejection for DFlash/DSpark."""
     sample_from_anchor: bool | None = None
     """DSpark layout override. If unset, the checkpoint value is authoritative."""
+    parallel_draft_profile_enabled: bool = False
+    """Enable sampled Phase-5 device timers for DFlash/DSpark."""
+    parallel_draft_profile_sample_every: int = Field(default=64, ge=1)
+    """Record one detailed parallel-draft proposal every N proposals."""
+    parallel_draft_profile_flush_every: int = Field(default=4, ge=1)
+    """Synchronize and publish after this many sampled proposals."""
+    parallel_draft_incremental_context_kv: bool = False
+    """Reserved Phase-5 capability. The old ABI currently rejects True."""
+    parallel_draft_dynamic_k: bool = False
+    """Reserved Phase-5 capability. The old fixed-K ABI rejects True."""
+    dspark_draft_topk: int | None = Field(default=None, ge=1)
+    """Reserved explicit DSpark algorithm variant; not a baseline shortcut."""
 
     # Advanced control
     disable_by_batch_size: int | None = Field(default=None, ge=2)
@@ -798,6 +810,33 @@ class SpeculativeConfig:
                 "DFlash/DSpark requires rejection_sample_method='standard'; "
                 "the legacy verifier is not valid for random RL rollout"
             )
+        if self.enforce_eager is False:
+            raise NotImplementedError(
+                "DFlash/DSpark draft full graph is not supported by the old "
+                "vLLM 0.14.1 + vLLM-Ascend 0.14.0rc1 ABI: draft attention "
+                "capture/update still assumes causal sparse_mode=3. Keep "
+                "speculative enforce_eager=true; target graph remains supported."
+            )
+        self.enforce_eager = True
+        if self.parallel_draft_incremental_context_kv:
+            raise NotImplementedError(
+                "parallel_draft_incremental_context_kv is not certified: the old "
+                "scheduler does not expose request/block generations needed for "
+                "safe invalidation after reject, preempt, remap, or actor update"
+            )
+        if self.parallel_draft_dynamic_k:
+            raise NotImplementedError(
+                "parallel_draft_dynamic_k is not certified: the old scheduler and "
+                "padded verifier ABI require one fixed K for every active request"
+            )
+        if self.dspark_draft_topk is not None:
+            if not self.use_dspark():
+                raise ValueError("dspark_draft_topk is only valid for method='dspark'")
+            raise NotImplementedError(
+                "dspark_draft_topk is an uncalibrated algorithm variant and is "
+                "not implemented by the reference DSpark path; use full-vocabulary "
+                "DSpark for the fair baseline"
+            )
 
         if self.draft_load_config is None:
             self.draft_load_config = LoadConfig(load_format="auto")
@@ -1021,6 +1060,20 @@ class SpeculativeConfig:
                 )
             if self.sample_from_anchor is not None:
                 raise ValueError("sample_from_anchor is only supported for DSpark")
+            if self.parallel_draft_profile_enabled:
+                raise ValueError(
+                    "parallel_draft_profile_enabled is only supported for DFlash/DSpark"
+                )
+            if self.parallel_draft_incremental_context_kv:
+                raise ValueError(
+                    "parallel_draft_incremental_context_kv is only supported for DFlash/DSpark"
+                )
+            if self.parallel_draft_dynamic_k:
+                raise ValueError(
+                    "parallel_draft_dynamic_k is only supported for DFlash/DSpark"
+                )
+            if self.dspark_draft_topk is not None:
+                raise ValueError("dspark_draft_topk is only supported for DSpark")
 
         if self.disable_by_batch_size is not None and self.disable_by_batch_size < 2:
             raise ValueError(

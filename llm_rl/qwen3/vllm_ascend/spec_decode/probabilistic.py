@@ -14,6 +14,50 @@ _SAMPLING_EPS = 1e-5
 _PROBABILITY_SUM_ATOL = 5e-5
 
 
+class DraftSamplingWorkspace:
+    """Persistent device buffers for allocation-free proposal sampling."""
+
+    def __init__(
+        self,
+        max_rows: int,
+        vocab_size: int,
+        *,
+        device: torch.device,
+    ) -> None:
+        if max_rows <= 0 or vocab_size <= 0:
+            raise ValueError("draft sampling workspace dimensions must be positive")
+        self.max_rows = int(max_rows)
+        self.vocab_size = int(vocab_size)
+        self.probabilities = torch.empty(
+            self.max_rows, self.vocab_size, dtype=torch.float32, device=device
+        )
+        self.race = torch.empty_like(self.probabilities)
+        self.row_temperatures = torch.empty(
+            self.max_rows, dtype=torch.float32, device=device
+        )
+        self.safe_temperatures = torch.empty_like(self.row_temperatures)
+        self.greedy_rows = torch.empty(
+            self.max_rows, dtype=torch.bool, device=device
+        )
+        self.token_ids = torch.empty(
+            self.max_rows, dtype=torch.int64, device=device
+        )
+
+    def rows(self, count: int) -> tuple[torch.Tensor, ...]:
+        if not 0 < count <= self.max_rows:
+            raise ValueError(
+                f"draft sampling rows {count} exceed workspace {self.max_rows}"
+            )
+        return (
+            self.probabilities[:count],
+            self.race[:count],
+            self.row_temperatures[:count],
+            self.safe_temperatures[:count],
+            self.greedy_rows[:count],
+            self.token_ids[:count],
+        )
+
+
 def estimate_draft_probability_bytes(
     max_batch_size: int,
     num_speculative_tokens: int,
@@ -82,6 +126,7 @@ def sample_draft_logits(
     all_greedy: bool,
     all_random: bool,
     generators: Mapping[int, torch.Generator] | None = None,
+    workspace: DraftSamplingWorkspace | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sample request-major draft rows and preserve the exact float32 q.
 
@@ -93,21 +138,50 @@ def sample_draft_logits(
         logits, temperatures, rows_per_request, generators
     )
     if all_greedy:
-        return logits.argmax(dim=-1), None
+        if workspace is None:
+            return logits.argmax(dim=-1), None
+        token_ids = workspace.rows(logits.shape[0])[-1]
+        torch.argmax(logits, dim=-1, out=token_ids)
+        return token_ids, None
 
-    row_temperatures = temperatures.repeat_interleave(rows_per_request)
-    greedy_rows = row_temperatures < _SAMPLING_EPS
-    safe_temperatures = torch.where(
-        greedy_rows, torch.ones_like(row_temperatures), row_temperatures
-    )
+    if workspace is None:
+        row_temperatures = temperatures.repeat_interleave(rows_per_request)
+        greedy_rows = row_temperatures < _SAMPLING_EPS
+        safe_temperatures = torch.where(
+            greedy_rows, torch.ones_like(row_temperatures), row_temperatures
+        )
+        probabilities = None
+        race = None
+        token_ids = None
+    else:
+        (
+            probabilities,
+            race,
+            row_temperatures,
+            safe_temperatures,
+            greedy_rows,
+            token_ids,
+        ) = workspace.rows(logits.shape[0])
+        row_temperatures.view(batch_size, rows_per_request).copy_(
+            temperatures[:, None]
+        )
+        torch.lt(row_temperatures, _SAMPLING_EPS, out=greedy_rows)
+        safe_temperatures.copy_(row_temperatures)
+        safe_temperatures.masked_fill_(greedy_rows, 1.0)
     logits.div_(safe_temperatures.unsqueeze(-1))
-    probabilities = logits.softmax(dim=-1, dtype=torch.float32)
+    if probabilities is None:
+        probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
+    else:
+        torch.softmax(logits, dim=-1, dtype=torch.float32, out=probabilities)
 
     if not all_random:
         # The actual proposal for near-zero-temperature rows is one-hot. Store
         # that exact q even though the rejection sampler also has a greedy mask.
         greedy_token_ids = probabilities.argmax(dim=-1)
-        probabilities.mul_((~greedy_rows).unsqueeze(-1))
+        if workspace is None:
+            probabilities.mul_((~greedy_rows).unsqueeze(-1))
+        else:
+            probabilities.masked_fill_(greedy_rows.unsqueeze(-1), 0.0)
         row_indices = torch.arange(
             probabilities.shape[0], dtype=torch.long, device=probabilities.device
         )
@@ -115,7 +189,8 @@ def sample_draft_logits(
             probabilities.dtype
         )
 
-    race = torch.empty_like(probabilities)
+    if race is None:
+        race = torch.empty_like(probabilities)
     # Follow vLLM's one-kernel common path, then overwrite rows owned by private
     # generators. If every row has a private owner, skip the otherwise unused
     # global draw so unrelated global requests do not consume random numbers.
@@ -125,7 +200,10 @@ def sample_draft_logits(
         start = request_index * rows_per_request
         race[start : start + rows_per_request].exponential_(generator=generator)
     torch.div(probabilities, race, out=race)
-    token_ids = race.argmax(dim=-1)
+    if token_ids is None:
+        token_ids = race.argmax(dim=-1)
+    else:
+        torch.argmax(race, dim=-1, out=token_ids)
     return token_ids, probabilities
 
 

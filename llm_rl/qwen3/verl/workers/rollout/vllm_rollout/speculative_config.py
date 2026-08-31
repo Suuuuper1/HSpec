@@ -123,7 +123,26 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
                 config.get("rejection_sample_method", "standard")
             ),
             "enforce_eager": bool(config.get("speculative_enforce_eager", True)),
+            "parallel_draft_profile_enabled": bool(
+                config.get("parallel_draft_profile_enabled", False)
+            ),
+            "parallel_draft_profile_sample_every": int(
+                config.get("parallel_draft_profile_sample_every", 64)
+            ),
+            "parallel_draft_profile_flush_every": int(
+                config.get("parallel_draft_profile_flush_every", 4)
+            ),
+            "parallel_draft_incremental_context_kv": bool(
+                config.get("parallel_draft_incremental_context_kv", False)
+            ),
+            "parallel_draft_dynamic_k": bool(
+                config.get("parallel_draft_dynamic_k", False)
+            ),
         }
+        if config.get("dspark_draft_topk", None) is not None:
+            speculative_config["dspark_draft_topk"] = int(
+                config.get("dspark_draft_topk")
+            )
         if draft_sample_method == "probabilistic":
             speculative_config["draft_probability_max_bytes"] = int(
                 config.get("draft_probability_max_memory_mb", 2048)
@@ -177,6 +196,25 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
             if method in {"dflash", "dspark"}
             else None
         ),
+        "parallel_draft_profile_enabled": (
+            bool(config.get("parallel_draft_profile_enabled", False))
+            if method in {"dflash", "dspark"}
+            else False
+        ),
+        "parallel_draft_profile_sample_every": (
+            int(config.get("parallel_draft_profile_sample_every", 64))
+            if method in {"dflash", "dspark"}
+            else None
+        ),
+        "parallel_draft_profile_flush_every": (
+            int(config.get("parallel_draft_profile_flush_every", 4))
+            if method in {"dflash", "dspark"}
+            else None
+        ),
+        "draft_full_graph": False,
+        "incremental_context_kv": False,
+        "dynamic_k": False,
+        "dspark_draft_topk": None,
         "async_scheduling": False,
         "prefix_caching": bool(config.get("enable_prefix_caching", True)),
         "mode": str(config.get("mode", "sync")),

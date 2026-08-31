@@ -8,6 +8,7 @@ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.sample.rejection_sampler import rejection_sample, verifier_mode
 from vllm_ascend.spec_decode.dspark_proposer import dspark_markov_probabilistic
 from vllm_ascend.spec_decode.probabilistic import (
+    DraftSamplingWorkspace,
     DraftProbabilityCache,
     sample_draft_logits,
 )
@@ -146,6 +147,49 @@ def test_npu_mixed_temperature_stores_one_hot_and_random_q():
     )
     assert aligned is not None and aligned.shape == (3, 3)
     assert cache.snapshot()["validation_sync_count"] == 1
+
+
+def test_npu_persistent_sampling_workspace_is_exact_and_address_stable():
+    _require_npu()
+    batch_size, rows_per_request, vocab_size = 3, 7, 257
+    rows = batch_size * rows_per_request
+    logits = torch.randn(rows, vocab_size, dtype=torch.bfloat16, device="npu")
+    temperatures = torch.tensor([0.0, 0.8, 1.2], device="npu")
+    workspace = DraftSamplingWorkspace(rows, vocab_size, device=torch.device("npu"))
+
+    torch.npu.manual_seed(20260830)
+    expected_tokens, expected_q = sample_draft_logits(
+        logits.clone(),
+        temperatures,
+        rows_per_request=rows_per_request,
+        all_greedy=False,
+        all_random=False,
+    )
+    torch.npu.manual_seed(20260830)
+    actual_tokens, actual_q = sample_draft_logits(
+        logits.clone(),
+        temperatures,
+        rows_per_request=rows_per_request,
+        all_greedy=False,
+        all_random=False,
+        workspace=workspace,
+    )
+    torch.npu.synchronize()
+    assert actual_q is not None and expected_q is not None
+    assert torch.equal(actual_tokens.cpu(), expected_tokens.cpu())
+    assert torch.equal(actual_q.cpu(), expected_q.cpu())
+    pointers = (actual_q.data_ptr(), workspace.race.data_ptr())
+
+    _, second_q = sample_draft_logits(
+        logits.clone(),
+        temperatures,
+        rows_per_request=rows_per_request,
+        all_greedy=False,
+        all_random=False,
+        workspace=workspace,
+    )
+    assert second_q is not None
+    assert (second_q.data_ptr(), workspace.race.data_ptr()) == pointers
 
 
 class _NPUFixedDSpark(torch.nn.Module):

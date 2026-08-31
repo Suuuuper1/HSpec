@@ -25,8 +25,15 @@ DSPARK_MODEL="${PHASE3_DSPARK_MODEL:-/home/data/Qwen3-8B-dspark}"
 TRAIN_FILE="${PHASE3_TRAIN_FILE:-/home/xy/gsm8k/train.parquet}"
 VAL_FILE="${PHASE3_VAL_FILE:-/home/xy/gsm8k/test.parquet}"
 TOTAL_STEPS="${PHASE3_TOTAL_STEPS:-3}"
+ACTOR_LR="${PHASE3_ACTOR_LR:-5e-7}"
+LIFECYCLE_AUDIT="${PHASE3_LIFECYCLE_AUDIT:-true}"
+EXPERIMENT_SEED="${PHASE3_SEED:-20260829}"
+SPECULATIVE_K="${PHASE3_NUM_SPECULATIVE_TOKENS:-7}"
 DRAFT_SAMPLE_METHOD="${PHASE3_DRAFT_SAMPLE_METHOD:-greedy}"
 DRAFT_PROBABILITY_MAX_MEMORY_MB="${PHASE3_DRAFT_PROBABILITY_MAX_MEMORY_MB:-2048}"
+PARALLEL_DRAFT_PROFILE_ENABLED="${PHASE3_PARALLEL_DRAFT_PROFILE_ENABLED:-false}"
+PARALLEL_DRAFT_PROFILE_SAMPLE_EVERY="${PHASE3_PARALLEL_DRAFT_PROFILE_SAMPLE_EVERY:-64}"
+PARALLEL_DRAFT_PROFILE_FLUSH_EVERY="${PHASE3_PARALLEL_DRAFT_PROFILE_FLUSH_EVERY:-4}"
 LIFECYCLE_DIR="${ARM_DIR}/lifecycle"
 RAY_TMPDIR="${PHASE3_RAY_TMPDIR:-/dev/shm/p3r3/manual/${ARM_CODE}}"
 RAY_TMPDIR_MAX_BYTES="${PHASE3_RAY_TMPDIR_MAX_BYTES:-31}"
@@ -41,6 +48,33 @@ if [[ "${DRAFT_SAMPLE_METHOD}" != "greedy" && "${DRAFT_SAMPLE_METHOD}" != "proba
 fi
 if ! [[ "${DRAFT_PROBABILITY_MAX_MEMORY_MB}" =~ ^[1-9][0-9]*$ ]]; then
     echo "PHASE3_DRAFT_PROBABILITY_MAX_MEMORY_MB must be a positive integer" >&2
+    exit 2
+fi
+if ! [[ "${EXPERIMENT_SEED}" =~ ^[0-9]+$ ]]; then
+    echo "PHASE3_SEED must be a non-negative integer" >&2
+    exit 2
+fi
+if [[ "${LIFECYCLE_AUDIT}" != "true" && "${LIFECYCLE_AUDIT}" != "false" ]]; then
+    echo "PHASE3_LIFECYCLE_AUDIT must be true or false" >&2
+    exit 2
+fi
+if ! [[ "${SPECULATIVE_K}" =~ ^([1-9]|1[0-5])$ ]]; then
+    echo "PHASE3_NUM_SPECULATIVE_TOKENS must be in [1, 15]" >&2
+    exit 2
+fi
+if [[ "${PARALLEL_DRAFT_PROFILE_ENABLED}" != "true" && "${PARALLEL_DRAFT_PROFILE_ENABLED}" != "false" ]]; then
+    echo "PHASE3_PARALLEL_DRAFT_PROFILE_ENABLED must be true or false" >&2
+    exit 2
+fi
+for PHASE3_PROFILE_INTERVAL in "${PARALLEL_DRAFT_PROFILE_SAMPLE_EVERY}" "${PARALLEL_DRAFT_PROFILE_FLUSH_EVERY}"; do
+    if ! [[ "${PHASE3_PROFILE_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Phase-5 draft profiling intervals must be positive integers" >&2
+        exit 2
+    fi
+done
+unset PHASE3_PROFILE_INTERVAL
+if [[ "${ARM}" != "dflash" && "${ARM}" != "dspark" && "${PARALLEL_DRAFT_PROFILE_ENABLED}" == "true" ]]; then
+    echo "parallel draft profiling is only valid for dflash/dspark arms" >&2
     exit 2
 fi
 if (( RAY_TMPDIR_BYTES > RAY_TMPDIR_MAX_BYTES )); then
@@ -158,7 +192,7 @@ else
     :
 fi
 
-echo "PHASE3_ARM_BEGIN arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS} draft_sample_method=${DRAFT_SAMPLE_METHOD}"
+echo "PHASE3_ARM_BEGIN arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS} seed=${EXPERIMENT_SEED} k=${SPECULATIVE_K} draft_sample_method=${DRAFT_SAMPLE_METHOD} parallel_draft_profile=${PARALLEL_DRAFT_PROFILE_ENABLED}"
 echo "PHASE3_RAY_TMPDIR path=${RAY_TMPDIR} bytes=${RAY_TMPDIR_BYTES} max_bytes=${RAY_TMPDIR_MAX_BYTES}"
 echo "PHASE3_OBSERVABILITY VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL} VLLM_LOG_STATS_INTERVAL=${VLLM_LOG_STATS_INTERVAL} VLLM_CONFIGURE_LOGGING=${VLLM_CONFIGURE_LOGGING} VLLM_LOGGING_CONFIG_PATH=${VLLM_LOGGING_CONFIG_PATH:-none} VLLM_LOGGING_STREAM=stdout ray_runtime_override=INFO"
 
@@ -172,11 +206,11 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     data.shuffle=False \
-    +data.seed=20260829 \
+    +data.seed="${EXPERIMENT_SEED}" \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.optim.lr=5e-7 \
+    actor_rollout_ref.actor.optim.lr="${ACTOR_LR}" \
     actor_rollout_ref.actor.entropy_coeff=0.001 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -187,7 +221,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=sync \
-    actor_rollout_ref.rollout.seed=20260829 \
+    actor_rollout_ref.rollout.seed="${EXPERIMENT_SEED}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.pipeline_model_parallel_size=1 \
     actor_rollout_ref.rollout.data_parallel_size=1 \
@@ -210,14 +244,17 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.use_hspec_decode=False \
     actor_rollout_ref.rollout.speculative_method="${METHOD}" \
     actor_rollout_ref.rollout.speculative_model="${DRAFT_MODEL}" \
-    actor_rollout_ref.rollout.num_speculative_tokens=7 \
+    actor_rollout_ref.rollout.num_speculative_tokens="${SPECULATIVE_K}" \
     actor_rollout_ref.rollout.draft_tensor_parallel_size=1 \
     actor_rollout_ref.rollout.draft_sample_method="${DRAFT_SAMPLE_METHOD}" \
     actor_rollout_ref.rollout.draft_probability_max_memory_mb="${DRAFT_PROBABILITY_MAX_MEMORY_MB}" \
     actor_rollout_ref.rollout.draft_load_format=auto \
     actor_rollout_ref.rollout.rejection_sample_method=standard \
     actor_rollout_ref.rollout.speculative_enforce_eager=True \
-    actor_rollout_ref.rollout.speculative_lifecycle_audit=True \
+    actor_rollout_ref.rollout.parallel_draft_profile_enabled="${PARALLEL_DRAFT_PROFILE_ENABLED}" \
+    actor_rollout_ref.rollout.parallel_draft_profile_sample_every="${PARALLEL_DRAFT_PROFILE_SAMPLE_EVERY}" \
+    actor_rollout_ref.rollout.parallel_draft_profile_flush_every="${PARALLEL_DRAFT_PROFILE_FLUSH_EVERY}" \
+    actor_rollout_ref.rollout.speculative_lifecycle_audit="${LIFECYCLE_AUDIT}" \
     actor_rollout_ref.rollout.speculative_lifecycle_strict=True \
     actor_rollout_ref.rollout.speculative_lifecycle_samples_per_parameter=8 \
     actor_rollout_ref.rollout.hspec_similarity_threshold=0.85 \
@@ -231,7 +268,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=console \
     trainer.project_name=dflash_dspark_phase3 \
-    trainer.experiment_name="qwen3_8b_${ARM}" \
+    trainer.experiment_name="qwen3_8b_${ARM}_s${EXPERIMENT_SEED}_k${SPECULATIVE_K}" \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
@@ -244,4 +281,4 @@ python3 -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECULATIVE_LIFECYCLE_DIR="${LIFECYCLE_DIR}" \
     "${RAY_ENV_ARGS[@]}"
 
-echo "PHASE3_ARM_END arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS} draft_sample_method=${DRAFT_SAMPLE_METHOD}"
+echo "PHASE3_ARM_END arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS} seed=${EXPERIMENT_SEED} k=${SPECULATIVE_K} draft_sample_method=${DRAFT_SAMPLE_METHOD} parallel_draft_profile=${PARALLEL_DRAFT_PROFILE_ENABLED}"

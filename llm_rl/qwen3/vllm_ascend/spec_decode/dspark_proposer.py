@@ -11,6 +11,12 @@ from vllm_ascend.spec_decode.dflash_proposer import DFlashProposer
 from vllm_ascend.spec_decode.probabilistic import sample_draft_logits
 
 
+def _compute_dspark_base_logits(
+    model: Qwen3DSparkForCausalLM, sample_hidden_states: torch.Tensor
+) -> torch.Tensor:
+    return model.compute_draft_logits(sample_hidden_states)
+
+
 def dspark_markov_greedy(
     model: Qwen3DSparkForCausalLM,
     sample_hidden_states: torch.Tensor,
@@ -19,6 +25,8 @@ def dspark_markov_greedy(
     token_buffer: torch.Tensor,
     embedding_buffer: torch.Tensor,
     corrected_logits_buffer: torch.Tensor,
+    *,
+    base_logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply the sequential Markov correction without per-position allocation."""
     batch_size = anchor_token_ids.numel()
@@ -35,7 +43,8 @@ def dspark_markov_greedy(
         raise TypeError(f"DSpark token buffer must be int64, got {tokens.dtype}")
     tokens[:, 0].copy_(anchor_token_ids)
 
-    base_logits = model.compute_draft_logits(sample_hidden_states)
+    if base_logits is None:
+        base_logits = _compute_dspark_base_logits(model, sample_hidden_states)
     if base_logits.ndim != 2 or base_logits.shape[0] != (
         batch_size * num_speculative_tokens
     ):
@@ -76,6 +85,8 @@ def dspark_markov_probabilistic(
     embedding_buffer: torch.Tensor,
     corrected_logits_buffer: torch.Tensor,
     sampling_metadata: SamplingMetadata,
+    *,
+    base_logits: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply sequential Markov feedback and preserve every sampled q row."""
     batch_size = anchor_token_ids.numel()
@@ -90,7 +101,8 @@ def dspark_markov_probabilistic(
     tokens[:, 0].copy_(anchor_token_ids)
     embedding = embedding_buffer[:batch_size]
     corrected = corrected_logits_buffer[:batch_size]
-    base_logits = model.compute_draft_logits(sample_hidden_states)
+    if base_logits is None:
+        base_logits = _compute_dspark_base_logits(model, sample_hidden_states)
     vocab_size = corrected.shape[1]
     if tuple(base_logits.shape) != (
         batch_size * num_speculative_tokens,
@@ -199,9 +211,23 @@ class DSparkProposer(DFlashProposer):
     ) -> torch.Tensor:
         if anchor_token_ids is None:
             raise ValueError("DSpark Markov proposal requires anchor token ids")
+        with self.phase5_metrics.timer("spec/draft_lm_head_ms"):
+            base_logits = self.model.compute_draft_logits(sample_hidden_states)
         if not getattr(self, "_probabilistic", False) or sampling_metadata is None:
             self._last_draft_probs = None
-            return dspark_markov_greedy(
+            with self.phase5_metrics.timer("spec/dspark_markov_ms"):
+                return dspark_markov_greedy(
+                    self.model,
+                    sample_hidden_states,
+                    anchor_token_ids,
+                    self.num_speculative_tokens,
+                    self._dspark_token_buffer,
+                    self._dspark_embedding_buffer,
+                    self._dspark_corrected_logits_buffer,
+                    base_logits=base_logits,
+                )
+        with self.phase5_metrics.timer("spec/dspark_markov_ms"):
+            tokens, self._last_draft_probs = dspark_markov_probabilistic(
                 self.model,
                 sample_hidden_states,
                 anchor_token_ids,
@@ -209,15 +235,7 @@ class DSparkProposer(DFlashProposer):
                 self._dspark_token_buffer,
                 self._dspark_embedding_buffer,
                 self._dspark_corrected_logits_buffer,
+                sampling_metadata,
+                base_logits=base_logits,
             )
-        tokens, self._last_draft_probs = dspark_markov_probabilistic(
-            self.model,
-            sample_hidden_states,
-            anchor_token_ids,
-            self.num_speculative_tokens,
-            self._dspark_token_buffer,
-            self._dspark_embedding_buffer,
-            self._dspark_corrected_logits_buffer,
-            sampling_metadata,
-        )
         return tokens

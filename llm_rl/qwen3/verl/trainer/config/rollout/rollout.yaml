@@ -325,6 +325,12 @@ draft_probability_max_memory_mb: 2048
 draft_load_format: auto
 rejection_sample_method: standard
 speculative_enforce_eager: true
+parallel_draft_profile_enabled: false
+parallel_draft_profile_sample_every: 64
+parallel_draft_profile_flush_every: 4
+parallel_draft_incremental_context_kv: false
+parallel_draft_dynamic_k: false
+dspark_draft_topk: null
 
 # Bounded lifecycle evidence collection. This is disabled in normal runs and
 # enabled only by the Phase-3 validation matrix.

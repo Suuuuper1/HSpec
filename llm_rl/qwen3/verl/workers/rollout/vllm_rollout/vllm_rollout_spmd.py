@@ -1211,10 +1211,22 @@ class vLLMRollout(BaseRollout):
         if not self.config.free_cache_engine:
             return
 
+        observe_wake = bool(
+            self.config.get("parallel_draft_profile_enabled", False)
+        )
+        wake_start_ns = time.perf_counter_ns() if observe_wake else 0
         if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
             self.inference_engine.wake_up(tags=tags)
         else:
             self.inference_engine.wake_up()
+        if observe_wake:
+            logger.info(
+                "PHASE5_WAKE_METRIC metric=%s method=%s tags=%s value_ms=%.6f",
+                "spec/draft_weight_wake_ms" if "weights" in tags else "spec/draft_kv_wake_ms",
+                self._resolved_speculation.method,
+                ",".join(sorted(tags)),
+                (time.perf_counter_ns() - wake_start_ns) / 1_000_000.0,
+            )
         self._lifecycle_audit.after_wake(self.inference_engine, list(tags))
 
     async def release(self):
@@ -1398,7 +1410,19 @@ class vLLMAsyncRollout(BaseRollout):
             tags: weights or kv_cache.
         """
         if self.config.free_cache_engine:
+            observe_wake = bool(
+                self.config.get("parallel_draft_profile_enabled", False)
+            )
+            wake_start_ns = time.perf_counter_ns() if observe_wake else 0
             self.inference_engine.wake_up(tags=tags)
+            if observe_wake:
+                logger.info(
+                    "PHASE5_WAKE_METRIC metric=%s method=%s tags=%s value_ms=%.6f",
+                    "spec/draft_weight_wake_ms" if "weights" in tags else "spec/draft_kv_wake_ms",
+                    getattr(getattr(self, "_resolved_speculation", None), "method", None),
+                    ",".join(sorted(tags)),
+                    (time.perf_counter_ns() - wake_start_ns) / 1_000_000.0,
+                )
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""

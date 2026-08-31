@@ -312,63 +312,92 @@ class DFlashProposer(ParallelBlockProposer):
         )
         self._last_draft_probs = None
         batch_size = common_attn_metadata.num_reqs
+        metrics = self.phase5_metrics
+        metrics.begin_step(
+            batch_size=batch_size,
+            context_tokens=target_positions.shape[-1],
+            k=self.num_speculative_tokens,
+        )
         rejected = self._num_rejected_tokens[:batch_size]
         if num_rejected_tokens_gpu is None:
             rejected.zero_()
         elif num_rejected_tokens_gpu.data_ptr() != rejected.data_ptr():
             rejected.copy_(num_rejected_tokens_gpu)
 
-        combined_hidden = self.model.combine_hidden_states(target_hidden_states)
-        (
-            context_positions,
-            context_slots,
-            query_ids,
-            query_positions,
-            query_slots,
-            sample_indices,
-        ) = self._build_parallel_layout(
-            target_positions, next_token_ids, common_attn_metadata, rejected
-        )
-        all_key, all_value = self.model.compute_context_kv(
-            combined_hidden, context_positions
-        )
-        store_all_context_kv(
-            self.model.get_context_kv_attention_layers(),
-            all_key,
-            all_value,
-            context_slots,
-            # Slots originate from the engine-owned block table and the layout
-            # kernels convert every rejected/out-of-window row to PAD. Repeating
-            # torch._assert_async here falls back to CPU on Ascend and inserts a
-            # host operation into every proposal step; direct-store tests retain
-            # range validation at the public adapter boundary.
-            validate_slot_range=False,
-        )
+        try:
+            with metrics.timer("spec/draft_context_project_ms"):
+                combined_hidden = self.model.combine_hidden_states(target_hidden_states)
+                (
+                    context_positions,
+                    context_slots,
+                    query_ids,
+                    query_positions,
+                    query_slots,
+                    sample_indices,
+                ) = self._build_parallel_layout(
+                    target_positions, next_token_ids, common_attn_metadata, rejected
+                )
+                all_key, all_value = self.model.compute_context_kv(
+                    combined_hidden, context_positions
+                )
+            with metrics.timer("spec/draft_kv_store_ms"):
+                store_all_context_kv(
+                    self.model.get_context_kv_attention_layers(),
+                    all_key,
+                    all_value,
+                    context_slots,
+                    # Slots originate from the engine-owned block table and the
+                    # layout kernels sanitize rejected/out-of-window rows.
+                    validate_slot_range=False,
+                )
 
-        metadata = self.build_parallel_attention_metadata(
-            common_attn_metadata, query_slots, rejected
-        )
-        per_layer_metadata = {
-            layer_name: metadata for layer_name in self.attn_layer_names
-        }
-        num_query_tokens = batch_size * self.num_queries
-        with set_ascend_forward_context(
-            per_layer_metadata,
-            self.vllm_config,
-            num_tokens=num_query_tokens,
-            num_tokens_across_dp=None,
-            num_actual_tokens=num_query_tokens,
-            aclgraph_runtime_mode=CUDAGraphMode.NONE,
-            is_draft_model=True,
-        ):
-            draft_token_ids = self._run_parallel_backbone(
-                query_ids,
-                query_positions,
-                sample_indices,
-                next_token_ids[:batch_size],
-                sampling_metadata,
+            metadata = self.build_parallel_attention_metadata(
+                common_attn_metadata, query_slots, rejected
             )
-        draft_token_ids.masked_fill_(
-            self._cannot_speculate[:batch_size, None], PAD_SLOT_ID
-        )
-        return draft_token_ids
+            per_layer_metadata = {
+                layer_name: metadata for layer_name in self.attn_layer_names
+            }
+            num_query_tokens = batch_size * self.num_queries
+            with set_ascend_forward_context(
+                per_layer_metadata,
+                self.vllm_config,
+                num_tokens=num_query_tokens,
+                num_tokens_across_dp=None,
+                num_actual_tokens=num_query_tokens,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                is_draft_model=True,
+            ):
+                draft_token_ids = self._run_parallel_backbone(
+                    query_ids,
+                    query_positions,
+                    sample_indices,
+                    next_token_ids[:batch_size],
+                    sampling_metadata,
+                )
+            draft_token_ids.masked_fill_(
+                self._cannot_speculate[:batch_size, None], PAD_SLOT_ID
+            )
+            if metrics.sampling_active:
+                metrics.add_device_counter(
+                    "spec/draft_skipped_max_len",
+                    torch.count_nonzero(self._cannot_speculate[:batch_size]),
+                )
+            metrics.add_counter(
+                "spec/draft_tokens", batch_size * self.num_speculative_tokens
+            )
+            if self._probabilistic and not sampling_metadata.all_greedy:
+                vocab_size = self.speculative_config.draft_model_config.get_vocab_size()
+                metrics.add_counter(
+                    "spec/draft_probability_bytes",
+                    batch_size
+                    * self.num_speculative_tokens
+                    * vocab_size
+                    * torch.float32.itemsize,
+                )
+            return draft_token_ids
+        except Exception:
+            metrics.abort_step()
+            raise
+        finally:
+            if metrics.sampling_active:
+                metrics.end_step()

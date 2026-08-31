@@ -228,6 +228,12 @@ class RolloutConfig(BaseConfig):
     draft_load_format: str = "auto"
     rejection_sample_method: str = "standard"
     speculative_enforce_eager: bool = True
+    parallel_draft_profile_enabled: bool = False
+    parallel_draft_profile_sample_every: int = 64
+    parallel_draft_profile_flush_every: int = 4
+    parallel_draft_incremental_context_kv: bool = False
+    parallel_draft_dynamic_k: bool = False
+    dspark_draft_topk: Optional[int] = None
 
     # Disabled by default. The Phase-3 evidence run enables this to emit a
     # bounded sampled checksum and state-machine record at lifecycle edges.
@@ -291,7 +297,32 @@ class RolloutConfig(BaseConfig):
                     "Phase-3 DFlash/DSpark certifies draft_load_format=auto only"
                 )
             if not self.speculative_enforce_eager:
-                raise ValueError("DFlash/DSpark draft execution must remain eager")
+                raise NotImplementedError(
+                    "DFlash/DSpark draft full graph is not available in the old "
+                    "Ascend ABI and must remain eager; keep "
+                    "speculative_enforce_eager=true"
+                )
+            if self.parallel_draft_profile_sample_every <= 0:
+                raise ValueError("parallel_draft_profile_sample_every must be positive")
+            if self.parallel_draft_profile_flush_every <= 0:
+                raise ValueError("parallel_draft_profile_flush_every must be positive")
+            if self.parallel_draft_incremental_context_kv:
+                raise NotImplementedError(
+                    "parallel_draft_incremental_context_kv lacks old-ABI request/block "
+                    "generation ownership and remains fail-closed"
+                )
+            if self.parallel_draft_dynamic_k:
+                raise NotImplementedError(
+                    "parallel_draft_dynamic_k is incompatible with the old fixed-K "
+                    "scheduler/verifier ABI and remains fail-closed"
+                )
+            if self.dspark_draft_topk is not None:
+                if method != "dspark":
+                    raise ValueError("dspark_draft_topk is only valid for DSpark")
+                raise NotImplementedError(
+                    "dspark_draft_topk is not implemented by the reference DSpark "
+                    "path and cannot enter the full-vocabulary fair baseline"
+                )
             if self.enforce_eager:
                 raise ValueError(
                     "Phase-3 DFlash/DSpark keeps the target graph enabled; "
@@ -312,6 +343,15 @@ class RolloutConfig(BaseConfig):
             )
             if async_scheduling:
                 raise ValueError("Phase-3 DFlash/DSpark requires async_scheduling=false")
+        elif (
+            self.parallel_draft_profile_enabled
+            or self.parallel_draft_incremental_context_kv
+            or self.parallel_draft_dynamic_k
+            or self.dspark_draft_topk is not None
+        ):
+            raise ValueError(
+                "parallel draft Phase-5 controls require speculative_method=dflash or dspark"
+            )
 
         if self.expert_parallel_size > 1:
             assert self.expert_parallel_size == (self.tensor_model_parallel_size * self.data_parallel_size), (

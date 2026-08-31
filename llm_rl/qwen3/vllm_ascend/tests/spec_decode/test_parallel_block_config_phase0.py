@@ -222,6 +222,40 @@ def test_probabilistic_config_rejects_uncertified_cross_rank_rng(checkpoint_path
         )
 
 
+@pytest.mark.parametrize("method", ["dflash", "dspark"])
+def test_phase5_observability_resolves_without_changing_eager_contract(
+    checkpoint_paths, method
+):
+    spec = _spec(
+        checkpoint_paths,
+        method,
+        parallel_draft_profile_enabled=True,
+        parallel_draft_profile_sample_every=8,
+        parallel_draft_profile_flush_every=2,
+    )
+    assert spec.enforce_eager is True
+    assert spec.parallel_draft_profile_enabled is True
+    assert spec.parallel_draft_profile_sample_every == 8
+    assert spec.parallel_draft_profile_flush_every == 2
+
+
+@pytest.mark.parametrize(
+    "kwargs,error",
+    [
+        ({"enforce_eager": False}, "full graph"),
+        ({"parallel_draft_incremental_context_kv": True}, "request/block"),
+        ({"parallel_draft_dynamic_k": True}, "fixed K"),
+        ({"dspark_draft_topk": 64}, "full-vocabulary"),
+    ],
+)
+def test_phase5_experimental_capabilities_fail_closed(
+    checkpoint_paths, kwargs, error
+):
+    method = "dspark" if "dspark_draft_topk" in kwargs else "dflash"
+    with pytest.raises(NotImplementedError, match=error):
+        _spec(checkpoint_paths, method, **kwargs)
+
+
 def test_vllm_scope_gates_and_geometry(checkpoint_paths):
     target, _, _ = checkpoint_paths
     target_config = _target(target)

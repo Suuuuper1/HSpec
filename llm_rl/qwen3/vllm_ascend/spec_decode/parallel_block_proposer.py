@@ -2,6 +2,7 @@
 """Old-ABI base for one-forward parallel-block speculative drafters."""
 
 import copy
+import json
 from dataclasses import replace
 from typing import Optional
 
@@ -30,6 +31,10 @@ from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.probabilistic import (
     estimate_draft_probability_bytes,
     sample_draft_logits,
+)
+from vllm_ascend.spec_decode.parallel_draft_metrics import (
+    ParallelDraftMetrics,
+    phase5_capability_manifest,
 )
 
 
@@ -62,6 +67,16 @@ class ParallelBlockProposer(EagleProposer):
             self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
+        self._phase5_metrics = ParallelDraftMetrics(
+            method=self.speculative_config.method,
+            enabled=self.speculative_config.parallel_draft_profile_enabled,
+            sample_every=self.speculative_config.parallel_draft_profile_sample_every,
+            flush_every=self.speculative_config.parallel_draft_profile_flush_every,
+        )
+        logger.info(
+            "PHASE5_DRAFT_CAPABILITY %s",
+            json.dumps(phase5_capability_manifest(self.speculative_config), sort_keys=True),
+        )
         self._draft_probability_memory: dict[str, int] | None = None
         if self._probabilistic:
             vocab_size = self.speculative_config.draft_model_config.get_vocab_size()
@@ -131,6 +146,20 @@ class ParallelBlockProposer(EagleProposer):
             + torch.remainder(dummy_sample_rows, self.num_speculative_tokens)
             + self.speculative_config.draft_sample_offset
         )
+
+    @property
+    def phase5_metrics(self) -> ParallelDraftMetrics:
+        """Keep pure-function tests that construct proposers via ``__new__`` valid."""
+        metrics = getattr(self, "_phase5_metrics", None)
+        if metrics is None:
+            metrics = ParallelDraftMetrics(
+                method=getattr(self, "method", "parallel"),
+                enabled=False,
+                sample_every=1,
+                flush_every=1,
+            )
+            self._phase5_metrics = metrics
+        return metrics
 
     def _draft_vllm_config(self) -> VllmConfig:
         draft_model_config = copy.copy(
@@ -284,7 +313,8 @@ class ParallelBlockProposer(EagleProposer):
         anchor_token_ids: torch.Tensor | None = None,
         sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids=input_ids, positions=positions)
+        with self.phase5_metrics.timer("spec/draft_backbone_ms"):
+            hidden_states = self.model(input_ids=input_ids, positions=positions)
         sample_hidden_states = hidden_states[sample_indices]
         return self._select_draft_tokens(
             sample_hidden_states, anchor_token_ids, sampling_metadata
@@ -297,7 +327,8 @@ class ParallelBlockProposer(EagleProposer):
         sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor:
         del anchor_token_ids
-        logits = self.model.compute_logits(sample_hidden_states)
+        with self.phase5_metrics.timer("spec/draft_lm_head_ms"):
+            logits = self.model.compute_logits(sample_hidden_states)
         if not getattr(self, "_probabilistic", False) or sampling_metadata is None:
             self._last_draft_probs = None
             token_ids = logits.argmax(dim=-1)
