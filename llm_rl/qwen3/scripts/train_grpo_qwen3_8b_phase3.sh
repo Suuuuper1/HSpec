@@ -192,7 +192,7 @@ else
     :
 fi
 
-echo "PHASE3_ARM_BEGIN arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS} seed=${EXPERIMENT_SEED} k=${SPECULATIVE_K} draft_sample_method=${DRAFT_SAMPLE_METHOD} parallel_draft_profile=${PARALLEL_DRAFT_PROFILE_ENABLED}"
+echo "PHASE3_ARM_BEGIN arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS} seed=${EXPERIMENT_SEED} k=${SPECULATIVE_K} draft_sample_method=${DRAFT_SAMPLE_METHOD} parallel_draft_profile=${PARALLEL_DRAFT_PROFILE_ENABLED} lifecycle_audit=${LIFECYCLE_AUDIT}"
 echo "PHASE3_RAY_TMPDIR path=${RAY_TMPDIR} bytes=${RAY_TMPDIR_BYTES} max_bytes=${RAY_TMPDIR_MAX_BYTES}"
 echo "PHASE3_OBSERVABILITY VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL} VLLM_LOG_STATS_INTERVAL=${VLLM_LOG_STATS_INTERVAL} VLLM_CONFIGURE_LOGGING=${VLLM_CONFIGURE_LOGGING} VLLM_LOGGING_CONFIG_PATH=${VLLM_LOGGING_CONFIG_PATH:-none} VLLM_LOGGING_STREAM=stdout ray_runtime_override=INFO"
 
@@ -281,4 +281,4 @@ python3 -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECULATIVE_LIFECYCLE_DIR="${LIFECYCLE_DIR}" \
     "${RAY_ENV_ARGS[@]}"
 
-echo "PHASE3_ARM_END arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS} seed=${EXPERIMENT_SEED} k=${SPECULATIVE_K} draft_sample_method=${DRAFT_SAMPLE_METHOD} parallel_draft_profile=${PARALLEL_DRAFT_PROFILE_ENABLED}"
+echo "PHASE3_ARM_END arm=${ARM} method=${METHOD} steps=${TOTAL_STEPS} seed=${EXPERIMENT_SEED} k=${SPECULATIVE_K} draft_sample_method=${DRAFT_SAMPLE_METHOD} parallel_draft_profile=${PARALLEL_DRAFT_PROFILE_ENABLED} lifecycle_audit=${LIFECYCLE_AUDIT}"
