@@ -15,6 +15,7 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
 """
 
+import json
 import os
 import socket
 
@@ -33,7 +34,40 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
+from verl.utils.ray_resource import (
+    evaluate_resource_pool_capacity,
+    format_resource_capacity_error,
+)
 from verl.workers.config.rollout import resolve_rollout_speculative_method
+
+
+def build_resource_pool_spec(config) -> dict[str, list[int]]:
+    """Build the single authoritative resource-pool shape from PPO config."""
+    spec = {
+        "global_pool": [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+    }
+    if config.reward_model.enable_resource_pool:
+        if config.reward_model.n_gpus_per_node <= 0:
+            raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
+        if config.reward_model.nnodes <= 0:
+            raise ValueError("config.reward_model.nnodes must be greater than 0")
+        spec["reward_pool"] = [
+            config.reward_model.n_gpus_per_node
+        ] * config.reward_model.nnodes
+    return spec
+
+
+def validate_ray_resource_pool_spec(resource_pool_spec) -> dict:
+    """Fail before method-specific setup if current Ray cannot place the pools."""
+    resources = ray._private.state.available_resources_per_node()
+    assessment = evaluate_resource_pool_capacity(resource_pool_spec, resources)
+    if assessment["status"] != "PASS":
+        raise ValueError(format_resource_capacity_error(assessment))
+    print(
+        "Ray accelerator topology validation PASS: "
+        + json.dumps(assessment, sort_keys=True, separators=(",", ":"))
+    )
+    return assessment
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -80,6 +114,8 @@ def run_ppo(config) -> None:
         )
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**ray_init_kwargs)
+
+    validate_ray_resource_pool_spec(build_resource_pool_spec(config))
 
     if resolve_rollout_speculative_method(config.actor_rollout_ref.rollout) == "hspec":
         from vllm_ascend.spec_decode.hspec_table import (
@@ -359,18 +395,7 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
-        # TODO Here you can use the new registration method to support dynamic registration of roles
-        if config.reward_model.enable_resource_pool:
-            if config.reward_model.n_gpus_per_node <= 0:
-                raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
-            if config.reward_model.nnodes <= 0:
-                raise ValueError("config.reward_model.nnodes must be greater than 0")
-
-            reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
-            resource_pool_spec["reward_pool"] = reward_pool
+        resource_pool_spec = build_resource_pool_spec(config)
 
         self.mapping[Role.ActorRollout] = global_pool_id
         self.mapping[Role.Critic] = global_pool_id
@@ -455,6 +480,12 @@ class TaskRunner:
             use_critic=need_critic(config),
         )
 
+        # Capacity and node-local bundle placement do not depend on tokenizer,
+        # datasets or model files. Fail before those expensive preparations and
+        # check once more when placement groups are created.
+        resource_pool_manager = self.init_resource_pool_mgr(config)
+        resource_pool_manager.validate_resource_available()
+
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
         local_path = copy_to_local(
@@ -476,8 +507,6 @@ class TaskRunner:
         val_reward_fn = load_reward_manager(
             config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
-
-        resource_pool_manager = self.init_resource_pool_mgr(config)
 
         from verl.utils.dataset.rl_dataset import collate_fn
 

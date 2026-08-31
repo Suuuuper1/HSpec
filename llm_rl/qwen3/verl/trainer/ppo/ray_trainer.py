@@ -59,6 +59,10 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
+from verl.utils.ray_resource import (
+    evaluate_resource_pool_capacity,
+    format_resource_capacity_error,
+)
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -283,6 +287,9 @@ class ResourcePoolManager:
         For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
         For Megatron backend, uses max_colocate_count>1 for different models.
         """
+        # Check before creating any placement group, then let the worker launch
+        # path check again so a capacity race remains fail-closed.
+        self.validate_resource_available()
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
             # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
             # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
@@ -293,8 +300,6 @@ class ResourcePoolManager:
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
-        self._check_resource_available()
-
     def get_resource_pool(self, role: Role) -> RayResourcePool:
         """Get the resource pool of the worker_cls"""
         return self.resource_pool_dict[self.mapping[role]]
@@ -303,23 +308,23 @@ class ResourcePoolManager:
         """Get the number of gpus in this cluster."""
         return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
 
-    def _check_resource_available(self):
-        """Check if the resource pool can be satisfied in this ray cluster."""
+    def validate_resource_available(self) -> dict:
+        """Check total capacity and node-local Ray bundle placement."""
         node_available_resources = ray._private.state.available_resources_per_node()
-        node_available_gpus = {
-            node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
-            for node, node_info in node_available_resources.items()
-        }
-
-        # check total required gpus can be satisfied
-        total_available_gpus = sum(node_available_gpus.values())
-        total_required_gpus = sum(
-            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
+        assessment = evaluate_resource_pool_capacity(
+            self.resource_pool_spec, node_available_resources
         )
-        if total_available_gpus < total_required_gpus:
-            raise ValueError(
-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
-            )
+        if assessment["status"] != "PASS":
+            raise ValueError(format_resource_capacity_error(assessment))
+        print(
+            "Ray accelerator topology validation PASS: "
+            + json.dumps(assessment, sort_keys=True, separators=(",", ":"))
+        )
+        return assessment
+
+    def _check_resource_available(self):
+        """Compatibility alias for callers using the previous private hook."""
+        return self.validate_resource_available()
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
