@@ -371,7 +371,7 @@ class SpeculativeConfig:
         ):
             self.method = "ngram"
 
-        if self.method in ("ngram", "[ngram]", "sam"):
+        if self.method in ("ngram", "[ngram]"):
             # Unified to "ngram" internally
             self.method = "ngram"
             # Set default values if not provided
@@ -404,6 +404,14 @@ class SpeculativeConfig:
             # TODO: current we still need extract vocab_size from target model
             # config, in future, we may try refactor it out, and set
             # draft related config as None here.
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "sam":
+            # SAM is a stateful suffix-automaton proposer, not an n-gram
+            # prompt lookup alias. Keep the method identity intact so platform
+            # plugins can instantiate the correct proposer.
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
         elif self.method in ("hspec", "[hspec]"):
@@ -1161,6 +1169,10 @@ class SpeculativeConfig:
 
     def __repr__(self) -> str:
         method = self.method
-        model = None if method in ("ngram", "suffix") else self.draft_model_config.model
+        model = (
+            None
+            if method in ("ngram", "suffix", "sam")
+            else self.draft_model_config.model
+        )
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"

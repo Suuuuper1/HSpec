@@ -96,6 +96,18 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
                 ),
                 "prompt_lookup_min": raw_spec_dict.get("prompt_lookup_min"),
                 "prompt_lookup_max": raw_spec_dict.get("prompt_lookup_max"),
+                "suffix_decoding_max_tree_depth": raw_spec_dict.get(
+                    "suffix_decoding_max_tree_depth"
+                ),
+                "suffix_decoding_max_cached_requests": raw_spec_dict.get(
+                    "suffix_decoding_max_cached_requests"
+                ),
+                "suffix_decoding_max_spec_factor": raw_spec_dict.get(
+                    "suffix_decoding_max_spec_factor"
+                ),
+                "suffix_decoding_min_token_prob": raw_spec_dict.get(
+                    "suffix_decoding_min_token_prob"
+                ),
                 "target_enforce_eager": bool(config.get("enforce_eager", True)),
                 "draft_enforce_eager": raw_spec_dict.get("enforce_eager"),
                 "draft_tensor_parallel_size": raw_spec_dict.get(

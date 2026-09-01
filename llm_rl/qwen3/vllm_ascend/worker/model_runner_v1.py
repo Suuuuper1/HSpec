@@ -118,7 +118,7 @@ from vllm_ascend.spec_decode.hspec_s4_trace import (
     seal_hspec_s4_trace_pending,
 )
 from vllm_ascend.spec_decode.hspec_utils import hspec_record_function
-from vllm_ascend.spec_decode.interface import SpecDcodeType
+from vllm_ascend.spec_decode.interface import Proposer, SpecDcodeType
 from vllm_ascend.spec_decode.medusa_proposer import MedusaProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
 from vllm_ascend.spec_decode.probabilistic import DraftProbabilityCache
@@ -453,9 +453,7 @@ class NPUModelRunner(GPUModelRunner):
         # decode stretches for RL rollout batches with request refill.
         self.speculative_auto_bs_thre = int(os.environ.get('VLLM_SPECULATIVE_BATCH_SIZE_THRE', "-1"))
         self.speculative_decoding_active = bool(self.speculative_config)
-        self.drafter: Optional[Union[NgramProposer, EagleProposer, DFlashProposer, DSparkProposer, MtpProposer,
-                                     SuffixDecodingProposer, MedusaProposer,
-                                     HSpecProposer]] = None
+        self.drafter: Optional[Proposer] = None
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
         if self.speculative_config:
@@ -464,6 +462,15 @@ class NPUModelRunner(GPUModelRunner):
             self.decode_token_per_req = 1 + spec_token_num
             if get_pp_group().is_last_rank:
                 self.drafter = self._get_drafter()
+                proposer_name = getattr(self.drafter, "name", None)
+                proposer_name = getattr(proposer_name, "name", proposer_name)
+                logger.info(
+                    "Resolved Ascend speculative proposer: method=%s "
+                    "proposer=%s name=%s",
+                    self.speculative_config.method,
+                    type(self.drafter).__name__,
+                    proposer_name,
+                )
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, EagleProposer)
                     self.use_aux_hidden_state_outputs = (
@@ -567,9 +574,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         super()._update_states(scheduler_output)
-        if (self.drafter is None
-                or getattr(self.drafter, "name", None) != SpecDcodeType.HSPEC
-                or not hasattr(self.drafter, "clear_request")):
+        if self.drafter is None or not hasattr(self.drafter, "clear_request"):
             return
         for req_id in scheduler_output.finished_req_ids:
             try:
@@ -1691,7 +1696,7 @@ class NPUModelRunner(GPUModelRunner):
             # Speculative decoding is not enabled.
             draft_token_ids = None
         else:
-            if self.speculative_config.method in ("suffix", "ngram"):
+            if self.speculative_config.method in ("suffix", "ngram", "sam"):
                 draft_token_ids = self.drafter.generate_token_ids(
                     valid_sampled_token_ids, sampling_metadata,
                     scheduler_output, spec_decode_metadata, positions,

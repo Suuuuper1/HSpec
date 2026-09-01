@@ -605,7 +605,7 @@ env \
     trainer.nnodes="${NODES}" \
     trainer.save_freq=-1 \
     trainer.test_freq=1 \
-    trainer.total_epochs=5 \
+    trainer.total_epochs=3 \
     +trainer.rollout_length_dir="${ROLLOUT_LENGTH_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \

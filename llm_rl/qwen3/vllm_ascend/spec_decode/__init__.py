@@ -21,7 +21,6 @@ from vllm_ascend.spec_decode.medusa_proposer import MedusaProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
 from vllm_ascend.spec_decode.ngram_proposer import NgramProposer
 from vllm_ascend.spec_decode.suffix_proposer import SuffixDecodingProposer
-from patches.vllm_ascend.spec_decode.sam_proposer import SAMDecodingProposer
 from vllm_ascend.spec_decode.hspec_proposer import HSpecProposer
 from vllm_ascend.spec_decode.dflash_proposer import DFlashProposer
 from vllm_ascend.spec_decode.dspark_proposer import DSparkProposer
@@ -39,6 +38,12 @@ def get_spec_decode_method(method, vllm_config, device, runner):
     elif method == "medusa":
         return MedusaProposer(vllm_config, device, runner)
     elif method == "sam":
+        # Keep the out-of-tree patch lazy: importing it while this package is
+        # initializing otherwise forms a package -> patch -> interface cycle.
+        from patches.vllm_ascend.spec_decode.sam_proposer import (
+            SAMDecodingProposer,
+        )
+
         return SAMDecodingProposer(vllm_config, device, runner)
     elif method == 'hspec':
         return HSpecProposer(vllm_config, device, runner)

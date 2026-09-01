@@ -925,7 +925,7 @@ def speculative_enable_dispatch_gmm_combine_decode(vllm_config: VllmConfig) -> b
     if vllm_config.speculative_config is None:
         return True
     speculative_method = getattr(vllm_config.speculative_config, "method", None)
-    if speculative_method in [None, "ngram", "suffix"]:
+    if speculative_method in [None, "ngram", "suffix", "sam"]:
         return True
     if speculative_method in ["eagle", "eagle3"]:
         if is_drafter_moe_model(vllm_config):

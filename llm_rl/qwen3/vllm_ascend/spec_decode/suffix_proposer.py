@@ -18,6 +18,11 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
         # No model to load.
         pass
 
+    def clear_request(self, request_id: str) -> None:
+        """Finalize an active request as soon as the scheduler releases it."""
+        if request_id in self.suffix_cache.active_requests:
+            self.suffix_cache.stop_request(request_id)
+
     @torch.inference_mode()
     def dummy_run(self,
                   num_tokens,
