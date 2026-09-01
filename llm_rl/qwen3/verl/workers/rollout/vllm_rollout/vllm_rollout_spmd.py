@@ -452,7 +452,7 @@ class vLLMRollout(BaseRollout):
             additional_config={
                 "ascend_scheduler_config": {
                     "enabled": True,
-                    "enable_chunked_prefill": True,
+                    "enable_chunked_prefill": bool(config.enable_chunked_prefill),
                 },
                 "refresh": True,
                 "dynamic_eplb": self.dynamic_eplb,

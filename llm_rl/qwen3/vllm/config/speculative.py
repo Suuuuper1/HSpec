@@ -108,8 +108,8 @@ class SpeculativeConfig:
     Hub. It can be a branch name, a tag name, or a commit id. If unspecified,
     will use the default version."""
     draft_load_config: LoadConfig | None = None
-    """Independent draft-weight loader. Parallel-block drafters must not
-    inherit Verl's target-side dummy loader."""
+    """Independent draft-weight loader. Neural drafters used by a Verl hybrid
+    engine must not inherit the target-side dummy loader."""
     draft_sample_method: DraftSampleMethod = "greedy"
     """Draft-token sampling mode."""
     draft_probability_max_bytes: int | None = Field(default=None, ge=1)
@@ -1042,7 +1042,15 @@ class SpeculativeConfig:
                 )
         else:
             if self.draft_load_config is not None:
-                raise ValueError("draft_load_config is only supported for DFlash/DSpark")
+                if self.method not in ("eagle", "eagle3"):
+                    raise ValueError(
+                        "draft_load_config is only supported for EAGLE/EAGLE3/"
+                        "DFlash/DSpark"
+                    )
+                if "dummy" in str(self.draft_load_config.load_format).lower():
+                    raise ValueError(
+                        "EAGLE/EAGLE3 draft_load_config cannot use dummy weights"
+                    )
             if self.rejection_sample_method is not None:
                 raise ValueError(
                     "rejection_sample_method is only supported for DFlash/DSpark "

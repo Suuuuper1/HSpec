@@ -330,6 +330,9 @@ parallel_draft_profile_sample_every: 64
 parallel_draft_profile_flush_every: 4
 parallel_draft_incremental_context_kv: false
 parallel_draft_dynamic_k: false
+# Explicit opt-in for target-eager DFlash/DSpark certification experiments.
+# Production Phase-3/5 behavior remains target graph by default.
+parallel_draft_allow_target_eager_experiment: false
 dspark_draft_topk: null
 
 # Bounded lifecycle evidence collection. This is disabled in normal runs and

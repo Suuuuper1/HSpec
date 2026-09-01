@@ -233,6 +233,10 @@ class RolloutConfig(BaseConfig):
     parallel_draft_profile_flush_every: int = 4
     parallel_draft_incremental_context_kv: bool = False
     parallel_draft_dynamic_k: bool = False
+    # Keep the Phase-3 graph-certified surface unchanged by default.  The
+    # 30B eager comparison must opt in explicitly and is treated as a new
+    # runtime certification candidate rather than production support.
+    parallel_draft_allow_target_eager_experiment: bool = False
     dspark_draft_topk: Optional[int] = None
 
     # Disabled by default. The Phase-3 evidence run enables this to emit a
@@ -323,10 +327,15 @@ class RolloutConfig(BaseConfig):
                     "dspark_draft_topk is not implemented by the reference DSpark "
                     "path and cannot enter the full-vocabulary fair baseline"
                 )
-            if self.enforce_eager:
+            if (
+                self.enforce_eager
+                and not self.parallel_draft_allow_target_eager_experiment
+            ):
                 raise ValueError(
                     "Phase-3 DFlash/DSpark keeps the target graph enabled; "
-                    "set rollout.enforce_eager=false"
+                    "set rollout.enforce_eager=false, or explicitly set "
+                    "parallel_draft_allow_target_eager_experiment=true for an "
+                    "eager-only certification experiment"
                 )
             if self.enable_prefix_caching:
                 raise ValueError(
@@ -347,6 +356,7 @@ class RolloutConfig(BaseConfig):
             self.parallel_draft_profile_enabled
             or self.parallel_draft_incremental_context_kv
             or self.parallel_draft_dynamic_k
+            or self.parallel_draft_allow_target_eager_experiment
             or self.dspark_draft_topk is not None
         ):
             raise ValueError(

@@ -69,13 +69,20 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
             "engine_kwargs.vllm.speculative_config"
         )
     if method is None and raw_spec is not None:
-        raw_method = str(_dict(raw_spec).get("method", "")).lower()
+        raw_spec_dict = _dict(raw_spec)
+        raw_method = str(raw_spec_dict.get("method", "")).lower()
         if raw_method in {"hspec", "dflash", "dspark"}:
             raise ValueError(
                 f"method={raw_method!r} must use rollout.speculative_method; "
                 "the unified migrated-method boundary is mandatory and the raw "
                 "engine escape hatch is reserved for existing methods"
             )
+        raw_draft_load = raw_spec_dict.get("draft_load_config")
+        raw_draft_load_format = (
+            _dict(raw_draft_load).get("load_format")
+            if isinstance(raw_draft_load, dict) or hasattr(raw_draft_load, "items")
+            else getattr(raw_draft_load, "load_format", None)
+        )
         return ResolvedRolloutSpeculation(
             method=raw_method or "external",
             engine_kwargs=engine_kwargs,
@@ -83,6 +90,37 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
             manifest={
                 "source": "engine_kwargs.vllm.speculative_config",
                 "method": raw_method or "external",
+                "model": raw_spec_dict.get("model"),
+                "num_speculative_tokens": int(
+                    raw_spec_dict.get("num_speculative_tokens", 0)
+                ),
+                "prompt_lookup_min": raw_spec_dict.get("prompt_lookup_min"),
+                "prompt_lookup_max": raw_spec_dict.get("prompt_lookup_max"),
+                "target_enforce_eager": bool(config.get("enforce_eager", True)),
+                "draft_enforce_eager": raw_spec_dict.get("enforce_eager"),
+                "draft_tensor_parallel_size": raw_spec_dict.get(
+                    "draft_tensor_parallel_size"
+                ),
+                "draft_load_format": (
+                    str(raw_draft_load_format)
+                    if raw_draft_load_format is not None
+                    else None
+                ),
+                "target_tensor_parallel_size": int(
+                    config.get("tensor_model_parallel_size", 1)
+                ),
+                "prefix_caching": bool(
+                    config.get("enable_prefix_caching", True)
+                ),
+                "chunked_prefill": bool(
+                    config.get("enable_chunked_prefill", True)
+                ),
+                "mode": str(config.get("mode", "sync")),
+                "seed": int(config.get("seed", 0)),
+                "temperature": float(config.get("temperature", 1.0)),
+                "top_p": float(config.get("top_p", 1.0)),
+                "top_k": int(config.get("top_k", -1)),
+                "rollout_n": int(config.get("n", 1)),
                 "parallel_draft": False,
             },
         )
@@ -211,12 +249,18 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
             if method in {"dflash", "dspark"}
             else None
         ),
+        "target_eager_experiment": (
+            bool(config.get("parallel_draft_allow_target_eager_experiment", False))
+            if method in {"dflash", "dspark"}
+            else False
+        ),
         "draft_full_graph": False,
         "incremental_context_kv": False,
         "dynamic_k": False,
         "dspark_draft_topk": None,
         "async_scheduling": False,
         "prefix_caching": bool(config.get("enable_prefix_caching", True)),
+        "chunked_prefill": bool(config.get("enable_chunked_prefill", True)),
         "mode": str(config.get("mode", "sync")),
         "seed": int(config.get("seed", 0)),
         "temperature": float(config.get("temperature", 1.0)),

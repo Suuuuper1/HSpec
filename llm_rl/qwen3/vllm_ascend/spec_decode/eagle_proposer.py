@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from typing import Any, Callable, ContextManager, Optional, Union
 
 import numpy as np
@@ -168,9 +169,30 @@ class EagleProposer(VllmEagleProposer):
                                         DeepseekV32IndexerCache).keys())
 
         with self.maybe_eager_context:
-            self.model = get_model(vllm_config=self.vllm_config,
-                                   model_config=self.vllm_config.
-                                   speculative_config.draft_model_config)
+            draft_load_config = self.speculative_config.draft_load_config
+            draft_vllm_config = self.vllm_config
+            draft_model_config = self.speculative_config.draft_model_config
+            if draft_load_config is not None:
+                # Verl hybrid rollout intentionally initializes the target with
+                # dummy weights before actor synchronization.  A checkpointed
+                # EAGLE head is independent and must use its own real loader.
+                draft_model_config = copy.copy(
+                    self.speculative_config.draft_model_config
+                )
+                if self.speculative_config.enforce_eager is not None:
+                    draft_model_config.enforce_eager = bool(
+                        self.speculative_config.enforce_eager
+                    )
+                draft_vllm_config = replace(
+                    self.vllm_config,
+                    model_config=draft_model_config,
+                    load_config=draft_load_config,
+                    parallel_config=self.speculative_config.draft_parallel_config,
+                )
+            self.model = get_model(
+                vllm_config=draft_vllm_config,
+                model_config=draft_model_config,
+            )
 
         indexer_layers = get_layers_from_vllm_config(
             self.vllm_config, DeepseekV32IndexerCache).keys()
