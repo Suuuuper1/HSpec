@@ -2,29 +2,13 @@
 # Qwen3-30B-A3B baseline: eager, TQ2, 16 NPUs, 32 prompts x 16 samples.
 set -eo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
-CONFIG_DIR=${CONFIG_DIR:-"${PROJECT_ROOT}/verl/trainer/config"}
-CUSTOM_OPP_PATH="${PROJECT_ROOT}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend"
-CUSTOM_OP_API_LIB="${CUSTOM_OPP_PATH}/op_api/lib"
-
-# Make module and relative resource resolution independent of the caller's cwd.
-cd "${PROJECT_ROOT}"
-export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "${ROOT}"
 
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/asdsip/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
-
-# Use the custom operators shipped with this vllm-ascend checkout, matching the
-# launch contract in train_grpo_qwen3_30b_hspec.sh.
-if [ -d "${CUSTOM_OPP_PATH}" ]; then
-  export ASCEND_CUSTOM_OPP_PATH="${CUSTOM_OPP_PATH}:${ASCEND_CUSTOM_OPP_PATH:-}"
-fi
-if [ -d "${CUSTOM_OP_API_LIB}" ]; then
-  export LD_LIBRARY_PATH="${CUSTOM_OP_API_LIB}:${LD_LIBRARY_PATH:-}"
-fi
 
 # Do not inherit rollout experiment knobs from the caller's shell.
 while IFS= read -r name; do
@@ -35,10 +19,8 @@ done < <(compgen -e)
 
 # Fixed baseline execution contract.
 export TASK_QUEUE_ENABLE=2
-export ASCEND_LAUNCH_BLOCKING=0
 export VLLM_USE_V1=1
 export VLLM_ENABLE_GRAPH_MODE=0
-export VERL_VLLM_CUDAGRAPH_MODE=NONE
 export VLLM_ASCEND_EAGER_COMPILE=1
 export VLLM_ENABLE_EXPERT_PARALLEL=1
 export VLLM_DP_SIZE=16
@@ -85,41 +67,16 @@ export D2D_DATA_TRANSFER=1
 export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ASCEND_ENABLE_NZ=0
 
-MODEL_PATH=${MODEL_PATH:-/home/data/Qwen3-30B-A3B}
-DISTCP_PATH=${DISTCP_PATH:-/home/data/Qwen3-30B-A3B_megatron}
+MODEL_PATH=${MODEL_PATH:-/data/Qwen3-30B-A3B}
+DISTCP_PATH=${DISTCP_PATH:-/data/Qwen3-30B-A3B_megatron}
 TRAIN_FILE=${TRAIN_FILE:-/data/deepscaler/train.parquet}
 TEST_FILE=${TEST_FILE:-/data/deepscaler/test.parquet}
-REWARD_FUNCTION_PATH=${REWARD_FUNCTION_PATH:-"${PROJECT_ROOT}/deepscaler.py"}
-OUTPUT_DIR=${OUTPUT_DIR:-"${PROJECT_ROOT}/outputs/rl/qwen3_baseline_eager_tq2_bs32_n16"}
+OUTPUT_DIR=${OUTPUT_DIR:-/workspace/qwen3_baseline_results/eager_tq2_bs32_n16}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-3}
 DATASET_FRACTION=${DATASET_FRACTION:-0.005}
 
-require_file() {
-  if [ ! -f "$1" ]; then
-    echo "ERROR: required file does not exist: $1" >&2
-    exit 2
-  fi
-}
-
-require_dir() {
-  if [ ! -d "$1" ]; then
-    echo "ERROR: required directory does not exist: $1" >&2
-    exit 2
-  fi
-}
-
-require_file "${CONFIG_DIR}/ppo_megatron_trainer.yaml"
-require_file "${REWARD_FUNCTION_PATH}"
-require_file "${TRAIN_FILE}"
-require_file "${TEST_FILE}"
-require_file "${DISTCP_PATH}/metadata.json"
-require_file "${MODEL_PATH}/config.json"
-require_dir "${PROJECT_ROOT}/vllm"
-require_dir "${PROJECT_ROOT}/vllm_ascend"
-require_dir "${PROJECT_ROOT}/verl"
-
 ARGS=(
-  --config-path="${CONFIG_DIR}"
+  --config-path="${ROOT}/verl/trainer/config"
   --config-name=ppo_megatron_trainer.yaml
   algorithm.adv_estimator=grpo
   data.train_files="${TRAIN_FILE}"
@@ -132,7 +89,7 @@ ARGS=(
   data.shuffle=False
   data.dataloader_num_workers=0
   +data.dataset_fraction="${DATASET_FRACTION}"
-  custom_reward_function.path="${REWARD_FUNCTION_PATH}"
+  custom_reward_function.path="${ROOT}/deepscaler.py"
   custom_reward_function.name=compute_score
   actor_rollout_ref.model.path="${MODEL_PATH}"
   actor_rollout_ref.model.use_fused_kernels=False
@@ -163,12 +120,11 @@ ARGS=(
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.tensor_model_parallel_size=1
   actor_rollout_ref.rollout.enforce_eager=True
-  actor_rollout_ref.rollout.cudagraph_mode=NONE
-  actor_rollout_ref.rollout.cudagraph_capture_sizes=null
   actor_rollout_ref.rollout.free_cache_engine=True
   actor_rollout_ref.rollout.gpu_memory_utilization=0.83
   actor_rollout_ref.rollout.max_num_batched_tokens=17408
   actor_rollout_ref.rollout.max_num_seqs=32
+  actor_rollout_ref.rollout.async_scheduling=true
   actor_rollout_ref.rollout.enable_prefix_caching=false
   actor_rollout_ref.rollout.enable_chunked_prefill=true
   actor_rollout_ref.rollout.n=16
@@ -216,45 +172,17 @@ ARGS=(
   +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11
   +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11
   +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True
-  +ray_kwargs.ray_init.address=local
-  '+ray_kwargs.ray_init.runtime_env.env_vars.TASK_QUEUE_ENABLE="2"'
-  '+ray_kwargs.ray_init.runtime_env.env_vars.ASCEND_LAUNCH_BLOCKING="0"'
-  '+ray_kwargs.ray_init.runtime_env.env_vars.VERL_VLLM_CUDAGRAPH_MODE="NONE"'
-  '+ray_kwargs.ray_init.runtime_env.env_vars.HCCL_OP_EXPANSION_MODE="AIV"'
-  "+ray_kwargs.ray_init.runtime_env.env_vars.HCCL_IF_BASE_PORT=\"${HCCL_IF_BASE_PORT}\""
 )
 
 if [ "${1:-}" = "dry-run" ]; then
-  printf 'PROJECT_ROOT=%s\nCONFIG_DIR=%s\nOUTPUT_DIR=%s\n' \
-    "${PROJECT_ROOT}" "${CONFIG_DIR}" "${OUTPUT_DIR}"
-  printf 'TASK_QUEUE_ENABLE=%s\nASCEND_LAUNCH_BLOCKING=%s\nVLLM_ENABLE_GRAPH_MODE=%s\nVERL_VLLM_CUDAGRAPH_MODE=%s\n' \
-    "${TASK_QUEUE_ENABLE}" "${ASCEND_LAUNCH_BLOCKING}" "${VLLM_ENABLE_GRAPH_MODE}" \
-    "${VERL_VLLM_CUDAGRAPH_MODE}"
+  printf 'TASK_QUEUE_ENABLE=%s\nVLLM_ENABLE_GRAPH_MODE=%s\n' \
+    "${TASK_QUEUE_ENABLE}" "${VLLM_ENABLE_GRAPH_MODE}"
   printf '%q ' python3 -m verl.trainer.main_ppo "${ARGS[@]}"
   printf '\n'
   exit 0
 fi
 
+mkdir -p "${OUTPUT_DIR}/logs" "${OUTPUT_DIR}/rollout_data" "${OUTPUT_DIR}/rollout_length"
 export TENSORBOARD_DIR="${OUTPUT_DIR}/tensorboard"
-mkdir -p \
-  "${OUTPUT_DIR}/logs" \
-  "${OUTPUT_DIR}/rollout_data" \
-  "${OUTPUT_DIR}/rollout_length" \
-  "${TENSORBOARD_DIR}"
 LOG_FILE="${OUTPUT_DIR}/logs/baseline_$(date -u +%Y%m%dT%H%M%SZ).log"
-
-{
-  printf 'project_root=%s\n' "${PROJECT_ROOT}"
-  printf 'config_dir=%s\n' "${CONFIG_DIR}"
-  printf 'model_path=%s\n' "${MODEL_PATH}"
-  printf 'train_file=%s\n' "${TRAIN_FILE}"
-  printf 'test_file=%s\n' "${TEST_FILE}"
-  printf 'output_dir=%s\n' "${OUTPUT_DIR}"
-  printf 'task_queue_enable=%s\n' "${TASK_QUEUE_ENABLE}"
-  printf 'ascend_launch_blocking=%s\n' "${ASCEND_LAUNCH_BLOCKING}"
-  printf 'enforce_eager=True\n'
-  printf 'cudagraph_mode=%s\n' "${VERL_VLLM_CUDAGRAPH_MODE}"
-  printf 'rollout_tp=1\nrollout_dp=%s\n' "${VLLM_DP_SIZE}"
-} | tee "${OUTPUT_DIR}/launch_contract.txt"
-
 python3 -m verl.trainer.main_ppo "${ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
