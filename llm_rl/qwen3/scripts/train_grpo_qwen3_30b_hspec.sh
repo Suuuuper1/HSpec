@@ -264,13 +264,30 @@ NODES="${NODES:-1}"
 TRAIN_GPUS_PER_NODE="${TRAIN_GPUS_PER_NODE:-16}"
 TRAIN_TP="${TRAIN_TP:-4}"
 TRAIN_PP="${TRAIN_PP:-4}"
+TRAIN_CP="${TRAIN_CP:-1}"
 TRAIN_EP="${TRAIN_EP:-4}"
 TRAIN_ETP="${TRAIN_ETP:-1}"
+REF_TP="${REF_TP:-1}"
+REF_PP="${REF_PP:-1}"
+REF_CP="${REF_CP:-1}"
+REF_EP="${REF_EP:-1}"
+REF_ETP="${REF_ETP:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.87}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.9}"
+ROLLOUT_TOP_K="${ROLLOUT_TOP_K:--1}"
+ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.9}"
+ROLLOUT_ENABLE_PREFIX_CACHING="${ROLLOUT_ENABLE_PREFIX_CACHING:-True}"
+ROLLOUT_ENABLE_CHUNKED_PREFILL="${ROLLOUT_ENABLE_CHUNKED_PREFILL:-True}"
+ACTOR_USE_DYNAMIC_BSZ="${ACTOR_USE_DYNAMIC_BSZ:-False}"
+ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ="${ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ:-${ACTOR_USE_DYNAMIC_BSZ}}"
+ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU="${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-20480}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
+MODEL_USE_FUSED_KERNELS="${MODEL_USE_FUSED_KERNELS:-False}"
+DATASET_FRACTION="${DATASET_FRACTION:-0.004}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-3}"
 INFER_TP="${INFER_TP:-4}"
 export HSPEC_INFER_TP="${HSPEC_INFER_TP:-${INFER_TP}}"
 export HSPEC_NUM_SHARDS="${HSPEC_NUM_SHARDS:-${HSPEC_INFER_TP}}"
@@ -278,10 +295,30 @@ export NODE_RANK="${NODE_RANK:-0}"
 export HSPEC_TP_GROUP_ID="${HSPEC_TP_GROUP_ID:-}"
 
 for parallel_value in \
-    NODES TRAIN_GPUS_PER_NODE TRAIN_TP TRAIN_PP TRAIN_EP TRAIN_ETP INFER_TP; do
+    NODES TRAIN_GPUS_PER_NODE TRAIN_TP TRAIN_PP TRAIN_CP TRAIN_EP TRAIN_ETP \
+    REF_TP REF_PP REF_CP REF_EP REF_ETP INFER_TP; do
     value=${!parallel_value}
     if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: ${parallel_value} must be a positive integer, got ${value}" >&2
+        exit 2
+    fi
+done
+for integer_value in DATALOADER_NUM_WORKERS ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU TOTAL_EPOCHS; do
+    value=${!integer_value}
+    if ! [[ "${value}" =~ ^[0-9]+$ ]] || { [ "${integer_value}" != "DATALOADER_NUM_WORKERS" ] && [ "${value}" -eq 0 ]; }; then
+        echo "ERROR: ${integer_value} must be a $([ "${integer_value}" = "DATALOADER_NUM_WORKERS" ] && echo non-negative || echo positive) integer, got ${value}" >&2
+        exit 2
+    fi
+done
+if ! [[ "${ROLLOUT_TOP_K}" =~ ^-?[0-9]+$ ]]; then
+    echo "ERROR: ROLLOUT_TOP_K must be an integer, got ${ROLLOUT_TOP_K}" >&2
+    exit 2
+fi
+for bool_value in ROLLOUT_ENABLE_PREFIX_CACHING ROLLOUT_ENABLE_CHUNKED_PREFILL \
+    ACTOR_USE_DYNAMIC_BSZ ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ MODEL_USE_FUSED_KERNELS; do
+    value=${!bool_value,,}
+    if [ "${value}" != "true" ] && [ "${value}" != "false" ]; then
+        echo "ERROR: ${bool_value} must be True or False, got ${!bool_value}" >&2
         exit 2
     fi
 done
@@ -331,6 +368,11 @@ hspec_maybe_clean_store_dirs
 export HSPEC_LAUNCHER_METADATA_PATH="${HSPEC_LAUNCHER_METADATA_PATH:-${OUT}.${HSPEC_RUN_UID}.launcher_metadata.json}"
 export OUT TRAIN_FILE TEST_FILE DATASET_FRACTION GPU_MEMORY_UTILIZATION
 export MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH MAX_NUM_SEQS ROLLOUT_N TRAIN_BATCH_SIZE
+export PPO_MINI_BATCH_SIZE PPO_MICRO_BATCH_SIZE_PER_GPU INFER_TP TRAIN_TP TRAIN_PP TRAIN_CP TRAIN_EP TRAIN_ETP
+export REF_TP REF_PP REF_CP REF_EP REF_ETP ROLLOUT_TOP_K ROLLOUT_TOP_P
+export ROLLOUT_ENABLE_PREFIX_CACHING ROLLOUT_ENABLE_CHUNKED_PREFILL ACTOR_USE_DYNAMIC_BSZ
+export ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU
+export DATALOADER_NUM_WORKERS MODEL_USE_FUSED_KERNELS TOTAL_EPOCHS
 python3 "${SCRIPT_DIR}/write_hspec_launcher_metadata.py" \
     --output "${HSPEC_LAUNCHER_METADATA_PATH}" --launcher-script "${BASH_SOURCE[0]}"
 
@@ -516,15 +558,31 @@ fi
     echo "train_world_size=${TRAIN_WORLD_SIZE}"
     echo "train_tp=${TRAIN_TP}"
     echo "train_pp=${TRAIN_PP}"
+    echo "train_cp=${TRAIN_CP}"
     echo "train_ep=${TRAIN_EP}"
     echo "train_etp=${TRAIN_ETP}"
+    echo "ref_tp=${REF_TP}"
+    echo "ref_pp=${REF_PP}"
+    echo "ref_cp=${REF_CP}"
+    echo "ref_ep=${REF_EP}"
+    echo "ref_etp=${REF_ETP}"
     echo "infer_tp=${INFER_TP}"
+    echo "vllm_dp_size=${VLLM_DP_SIZE:-auto}"
     echo "max_prompt_length=${MAX_PROMPT_LENGTH}"
     echo "max_response_length=${MAX_RESPONSE_LENGTH}"
     echo "max_num_seqs=${MAX_NUM_SEQS}"
     echo "rollout_n=${ROLLOUT_N}"
+    echo "rollout_top_k=${ROLLOUT_TOP_K}"
+    echo "rollout_top_p=${ROLLOUT_TOP_P}"
+    echo "rollout_enable_prefix_caching=${ROLLOUT_ENABLE_PREFIX_CACHING}"
+    echo "rollout_enable_chunked_prefill=${ROLLOUT_ENABLE_CHUNKED_PREFILL}"
     echo "train_batch_size=${TRAIN_BATCH_SIZE}"
     echo "ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}"
+    echo "actor_use_dynamic_bsz=${ACTOR_USE_DYNAMIC_BSZ}"
+    echo "rollout_log_prob_use_dynamic_bsz=${ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ}"
+    echo "dataset_fraction=${DATASET_FRACTION}"
+    echo "dataloader_num_workers=${DATALOADER_NUM_WORKERS}"
+    echo "total_epochs=${TOTAL_EPOCHS}"
 } >> "${OUT}"
 
 set -x
@@ -543,10 +601,12 @@ env \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=False \
-    +data.dataset_fraction=0.004\
+    data.dataloader_num_workers="${DATALOADER_NUM_WORKERS}" \
+    +data.dataset_fraction="${DATASET_FRACTION}" \
     custom_reward_function.path=deepscaler.py \
     custom_reward_function.name=compute_score \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.use_fused_kernels="${MODEL_USE_FUSED_KERNELS}" \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -555,10 +615,12 @@ env \
     actor_rollout_ref.actor.optim.clip_grad=10000 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
+    actor_rollout_ref.actor.use_dynamic_bsz="${ACTOR_USE_DYNAMIC_BSZ}" \
     actor_rollout_ref.actor.megatron.sequence_parallel=True \
     actor_rollout_ref.actor.megatron.expert_model_parallel_size="${TRAIN_EP}" \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size="${TRAIN_TP}" \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size="${TRAIN_PP}" \
+    actor_rollout_ref.actor.megatron.context_parallel_size="${TRAIN_CP}" \
     actor_rollout_ref.actor.megatron.expert_tensor_parallel_size="${TRAIN_ETP}" \
     actor_rollout_ref.actor.megatron.param_offload=True \
     actor_rollout_ref.actor.megatron.grad_offload=True \
@@ -574,14 +636,19 @@ env \
     actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}" \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
     actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.max_num_seqs="${MAX_NUM_SEQS}" \
+    actor_rollout_ref.rollout.enable_prefix_caching="${ROLLOUT_ENABLE_PREFIX_CACHING}" \
+    actor_rollout_ref.rollout.enable_chunked_prefill="${ROLLOUT_ENABLE_CHUNKED_PREFILL}" \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE}" \
-    actor_rollout_ref.rollout.top_k=-1 \
-    actor_rollout_ref.rollout.top_p=0.9 \
+    actor_rollout_ref.rollout.top_k="${ROLLOUT_TOP_K}" \
+    actor_rollout_ref.rollout.top_p="${ROLLOUT_TOP_P}" \
     actor_rollout_ref.rollout.ignore_eos=False \
     actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz="${ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ}" \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}" \
     actor_rollout_ref.rollout.use_hspec_decode="${USE_HSPEC_DECODE}" \
     actor_rollout_ref.rollout.hspec_num_speculative_tokens=15 \
     actor_rollout_ref.rollout.hspec_similarity_threshold=0.85 \
@@ -590,6 +657,11 @@ env \
     actor_rollout_ref.rollout.hspec_max_entries_per_prompt=160000 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.load_weight=True \
+    actor_rollout_ref.ref.megatron.tensor_model_parallel_size="${REF_TP}" \
+    actor_rollout_ref.ref.megatron.pipeline_model_parallel_size="${REF_PP}" \
+    actor_rollout_ref.ref.megatron.context_parallel_size="${REF_CP}" \
+    actor_rollout_ref.ref.megatron.expert_model_parallel_size="${REF_EP}" \
+    actor_rollout_ref.ref.megatron.expert_tensor_parallel_size="${REF_ETP}" \
     actor_rollout_ref.ref.megatron.param_offload=True \
     actor_rollout_ref.ref.megatron.use_dist_checkpointing=True \
     actor_rollout_ref.ref.megatron.dist_checkpointing_path="${DISTCP_PATH}" \
@@ -605,7 +677,7 @@ env \
     trainer.nnodes="${NODES}" \
     trainer.save_freq=-1 \
     trainer.test_freq=1 \
-    trainer.total_epochs=3 \
+    trainer.total_epochs="${TOTAL_EPOCHS}" \
     +trainer.rollout_length_dir="${ROLLOUT_LENGTH_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
