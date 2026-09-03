@@ -767,6 +767,11 @@ class SpeculativeConfig:
 
     def _resolve_parallel_block_options(self) -> None:
         assert self.draft_model_config is not None
+        if self.draft_parallel_config.tensor_parallel_size != 1:
+            raise NotImplementedError(
+                "DFlash/DSpark currently require draft_tensor_parallel_size=1; "
+                "replicated dense draft weights are the only certified DP surface"
+            )
         if self.num_speculative_tokens is None or not 1 <= self.num_speculative_tokens <= 15:
             raise ValueError(
                 "DFlash/DSpark requires 1 <= num_speculative_tokens <= 15"

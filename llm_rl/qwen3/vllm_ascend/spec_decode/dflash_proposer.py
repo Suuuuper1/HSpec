@@ -104,7 +104,11 @@ class DFlashProposer(ParallelBlockProposer):
                 f"fc={self.model.model.fc.input_size}, layers="
                 f"{self.aux_hidden_state_layer_ids}, hidden={self.hidden_size}"
             )
-        self._aux_hidden_buffer = torch.empty(
+        # Dummy/profile may run before the first real proposal. Initialize this
+        # persistent buffer once on allocation (and on any future rebuild) so
+        # those paths never consume uninitialized values; do not clear it per
+        # dummy step.
+        self._aux_hidden_buffer = torch.zeros(
             (self.max_num_tokens, self.model.model.fc.input_size),
             dtype=self.dtype,
             device=self.device,

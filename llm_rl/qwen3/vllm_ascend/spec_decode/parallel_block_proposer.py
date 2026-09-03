@@ -3,7 +3,7 @@
 
 import copy
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -26,6 +26,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionState,
     AscendMetadata,
 )
+from vllm_ascend.attention.context_kv import PAD_SLOT_ID
 from vllm_ascend.ops.triton.spec_decode.utils import compute_rejected_tokens_kernel
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.probabilistic import (
@@ -36,6 +37,177 @@ from vllm_ascend.spec_decode.parallel_draft_metrics import (
     ParallelDraftMetrics,
     phase5_capability_manifest,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class DraftDPPlan:
+    """Validated execution lengths for one parallel-draft forward.
+
+    ``num_tokens_across_dp`` is borrowed from the runner and is valid for the
+    lifetime of the forward. Keeping the reference avoids a per-step clone.
+    """
+
+    num_actual_tokens: int
+    num_tokens: int
+    num_padding_tokens: int
+    num_tokens_across_dp: Optional[torch.Tensor]
+
+
+def _format_dp_plan_context(
+    *,
+    method: str,
+    batch_size: int,
+    num_speculative_tokens: int,
+    num_queries: int,
+    num_actual_tokens: int,
+    num_tokens: int,
+    dp_size: int,
+    dp_rank: int,
+    num_tokens_across_dp: Optional[torch.Tensor],
+    max_query_tokens: int,
+) -> str:
+    try:
+        padding: object = num_tokens - num_actual_tokens
+    except TypeError:
+        padding = "<invalid>"
+    if isinstance(num_tokens_across_dp, torch.Tensor):
+        if num_tokens_across_dp.device.type == "cpu":
+            counts: object = tuple(num_tokens_across_dp.tolist())
+        else:
+            counts = (
+                f"Tensor(device={num_tokens_across_dp.device}, "
+                f"dtype={num_tokens_across_dp.dtype}, "
+                f"shape={tuple(num_tokens_across_dp.shape)})"
+            )
+    else:
+        counts = num_tokens_across_dp
+    return (
+        f"method={method}, B={batch_size}, K={num_speculative_tokens}, "
+        f"Q={num_queries}, actual={num_actual_tokens}, exec={num_tokens}, "
+        f"pad={padding}, DP size/rank={dp_size}/{dp_rank}, counts={counts}, "
+        f"capacity={max_query_tokens}"
+    )
+
+
+def validate_draft_dp_plan(
+    *,
+    method: str,
+    batch_size: int,
+    num_speculative_tokens: int,
+    num_queries: int,
+    num_actual_tokens: int,
+    num_tokens: int,
+    dp_size: int,
+    dp_rank: int,
+    num_tokens_across_dp: Optional[torch.Tensor],
+    max_query_tokens: int,
+) -> DraftDPPlan:
+    """Validate the logical/execution split without touching an accelerator."""
+
+    scalar_values = {
+        "B": batch_size,
+        "K": num_speculative_tokens,
+        "Q": num_queries,
+        "actual": num_actual_tokens,
+        "exec": num_tokens,
+        "DP size": dp_size,
+        "DP rank": dp_rank,
+        "capacity": max_query_tokens,
+    }
+
+    def context() -> str:
+        # Keep counts materialization off the successful per-step path.
+        return _format_dp_plan_context(
+            method=method,
+            batch_size=batch_size,
+            num_speculative_tokens=num_speculative_tokens,
+            num_queries=num_queries,
+            num_actual_tokens=num_actual_tokens,
+            num_tokens=num_tokens,
+            dp_size=dp_size,
+            dp_rank=dp_rank,
+            num_tokens_across_dp=num_tokens_across_dp,
+            max_query_tokens=max_query_tokens,
+        )
+
+    for name, value in scalar_values.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"Draft DP plan {name} must be an int; {context()}")
+    if not method:
+        raise ValueError(f"Draft DP plan method must be non-empty; {context()}")
+    if batch_size < 0 or num_speculative_tokens <= 0 or num_queries <= 0:
+        raise ValueError(f"Draft DP plan has invalid B/K/Q; {context()}")
+    if dp_size <= 0 or not 0 <= dp_rank < dp_size:
+        raise ValueError(f"Draft DP plan has invalid DP topology; {context()}")
+    if max_query_tokens < 0:
+        raise ValueError(f"Draft DP plan has invalid capacity; {context()}")
+    if num_actual_tokens != batch_size * num_queries:
+        raise ValueError(f"Draft DP plan violates actual=B*Q; {context()}")
+    if not 0 <= num_actual_tokens <= num_tokens <= max_query_tokens:
+        raise ValueError(
+            "Draft DP plan violates 0<=actual<=exec<=capacity; " + context()
+        )
+
+    if dp_size == 1:
+        if num_tokens_across_dp is not None:
+            raise ValueError(f"Draft DP1 plan requires counts=None; {context()}")
+        if num_tokens != num_actual_tokens:
+            raise ValueError(f"Draft DP1 plan requires exec=actual; {context()}")
+    else:
+        counts = num_tokens_across_dp
+        if not isinstance(counts, torch.Tensor):
+            raise TypeError(f"Draft DP>1 plan requires a counts tensor; {context()}")
+        if counts.device.type != "cpu":
+            raise ValueError(f"Draft DP counts must remain on CPU; {context()}")
+        if counts.dtype != torch.int32:
+            raise TypeError(f"Draft DP counts must use torch.int32; {context()}")
+        if counts.ndim != 1 or counts.numel() != dp_size:
+            raise ValueError(
+                f"Draft DP counts must have shape [{dp_size}]; {context()}"
+            )
+        if counts[dp_rank].item() != num_tokens:
+            raise ValueError(f"Draft DP local count must equal exec; {context()}")
+
+    return DraftDPPlan(
+        num_actual_tokens=num_actual_tokens,
+        num_tokens=num_tokens,
+        num_padding_tokens=num_tokens - num_actual_tokens,
+        num_tokens_across_dp=num_tokens_across_dp,
+    )
+
+
+def validate_homogeneous_draft_capacities(
+    capacities: tuple[int, ...],
+    *,
+    dp_size: int,
+    local_capacity: int,
+) -> None:
+    """Fail closed before execution when DP workers preallocate differently."""
+
+    if (
+        isinstance(dp_size, bool)
+        or not isinstance(dp_size, int)
+        or dp_size <= 0
+        or isinstance(local_capacity, bool)
+        or not isinstance(local_capacity, int)
+        or local_capacity < 0
+        or len(capacities) != dp_size
+        or any(
+            isinstance(capacity, bool) or not isinstance(capacity, int)
+            for capacity in capacities
+        )
+    ):
+        raise ValueError(
+            "Draft DP capacities must contain one integer per rank: "
+            f"DP size={dp_size}, capacities={capacities}, "
+            f"local capacity={local_capacity}"
+        )
+    if any(capacity != local_capacity for capacity in capacities):
+        raise ValueError(
+            "Heterogeneous draft DP capacities are unsupported: "
+            f"DP size={dp_size}, capacities={capacities}, "
+            f"local capacity={local_capacity}"
+        )
 
 
 class ParallelBlockProposer(EagleProposer):
@@ -160,6 +332,101 @@ class ParallelBlockProposer(EagleProposer):
             )
             self._phase5_metrics = metrics
         return metrics
+
+    def _validate_dp_plan(
+        self,
+        *,
+        batch_size: int,
+        num_actual_tokens: int,
+        num_tokens: int,
+        num_tokens_across_dp: Optional[torch.Tensor],
+    ) -> DraftDPPlan:
+        parallel_config = self.vllm_config.parallel_config
+        return validate_draft_dp_plan(
+            method=self.method,
+            batch_size=batch_size,
+            num_speculative_tokens=self.num_speculative_tokens,
+            num_queries=self.num_queries,
+            num_actual_tokens=num_actual_tokens,
+            num_tokens=num_tokens,
+            dp_size=parallel_config.data_parallel_size,
+            dp_rank=parallel_config.data_parallel_rank,
+            num_tokens_across_dp=num_tokens_across_dp,
+            max_query_tokens=self.max_query_tokens,
+        )
+
+    def _pad_draft_buffers(
+        self,
+        *,
+        num_actual_tokens: int,
+        num_tokens: int,
+    ) -> None:
+        """Sanitize only the execution-only tail of persistent query buffers."""
+
+        if not 0 <= num_actual_tokens <= num_tokens <= self.max_query_tokens:
+            raise ValueError(
+                "Invalid draft padding range: "
+                f"method={self.method}, actual={num_actual_tokens}, "
+                f"exec={num_tokens}, capacity={self.max_query_tokens}"
+            )
+        if num_tokens == num_actual_tokens:
+            return
+
+        buffers = (
+            ("_query_input_ids", self.model.model.mask_token_id),
+            ("_query_positions", 0),
+            ("_query_slots", PAD_SLOT_ID),
+        )
+        validated_buffers: list[tuple[torch.Tensor, int]] = []
+        for name, value in buffers:
+            buffer = getattr(self, name, None)
+            if not isinstance(buffer, torch.Tensor) or buffer.ndim != 1:
+                raise RuntimeError(
+                    f"Draft padding requires one-dimensional {name}; "
+                    f"method={self.method}, actual={num_actual_tokens}, "
+                    f"exec={num_tokens}, capacity={self.max_query_tokens}"
+                )
+            if buffer.shape[0] < num_tokens:
+                raise RuntimeError(
+                    f"Draft padding exceeds {name} capacity={buffer.shape[0]}; "
+                    f"method={self.method}, actual={num_actual_tokens}, "
+                    f"exec={num_tokens}, capacity={self.max_query_tokens}"
+                )
+            validated_buffers.append((buffer, value))
+
+        group_buffers = tuple(
+            getattr(self, "_per_group_query_slot_mapping_buffers", {}).values()
+        )
+        for buffer in group_buffers:
+            if buffer.ndim != 1 or buffer.shape[0] < num_tokens:
+                raise RuntimeError(
+                    "Draft per-group query slot buffer cannot cover padding: "
+                    f"method={self.method}, actual={num_actual_tokens}, "
+                    f"exec={num_tokens}, shape={tuple(buffer.shape)}"
+                )
+
+        for buffer, value in validated_buffers:
+            buffer[num_actual_tokens:num_tokens].fill_(value)
+        for buffer in group_buffers:
+            buffer[num_actual_tokens:num_tokens].fill_(PAD_SLOT_ID)
+
+    def _pad_and_build_parallel_attention_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        rejected_counts: torch.Tensor,
+        plan: DraftDPPlan,
+    ) -> AscendMetadata:
+        """Preserve the required padding-before-metadata ordering."""
+
+        self._pad_draft_buffers(
+            num_actual_tokens=plan.num_actual_tokens,
+            num_tokens=plan.num_tokens,
+        )
+        return self.build_parallel_attention_metadata(
+            common_attn_metadata,
+            self._query_slots[: plan.num_tokens],
+            rejected_counts,
+        )
 
     def _draft_vllm_config(self) -> VllmConfig:
         draft_model_config = copy.copy(

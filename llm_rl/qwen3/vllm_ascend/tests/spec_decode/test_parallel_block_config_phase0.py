@@ -422,14 +422,21 @@ def test_parallelism_and_checkpoint_mismatch_fail_closed(
 def test_draft_tp_contract_and_dspark_model_requirement(checkpoint_paths):
     target, _, _ = checkpoint_paths
     target_parallel = ParallelConfig(tensor_parallel_size=4)
-    for draft_tp in (1, 4):
-        spec = _spec(
+    spec = _spec(
+        checkpoint_paths,
+        "dflash",
+        target_parallel_config=target_parallel,
+        draft_tensor_parallel_size=1,
+    )
+    assert spec.draft_parallel_config.tensor_parallel_size == 1
+
+    with pytest.raises(NotImplementedError, match="draft_tensor_parallel_size=1"):
+        _spec(
             checkpoint_paths,
             "dflash",
             target_parallel_config=target_parallel,
-            draft_tensor_parallel_size=draft_tp,
+            draft_tensor_parallel_size=4,
         )
-        assert spec.draft_parallel_config.tensor_parallel_size == draft_tp
 
     with pytest.raises(ValueError, match="draft_tensor_parallel_size"):
         _spec(
