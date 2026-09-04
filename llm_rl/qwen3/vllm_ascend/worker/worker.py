@@ -19,6 +19,7 @@
 
 import copy
 import gc
+import os
 from types import NoneType
 from typing import Any, Optional
 
@@ -409,6 +410,61 @@ class NPUWorker(WorkerBase):
         if not hasattr(self.model_runner, "clear_draft_probability_cache"):
             return None
         return self.model_runner.clear_draft_probability_cache()
+
+    def get_parallel_draft_worker_state(
+        self,
+        stage: str,
+        reset_peak_memory: bool = False,
+        flush_metrics: bool = False,
+    ) -> dict[str, Any]:
+        """Return bounded DFlash/DSpark control-plane state for qualification."""
+        if stage not in {"pre_decode", "post_decode"}:
+            raise ValueError(f"unknown worker observation stage: {stage!r}")
+        runner = getattr(self, "model_runner", None)
+        if runner is None:
+            raise RuntimeError("worker RPC cannot resolve model_runner")
+        drafter = getattr(runner, "drafter", None)
+        if drafter is None:
+            raise RuntimeError("worker RPC cannot resolve parallel-block drafter")
+        qualification = getattr(drafter, "_dp_qualification", None)
+        if qualification is None:
+            raise RuntimeError("worker RPC cannot resolve draft DP qualification")
+        cache_snapshot = getattr(runner, "draft_probability_cache_snapshot", None)
+        if not callable(cache_snapshot):
+            raise RuntimeError("worker RPC cannot resolve draft probability cache")
+
+        if reset_peak_memory:
+            torch.npu.reset_peak_memory_stats()
+        observability = None
+        if flush_metrics:
+            flush = getattr(drafter, "flush_observability_metrics", None)
+            if not callable(flush):
+                raise RuntimeError("worker RPC cannot flush draft observability")
+            observability = flush()
+
+        return {
+            "schema_version": "dflash-dspark.dp-repair-r1-worker-state.v1",
+            "stage": stage,
+            "worker_pid": os.getpid(),
+            "worker_rank": int(self.rank),
+            "worker_local_rank": int(self.local_rank),
+            "runner_class": (
+                f"{type(runner).__module__}.{type(runner).__qualname__}"
+            ),
+            "qualification": {
+                "method": qualification.method,
+                "proposal": qualification.proposal,
+                "requested_dp_size": qualification.requested_dp_size,
+                "effective_dp_size": qualification.effective_dp_size,
+                "effective_dp_rank": qualification.effective_dp_rank,
+                "draft_model_kind": qualification.draft_model_kind,
+                "draft_dp_sync_mode": qualification.draft_dp_sync_mode,
+            },
+            "draft_observability": observability,
+            "draft_probability_cache": cache_snapshot(),
+            "peak_memory_reset": bool(reset_peak_memory),
+            "metrics_flushed": bool(flush_metrics),
+        }
 
     def shutdown(self) -> None:
         try:

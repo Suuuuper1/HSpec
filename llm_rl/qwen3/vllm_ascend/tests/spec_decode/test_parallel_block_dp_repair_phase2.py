@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import vllm_ascend.spec_decode.parallel_block_proposer as parallel_block
 from vllm_ascend.spec_decode.parallel_block_proposer import (
@@ -12,6 +13,7 @@ from vllm_ascend.spec_decode.parallel_draft_metrics import (
     dp_repair_capability_manifest,
     phase5_capability_manifest,
 )
+from vllm_ascend.worker.worker import NPUWorker
 
 
 def _config(
@@ -247,3 +249,59 @@ def test_phase1_capability_schema_remains_available_for_frozen_analyzers():
     assert manifest["schema_version"] == "dflash-dspark.dp-repair-capability.v1"
     assert manifest["production_dp_gt1_enabled"] is False
     assert "requested_vllm_dp_size" not in manifest
+
+
+def test_named_worker_rpc_returns_bounded_parallel_draft_state(monkeypatch):
+    resets = []
+    monkeypatch.setattr(torch.npu, "reset_peak_memory_stats", lambda: resets.append(1))
+    qualification = ParallelBlockDPQualification(
+        method="dflash",
+        proposal="probabilistic",
+        requested_dp_size=2,
+        effective_dp_size=2,
+        effective_dp_rank=1,
+        draft_model_kind="dense",
+        draft_dp_sync_mode="local_fast_path",
+    )
+    drafter = SimpleNamespace(
+        _dp_qualification=qualification,
+        flush_observability_metrics=lambda: {"phase5": {}, "dp": {}},
+    )
+    runner = SimpleNamespace(
+        drafter=drafter,
+        draft_probability_cache_snapshot=lambda: {"enabled": True},
+    )
+    worker = NPUWorker.__new__(NPUWorker)
+    worker.model_runner = runner
+    worker.rank = 1
+    worker.local_rank = 1
+
+    pre = worker.get_parallel_draft_worker_state(
+        "pre_decode", reset_peak_memory=True
+    )
+    post = worker.get_parallel_draft_worker_state(
+        "post_decode", flush_metrics=True
+    )
+
+    assert resets == [1]
+    assert pre["qualification"] == {
+        "method": "dflash",
+        "proposal": "probabilistic",
+        "requested_dp_size": 2,
+        "effective_dp_size": 2,
+        "effective_dp_rank": 1,
+        "draft_model_kind": "dense",
+        "draft_dp_sync_mode": "local_fast_path",
+    }
+    assert pre["draft_observability"] is None
+    assert post["draft_observability"] == {"phase5": {}, "dp": {}}
+    assert post["draft_probability_cache"] == {"enabled": True}
+
+
+def test_named_worker_rpc_rejects_wrong_stage_and_missing_drafter():
+    worker = NPUWorker.__new__(NPUWorker)
+    worker.model_runner = SimpleNamespace()
+    with pytest.raises(ValueError, match="unknown worker observation stage"):
+        worker.get_parallel_draft_worker_state("unknown")
+    with pytest.raises(RuntimeError, match="parallel-block drafter"):
+        worker.get_parallel_draft_worker_state("pre_decode")

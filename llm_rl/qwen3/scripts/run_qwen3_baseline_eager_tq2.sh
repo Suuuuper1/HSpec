@@ -156,7 +156,6 @@ ARGS=(
   actor_rollout_ref.rollout.gpu_memory_utilization=0.83
   actor_rollout_ref.rollout.max_num_batched_tokens=17408
   actor_rollout_ref.rollout.max_num_seqs=32
-  +actor_rollout_ref.rollout.async_scheduling=true
   actor_rollout_ref.rollout.enable_prefix_caching=false
   actor_rollout_ref.rollout.enable_chunked_prefill=true
   actor_rollout_ref.rollout.n=16
