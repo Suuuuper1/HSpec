@@ -21,7 +21,7 @@ _SCHEMA = "dflash-dspark.phase5-draft-metrics.v1"
 _MAX_PERCENTILE_SAMPLES = 4096
 _MAX_SHAPES = 256
 _DP_SCHEMA = "dflash-dspark.dp-repair-draft-metrics.v1"
-_DP_CAPABILITY_SCHEMA = "dflash-dspark.dp-repair-capability.v1"
+_DP_CAPABILITY_SCHEMA = "dflash-dspark.dp-repair-capability.v2"
 
 
 class DraftDPObserver:
@@ -454,6 +454,7 @@ def phase5_capability_manifest(
     *,
     vllm_config: Any | None = None,
     draft_model_kind: str = "dense",
+    certification_state: str = "phase1_production_gate_closed",
 ) -> dict[str, Any]:
     """Return the runtime support surface consumed by the R5 analyzer."""
     manifest = {
@@ -497,7 +498,7 @@ def phase5_capability_manifest(
                 if draft_model_kind == "dense"
                 else "cpu_group_max_pad"
             ),
-            "certification_state": "phase1_production_gate_closed",
+            "certification_state": certification_state,
         }
     return manifest
 
@@ -507,14 +508,26 @@ def dp_repair_capability_manifest(
     vllm_config: Any,
     *,
     draft_model_kind: str,
+    requested_vllm_dp_size: int | None = None,
+    production_dp_gt1_enabled: bool = False,
 ) -> dict[str, Any]:
     """Strict per-rank capability record for the DP repair analyzer."""
 
     parallel = vllm_config.parallel_config
-    return {
-        "schema_version": _DP_CAPABILITY_SCHEMA,
+    effective_dp_size = int(parallel.data_parallel_size)
+    requested_dp_size = (
+        effective_dp_size
+        if requested_vllm_dp_size is None
+        else int(requested_vllm_dp_size)
+    )
+    manifest = {
+        "schema_version": (
+            _DP_CAPABILITY_SCHEMA
+            if production_dp_gt1_enabled
+            else "dflash-dspark.dp-repair-capability.v1"
+        ),
         "method": speculative_config.method,
-        "effective_vllm_dp_size": int(parallel.data_parallel_size),
+        "effective_vllm_dp_size": effective_dp_size,
         "effective_vllm_dp_rank": int(parallel.data_parallel_rank),
         "draft_model_kind": draft_model_kind,
         "draft_dp_sync_mode": (
@@ -522,7 +535,7 @@ def dp_repair_capability_manifest(
             if draft_model_kind == "dense"
             else "cpu_group_max_pad"
         ),
-        "production_dp_gt1_enabled": False,
+        "production_dp_gt1_enabled": bool(production_dp_gt1_enabled),
         "certified_candidate": {
             "draft_execution": "eager",
             "proposal": speculative_config.draft_sample_method,
@@ -544,3 +557,7 @@ def dp_repair_capability_manifest(
             "topk_or_reduced_vocab": True,
         },
     }
+    if production_dp_gt1_enabled:
+        manifest["requested_vllm_dp_size"] = requested_dp_size
+        manifest["certification_state"] = "phase2_candidate_r1_r2_required"
+    return manifest

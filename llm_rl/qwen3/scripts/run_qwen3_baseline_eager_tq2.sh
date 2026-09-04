@@ -27,16 +27,34 @@ if [ -d "${CUSTOM_OP_API_LIB}" ]; then
 fi
 
 # Do not inherit rollout experiment knobs from the caller's shell.
+
+# Do not inherit rollout experiment knobs from the caller's shell. Set options
+# that affect plugin/native loading before the runtime audit imports anything.
 while IFS= read -r name; do
   case "${name}" in
     VLLM_* | VERL_*) unset "${name}" ;;
   esac
 done < <(compgen -e)
 
-# Fixed baseline execution contract.
+# CANN 8.5 HCCL cannot build a multi-NPU communicator when Ray restricts each
+# actor to a single logical device through ASCEND_RT_VISIBLE_DEVICES. Keep all
+# local NPUs visible and let VERL bind each actor to the physical ID assigned
+# by Ray. This is required before ray.init() starts worker processes.
+unset ASCEND_RT_VISIBLE_DEVICES NPU_VISIBLE_DEVICES
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export HCCL_OP_EXPANSION_MODE=HOST
+
+# Match the remote 014_baseline execution contract. In particular, keep TQ2
+# paired with manual cache-engine release below; changing either setting makes
+# the local result no longer comparable with the validated remote run.
 export TASK_QUEUE_ENABLE=2
 export VLLM_USE_V1=1
 export VLLM_ENABLE_GRAPH_MODE=0
+export VLLM_PLUGINS=ascend,ascend_kv_connector,ascend_model_loader,ascend_service_profiling
+export VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP=0
+export VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB=0
+
+
 export VLLM_ASCEND_EAGER_COMPILE=1
 export VLLM_ENABLE_EXPERT_PARALLEL=1
 export VLLM_DP_SIZE=16
@@ -45,8 +63,6 @@ export ALL_TO_ALL_RESHARD=1
 export USE_ALLTOALL_OVERLAP=1
 
 # Fast validated v0.14 eager backend settings.
-export VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP=0
-export VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB=0
 export VLLM_ASCEND_FORCE_TORCH_NPU_ADD_RMS_NORM=1
 export VLLM_ASCEND_EAGER_COMPILE_PASS_FUSION=0
 export VLLM_ASCEND_USE_LEGACY_FUSED_MOE=0
@@ -74,7 +90,6 @@ export ASCEND_SLOG_PRINT_TO_STDOUT=0
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-50021}
 export HCCL_BUFFSIZE=800
-export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_ASYNC_ERROR_HANDLING=0
 export HCCL_EXEC_TIMEOUT=7200
 export HCCL_CONNECT_TIMEOUT=7200
@@ -141,6 +156,7 @@ ARGS=(
   actor_rollout_ref.rollout.gpu_memory_utilization=0.83
   actor_rollout_ref.rollout.max_num_batched_tokens=17408
   actor_rollout_ref.rollout.max_num_seqs=32
+  +actor_rollout_ref.rollout.async_scheduling=true
   actor_rollout_ref.rollout.enable_prefix_caching=false
   actor_rollout_ref.rollout.enable_chunked_prefill=true
   actor_rollout_ref.rollout.n=16

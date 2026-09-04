@@ -548,6 +548,11 @@ class vLLMRollout(BaseRollout):
                     if model_runner.speculative_config.draft_model_config.is_moe
                     else "dense"
                 ),
+                draft_max_num_reqs=int(model_runner.max_num_reqs),
+                draft_query_count=int(
+                    model_runner.speculative_config.parallel_query_count
+                ),
+                draft_query_capacity=int(model_runner.drafter.max_query_tokens),
             )
             self._vllm_dp_topology_record = reflected_record
             logger.warning(

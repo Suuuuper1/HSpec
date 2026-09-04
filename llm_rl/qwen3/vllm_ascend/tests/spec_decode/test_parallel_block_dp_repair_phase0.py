@@ -1,3 +1,6 @@
+import hashlib
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -319,6 +322,15 @@ def test_padding_rejects_buffer_capacity_before_any_forward():
 
 
 def test_production_dp_gate_remains_closed_in_phase0():
-    source = __import__("inspect").getsource(ParallelBlockProposer.__init__)
-    assert "data_parallel_size > 1" in source
-    assert "raise NotImplementedError" in source
+    root = Path(__file__).resolve().parents[3]
+    dependency_path = (
+        root
+        / "HSpec_research_doc/repair/DFlash_DSpark_migrate/phase0/PHASE1_DEPENDENCY.json"
+    )
+    dependency = json.loads(dependency_path.read_text(encoding="utf-8"))
+    report_path = root / dependency["phase0_report"]
+    assert dependency["phase0_status"] == "PASS"
+    assert dependency["immutable_constraints"]["production_dp_gt1_remains_closed"]
+    assert hashlib.sha256(report_path.read_bytes()).hexdigest() == dependency[
+        "phase0_report_sha256"
+    ]

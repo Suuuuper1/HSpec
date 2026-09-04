@@ -3,8 +3,9 @@
 
 import copy
 import json
+import os
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -53,6 +54,214 @@ class DraftDPPlan:
     num_tokens: int
     num_padding_tokens: int
     num_tokens_across_dp: Optional[torch.Tensor]
+
+
+@dataclass(frozen=True, slots=True)
+class ParallelBlockDPQualification:
+    """Startup qualification for the narrow, production DP surface."""
+
+    method: str
+    proposal: str
+    requested_dp_size: int
+    effective_dp_size: int
+    effective_dp_rank: int
+    draft_model_kind: str
+    draft_dp_sync_mode: str
+
+
+_DP_CERTIFIED_ALTERNATIVE = (
+    "Certified alternatives: use model-internal DP=1; or use a DP-compatible "
+    "MoE target with a replicated dense DFlash/DSpark draft, draft TP=1, "
+    "PP/PCP/DCP=1, eager fixed-K full-vocabulary proposal and standard rejection."
+)
+
+
+def _required_attr(owner: Any, name: str, *, surface: str) -> Any:
+    if owner is None or not hasattr(owner, name):
+        raise ValueError(
+            f"Parallel-block DP qualification cannot resolve {surface}.{name}. "
+            + _DP_CERTIFIED_ALTERNATIVE
+        )
+    return getattr(owner, name)
+
+
+def validate_parallel_block_dp_qualification(
+    vllm_config: VllmConfig,
+    *,
+    environ: dict[str, str] | None = None,
+) -> ParallelBlockDPQualification:
+    """Fail closed before model allocation unless the exact DP surface is used."""
+
+    spec = _required_attr(vllm_config, "speculative_config", surface="vllm_config")
+    parallel = _required_attr(vllm_config, "parallel_config", surface="vllm_config")
+    scheduler = _required_attr(vllm_config, "scheduler_config", surface="vllm_config")
+    cache = _required_attr(vllm_config, "cache_config", surface="vllm_config")
+    method = _required_attr(spec, "method", surface="speculative_config")
+    proposal = _required_attr(
+        spec, "draft_sample_method", surface="speculative_config"
+    )
+    dp_size = _required_attr(
+        parallel, "data_parallel_size", surface="parallel_config"
+    )
+    dp_rank = _required_attr(
+        parallel, "data_parallel_rank", surface="parallel_config"
+    )
+    if (
+        isinstance(dp_size, bool)
+        or not isinstance(dp_size, int)
+        or dp_size <= 0
+        or isinstance(dp_rank, bool)
+        or not isinstance(dp_rank, int)
+        or not 0 <= dp_rank < dp_size
+    ):
+        raise ValueError(
+            f"Invalid effective model-internal DP size/rank={dp_size}/{dp_rank}. "
+            + _DP_CERTIFIED_ALTERNATIVE
+        )
+
+    env = os.environ if environ is None else environ
+    raw_requested = env.get("VLLM_DP_SIZE")
+    try:
+        requested_dp_size = dp_size if raw_requested is None else int(raw_requested)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"VLLM_DP_SIZE must be a positive integer, got {raw_requested!r}. "
+            + _DP_CERTIFIED_ALTERNATIVE
+        ) from error
+    if raw_requested is not None and raw_requested.strip() != str(requested_dp_size):
+        raise ValueError(
+            f"VLLM_DP_SIZE must be a canonical positive integer, got "
+            f"{raw_requested!r}. "
+            + _DP_CERTIFIED_ALTERNATIVE
+        )
+    if requested_dp_size <= 0 or requested_dp_size != dp_size:
+        raise ValueError(
+            "Requested/effective model-internal DP mismatch: "
+            f"requested={requested_dp_size}, effective={dp_size}. "
+            + _DP_CERTIFIED_ALTERNATIVE
+        )
+
+    target_parallel = _required_attr(
+        spec, "target_parallel_config", surface="speculative_config"
+    )
+    draft_parallel = _required_attr(
+        spec, "draft_parallel_config", surface="speculative_config"
+    )
+    draft_model = _required_attr(
+        spec, "draft_model_config", surface="speculative_config"
+    )
+    target_model = _required_attr(
+        spec, "target_model_config", surface="speculative_config"
+    )
+    failures: list[str] = []
+    if method not in {"dflash", "dspark"}:
+        failures.append(f"method={method!r}")
+    if proposal not in {"greedy", "probabilistic"}:
+        failures.append(f"draft_sample_method={proposal!r}")
+    if bool(_required_attr(draft_model, "is_moe", surface="draft_model_config")):
+        failures.append("draft model is MoE/EP instead of replicated dense")
+    if bool(
+        _required_attr(
+            draft_parallel,
+            "enable_expert_parallel",
+            surface="draft_parallel_config",
+        )
+    ):
+        failures.append("draft expert parallelism is enabled")
+    target_vocab_size = _required_attr(
+        target_model, "get_vocab_size", surface="target_model_config"
+    )()
+    draft_vocab_size = _required_attr(
+        draft_model, "get_vocab_size", surface="draft_model_config"
+    )()
+    if target_vocab_size != draft_vocab_size:
+        failures.append(
+            "target/draft vocabulary mismatch "
+            f"({target_vocab_size} != {draft_vocab_size})"
+        )
+    if _required_attr(
+        draft_parallel, "tensor_parallel_size", surface="draft_parallel_config"
+    ) != 1:
+        failures.append("draft tensor_parallel_size is not 1")
+    for name in (
+        "pipeline_parallel_size",
+        "prefill_context_parallel_size",
+        "decode_context_parallel_size",
+    ):
+        if _required_attr(target_parallel, name, surface="target_parallel_config") != 1:
+            failures.append(f"target {name} is not 1")
+        if _required_attr(draft_parallel, name, surface="draft_parallel_config") != 1:
+            failures.append(f"draft {name} is not 1")
+    if dp_size > 1 and _required_attr(
+        parallel, "is_moe_model", surface="parallel_config"
+    ) is not True:
+        failures.append("DP>1 target is not an explicitly DP-compatible MoE model")
+    if bool(_required_attr(scheduler, "async_scheduling", surface="scheduler_config")):
+        failures.append("async_scheduling is enabled")
+    if _required_attr(spec, "enforce_eager", surface="speculative_config") is not True:
+        failures.append("draft eager execution is not explicit")
+    fixed_k = _required_attr(
+        spec, "num_speculative_tokens", surface="speculative_config"
+    )
+    if isinstance(fixed_k, bool) or not isinstance(fixed_k, int) or not 1 <= fixed_k <= 15:
+        failures.append(f"fixed K is invalid ({fixed_k!r})")
+    if bool(
+        _required_attr(
+            spec, "disable_padded_drafter_batch", surface="speculative_config"
+        )
+    ):
+        failures.append("padded drafter batch is disabled")
+    if bool(
+        _required_attr(
+            spec, "parallel_draft_incremental_context_kv", surface="speculative_config"
+        )
+    ):
+        failures.append("incremental context KV is enabled")
+    if bool(
+        _required_attr(
+            spec, "parallel_draft_dynamic_k", surface="speculative_config"
+        )
+    ):
+        failures.append("dynamic K/confidence is enabled")
+    if _required_attr(spec, "dspark_draft_topk", surface="speculative_config") is not None:
+        failures.append("top-k/reduced-vocabulary drafting is enabled")
+    if bool(_required_attr(cache, "enable_prefix_caching", surface="cache_config")):
+        failures.append("prefix caching is enabled")
+    if getattr(vllm_config, "lora_config", None) is not None:
+        failures.append("LoRA is enabled")
+    if _required_attr(
+        spec, "rejection_sample_method", surface="speculative_config"
+    ) != "standard":
+        failures.append("verification is not standard rejection")
+    probability_budget = _required_attr(
+        spec, "draft_probability_max_bytes", surface="speculative_config"
+    )
+    if proposal == "probabilistic":
+        if _required_attr(
+            target_parallel, "tensor_parallel_size", surface="target_parallel_config"
+        ) != 1:
+            failures.append("probabilistic proposal target TP is not 1")
+        if probability_budget is None:
+            failures.append("probabilistic proposal has no explicit memory budget")
+    elif probability_budget is not None:
+        failures.append("greedy proposal has a probabilistic memory budget")
+    if failures:
+        raise NotImplementedError(
+            "Unsupported parallel-block DP configuration: "
+            + "; ".join(failures)
+            + ". "
+            + _DP_CERTIFIED_ALTERNATIVE
+        )
+
+    return ParallelBlockDPQualification(
+        method=method,
+        proposal=proposal,
+        requested_dp_size=requested_dp_size,
+        effective_dp_size=dp_size,
+        effective_dp_rank=dp_rank,
+        draft_model_kind="dense",
+        draft_dp_sync_mode="local_fast_path",
+    )
 
 
 def _format_dp_plan_context(
@@ -223,14 +432,10 @@ class ParallelBlockProposer(EagleProposer):
     def __init__(
         self, vllm_config: VllmConfig, device: torch.device, runner=None
     ) -> None:
+        # Qualification is deliberately before EagleProposer/model allocation.
+        self._dp_qualification = validate_parallel_block_dp_qualification(vllm_config)
         super().__init__(vllm_config, device, runner)
         self._checkpoint_load_count = 0
-        if vllm_config.parallel_config.data_parallel_size > 1:
-            raise NotImplementedError("Phase 1/2 parallel drafters certify DP=1 only")
-        if vllm_config.scheduler_config.async_scheduling:
-            raise NotImplementedError(
-                "Phase 1/2 parallel drafters require async_scheduling=False"
-            )
         # Full graph still hard-codes causal FIA arguments in this ABI.
         self.use_cuda_graph = False
         self._runnable = self._run_parallel_backbone
@@ -266,6 +471,7 @@ class ParallelBlockProposer(EagleProposer):
                     self.speculative_config,
                     vllm_config=self.vllm_config,
                     draft_model_kind=self._draft_model_kind,
+                    certification_state="phase2_candidate_open",
                 ),
                 sort_keys=True,
             ),
@@ -277,6 +483,10 @@ class ParallelBlockProposer(EagleProposer):
                     self.speculative_config,
                     self.vllm_config,
                     draft_model_kind=self._draft_model_kind,
+                    requested_vllm_dp_size=(
+                        self._dp_qualification.requested_dp_size
+                    ),
+                    production_dp_gt1_enabled=True,
                 ),
                 sort_keys=True,
             ),

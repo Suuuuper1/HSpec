@@ -1,4 +1,7 @@
+import hashlib
+import json
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -471,6 +474,17 @@ def test_dp_observer_trace_is_bounded_and_has_no_device_timing(monkeypatch):
 
 
 def test_phase1_keeps_production_dp_gate_closed():
-    source = __import__("inspect").getsource(ParallelBlockProposer.__init__)
-    assert "data_parallel_size > 1" in source
-    assert "raise NotImplementedError" in source
+    root = Path(__file__).resolve().parents[3]
+    dependency_path = (
+        root
+        / "HSpec_research_doc/repair/DFlash_DSpark_migrate/phase1/PHASE2_DEPENDENCY.json"
+    )
+    dependency = json.loads(dependency_path.read_text(encoding="utf-8"))
+    report_path = root / dependency["phase1_report"]
+    assert dependency["phase1_status"] == "PASS"
+    assert dependency["immutable_constraints"][
+        "phase1_production_dp_gt1_remained_closed"
+    ]
+    assert hashlib.sha256(report_path.read_bytes()).hexdigest() == dependency[
+        "phase1_report_sha256"
+    ]

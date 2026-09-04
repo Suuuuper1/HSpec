@@ -112,6 +112,9 @@ def test_topology_manifest_requires_complete_consistent_engine_records():
             actual_dp_group_ranks=(rank % 2, rank % 2 + 2),
             method="dflash",
             draft_model_kind="dense",
+            draft_max_num_reqs=8,
+            draft_query_count=8,
+            draft_query_capacity=64,
         )
         for rank in range(4)
     ]
@@ -120,6 +123,8 @@ def test_topology_manifest_requires_complete_consistent_engine_records():
     assert manifest["all_engine_reflected"] is True
     assert manifest["dp_groups"] == [[0, 2], [1, 3]]
     assert manifest["draft_dp_sync_mode"] == "local_fast_path"
+    assert manifest["draft_capacity_validated"] is True
+    assert manifest["draft_query_capacity_by_dp_group"] == {"0,2": 64, "1,3": 64}
 
     incomplete = records[:-1]
     with pytest.raises(ValueError, match="each rank once"):
@@ -192,6 +197,9 @@ def test_topology_record_accepts_parallel_config_shape():
         actual_dp_group_ranks=(0, 1),
         method="dspark",
         draft_model_kind="dense",
+        draft_max_num_reqs=8,
+        draft_query_count=7,
+        draft_query_capacity=56,
     )
     assert record["effective_vllm_dp_rank"] == 1
     assert record["draft_model_kind"] == "dense"
@@ -217,6 +225,9 @@ def test_topology_does_not_guess_draft_kind_before_engine_reflection():
         actual_dp_group_ranks=(0, 1),
         method="dflash",
         draft_model_kind="moe",
+        draft_max_num_reqs=8,
+        draft_query_count=8,
+        draft_query_capacity=64,
     )
     assert reflected["draft_model_kind"] == "moe"
     assert reflected["draft_dp_sync_mode"] == "cpu_group_max_pad"
@@ -227,3 +238,71 @@ def test_topology_does_not_guess_draft_kind_before_engine_reflection():
             global_rank=0,
             draft_model_kind="dense",
         )
+
+
+def test_engine_reflected_capacity_fails_closed_before_rollout():
+    resolved = resolve_vllm_data_parallel_size(2, environ={})
+    layout = validate_vllm_dp_layout(
+        world_size=2, vllm_dp_size=2, tensor_parallel_size=1
+    )
+    common = dict(
+        resolved=resolved,
+        layout=layout,
+        actual_dp_size=2,
+        actual_dp_group_ranks=(0, 1),
+        method="dflash",
+        draft_model_kind="dense",
+        draft_max_num_reqs=8,
+        draft_query_count=8,
+        draft_query_capacity=64,
+    )
+    records = [
+        build_topology_record(
+            **common, global_rank=rank, actual_dp_rank=rank
+        )
+        for rank in range(2)
+    ]
+    records[1]["draft_query_capacity"] = 56
+    with pytest.raises(ValueError, match="Heterogeneous or invalid"):
+        build_topology_manifest(records)
+
+    with pytest.raises(RuntimeError, match="capacity mismatch"):
+        build_topology_record(
+            **{
+                **common,
+                "global_rank": 0,
+                "actual_dp_rank": 0,
+                "draft_query_capacity": 63,
+            }
+        )
+
+
+def test_topology_manifest_rejects_mixed_engine_reflection():
+    resolved = resolve_vllm_data_parallel_size(2, environ={})
+    layout = validate_vllm_dp_layout(
+        world_size=2, vllm_dp_size=2, tensor_parallel_size=1
+    )
+    records = [
+        build_topology_record(
+            resolved=resolved,
+            layout=layout,
+            global_rank=0,
+            method="dflash",
+            draft_model_kind="dense",
+        ),
+        build_topology_record(
+            resolved=resolved,
+            layout=layout,
+            global_rank=1,
+            actual_dp_size=2,
+            actual_dp_rank=1,
+            actual_dp_group_ranks=(0, 1),
+            method="dflash",
+            draft_model_kind="dense",
+            draft_max_num_reqs=4,
+            draft_query_count=8,
+            draft_query_capacity=32,
+        ),
+    ]
+    with pytest.raises(ValueError, match="mix predicted and engine-reflected"):
+        build_topology_manifest(records)

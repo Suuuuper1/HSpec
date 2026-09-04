@@ -183,6 +183,9 @@ def build_topology_record(
     actual_dp_group_ranks: Sequence[int] | None = None,
     method: str | None = None,
     draft_model_kind: str | None = None,
+    draft_max_num_reqs: int | None = None,
+    draft_query_count: int | None = None,
+    draft_query_capacity: int | None = None,
 ) -> dict[str, Any]:
     expected_group = predicted_dp_group(layout, global_rank)
     expected_rank = expected_group.index(global_rank)
@@ -221,8 +224,38 @@ def build_topology_record(
         sync_mode = "local_fast_path"
     elif draft_model_kind == "moe":
         sync_mode = "cpu_group_max_pad"
+    engine_reflected = actual_dp_size is not None
+    capacity_values = (
+        draft_max_num_reqs,
+        draft_query_count,
+        draft_query_capacity,
+    )
+    if parallel_block and engine_reflected:
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in capacity_values
+        ):
+            raise RuntimeError(
+                "Engine-reflected DFlash/DSpark topology requires positive "
+                "draft_max_num_reqs, draft_query_count and draft_query_capacity"
+            )
+        assert draft_max_num_reqs is not None
+        assert draft_query_count is not None
+        assert draft_query_capacity is not None
+        expected_capacity = draft_max_num_reqs * draft_query_count
+        if draft_query_capacity != expected_capacity:
+            raise RuntimeError(
+                "Draft query capacity mismatch before rollout: "
+                f"capacity={draft_query_capacity}, max_num_reqs={draft_max_num_reqs}, "
+                f"query_count={draft_query_count}, expected={expected_capacity}"
+            )
+    elif any(value is not None for value in capacity_values):
+        raise ValueError(
+            "Draft capacity fields are only valid for engine-reflected "
+            "DFlash/DSpark topology records"
+        )
     return {
-        "schema_version": "dflash-dspark.dp-repair-topology-record.v1",
+        "schema_version": "dflash-dspark.dp-repair-topology-record.v2",
         "global_rank": int(global_rank),
         "world_size": layout.world_size,
         "requested_vllm_dp_size": resolved.size,
@@ -238,7 +271,10 @@ def build_topology_record(
         "method": method,
         "draft_model_kind": draft_model_kind,
         "draft_dp_sync_mode": sync_mode,
-        "engine_reflected": actual_dp_size is not None,
+        "draft_max_num_reqs": draft_max_num_reqs,
+        "draft_query_count": draft_query_count,
+        "draft_query_capacity": draft_query_capacity,
+        "engine_reflected": engine_reflected,
     }
 
 
@@ -301,8 +337,45 @@ def build_topology_manifest(
             raise ValueError(
                 f"Topology rank/group mismatch: rank={rank}, dp_rank={dp_rank}, group={group}"
             )
+    parallel_block = records[0].get("method") in {"dflash", "dspark"}
+    reflected_states = {
+        bool(record.get("engine_reflected")) for record in records
+    }
+    if len(reflected_states) != 1:
+        raise ValueError(
+            "Topology records mix predicted and engine-reflected states across ranks"
+        )
+    all_engine_reflected = reflected_states == {True}
+    capacity_by_group: dict[str, int] = {}
+    if parallel_block and all_engine_reflected:
+        for group in sorted(groups):
+            group_records = [
+                record for record in records if int(record["global_rank"]) in group
+            ]
+            capacities = [record.get("draft_query_capacity") for record in group_records]
+            max_reqs = [record.get("draft_max_num_reqs") for record in group_records]
+            query_counts = [record.get("draft_query_count") for record in group_records]
+            if (
+                any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value <= 0
+                    for value in capacities + max_reqs + query_counts
+                )
+                or len(set(capacities)) != 1
+                or len(set(max_reqs)) != 1
+                or len(set(query_counts)) != 1
+            ):
+                raise ValueError(
+                    "Heterogeneous or invalid draft capacity inside DP group "
+                    f"{group}: max_num_reqs={max_reqs}, "
+                    f"query_counts={query_counts}, capacities={capacities}"
+                )
+            capacity_by_group[",".join(str(rank) for rank in group)] = int(
+                capacities[0]
+            )
     return {
-        "schema_version": "dflash-dspark.dp-repair-topology-manifest.v1",
+        "schema_version": "dflash-dspark.dp-repair-topology-manifest.v2",
         "status": "PASS",
         "world_size": world_size,
         "rank_count": len(records),
@@ -322,7 +395,12 @@ def build_topology_manifest(
         "method": records[0].get("method"),
         "draft_model_kind": records[0].get("draft_model_kind"),
         "draft_dp_sync_mode": records[0].get("draft_dp_sync_mode"),
-        "all_engine_reflected": all(
-            bool(record.get("engine_reflected")) for record in records
+        "all_engine_reflected": all_engine_reflected,
+        "draft_capacity_validated": bool(
+            parallel_block and all_engine_reflected and capacity_by_group
         ),
+        "homogeneous_draft_capacity_per_dp_group": bool(
+            parallel_block and all_engine_reflected and capacity_by_group
+        ),
+        "draft_query_capacity_by_dp_group": capacity_by_group,
     }
