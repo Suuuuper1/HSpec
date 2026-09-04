@@ -82,6 +82,9 @@ init_rollout_rebalance()
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+_DP_REPAIR_PHASE3_OBSERVE = (
+    os.environ.get("VERL_DP_REPAIR_PHASE3_PRELUDE", "0") == "1"
+)
 
 MindSpeedPatchesManager.patches_info['torch.compile'].remove_patch()
 TRUE_COMPILE = torch.compile
@@ -613,6 +616,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        transition_start_ns = (
+            time.perf_counter_ns() if _DP_REPAIR_PHASE3_OBSERVE else 0
+        )
         aggressive_empty_cache(force_sync=True)
 
         if self._is_offload_param:
@@ -643,9 +649,19 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
         self.rollout.eplb_start()
+        if _DP_REPAIR_PHASE3_OBSERVE:
+            logger.warning(
+                "PHASE3_ENGINE_TRANSITION_TIMING transition=rollout_mode "
+                "rank=%d value_ms=%.6f",
+                int(torch.distributed.get_rank()),
+                (time.perf_counter_ns() - transition_start_ns) / 1_000_000.0,
+            )
 
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
+        transition_start_ns = (
+            time.perf_counter_ns() if _DP_REPAIR_PHASE3_OBSERVE else 0
+        )
         self.rollout.eplb_end()
         if self.config.rollout.free_cache_engine:
             log_gpu_memory_usage("Before rollout offload", logger=logger)
@@ -666,6 +682,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # restore random states
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
+        if _DP_REPAIR_PHASE3_OBSERVE:
+            logger.warning(
+                "PHASE3_ENGINE_TRANSITION_TIMING transition=trainer_mode "
+                "rank=%d value_ms=%.6f",
+                int(torch.distributed.get_rank()),
+                (time.perf_counter_ns() - transition_start_ns) / 1_000_000.0,
+            )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="update_actor", logger=logger)
@@ -739,6 +762,26 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
+            if (
+                _DP_REPAIR_PHASE3_OBSERVE
+                and not getattr(self, "_dp_repair_phase3_prelude_done", False)
+            ):
+                from verl.workers.rollout.vllm_rollout.dp_repair_phase3_prelude import (
+                    run_dp_repair_phase3_prelude,
+                )
+
+                prelude = run_dp_repair_phase3_prelude(self.rollout, prompts)
+                self._dp_repair_phase3_prelude_done = True
+                logger.warning(
+                    "DP_REPAIR_PHASE3_PRELUDE_RECORD method=%s rank=%s "
+                    "status=%s submitted=%s completed=%s output_tokens=%s",
+                    prelude.get("method"),
+                    prelude.get("global_rank"),
+                    prelude.get("status"),
+                    prelude.get("submitted_requests"),
+                    prelude.get("completed_requests"),
+                    prelude.get("output_token_count"),
+                )
             output = self.rollout.generate_sequences(prompts=prompts)
 
         if self._is_actor:

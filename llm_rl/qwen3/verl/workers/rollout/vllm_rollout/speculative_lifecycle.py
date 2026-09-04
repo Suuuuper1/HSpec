@@ -136,6 +136,41 @@ def _allocator_summary() -> dict[str, Any]:
     }
 
 
+def _rng_summary() -> dict[str, Any]:
+    try:
+        state = torch.npu.get_rng_state().cpu()
+    except Exception as error:
+        return {
+            "available": False,
+            "error": f"{type(error).__name__}: {error}",
+        }
+    return {
+        "available": True,
+        "bytes": int(state.numel() * state.element_size()),
+        "sha256": hashlib.sha256(state.numpy().tobytes()).hexdigest(),
+    }
+
+
+def _draft_method_state(method: str | None, drafter: Any) -> dict[str, Any] | None:
+    if method != "dspark" or drafter is None:
+        return None
+    names = (
+        "_dspark_token_buffer",
+        "_dspark_embedding_buffer",
+        "_dspark_corrected_logits_buffer",
+    )
+    shapes = {
+        name: list(getattr(drafter, name).shape)
+        for name in names
+        if isinstance(getattr(drafter, name, None), torch.Tensor)
+    }
+    return {
+        "anchor_required": True,
+        "markov_feedback": "sequential",
+        "workspace_shapes": shapes,
+    }
+
+
 class SpeculativeLifecycleAudit:
     """Fail-fast state-machine checker and append-only JSONL recorder."""
 
@@ -186,7 +221,13 @@ class SpeculativeLifecycleAudit:
             os.fsync(stream.fileno())
 
     def _snapshot(
-        self, inference_engine, event: str, *, checksum_weights: bool = True, **extra
+        self,
+        inference_engine,
+        event: str,
+        *,
+        checksum_weights: bool = True,
+        flush_draft_metrics: bool = False,
+        **extra,
     ) -> dict[str, Any]:
         runner, target, drafter, draft = _models(inference_engine)
         if checksum_weights:
@@ -224,6 +265,47 @@ class SpeculativeLifecycleAudit:
             if hasattr(runner, "draft_probability_cache_snapshot")
             else None
         )
+        draft_observability = None
+        if drafter is not None:
+            if flush_draft_metrics and hasattr(
+                drafter, "flush_observability_metrics"
+            ):
+                draft_observability = drafter.flush_observability_metrics()
+                # The sampled profiler may have auto-flushed exactly at its
+                # cadence boundary. Preserve its cumulative snapshot in the
+                # lifecycle record even when that final explicit flush had no
+                # pending device events and therefore returned phase5=None.
+                if (
+                    isinstance(draft_observability, dict)
+                    and draft_observability.get("phase5") is None
+                    and getattr(drafter, "phase5_metrics", None) is not None
+                ):
+                    draft_observability = {
+                        **draft_observability,
+                        "phase5": drafter.phase5_metrics.snapshot(),
+                    }
+            else:
+                observer = getattr(drafter, "draft_dp_observer", None)
+                phase5 = getattr(drafter, "phase5_metrics", None)
+                draft_observability = {
+                    "dp": observer.snapshot() if observer is not None else None,
+                    "phase5": phase5.snapshot() if phase5 is not None else None,
+                }
+        qualification = getattr(drafter, "_dp_qualification", None)
+        draft_capability = None
+        if qualification is not None:
+            draft_capability = {
+                name: getattr(qualification, name)
+                for name in (
+                    "method",
+                    "proposal",
+                    "requested_dp_size",
+                    "effective_dp_size",
+                    "effective_dp_rank",
+                    "draft_model_kind",
+                    "draft_dp_sync_mode",
+                )
+            }
         record = {
             "event": event,
             "target_updates": self.target_updates,
@@ -245,6 +327,10 @@ class SpeculativeLifecycleAudit:
             "request_identities_available": request_identities_available,
             "hspec_collection_enabled": bool(getattr(runner, "_hspec_collect", False)),
             "draft_probability_cache": probability_cache,
+            "draft_observability": draft_observability,
+            "draft_capability": draft_capability,
+            "rng_state": _rng_summary(),
+            "draft_method_state": _draft_method_state(self.method, drafter),
             "allocator": _allocator_summary(),
             **extra,
         }
@@ -396,7 +482,11 @@ class SpeculativeLifecycleAudit:
     def after_rollout(self, inference_engine) -> None:
         if not self.enabled:
             return
-        record = self._snapshot(inference_engine, "after_rollout")
+        record = self._snapshot(
+            inference_engine,
+            "after_rollout",
+            flush_draft_metrics=self.method in {"dflash", "dspark"},
+        )
         self._check_parallel_draft(record)
         request_ids = self._request_ids(record, "after_rollout")
         leaked = request_ids & self._terminal_request_ids
@@ -408,6 +498,35 @@ class SpeculativeLifecycleAudit:
         self._terminal_request_ids = request_ids
         self._write(record)
         self.rollouts += 1
+
+    def after_dp_repair_prelude(
+        self, inference_engine, prelude: dict[str, Any]
+    ) -> None:
+        """Adopt the old-V1 terminal cache left by the qualification wave.
+
+        The prelude bypasses the RL rollout counter and actor update state
+        machine. Old V1 keeps the just-finished request IDs until the next
+        scheduler update, so record them as the prior terminal generation;
+        ``after_rollout`` will require the formal wave to retire them.
+        """
+        if not self.enabled:
+            return
+        record = self._snapshot(
+            inference_engine,
+            "after_dp_repair_prelude",
+            flush_draft_metrics=True,
+            prelude=prelude,
+        )
+        self._check_parallel_draft(record)
+        request_ids = self._request_ids(record, "after_dp_repair_prelude")
+        leaked = request_ids & self._terminal_request_ids
+        if self.strict and leaked:
+            raise RuntimeError(
+                "Phase-3 prelude reused an earlier terminal request ID: "
+                f"{sorted(leaked)}"
+            )
+        self._terminal_request_ids = request_ids
+        self._write(record)
 
     def after_sleep(self, *, reset_prefix_cache_succeeded: bool) -> None:
         if not self.enabled:
