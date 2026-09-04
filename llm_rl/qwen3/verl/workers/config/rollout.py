@@ -147,6 +147,9 @@ class RolloutConfig(BaseConfig):
     cudagraph_mode: Optional[str] = None
     cudagraph_capture_sizes: Optional[list] = None
     free_cache_engine: bool = True
+    # Model-internal vLLM DP. This is distinct from the Verl request/output
+    # dispatch ``data_parallel_size`` below. None preserves VLLM_DP_SIZE.
+    vllm_data_parallel_size: Optional[int] = None
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2
@@ -248,6 +251,12 @@ class RolloutConfig(BaseConfig):
     def __post_init__(self):
         """Validate the rollout config"""
         method = resolve_rollout_speculative_method(self)
+        if self.vllm_data_parallel_size is not None and (
+            isinstance(self.vllm_data_parallel_size, bool)
+            or not isinstance(self.vllm_data_parallel_size, int)
+            or self.vllm_data_parallel_size <= 0
+        ):
+            raise ValueError("vllm_data_parallel_size must be a positive integer or null")
         if not 1 <= self.num_speculative_tokens <= 15:
             raise ValueError("num_speculative_tokens must be in [1, 15]")
         if not 1 <= self.speculative_lifecycle_samples_per_parameter <= 64:
@@ -282,9 +291,16 @@ class RolloutConfig(BaseConfig):
                     "tensor_model_parallel_size=1 until cross-rank RNG/proposal "
                     "equivalence is certified"
                 )
-            if self.pipeline_model_parallel_size != 1 or self.data_parallel_size != 1:
+            if self.pipeline_model_parallel_size != 1:
                 raise NotImplementedError(
-                    "Phase-3 DFlash/DSpark supports vLLM PP=1 and DP=1 only"
+                    "DFlash/DSpark supports vLLM pipeline_model_parallel_size=1 only"
+                )
+            if self.data_parallel_size != 1:
+                raise NotImplementedError(
+                    "rollout.data_parallel_size is Verl request/output dispatch DP "
+                    "and must remain 1 for synchronous DFlash/DSpark; use "
+                    "rollout.vllm_data_parallel_size or VLLM_DP_SIZE for "
+                    "model-internal vLLM DP"
                 )
             if self.draft_sample_method not in {"greedy", "probabilistic"}:
                 raise NotImplementedError(

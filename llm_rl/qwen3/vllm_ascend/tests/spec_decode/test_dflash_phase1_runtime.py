@@ -191,19 +191,30 @@ def test_parallel_dummy_run_profiles_aux_context_and_exact_greedy_head(monkeypat
     )
     proposer = ParallelBlockProposer.__new__(ParallelBlockProposer)
     proposer.model = ProfileDraft()
+    proposer.model.model = SimpleNamespace(mask_token_id=0)
+    proposer.method = "dflash"
     proposer.max_num_tokens = 16
     proposer.max_batch_size = 3
     proposer.num_queries = 3
     proposer.num_speculative_tokens = 2
     proposer.max_query_tokens = 9
     proposer._aux_hidden_buffer = torch.zeros(16, 4)
-    proposer.input_ids = torch.zeros(9, dtype=torch.int32)
+    proposer._query_input_ids = torch.zeros(9, dtype=torch.int32)
+    proposer._query_positions = torch.zeros(9, dtype=torch.int32)
+    proposer._query_slots = torch.zeros(9, dtype=torch.int32)
+    proposer._per_group_query_slot_mapping_buffers = {}
     proposer._parallel_dummy_positions = torch.zeros(9, dtype=torch.int32)
     proposer._parallel_dummy_sample_indices = torch.tensor(
         [1, 2, 4, 5, 7, 8], dtype=torch.int32
     )
     proposer._get_positions = lambda count: torch.arange(count, dtype=torch.int32)
-    proposer.vllm_config = SimpleNamespace()
+    proposer.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0)
+    )
+    proposer.runner = SimpleNamespace(
+        _sync_metadata_across_dp=lambda tokens, **_: (tokens, None, False)
+    )
+    proposer._last_draft_dp_sequence = None
 
     proposer.dummy_run(num_tokens=7, num_reqs=2, is_profile=True)
 

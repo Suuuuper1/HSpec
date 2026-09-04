@@ -128,11 +128,20 @@ class MegatronWorker(Worker):
             if "VLLM_ENABLE_EXPERT_PARALLEL" not in os.environ:
                 os.environ["VLLM_ENABLE_EXPERT_PARALLEL"] = "1"
 
-            if "VLLM_DP_SIZE" not in os.environ:
+            configured_dp = getattr(
+                self.config.rollout, "vllm_data_parallel_size", None
+            )
+            if configured_dp is not None and "VLLM_DP_SIZE" not in os.environ:
+                os.environ["VLLM_DP_SIZE"] = str(int(configured_dp))
+                os.environ["VERL_VLLM_DP_SIZE_SOURCE"] = "yaml"
+            elif "VLLM_DP_SIZE" not in os.environ:
                 rollout_tp = max(1, int(self.config.rollout.tensor_model_parallel_size))
                 rollout_pp = max(1, int(self.config.rollout.pipeline_model_parallel_size))
                 infer_world_size = rollout_tp * rollout_pp
                 os.environ["VLLM_DP_SIZE"] = str(max(1, self.world_size // infer_world_size))
+                os.environ["VERL_VLLM_DP_SIZE_SOURCE"] = "worker-derived"
+            elif "VERL_VLLM_DP_SIZE_SOURCE" not in os.environ:
+                os.environ["VERL_VLLM_DP_SIZE_SOURCE"] = "user-env"
 
     def _init_hf_config_and_tf_config(
         self,

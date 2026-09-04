@@ -29,6 +29,7 @@ When working with Megatron:
 import asyncio
 import getpass
 import inspect
+import json
 import logging
 import os
 import pickle
@@ -91,6 +92,13 @@ from verl.workers.rollout.vllm_rollout.speculative_config import (
 )
 from verl.workers.rollout.vllm_rollout.speculative_lifecycle import (
     SpeculativeLifecycleAudit,
+)
+from verl.workers.rollout.vllm_rollout.vllm_dp_topology import (
+    apply_vllm_dp_environment,
+    build_topology_manifest,
+    build_topology_record,
+    resolve_vllm_data_parallel_size,
+    validate_vllm_dp_layout,
 )
 
 logger = logging.getLogger(__file__)
@@ -336,15 +344,68 @@ class vLLMRollout(BaseRollout):
         )
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
-        assert tensor_parallel_size <= torch.distributed.get_world_size(), (
+        distributed_world_size = torch.distributed.get_world_size()
+        assert tensor_parallel_size <= distributed_world_size, (
             "tensor parallel size should be less than or equal to the world size"
         )
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
 
-        # If VLLM_DP_SIZE is configured, the DP communication domain needs to be explicitly initialized.
-        if int(os.environ.get("VLLM_DP_SIZE", "1")) > 1:
+        self._resolved_speculation = resolve_rollout_speculation(config)
+        method = self._resolved_speculation.method
+        parallel_block_enabled = method in {"dflash", "dspark"}
+        self._resolved_vllm_dp = resolve_vllm_data_parallel_size(
+            config.get("vllm_data_parallel_size", None)
+        )
+        apply_vllm_dp_environment(self._resolved_vllm_dp)
+        self._vllm_dp_layout = validate_vllm_dp_layout(
+            world_size=distributed_world_size,
+            vllm_dp_size=self._resolved_vllm_dp.size,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=config.get("pipeline_model_parallel_size", 1),
+            prefill_context_parallel_size=1,
+            rollout_data_parallel_size=config.get("data_parallel_size", 1),
+            require_rollout_dispatch_one=parallel_block_enabled,
+        )
+        global_rank = torch.distributed.get_rank()
+        if parallel_block_enabled:
+            predicted_record = build_topology_record(
+                resolved=self._resolved_vllm_dp,
+                layout=self._vllm_dp_layout,
+                global_rank=global_rank,
+                method=method,
+            )
+            logger.warning(
+                "DP_REPAIR_TOPOLOGY_RECORD_PRE_ENGINE %s",
+                json.dumps(predicted_record, sort_keys=True),
+            )
+            if global_rank == 0:
+                predicted_records = [
+                    build_topology_record(
+                        resolved=self._resolved_vllm_dp,
+                        layout=self._vllm_dp_layout,
+                        global_rank=rank,
+                        method=method,
+                    )
+                    for rank in range(distributed_world_size)
+                ]
+                logger.warning(
+                    "DP_REPAIR_TOPOLOGY_MANIFEST %s",
+                    json.dumps(
+                        build_topology_manifest(predicted_records), sort_keys=True
+                    ),
+                )
+
+        # The old external-launcher integration must construct model-internal
+        # DP groups before LLM initialization when DP is active.
+        if self._resolved_vllm_dp.size > 1:
             from r1_ascend.vllm_parallel_state import init_parallel_state
-            init_parallel_state(tensor_parallel_size)
+
+            init_parallel_state(
+                tensor_parallel_size,
+                expected_data_parallel_size=self._resolved_vllm_dp.size,
+                pipeline_parallel_size=config.get("pipeline_model_parallel_size", 1),
+                prefill_context_parallel_size=1,
+            )
 
         rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
         if not rope_scaling_config:
@@ -394,7 +455,6 @@ class vLLMRollout(BaseRollout):
                 "hybrid-engine training only if actor weights are synchronized before generation."
             )
 
-        self._resolved_speculation = resolve_rollout_speculation(config)
         engine_kwargs = dict(self._resolved_speculation.engine_kwargs)
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
@@ -467,12 +527,52 @@ class vLLMRollout(BaseRollout):
             **self.lora_kwargs,
             **engine_kwargs,
         )
+        model_runner = (
+            self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
+        )
+        if parallel_block_enabled:
+            engine_parallel = model_runner.vllm_config.parallel_config
+            from vllm.distributed import get_dp_group
+
+            dp_group = get_dp_group()
+            reflected_record = build_topology_record(
+                resolved=self._resolved_vllm_dp,
+                layout=self._vllm_dp_layout,
+                global_rank=global_rank,
+                actual_dp_size=engine_parallel.data_parallel_size,
+                actual_dp_rank=engine_parallel.data_parallel_rank,
+                actual_dp_group_ranks=dp_group.ranks,
+                method=method,
+                draft_model_kind=(
+                    "moe"
+                    if model_runner.speculative_config.draft_model_config.is_moe
+                    else "dense"
+                ),
+            )
+            self._vllm_dp_topology_record = reflected_record
+            logger.warning(
+                "DP_REPAIR_TOPOLOGY_RECORD %s",
+                json.dumps(reflected_record, sort_keys=True),
+            )
+            reflected_records: list[dict[str, Any] | None] = [
+                None for _ in range(distributed_world_size)
+            ]
+            torch.distributed.all_gather_object(reflected_records, reflected_record)
+            reflected_manifest = build_topology_manifest(
+                [record for record in reflected_records if record is not None]
+            )
+            self._vllm_dp_topology_manifest = reflected_manifest
+            if global_rank == 0:
+                logger.warning(
+                    "DP_REPAIR_TOPOLOGY_MANIFEST_ENGINE %s",
+                    json.dumps(reflected_manifest, sort_keys=True),
+                )
         # vLLM may expose logits for padded vocabulary rows from tensor
         # parallel output heads. Those rows are not tokenizer tokens and must
         # not be sampled; otherwise rollout text can degenerate into invalid
         # or nonsensical token streams.
         _monkey_patch_compute_logits(
-            self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model(),
+            model_runner.get_model(),
             len(tokenizer),
         )
 

@@ -34,7 +34,9 @@ from vllm_ascend.spec_decode.probabilistic import (
     sample_draft_logits,
 )
 from vllm_ascend.spec_decode.parallel_draft_metrics import (
+    DraftDPObserver,
     ParallelDraftMetrics,
+    dp_repair_capability_manifest,
     phase5_capability_manifest,
 )
 
@@ -239,6 +241,18 @@ class ParallelBlockProposer(EagleProposer):
             self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
+        self._draft_model_kind = (
+            "moe" if self.speculative_config.draft_model_config.is_moe else "dense"
+        )
+        parallel_config = self.vllm_config.parallel_config
+        self._draft_dp_observer = DraftDPObserver(
+            method=self.speculative_config.method,
+            dp_size=parallel_config.data_parallel_size,
+            dp_rank=parallel_config.data_parallel_rank,
+            draft_model_kind=self._draft_model_kind,
+            sample_every=self.speculative_config.parallel_draft_profile_sample_every,
+        )
+        self._last_draft_dp_sequence: int | None = None
         self._phase5_metrics = ParallelDraftMetrics(
             method=self.speculative_config.method,
             enabled=self.speculative_config.parallel_draft_profile_enabled,
@@ -247,7 +261,25 @@ class ParallelBlockProposer(EagleProposer):
         )
         logger.info(
             "PHASE5_DRAFT_CAPABILITY %s",
-            json.dumps(phase5_capability_manifest(self.speculative_config), sort_keys=True),
+            json.dumps(
+                phase5_capability_manifest(
+                    self.speculative_config,
+                    vllm_config=self.vllm_config,
+                    draft_model_kind=self._draft_model_kind,
+                ),
+                sort_keys=True,
+            ),
+        )
+        logger.info(
+            "DP_REPAIR_DRAFT_CAPABILITY %s",
+            json.dumps(
+                dp_repair_capability_manifest(
+                    self.speculative_config,
+                    self.vllm_config,
+                    draft_model_kind=self._draft_model_kind,
+                ),
+                sort_keys=True,
+            ),
         )
         self._draft_probability_memory: dict[str, int] | None = None
         if self._probabilistic:
@@ -354,6 +386,93 @@ class ParallelBlockProposer(EagleProposer):
             num_tokens_across_dp=num_tokens_across_dp,
             max_query_tokens=self.max_query_tokens,
         )
+
+    @property
+    def draft_dp_observer(self) -> DraftDPObserver:
+        """Return the DP observer, including for lightweight ``__new__`` tests."""
+
+        observer = getattr(self, "_draft_dp_observer", None)
+        if observer is None:
+            parallel = self.vllm_config.parallel_config
+            observer = DraftDPObserver(
+                method=getattr(self, "method", "parallel"),
+                dp_size=parallel.data_parallel_size,
+                dp_rank=parallel.data_parallel_rank,
+                draft_model_kind=getattr(self, "_draft_model_kind", "dense"),
+                sample_every=64,
+            )
+            self._draft_dp_observer = observer
+        return observer
+
+    def _coordinate_draft_dp(
+        self,
+        *,
+        batch_size: int,
+        num_actual_tokens: int,
+        kind: str,
+    ) -> DraftDPPlan:
+        """Run exactly one old-runner draft sync and validate its result."""
+
+        observer = self.draft_dp_observer
+        sequence, start_ns = observer.begin_sync(kind)
+        num_tokens: int | None = None
+        try:
+            num_tokens, counts, _ = self.runner._sync_metadata_across_dp(
+                num_actual_tokens,
+                is_draft_model=True,
+            )
+            plan = self._validate_dp_plan(
+                batch_size=batch_size,
+                num_actual_tokens=num_actual_tokens,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=counts,
+            )
+        except Exception:
+            observer.finish_sync(
+                sequence=sequence,
+                kind=kind,
+                start_ns=start_ns,
+                batch_size=batch_size,
+                num_queries=self.num_queries,
+                num_actual_tokens=num_actual_tokens,
+                num_tokens=num_tokens,
+                num_padding_tokens=None,
+                success=False,
+            )
+            raise
+        observer.finish_sync(
+            sequence=sequence,
+            kind=kind,
+            start_ns=start_ns,
+            batch_size=batch_size,
+            num_queries=self.num_queries,
+            num_actual_tokens=num_actual_tokens,
+            num_tokens=plan.num_tokens,
+            num_padding_tokens=plan.num_padding_tokens,
+            success=True,
+        )
+        self._last_draft_dp_sequence = sequence
+        return plan
+
+    def _finish_draft_dp_context(self, *, success: bool) -> None:
+        sequence = self._last_draft_dp_sequence
+        if sequence is None:
+            return
+        self.draft_dp_observer.finish_context(sequence, success=success)
+        self._last_draft_dp_sequence = None
+
+    def _begin_draft_dp_context(self) -> None:
+        sequence = self._last_draft_dp_sequence
+        if sequence is not None:
+            self.draft_dp_observer.begin_context(sequence)
+
+    def flush_observability_metrics(self) -> dict[str, object]:
+        """Publish DP evidence; an enabled legacy Phase-5 flush may sync events."""
+
+        phase5 = self.phase5_metrics.flush()
+        dp = self.draft_dp_observer.snapshot()
+        logger.info("DP_REPAIR_DRAFT_METRICS %s", json.dumps(dp, sort_keys=True))
+        return {"phase5": phase5, "dp": dp}
 
     def _pad_draft_buffers(
         self,
@@ -649,13 +768,20 @@ class ParallelBlockProposer(EagleProposer):
         del (
             with_prefill,
             in_graph_capturing,
+            num_tokens_across_dp,
             aclgraph_runtime_mode,
             batch_descriptor,
             dummy_compute_logits,
         )
         context_tokens = min(num_tokens, self.max_num_tokens)
-        profile_reqs = min(max(num_reqs, 1), self.max_batch_size)
-        query_tokens = profile_reqs * self.num_queries
+        dummy_reqs = min(max(num_reqs, 1), self.max_batch_size)
+        num_actual_tokens = dummy_reqs * self.num_queries
+        kind = "profile" if is_profile else "dummy"
+        plan = self._coordinate_draft_dp(
+            batch_size=dummy_reqs,
+            num_actual_tokens=num_actual_tokens,
+            kind=kind,
+        )
         positions = self._get_positions(context_tokens)
         aux_hidden_buffer = getattr(self, "_aux_hidden_buffer", None)
         if aux_hidden_buffer is None:
@@ -668,23 +794,48 @@ class ParallelBlockProposer(EagleProposer):
         # still profiling the draft transformer allocations.
         from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 
-        with set_ascend_forward_context(
-            None,
-            self.vllm_config,
-            num_tokens=query_tokens,
-            num_tokens_across_dp=num_tokens_across_dp,
-            num_actual_tokens=0,
-            in_profile_run=is_profile,
-            aclgraph_runtime_mode=CUDAGraphMode.NONE,
-            is_draft_model=True,
-        ):
-            hidden = self.model(
-                input_ids=self.input_ids[:query_tokens],
-                positions=self._parallel_dummy_positions[:query_tokens],
-            )
-            sample_count = profile_reqs * self.num_speculative_tokens
-            sample_hidden = hidden[
-                self._parallel_dummy_sample_indices[:sample_count]
-            ]
-            anchor_tokens = self.input_ids[:query_tokens:self.num_queries]
-            self._select_draft_tokens(sample_hidden, anchor_tokens, None)
+        mask_token_id = self.model.model.mask_token_id
+        self._query_input_ids[:num_actual_tokens].fill_(mask_token_id)
+        self._query_positions[:num_actual_tokens].zero_()
+        self._query_slots[:num_actual_tokens].fill_(PAD_SLOT_ID)
+        for slot_buffer in getattr(
+            self, "_per_group_query_slot_mapping_buffers", {}
+        ).values():
+            slot_buffer[:num_actual_tokens].fill_(PAD_SLOT_ID)
+        self._pad_draft_buffers(
+            num_actual_tokens=num_actual_tokens,
+            num_tokens=plan.num_tokens,
+        )
+
+        context_success = False
+        try:
+            self._begin_draft_dp_context()
+            with set_ascend_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=plan.num_tokens,
+                num_tokens_across_dp=plan.num_tokens_across_dp,
+                # Runtime dummy participates in model/DP communication but must
+                # not expose any row as a cache-writing logical token.
+                num_actual_tokens=(plan.num_actual_tokens if is_profile else 0),
+                in_profile_run=is_profile,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                is_draft_model=True,
+            ):
+                hidden = self.model(
+                    input_ids=self._query_input_ids[: plan.num_tokens],
+                    positions=self._query_positions[: plan.num_tokens],
+                )
+                sample_count = dummy_reqs * self.num_speculative_tokens
+                sample_hidden = hidden[
+                    self._parallel_dummy_sample_indices[:sample_count]
+                ]
+                anchor_tokens = self._query_input_ids[
+                    :num_actual_tokens:self.num_queries
+                ]
+                # No SamplingMetadata means deterministic argmax/Markov scratch:
+                # dummy never consumes proposal RNG or publishes q.
+                self._select_draft_tokens(sample_hidden, anchor_tokens, None)
+            context_success = True
+        finally:
+            self._finish_draft_dp_context(success=context_success)

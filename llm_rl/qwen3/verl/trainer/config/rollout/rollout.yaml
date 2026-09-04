@@ -61,6 +61,10 @@ tensor_model_parallel_size: 2
 # DP size for rollout
 data_parallel_size: 1
 
+# Model-internal vLLM DP. null preserves the legacy VLLM_DP_SIZE environment
+# source; if both are set they must be equal.
+vllm_data_parallel_size: null
+
 # EP size for rollout
 expert_parallel_size: 1
 

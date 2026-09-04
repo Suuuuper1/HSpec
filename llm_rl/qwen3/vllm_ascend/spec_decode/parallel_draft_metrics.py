@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -19,6 +20,212 @@ from vllm.logger import logger
 _SCHEMA = "dflash-dspark.phase5-draft-metrics.v1"
 _MAX_PERCENTILE_SAMPLES = 4096
 _MAX_SHAPES = 256
+_DP_SCHEMA = "dflash-dspark.dp-repair-draft-metrics.v1"
+_DP_CAPABILITY_SCHEMA = "dflash-dspark.dp-repair-capability.v1"
+
+
+class DraftDPObserver:
+    """Always-on integer accounting with sampled host-only sync timing.
+
+    The correctness counters deliberately do not depend on Phase-5 device
+    profiling. They add no device event, transfer, synchronization, or
+    per-token logging. Detailed trace rows are opt-in and bounded in memory.
+    """
+
+    _KINDS = ("real", "dummy", "profile")
+
+    def __init__(
+        self,
+        *,
+        method: str,
+        dp_size: int,
+        dp_rank: int,
+        draft_model_kind: str,
+        sample_every: int = 64,
+        trace_enabled: bool | None = None,
+        trace_limit: int | None = None,
+    ) -> None:
+        if not method:
+            raise ValueError("Draft DP observer method must be non-empty")
+        if dp_size <= 0 or not 0 <= dp_rank < dp_size:
+            raise ValueError(
+                f"Invalid draft DP observer topology: size/rank={dp_size}/{dp_rank}"
+            )
+        if draft_model_kind not in {"dense", "moe"}:
+            raise ValueError(
+                f"Invalid draft model kind {draft_model_kind!r}; expected dense or moe"
+            )
+        if sample_every <= 0:
+            raise ValueError("Draft DP sync sample interval must be positive")
+        if trace_enabled is None:
+            trace_enabled = os.getenv("VLLM_ASCEND_PARALLEL_DRAFT_DP_TRACE", "0") != "0"
+        if trace_limit is None:
+            trace_limit = int(
+                os.getenv("VLLM_ASCEND_PARALLEL_DRAFT_DP_TRACE_LIMIT", "256")
+            )
+        if trace_limit <= 0:
+            raise ValueError("Draft DP trace limit must be positive")
+
+        self.method = method
+        self.dp_size = int(dp_size)
+        self.dp_rank = int(dp_rank)
+        self.draft_model_kind = draft_model_kind
+        self.sync_mode = (
+            "local_fast_path" if draft_model_kind == "dense" else "cpu_group_max_pad"
+        )
+        self.sample_every = int(sample_every)
+        self.trace_enabled = bool(trace_enabled)
+        self.trace_limit = int(trace_limit)
+        self._sequence = 0
+        self._counters = {
+            "draft_dp_real_calls": 0,
+            "draft_dp_dummy_calls": 0,
+            "draft_dp_profile_calls": 0,
+            "draft_dp_sync_calls": 0,
+            "draft_dp_sync_skipped_dense": 0,
+            "draft_dp_actual_query_tokens": 0,
+            "draft_dp_execution_query_tokens": 0,
+            "draft_dp_padding_tokens": 0,
+            "draft_dp_padding_steps": 0,
+            "draft_dp_plan_failures": 0,
+        }
+        self._sync_samples_ms: list[float] = []
+        self._sync_sample_overflow = 0
+        self._trace: list[dict[str, Any]] = []
+        self._trace_dropped = 0
+
+    def begin_sync(self, kind: str) -> tuple[int, int | None]:
+        if kind not in self._KINDS:
+            raise ValueError(f"Unknown draft DP invocation kind {kind!r}")
+        sequence = self._sequence
+        self._sequence += 1
+        self._counters[f"draft_dp_{kind}_calls"] += 1
+        self._counters["draft_dp_sync_calls"] += 1
+        if self.dp_size > 1 and self.draft_model_kind == "dense":
+            self._counters["draft_dp_sync_skipped_dense"] += 1
+        start_ns = (
+            time.perf_counter_ns() if sequence % self.sample_every == 0 else None
+        )
+        return sequence, start_ns
+
+    def finish_sync(
+        self,
+        *,
+        sequence: int,
+        kind: str,
+        start_ns: int | None,
+        batch_size: int,
+        num_queries: int,
+        num_actual_tokens: int,
+        num_tokens: int | None,
+        num_padding_tokens: int | None,
+        success: bool,
+    ) -> None:
+        if start_ns is not None:
+            duration_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+            if len(self._sync_samples_ms) < _MAX_PERCENTILE_SAMPLES:
+                self._sync_samples_ms.append(duration_ms)
+            else:
+                self._sync_sample_overflow += 1
+        if not success:
+            self._counters["draft_dp_plan_failures"] += 1
+        else:
+            assert num_tokens is not None and num_padding_tokens is not None
+            if num_tokens != num_actual_tokens + num_padding_tokens:
+                raise AssertionError("Draft DP observer token conservation failed")
+            self._counters["draft_dp_actual_query_tokens"] += num_actual_tokens
+            self._counters["draft_dp_execution_query_tokens"] += num_tokens
+            self._counters["draft_dp_padding_tokens"] += num_padding_tokens
+            self._counters["draft_dp_padding_steps"] += int(num_padding_tokens > 0)
+
+        if not self.trace_enabled:
+            return
+        row = {
+            "schema_version": "dflash-dspark.dp-repair-trace-row.v1",
+            "method": self.method,
+            "dp_rank": self.dp_rank,
+            "proposal_sequence": int(sequence),
+            "kind": kind,
+            "batch_size": int(batch_size),
+            "num_queries": int(num_queries),
+            "num_actual_tokens": int(num_actual_tokens),
+            "num_tokens": num_tokens,
+            "num_padding_tokens": num_padding_tokens,
+            "sync_enter": True,
+            "sync_exit": bool(success),
+            "context_enter": False,
+            "context_exit": False,
+            "status": "SYNCED" if success else "FAILED",
+        }
+        if len(self._trace) < self.trace_limit:
+            self._trace.append(row)
+        else:
+            self._trace_dropped += 1
+
+    def begin_context(self, sequence: int) -> None:
+        if not self.trace_enabled:
+            return
+        for row in reversed(self._trace):
+            if row["proposal_sequence"] == sequence:
+                row["context_enter"] = True
+                row["status"] = "CONTEXT_ENTERED"
+                return
+
+    def finish_context(self, sequence: int, *, success: bool) -> None:
+        if not self.trace_enabled:
+            return
+        for row in reversed(self._trace):
+            if row["proposal_sequence"] == sequence:
+                row["context_exit"] = bool(success)
+                row["status"] = "PASS" if success else "FAILED"
+                return
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = int(math.ceil(percentile * len(ordered))) - 1
+        return ordered[max(0, min(index, len(ordered) - 1))]
+
+    def snapshot(self) -> dict[str, Any]:
+        samples = self._sync_samples_ms
+        return {
+            "schema_version": _DP_SCHEMA,
+            "method": self.method,
+            "draft_dp_size": self.dp_size,
+            "draft_dp_rank": self.dp_rank,
+            "draft_model_kind": self.draft_model_kind,
+            "draft_dp_sync_mode": self.sync_mode,
+            "counters": dict(self._counters),
+            "invariants": {
+                "sync_call_parity": self._counters["draft_dp_sync_calls"]
+                == self._counters["draft_dp_real_calls"]
+                + self._counters["draft_dp_dummy_calls"]
+                + self._counters["draft_dp_profile_calls"],
+                "token_conservation": self._counters[
+                    "draft_dp_execution_query_tokens"
+                ]
+                == self._counters["draft_dp_actual_query_tokens"]
+                + self._counters["draft_dp_padding_tokens"],
+            },
+            "host_sync_timer": {
+                "sample_every": self.sample_every,
+                "sample_count": len(samples),
+                "sample_overflow": self._sync_sample_overflow,
+                "p50_ms": self._percentile(samples, 0.50),
+                "p95_ms": self._percentile(samples, 0.95),
+                "max_ms": max(samples) if samples else None,
+            },
+            "trace": {
+                "enabled": self.trace_enabled,
+                "limit": self.trace_limit,
+                "dropped": self._trace_dropped,
+                "rows": [dict(row) for row in self._trace],
+            },
+            "device_synchronize_calls": 0,
+            "new_npu_collectives": 0,
+        }
 
 
 @dataclass
@@ -242,9 +449,14 @@ class ParallelDraftMetrics:
         }
 
 
-def phase5_capability_manifest(speculative_config: Any) -> dict[str, Any]:
+def phase5_capability_manifest(
+    speculative_config: Any,
+    *,
+    vllm_config: Any | None = None,
+    draft_model_kind: str = "dense",
+) -> dict[str, Any]:
     """Return the runtime support surface consumed by the R5 analyzer."""
-    return {
+    manifest = {
         "schema_version": "dflash-dspark.phase5-capability.v1",
         "method": speculative_config.method,
         "stable_baseline": {
@@ -270,5 +482,65 @@ def phase5_capability_manifest(speculative_config: Any) -> dict[str, Any]:
             "prefix_sharing": True,
             "dspark_draft_topk": True,
             "dynamic_k_or_confidence": True,
+        },
+    }
+    # Keep the v1 schema/fields accepted by the frozen Phase-5 analyzer while
+    # making new logs self-describing. DP certification consumes the strict
+    # repair manifest below, never this compatibility record alone.
+    if vllm_config is not None:
+        parallel = vllm_config.parallel_config
+        manifest["dp_extension"] = {
+            "effective_vllm_dp_size": int(parallel.data_parallel_size),
+            "draft_model_kind": draft_model_kind,
+            "draft_dp_sync_mode": (
+                "local_fast_path"
+                if draft_model_kind == "dense"
+                else "cpu_group_max_pad"
+            ),
+            "certification_state": "phase1_production_gate_closed",
+        }
+    return manifest
+
+
+def dp_repair_capability_manifest(
+    speculative_config: Any,
+    vllm_config: Any,
+    *,
+    draft_model_kind: str,
+) -> dict[str, Any]:
+    """Strict per-rank capability record for the DP repair analyzer."""
+
+    parallel = vllm_config.parallel_config
+    return {
+        "schema_version": _DP_CAPABILITY_SCHEMA,
+        "method": speculative_config.method,
+        "effective_vllm_dp_size": int(parallel.data_parallel_size),
+        "effective_vllm_dp_rank": int(parallel.data_parallel_rank),
+        "draft_model_kind": draft_model_kind,
+        "draft_dp_sync_mode": (
+            "local_fast_path"
+            if draft_model_kind == "dense"
+            else "cpu_group_max_pad"
+        ),
+        "production_dp_gt1_enabled": False,
+        "certified_candidate": {
+            "draft_execution": "eager",
+            "proposal": speculative_config.draft_sample_method,
+            "verification": speculative_config.rejection_sample_method,
+            "fixed_k": int(speculative_config.num_speculative_tokens),
+            "full_vocab": True,
+            "draft_tensor_parallel_size": int(
+                speculative_config.draft_parallel_config.tensor_parallel_size
+            ),
+        },
+        "unsupported_fail_closed": {
+            "draft_moe_or_ep": True,
+            "draft_tensor_parallel_gt1": True,
+            "pipeline_or_context_parallel": True,
+            "async_scheduling": True,
+            "draft_graph": True,
+            "incremental_or_prefix_kv": True,
+            "dynamic_k_or_confidence": True,
+            "topk_or_reduced_vocab": True,
         },
     }

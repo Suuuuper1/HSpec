@@ -355,29 +355,36 @@ class DFlashProposer(ParallelBlockProposer):
                     validate_slot_range=False,
                 )
 
-            metadata = self.build_parallel_attention_metadata(
-                common_attn_metadata, query_slots, rejected
+            num_query_tokens = batch_size * self.num_queries
+            plan = self._coordinate_draft_dp(
+                batch_size=batch_size,
+                num_actual_tokens=num_query_tokens,
+                kind="real",
+            )
+            metadata = self._pad_and_build_parallel_attention_metadata(
+                common_attn_metadata, rejected, plan
             )
             per_layer_metadata = {
                 layer_name: metadata for layer_name in self.attn_layer_names
             }
-            num_query_tokens = batch_size * self.num_queries
+            self._begin_draft_dp_context()
             with set_ascend_forward_context(
                 per_layer_metadata,
                 self.vllm_config,
-                num_tokens=num_query_tokens,
-                num_tokens_across_dp=None,
-                num_actual_tokens=num_query_tokens,
+                num_tokens=plan.num_tokens,
+                num_tokens_across_dp=plan.num_tokens_across_dp,
+                num_actual_tokens=plan.num_actual_tokens,
                 aclgraph_runtime_mode=CUDAGraphMode.NONE,
                 is_draft_model=True,
             ):
                 draft_token_ids = self._run_parallel_backbone(
-                    query_ids,
-                    query_positions,
+                    self._query_input_ids[: plan.num_tokens],
+                    self._query_positions[: plan.num_tokens],
                     sample_indices,
                     next_token_ids[:batch_size],
                     sampling_metadata,
                 )
+            self._finish_draft_dp_context(success=True)
             draft_token_ids.masked_fill_(
                 self._cannot_speculate[:batch_size, None], PAD_SLOT_ID
             )
@@ -400,6 +407,7 @@ class DFlashProposer(ParallelBlockProposer):
                 )
             return draft_token_ids
         except Exception:
+            self._finish_draft_dp_context(success=False)
             metrics.abort_step()
             raise
         finally:

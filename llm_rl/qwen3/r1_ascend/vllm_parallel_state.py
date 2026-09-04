@@ -18,6 +18,11 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.config import VllmConfig, set_current_vllm_config
 
+from verl.workers.rollout.vllm_rollout.vllm_dp_topology import (
+    predicted_dp_group,
+    validate_vllm_dp_layout,
+)
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -81,16 +86,50 @@ def get_cluster_info():
 
 
 ### init DP group ranks for vLLM ascend
-def init_parallel_state(tensor_parallel_size):
+def init_parallel_state(
+    tensor_parallel_size,
+    *,
+    expected_data_parallel_size=None,
+    pipeline_parallel_size=1,
+    prefill_context_parallel_size=1,
+):
     rank = int(os.getenv("RANK", "-1"))
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
     world_size: int = torch.distributed.get_world_size()
+    configured_dp = int(os.environ.get("VLLM_DP_SIZE", "1"))
+    if (
+        expected_data_parallel_size is not None
+        and configured_dp != int(expected_data_parallel_size)
+    ):
+        raise RuntimeError(
+            "VLLM_DP_SIZE changed after Verl topology resolution: "
+            f"environment={configured_dp}, expected={expected_data_parallel_size}"
+        )
+    layout = validate_vllm_dp_layout(
+        world_size=world_size,
+        vllm_dp_size=configured_dp,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        prefill_context_parallel_size=prefill_context_parallel_size,
+        rollout_data_parallel_size=1,
+    )
     distributed_init_method = "env://"
     backend = "hccl"
     init_distributed_environment(world_size, rank, distributed_init_method, local_rank, backend)
 
     with set_current_vllm_config(VllmConfig()):
-        initialize_model_parallel(tensor_parallel_size)
+        initialize_model_parallel(
+            tensor_parallel_size,
+            pipeline_parallel_size,
+            prefill_context_parallel_size,
+        )
+    expected_group = predicted_dp_group(layout, rank)
+    observed_group = tuple(int(value) for value in vllm_ps._DP.ranks)
+    if observed_group != expected_group:
+        raise RuntimeError(
+            "vLLM model-parallel DP group does not match the resolved layout: "
+            f"rank={rank}, expected={expected_group}, observed={observed_group}"
+        )
     logger.info(
         f"[DEBUG]: RANK[{rank}]: TP group: {vllm_ps._TP.ranks}\n"
         f"[DEBUG]: RANK[{rank}]: PP group: {vllm_ps._PP.ranks}\n"
