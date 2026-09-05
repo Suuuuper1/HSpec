@@ -34,9 +34,24 @@ readonly SPECULATIVE_K=7
 readonly TRAINING_STEPS=2
 readonly PROBABILITY_BUDGET_MB=512
 readonly TRACE_LIMIT=256
+readonly HCCL_BUFFER_MB=800
+readonly HCCL_HOST_PORT_COUNT=32
+if [[ "${METHOD}" == "dflash" ]]; then
+    readonly EXPECTED_HCCL_IF_BASE_PORT=63000
+else
+    readonly EXPECTED_HCCL_IF_BASE_PORT=63032
+fi
 
 if [[ ${VLLM_DP_SIZE:-${DP_SIZE}} != "${DP_SIZE}" ]]; then
     echo "VLLM_DP_SIZE must equal frozen Phase-3 DP=${DP_SIZE}" >&2
+    exit 2
+fi
+if [[ ${HCCL_BUFFSIZE:-} != "${HCCL_BUFFER_MB}" ]]; then
+    echo "HCCL_BUFFSIZE must equal frozen Phase-3 value ${HCCL_BUFFER_MB} MB" >&2
+    exit 2
+fi
+if [[ ${HCCL_IF_BASE_PORT:-} != "${EXPECTED_HCCL_IF_BASE_PORT}" ]]; then
+    echo "HCCL_IF_BASE_PORT must equal frozen Phase-3 ${METHOD} value ${EXPECTED_HCCL_IF_BASE_PORT}" >&2
     exit 2
 fi
 IFS=',' read -r -a DEVICES <<< "${ASCEND_RT_VISIBLE_DEVICES:-}"
@@ -75,6 +90,11 @@ export VERL_DP_REPAIR_PHASE3_SEED=${SEED}
 export VLLM_ASCEND_ENABLE_NZ=0
 export VLLM_ASCEND_STRICT_FULL_GRAPH=1
 export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_BUFFSIZE=${HCCL_BUFFER_MB}
+export HCCL_IF_BASE_PORT=${EXPECTED_HCCL_IF_BASE_PORT}
+export HCCL_ASYNC_ERROR_HANDLING=0
+export HCCL_EXEC_TIMEOUT=7200
+export HCCL_CONNECT_TIMEOUT=7200
 
 # Inputs consumed by the existing, production-shaped 30B Megatron launcher.
 export RUN_NAME="dp_repair_phase3_${METHOD}"
@@ -143,7 +163,7 @@ bash "${SCRIPT_DIR}/train_grpo_qwen3_30b_hspec.sh" \
     trainer.test_freq=-1 \
     trainer.total_training_steps=${TRAINING_STEPS} \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_DP_SIZE="'${DP_SIZE}'" \
-    +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_LEVEL=INFO \
+    ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_LEVEL=INFO \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOG_STATS_INTERVAL="'0.1'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_CONFIGURE_LOGGING="'1'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_STREAM=ext://sys.stdout \
@@ -153,6 +173,8 @@ bash "${SCRIPT_DIR}/train_grpo_qwen3_30b_hspec.sh" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_DP_REPAIR_PHASE3_PRELUDE="'1'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_DP_REPAIR_PHASE3_PRELUDE_DIR="'${PRELUDE_DIR}'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_DP_REPAIR_PHASE3_PRELUDE_TOKENS="'2'" \
-    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_DP_REPAIR_PHASE3_SEED="'${SEED}'"
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_DP_REPAIR_PHASE3_SEED="'${SEED}'" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HCCL_BUFFSIZE="'${HCCL_BUFFER_MB}'" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HCCL_IF_BASE_PORT="'${EXPECTED_HCCL_IF_BASE_PORT}'"
 
 echo "DP_REPAIR_PHASE3_ARM_END method=${METHOD} status=PASS"

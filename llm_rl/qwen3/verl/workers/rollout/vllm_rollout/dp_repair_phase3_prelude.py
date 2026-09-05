@@ -81,6 +81,26 @@ def _atomic_write(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _build_prelude_sampling_params(
+    base_sampling_params: Any,
+    *,
+    max_tokens: int,
+    seed: int,
+) -> Any:
+    """Build an isolated request compatible with the old speculative ABI."""
+    sampling = copy.deepcopy(base_sampling_params)
+    sampling.max_tokens = max_tokens
+    # ignore_eos already makes max_tokens the exact decode bound.  Keeping
+    # min_tokens at zero avoids the old V1 speculative-input restriction.
+    sampling.min_tokens = 0
+    sampling.min_p = 0.0
+    sampling.logit_bias = None
+    sampling.ignore_eos = True
+    sampling.n = 1
+    sampling.seed = seed
+    return sampling
+
+
 def _validate_group(records: list[dict[str, Any]]) -> dict[str, Any]:
     errors: list[str] = []
     by_group: dict[tuple[int, ...], list[dict[str, Any]]] = {}
@@ -212,15 +232,14 @@ def run_dp_repair_phase3_prelude(rollout: Any, prompts: Any) -> dict[str, Any]:
             raise RuntimeError("active prelude prompt is empty after padding removal")
         local_prompts = [{"prompt_token_ids": [int(value) for value in token_ids]}]
 
-    sampling = copy.deepcopy(rollout.sampling_params)
     max_tokens = int(os.environ.get("VERL_DP_REPAIR_PHASE3_PRELUDE_TOKENS", "2"))
     if not 1 <= max_tokens <= 8:
         raise ValueError("VERL_DP_REPAIR_PHASE3_PRELUDE_TOKENS must be in [1, 8]")
-    sampling.max_tokens = max_tokens
-    sampling.min_tokens = max_tokens
-    sampling.ignore_eos = True
-    sampling.n = 1
-    sampling.seed = int(os.environ.get("VERL_DP_REPAIR_PHASE3_SEED", "20260829"))
+    sampling = _build_prelude_sampling_params(
+        rollout.sampling_params,
+        max_tokens=max_tokens,
+        seed=int(os.environ.get("VERL_DP_REPAIR_PHASE3_SEED", "20260829")),
+    )
 
     rng_before = torch.npu.get_rng_state().cpu()
     rng_before_sha256 = hashlib.sha256(rng_before.numpy().tobytes()).hexdigest()

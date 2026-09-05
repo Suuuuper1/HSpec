@@ -33,13 +33,15 @@ class NpuGraphEXPassManager:
     def __init__(self):
         self.passes: list[VllmInductorPass] = []
 
-    def __call__(self, graph: fx.Graph) -> fx.Graph:
+    def __call__(self, graph: fx.GraphModule) -> fx.GraphModule:
         compile_range = get_pass_context().compile_range
 
         for pass_ in self.passes:
             if pass_.is_applicable_for_range(compile_range):
                 pass_(graph)
-        graph.recompiler()
+        # fusion_pass_compile passes a GraphModule, matching the regular
+        # Ascend fusion manager and the upstream FX API.
+        graph.recompile()
         return graph
 
     def add(self, pass_: VllmInductorPass):
