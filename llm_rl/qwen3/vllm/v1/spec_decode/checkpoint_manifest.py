@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -74,7 +75,9 @@ def _tokenizer_manifest(path: Path) -> dict[str, Any]:
     }
 
 
-def _weight_metadata(path: Path) -> tuple[dict[str, Any], int | None]:
+def _weight_metadata(
+    path: Path, *, include_draft_contract: bool = False
+) -> tuple[dict[str, Any], int | None]:
     """Return safetensors file identity/shape metadata without materializing weights."""
     files = sorted(path.glob("*.safetensors"))
     metadata: dict[str, Any] = {
@@ -90,6 +93,7 @@ def _weight_metadata(path: Path) -> tuple[dict[str, Any], int | None]:
 
     fc_input_width: int | None = None
     shapes: dict[str, list[int]] = {}
+    dtypes: dict[str, str] = {}
     try:
         from safetensors import safe_open
 
@@ -98,6 +102,7 @@ def _weight_metadata(path: Path) -> tuple[dict[str, Any], int | None]:
                 for key in handle.keys():
                     shape = list(handle.get_slice(key).get_shape())
                     shapes[key] = shape
+                    dtypes[key] = str(handle.get_slice(key).get_dtype())
                     if key.endswith("fc.weight") and len(shape) == 2:
                         fc_input_width = shape[1]
         metadata["tensor_shape_sha256"] = _canonical_hash(shapes)
@@ -106,7 +111,196 @@ def _weight_metadata(path: Path) -> tuple[dict[str, Any], int | None]:
         metadata["tensor_metadata_error"] = "safetensors package unavailable"
     except Exception as error:  # Corrupt/unsupported checkpoints must stay visible.
         metadata["tensor_metadata_error"] = f"{type(error).__name__}: {error}"
+    def matching(suffix: str) -> list[dict[str, Any]]:
+        return [
+            {"name": key, "shape": shapes[key], "dtype": dtypes[key]}
+            for key in sorted(shapes)
+            if key == suffix or key.endswith(f".{suffix}")
+        ]
+
+    critical = {
+        name: matching(name)
+        for name in (
+            "embed_tokens.weight",
+            "lm_head.weight",
+            "d2t",
+            "t2d",
+            "fc.weight",
+            "markov_head.markov_w1.weight",
+            "markov_head.markov_w2.weight",
+            "confidence_head.proj.weight",
+            "confidence_head.proj.bias",
+            "hidden_norm.weight",
+        )
+    }
+    critical["final_norm.weight"] = [
+        {"name": key, "shape": shapes[key], "dtype": dtypes[key]}
+        for key in sorted(shapes)
+        if key in ("norm.weight", "model.norm.weight")
+        or key.endswith(".model.norm.weight")
+    ]
+    metadata["critical_tensors"] = critical
+    metadata["ownership"] = {
+        "checkpoint_embedding": bool(critical["embed_tokens.weight"]),
+        "checkpoint_lm_head": bool(critical["lm_head.weight"]),
+        "draft_to_target_mapping": bool(critical["d2t"]),
+        "target_to_draft_mapping": bool(critical["t2d"]),
+        "markov_head": bool(critical["markov_head.markov_w1.weight"])
+        and bool(critical["markov_head.markov_w2.weight"]),
+        "confidence_head": bool(critical["confidence_head.proj.weight"])
+        and bool(critical["confidence_head.proj.bias"]),
+    }
+    required_layer_suffixes = (
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+    )
+    layer_indices = sorted(
+        {
+            int(match.group(1))
+            for key in shapes
+            if (match := re.search(r"(?:^|\.)layers\.(\d+)\.", key))
+        }
+    )
+    if include_draft_contract:
+        metadata["transformer_layers"] = {
+            "indices": layer_indices,
+            "missing_required_tensors": {
+                str(layer): [
+                    suffix
+                    for suffix in required_layer_suffixes
+                    if not any(
+                        key.endswith(f"layers.{layer}.{suffix}") for key in shapes
+                    )
+                ]
+                for layer in layer_indices
+            },
+            "shapes": {
+                str(layer): {
+                    suffix: next(
+                        (
+                            shapes[key]
+                            for key in shapes
+                            if key.endswith(f"layers.{layer}.{suffix}")
+                        ),
+                        None,
+                    )
+                    for suffix in required_layer_suffixes
+                }
+                for layer in layer_indices
+            },
+        }
     return metadata, fc_input_width
+
+
+def _normalize_config_schema(
+    config: dict[str, Any], method: str | None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return an inspection view for native and Speculators checkpoints.
+
+    This is deliberately not a runtime conversion. It mirrors the new vLLM
+    ``SpeculatorsConfig`` field mapping closely enough to audit an asset while
+    preserving the source schema and every algorithm-affecting capability.
+    """
+
+    speculators_type = config.get("speculators_model_type")
+    if speculators_type is None:
+        return config, {
+            "format": "native",
+            "speculators_model_type": None,
+            "source_transformer_model_type": config.get("model_type"),
+            "verifier_name_or_path": None,
+            "runtime_conversion_performed": False,
+        }
+    if speculators_type not in ("dflash", "dspark"):
+        raise ManifestError(
+            f"unsupported speculators_model_type={speculators_type!r}"
+        )
+    if method is not None and method != speculators_type:
+        raise ManifestError(
+            f"requested method={method!r} does not match "
+            f"speculators_model_type={speculators_type!r}"
+        )
+    transformer = config.get("transformer_layer_config")
+    if not isinstance(transformer, dict):
+        raise ManifestError("Speculators checkpoint has no object-valued transformer_layer_config")
+    speculators = config.get("speculators_config")
+    if not isinstance(speculators, dict):
+        raise ManifestError("Speculators checkpoint has no object-valued speculators_config")
+    verifier = speculators.get("verifier")
+    if not isinstance(verifier, dict):
+        raise ManifestError("Speculators checkpoint has no object-valued verifier config")
+
+    normalized = json.loads(json.dumps(transformer))
+    normalized["architectures"] = [
+        "DFlashDraftModel" if speculators_type == "dflash" else "Qwen3DSparkModel"
+    ]
+    for key in (
+        "block_size",
+        "draft_vocab_size",
+        "dtype",
+        "target_hidden_size",
+        "mask_token_id",
+    ):
+        if config.get(key) is not None:
+            normalized[key] = config[key]
+
+    capture_ids = config.get("aux_hidden_state_layer_ids")
+    if not isinstance(capture_ids, list) or not capture_ids:
+        raise ManifestError(
+            "Speculators checkpoint has no non-empty aux_hidden_state_layer_ids"
+        )
+    normalized["eagle_aux_hidden_state_layer_ids"] = list(capture_ids)
+    if speculators_type == "dflash":
+        normalized["dflash_config"] = {
+            "mask_token_id": config.get("mask_token_id"),
+            "target_layer_ids": [layer - 1 for layer in capture_ids],
+            "sample_from_anchor": config.get("sample_from_anchor", False),
+            "causal": not config.get("sliding_window_non_causal", True),
+        }
+    else:
+        normalized["target_layer_ids"] = [layer - 1 for layer in capture_ids]
+        normalized["sample_from_anchor"] = config.get("sample_from_anchor", False)
+        for key in (
+            "markov_rank",
+            "markov_head_type",
+            "enable_confidence_head",
+            "confidence_head_with_markov",
+        ):
+            if config.get(key) is not None:
+                normalized[key] = config[key]
+
+    verifier_name = verifier.get("name_or_path")
+    source_model_type = transformer.get("model_type")
+    # The RedHat Qwen3 DFlash asset uses the generic Llama transformer schema.
+    # Treat that as schema-adaptable only for inspection; runtime conversion is
+    # still a separate, explicit artifact-generation step.
+    qwen3_schema_adaptable = (
+        source_model_type in ("qwen3", "llama")
+        and isinstance(verifier_name, str)
+        and "qwen3" in verifier_name.lower()
+    )
+    if qwen3_schema_adaptable:
+        normalized["model_type"] = "qwen3"
+    return normalized, {
+        "format": "speculators",
+        "speculators_model_type": speculators_type,
+        "speculators_version": config.get("speculators_version"),
+        "source_transformer_model_type": source_model_type,
+        "verifier_name_or_path": verifier_name,
+        "verifier_architectures": verifier.get("architectures") or [],
+        "qwen3_schema_adaptable": qwen3_schema_adaptable,
+        "runtime_conversion_performed": False,
+        "capture_aux_layer_ids": list(capture_ids),
+    }
 
 
 def _extract_aux_layer_ids(config: dict[str, Any], method: str) -> list[int]:
@@ -158,9 +352,12 @@ def build_checkpoint_manifest(
     config_path = path / "config.json"
     if not config_path.is_file():
         raise ManifestError(f"missing checkpoint config: {config_path}")
-    config = _load_json(config_path)
+    source_config = _load_json(config_path)
+    config, schema = _normalize_config_schema(source_config, method)
     tokenizer_info = _tokenizer_manifest(Path(tokenizer))
-    weight_info, fc_input_width = _weight_metadata(path)
+    weight_info, fc_input_width = _weight_metadata(
+        path, include_draft_contract=method is not None
+    )
 
     aux_layer_ids = _extract_aux_layer_ids(config, method or "")
     dflash_config = config.get("dflash_config") or {}
@@ -173,12 +370,15 @@ def build_checkpoint_manifest(
         "method": method,
         "id": path.name,
         "path": str(path.resolve()),
-        "revision": revision or config.get("_commit_hash"),
+        "revision": revision or source_config.get("_commit_hash"),
         "config_sha256": _sha256_file(config_path),
         "config_canonical_sha256": _canonical_hash(config),
         "architectures": config.get("architectures") or [],
         "model_type": config.get("model_type"),
         "vocab_size": config.get("vocab_size"),
+        "draft_vocab_size": config.get("draft_vocab_size")
+        or config.get("vocab_size"),
+        "schema": schema,
         "hidden_size": hidden_size,
         "dtype": config.get("dtype") or config.get("torch_dtype"),
         "num_hidden_layers": config.get("num_hidden_layers"),
@@ -186,6 +386,7 @@ def build_checkpoint_manifest(
         "num_attention_heads": config.get("num_attention_heads"),
         "num_key_value_heads": config.get("num_key_value_heads"),
         "head_dim": config.get("head_dim"),
+        "intermediate_size": config.get("intermediate_size"),
         "rope_theta": _resolve_rope_theta(config),
         "rope_scaling": config.get("rope_scaling"),
         "is_neox_style": config.get("is_neox_style"),
@@ -214,6 +415,11 @@ def build_checkpoint_manifest(
         },
         "sample_from_anchor": config.get(
             "sample_from_anchor", True if method == "dspark" else False
+        ),
+        "markov_rank": config.get("markov_rank"),
+        "enable_confidence_head": config.get("enable_confidence_head"),
+        "confidence_head_with_markov": config.get(
+            "confidence_head_with_markov"
         ),
         "block_size": config.get("block_size"),
         "tokenizer": tokenizer_info,
@@ -274,9 +480,19 @@ def compare_checkpoint_pair(
             "head_dim",
             "rope_theta",
             "rope_scaling",
-            "special_token_ids",
         ),
     )
+    if (draft.get("schema") or {}).get("format") == "speculators":
+        warnings.append(
+            "Speculators source special-token ids require explicit target-config "
+            "injection in any old-ABI derived artifact"
+        )
+    elif target.get("special_token_ids") != draft.get("special_token_ids"):
+        errors.append(
+            "special_token_ids mismatch: "
+            f"target={target.get('special_token_ids')!r}, "
+            f"draft={draft.get('special_token_ids')!r}"
+        )
     if target["tokenizer"]["aggregate_sha256"] != draft["tokenizer"]["aggregate_sha256"]:
         errors.append("target/draft tokenizer hash mismatch")
     if target.get("model_type") not in ("qwen3", "qwen3_moe"):
@@ -293,10 +509,43 @@ def compare_checkpoint_pair(
         errors.append(
             f"{method} architecture mismatch: {draft.get('architectures')!r}"
         )
-    if any(value != "full_attention" for value in draft.get("layer_types") or []):
-        errors.append("first scope requires uniform full-attention draft layers")
-    if draft.get("sliding_window") is not None:
-        errors.append("first scope does not support sliding-window draft layers")
+    draft_vocab_size = draft.get("draft_vocab_size")
+    target_vocab_size = target.get("vocab_size")
+    reduced_dflash_vocab = (
+        method == "dflash"
+        and isinstance(draft_vocab_size, int)
+        and isinstance(target_vocab_size, int)
+        and 0 < draft_vocab_size < target_vocab_size
+    )
+    if draft_vocab_size != target_vocab_size and not reduced_dflash_vocab:
+        errors.append(
+            "unsupported internal draft vocabulary: "
+            f"method={method}, target={target_vocab_size!r}, "
+            f"draft={draft_vocab_size!r}"
+        )
+    layer_types = draft.get("layer_types") or []
+    layer_causality = draft.get("layer_causality") or []
+    full_noncausal = (
+        bool(layer_types)
+        and set(layer_types) == {"full_attention"}
+        and draft.get("sliding_window") is None
+        and len(layer_causality) == len(layer_types)
+        and not any(layer_causality)
+    )
+    sliding_causal = (
+        method == "dflash"
+        and bool(layer_types)
+        and set(layer_types) == {"sliding_attention"}
+        and isinstance(draft.get("sliding_window"), int)
+        and draft["sliding_window"] > 0
+        and len(layer_causality) == len(layer_types)
+        and all(layer_causality)
+    )
+    if not (full_noncausal or sliding_causal):
+        errors.append(
+            "unsupported draft attention contract: expected uniform "
+            "full/non-causal, or DFlash uniform sliding/causal"
+        )
     trained_block_size = draft.get("block_size")
     if isinstance(trained_block_size, int) and (
         trained_block_size < 1 or num_speculative_tokens > trained_block_size
@@ -337,6 +586,147 @@ def compare_checkpoint_pair(
     if method == "dflash" and draft.get("mask_token_id") is None:
         errors.append("DFlash checkpoint has no mask_token_id")
 
+    ownership = (draft.get("weights") or {}).get("ownership") or {}
+    critical = (draft.get("weights") or {}).get("critical_tensors") or {}
+
+    def one_shape(name: str) -> list[int] | None:
+        rows = critical.get(name) or []
+        if len(rows) != 1:
+            return None
+        return rows[0].get("shape")
+
+    hidden_size = draft.get("hidden_size")
+    target_vocab = target.get("vocab_size")
+    internal_vocab = draft.get("draft_vocab_size")
+    if one_shape("fc.weight") != [hidden_size, draft.get("aux_concat_width")]:
+        errors.append("draft fc.weight shape does not match hidden/aux contract")
+    layer_inventory = (draft.get("weights") or {}).get("transformer_layers") or {}
+    expected_layer_indices = list(range(draft.get("num_hidden_layers") or 0))
+    if layer_inventory.get("indices") != expected_layer_indices:
+        errors.append(
+            "draft transformer layer tensor indices do not match num_hidden_layers"
+        )
+    if any((layer_inventory.get("missing_required_tensors") or {}).values()):
+        errors.append("draft transformer layers have missing required tensors")
+    num_heads = draft.get("num_attention_heads")
+    num_kv_heads = draft.get("num_key_value_heads")
+    head_dim = draft.get("head_dim")
+    intermediate_size = draft.get("intermediate_size")
+    if all(
+        isinstance(value, int)
+        for value in (
+            hidden_size,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            intermediate_size,
+        )
+    ):
+        expected_layer_shapes = {
+            "input_layernorm.weight": [hidden_size],
+            "post_attention_layernorm.weight": [hidden_size],
+            "self_attn.q_proj.weight": [num_heads * head_dim, hidden_size],
+            "self_attn.k_proj.weight": [num_kv_heads * head_dim, hidden_size],
+            "self_attn.v_proj.weight": [num_kv_heads * head_dim, hidden_size],
+            "self_attn.o_proj.weight": [hidden_size, num_heads * head_dim],
+            "self_attn.q_norm.weight": [head_dim],
+            "self_attn.k_norm.weight": [head_dim],
+            "mlp.gate_proj.weight": [intermediate_size, hidden_size],
+            "mlp.up_proj.weight": [intermediate_size, hidden_size],
+            "mlp.down_proj.weight": [hidden_size, intermediate_size],
+        }
+        observed_layer_shapes = layer_inventory.get("shapes") or {}
+        if any(
+            observed_layer_shapes.get(str(layer), {}).get(suffix) != shape
+            for layer in expected_layer_indices
+            for suffix, shape in expected_layer_shapes.items()
+        ):
+            errors.append("draft transformer layer tensor shapes are invalid")
+    else:
+        errors.append("draft transformer dimensions are incomplete")
+    if one_shape("hidden_norm.weight") != [hidden_size]:
+        errors.append("draft hidden_norm.weight shape is invalid")
+    if one_shape("final_norm.weight") != [hidden_size]:
+        errors.append("draft final norm shape is invalid")
+    if method == "dflash":
+        required_ownership = (
+            "checkpoint_embedding",
+            "checkpoint_lm_head",
+            "draft_to_target_mapping",
+            "target_to_draft_mapping",
+        )
+        observed_ownership = tuple(
+            bool(ownership.get(name)) for name in required_ownership
+        )
+        expected_ownership = (True,) * 4 if reduced_dflash_vocab else (False,) * 4
+        if observed_ownership != expected_ownership:
+            errors.append(
+                "DFlash vocabulary weight ownership is incomplete or inconsistent "
+                f"for {'reduced' if reduced_dflash_vocab else 'full'} vocabulary"
+            )
+        if ownership.get("checkpoint_embedding") and one_shape(
+            "embed_tokens.weight"
+        ) != [target_vocab, hidden_size]:
+            errors.append("DFlash checkpoint embedding shape is invalid")
+        if ownership.get("checkpoint_lm_head") and one_shape("lm_head.weight") != [
+            internal_vocab,
+            hidden_size,
+        ]:
+            errors.append("DFlash checkpoint LM-head shape is invalid")
+        if ownership.get("draft_to_target_mapping") and one_shape("d2t") != [
+            internal_vocab
+        ]:
+            errors.append("DFlash d2t tensor shape is invalid")
+        if ownership.get("target_to_draft_mapping") and one_shape("t2d") != [
+            target_vocab
+        ]:
+            errors.append("DFlash t2d tensor shape is invalid")
+        if ownership.get("draft_to_target_mapping"):
+            d2t_rows = critical.get("d2t") or []
+            if len(d2t_rows) != 1 or d2t_rows[0].get("dtype") not in (
+                "I64",
+                "torch.int64",
+            ):
+                errors.append("DFlash d2t tensor must use int64")
+        if ownership.get("target_to_draft_mapping"):
+            t2d_rows = critical.get("t2d") or []
+            if len(t2d_rows) != 1 or t2d_rows[0].get("dtype") not in (
+                "BOOL",
+                "torch.bool",
+            ):
+                errors.append("DFlash t2d tensor must use bool")
+    else:
+        if not ownership.get("checkpoint_embedding") or not ownership.get(
+            "checkpoint_lm_head"
+        ):
+            errors.append("DSpark checkpoint must own both embedding and LM-head weights")
+        if not ownership.get("markov_head"):
+            errors.append("DSpark checkpoint is missing the complete Markov head")
+        if one_shape("embed_tokens.weight") != [target_vocab, hidden_size]:
+            errors.append("DSpark checkpoint embedding shape is invalid")
+        if one_shape("lm_head.weight") != [target_vocab, hidden_size]:
+            errors.append("DSpark checkpoint LM-head shape is invalid")
+        markov_rank = draft.get("markov_rank")
+        expected_markov = [target_vocab, markov_rank]
+        if one_shape("markov_head.markov_w1.weight") != expected_markov or one_shape(
+            "markov_head.markov_w2.weight"
+        ) != expected_markov:
+            errors.append("DSpark Markov tensor shapes are invalid")
+        if draft.get("enable_confidence_head"):
+            confidence_width = (
+                hidden_size + markov_rank
+                if isinstance(hidden_size, int)
+                and isinstance(markov_rank, int)
+                and draft.get("confidence_head_with_markov")
+                else hidden_size
+            )
+            if not isinstance(confidence_width, int) or one_shape(
+                "confidence_head.proj.weight"
+            ) != [1, confidence_width]:
+                errors.append("DSpark confidence weight shape is invalid")
+            if one_shape("confidence_head.proj.bias") != [1]:
+                errors.append("DSpark confidence bias shape is invalid")
+
     status = "FAIL" if errors else "BLOCKED" if blockers else "PASS"
     return {
         "method": method,
@@ -366,6 +756,7 @@ def build_migration_manifest(
     draft_tp: int,
     draft_sample_method: str = "greedy",
     rejection_sample_method: str = "standard",
+    required_methods: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     revisions = revisions or {}
     draft_tokenizer_paths = draft_tokenizer_paths or {}
@@ -398,7 +789,11 @@ def build_migration_manifest(
             rejection_sample_method=rejection_sample_method,
         )
 
-    missing = sorted({"dflash", "dspark"} - set(drafts))
+    required = set(required_methods or ("dflash", "dspark"))
+    unknown_required = required - {"dflash", "dspark"}
+    if unknown_required:
+        raise ManifestError(f"unsupported required methods: {sorted(unknown_required)}")
+    missing = sorted(required - set(drafts))
     statuses = [item["status"] for item in compatibility.values()]
     overall = (
         "FAIL"
@@ -415,12 +810,15 @@ def build_migration_manifest(
             "fixed_k": True,
             "draft_eager": True,
             "full_vocab": True,
+            "target_probability_vocab": True,
+            "reduced_dflash_vocab_supported": True,
             "draft_sample_method": draft_sample_method,
             "rejection_sample_method": rejection_sample_method,
             "num_speculative_tokens": num_speculative_tokens,
             "target_tp": target_tp,
             "draft_tp": draft_tp,
             "draft_load_format": "auto",
+            "required_methods": sorted(required),
         },
         "target": target,
         "drafts": drafts,

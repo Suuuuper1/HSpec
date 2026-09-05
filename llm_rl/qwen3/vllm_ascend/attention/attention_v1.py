@@ -797,9 +797,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
-        # DFlash query blocks are intentionally non-causal. Keep this eager
-        # branch explicit: inferring causality from mask=None is unsafe because
-        # other decoder paths may omit masks for unrelated reasons.
+        # Parallel-block draft attention carries causality explicitly in the
+        # metadata. A causal sliding-window draft additionally needs sparse
+        # mode 4 and the checkpoint-authored window bound.
         if not attn_metadata.causal:
             attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                 query=query,
@@ -814,6 +814,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_heads=self.num_heads,
                 scale=self.scale,
                 sparse_mode=0,
+            )
+        elif self.sliding_window is not None:
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                query=query,
+                key=key,
+                value=value,
+                atten_mask=attn_metadata.attn_mask,
+                block_table=block_table,
+                input_layout="TND",
+                block_size=block_size,
+                actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                num_key_value_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale=self.scale,
+                pre_tokens=self.sliding_window,
+                next_tokens=0,
+                sparse_mode=4,
             )
         else:
             attn_output, _ = torch_npu.npu_fused_infer_attention_score(

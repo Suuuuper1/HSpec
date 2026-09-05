@@ -481,7 +481,7 @@ def test_draft_tp_contract_and_dspark_model_requirement(checkpoint_paths):
             lambda config: config.update(
                 layer_types=["full_attention", "sliding_attention"]
             ),
-            "uniform full attention",
+            "uniform full/non-causal",
         ),
     ],
 )
@@ -495,6 +495,28 @@ def test_dflash_checkpoint_contract_fields_fail_closed(
     config_path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match=error):
         _spec(checkpoint_paths, "dflash")
+
+
+def test_dflash_reduced_vocab_causal_sliding_config_is_supported(
+    checkpoint_paths,
+):
+    _, dflash, _ = checkpoint_paths
+    config_path = dflash / "config.json"
+    config = json.loads(config_path.read_text())
+    config.update(
+        draft_vocab_size=64,
+        layer_types=["sliding_attention"] * config["num_hidden_layers"],
+        sliding_window=32,
+        use_sliding_window=True,
+    )
+    config["dflash_config"]["causal"] = True
+    config_path.write_text(json.dumps(config))
+
+    spec = _spec(checkpoint_paths, "dflash")
+    draft = spec.draft_model_config.hf_text_config
+    assert draft.draft_vocab_size == 64
+    assert draft.sliding_window == 32
+    assert draft.dflash_config["causal"] is True
 
 
 def test_hspec_defaults_and_old_eagle_three_value_abi(checkpoint_paths):

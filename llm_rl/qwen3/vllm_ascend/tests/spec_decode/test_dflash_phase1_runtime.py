@@ -68,6 +68,66 @@ def test_parallel_metadata_clamps_incomplete_fixed_k_window():
     assert proposer._can_speculate.tolist() == [True, False]
 
 
+def test_parallel_metadata_propagates_uniform_draft_causality():
+    proposer = ParallelBlockProposer.__new__(ParallelBlockProposer)
+    proposer.num_queries = 3
+    proposer.draft_attn_causal = True
+    persistent_mask = torch.ones(8, 8, dtype=torch.bool)
+    proposer._draft_attn_mask = persistent_mask
+    proposer._effective_seq_lens = torch.empty(1, dtype=torch.int32)
+    proposer._can_speculate = torch.empty(1, dtype=torch.bool)
+    proposer._cannot_speculate = torch.empty(1, dtype=torch.bool)
+    proposer._query_start_loc = torch.tensor([0, 3], dtype=torch.int32)
+    proposer._actual_query_lengths = ((3,),)
+    proposer.speculative_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(max_model_len=32)
+    )
+    proposer.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(runner_type="generate")
+    )
+    common = SimpleNamespace(
+        num_reqs=1,
+        seq_lens=torch.tensor([10], dtype=torch.int32),
+        block_table_tensor=torch.zeros(1, 2, dtype=torch.int32),
+    )
+    metadata = proposer.build_parallel_attention_metadata(
+        common,
+        torch.full((3,), -1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+    )
+    assert metadata.causal is True
+    assert metadata.attn_mask is persistent_mask
+
+
+def test_parallel_metadata_rejects_causal_mode_without_persistent_mask():
+    proposer = ParallelBlockProposer.__new__(ParallelBlockProposer)
+    proposer.num_queries = 3
+    proposer.draft_attn_causal = True
+    proposer._draft_attn_mask = None
+    proposer._effective_seq_lens = torch.empty(1, dtype=torch.int32)
+    proposer._can_speculate = torch.empty(1, dtype=torch.bool)
+    proposer._cannot_speculate = torch.empty(1, dtype=torch.bool)
+    proposer._query_start_loc = torch.tensor([0, 3], dtype=torch.int32)
+    proposer._actual_query_lengths = ((3,),)
+    proposer.speculative_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(max_model_len=32)
+    )
+    proposer.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(runner_type="generate")
+    )
+    common = SimpleNamespace(
+        num_reqs=1,
+        seq_lens=torch.tensor([10], dtype=torch.int32),
+        block_table_tensor=torch.zeros(1, 2, dtype=torch.int32),
+    )
+    with pytest.raises(RuntimeError, match="initialization-time NPU attention mask"):
+        proposer.build_parallel_attention_metadata(
+            common,
+            torch.full((3,), -1, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+        )
+
+
 def test_old_and_parallel_padded_abis_remain_separate():
     old = inspect.signature(EagleProposer.prepare_inputs_padded).return_annotation
     new = inspect.signature(

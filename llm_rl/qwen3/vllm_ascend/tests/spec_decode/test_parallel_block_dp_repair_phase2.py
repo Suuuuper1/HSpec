@@ -25,6 +25,7 @@ def _config(
     target_is_moe=True,
     target_vocab_size=151936,
     draft_vocab_size=151936,
+    internal_draft_vocab_size=None,
 ):
     target_parallel = SimpleNamespace(
         tensor_parallel_size=1,
@@ -53,6 +54,13 @@ def _config(
         draft_model_config=SimpleNamespace(
             is_moe=False,
             get_vocab_size=lambda: draft_vocab_size,
+            hf_text_config=SimpleNamespace(
+                draft_vocab_size=(
+                    draft_vocab_size
+                    if internal_draft_vocab_size is None
+                    else internal_draft_vocab_size
+                )
+            ),
         ),
         enforce_eager=True,
         disable_padded_drafter_batch=False,
@@ -239,6 +247,31 @@ def test_phase2_capability_is_self_describing_but_not_prematurely_certified(meth
     )
     assert compatibility["schema_version"] == "dflash-dspark.phase5-capability.v1"
     assert compatibility["dp_extension"]["certification_state"] == "phase2_candidate_open"
+
+
+def test_dflash_mapped_reduced_vocab_capability_is_described_exactly():
+    config = _config(method="dflash", internal_draft_vocab_size=32000)
+    spec = config.speculative_config
+    manifest = dp_repair_capability_manifest(
+        spec,
+        config,
+        draft_model_kind="dense",
+        requested_vllm_dp_size=2,
+        production_dp_gt1_enabled=True,
+    )
+
+    vocabulary = manifest["certified_candidate"]["vocabulary"]
+    assert vocabulary == {
+        "internal_draft_vocab_size": 32000,
+        "output_vocab_size": 151936,
+        "target_vocab_size": 151936,
+        "target_probability_vocab": True,
+        "mapped_reduced_vocab": True,
+        "mode": "mapped_reduced",
+    }
+    assert manifest["certified_candidate"]["full_vocab"] is True
+    assert manifest["unsupported_fail_closed"]["dspark_topk"] is True
+    assert manifest["unsupported_fail_closed"]["unmapped_reduced_vocab"] is True
 
 
 def test_phase1_capability_schema_remains_available_for_frozen_analyzers():

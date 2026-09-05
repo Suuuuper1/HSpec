@@ -112,6 +112,11 @@ def test_capability_manifest_separates_stable_and_experimental_paths():
         rejection_sample_method="standard",
         num_speculative_tokens=7,
         parallel_draft_profile_enabled=True,
+        target_model_config=SimpleNamespace(get_vocab_size=lambda: 151936),
+        draft_model_config=SimpleNamespace(
+            get_vocab_size=lambda: 151936,
+            hf_text_config=SimpleNamespace(draft_vocab_size=32000),
+        ),
     )
     manifest = phase5_capability_manifest(config)
     assert manifest["stable_baseline"] == {
@@ -120,6 +125,14 @@ def test_capability_manifest_separates_stable_and_experimental_paths():
         "verification": "standard",
         "fixed_k": 7,
         "full_vocab": True,
+        "vocabulary": {
+            "internal_draft_vocab_size": 32000,
+            "output_vocab_size": 151936,
+            "target_vocab_size": 151936,
+            "target_probability_vocab": True,
+            "mapped_reduced_vocab": True,
+            "mode": "mapped_reduced",
+        },
     }
     assert manifest["enabled"]["persistent_sampling_workspace"] is False
     assert manifest["evaluated_and_rolled_back"]["persistent_sampling_workspace"]

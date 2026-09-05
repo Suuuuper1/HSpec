@@ -84,10 +84,26 @@ class DFlashProposer(ParallelBlockProposer):
         self.model.set_context_rms_norm_impl(rms_norm_into)
         self.model.set_context_rope_impl(rotary_embedding_into)
         self.attn_layer_names = self._discover_draft_attention_layers(target_names)
-        if self.model.get_draft_attn_causal() != [False] * len(self.attn_layer_names):
+        layer_causality = self.model.get_draft_attn_causal()
+        if (
+            len(layer_causality) != len(self.attn_layer_names)
+            or len(set(layer_causality)) != 1
+        ):
             raise RuntimeError(
-                f"Phase 1/2 {self.method} draft layers must all be non-causal"
+                f"{self.method} old eager ABI requires uniform draft causality; "
+                f"got {layer_causality}"
             )
+        self.draft_attn_causal = layer_causality[0]
+        # EagleProposer already owns the backend singleton mask builder. Build
+        # the causal mask once after checkpoint causality is known, then retain
+        # the same device tensor for every proposal step.
+        self._draft_attn_mask = (
+            self.attn_mask_builder.get_attention_mask(
+                self.speculative_config.draft_model_config
+            )
+            if self.draft_attn_causal
+            else None
+        )
 
         target_language_model = (
             target_model.get_language_model()
@@ -142,8 +158,29 @@ class DFlashProposer(ParallelBlockProposer):
                 f"Target LM-head/embedding local shapes differ: "
                 f"{lm_head_shape} != {embedding_shape}"
             )
-        self.model.model.embed_tokens = target_embedding
-        self.model.lm_head = target_lm_head
+        if self.model.has_own_embed_tokens:
+            own_embedding_shape = tuple(self.model.model.embed_tokens.weight.shape)
+            if own_embedding_shape != embedding_shape:
+                raise ValueError(
+                    "Checkpoint-owned DFlash embedding shape differs from target: "
+                    f"{own_embedding_shape} != {embedding_shape}"
+                )
+        else:
+            self.model.model.embed_tokens = target_embedding
+        if self.model.has_own_lm_head:
+            expected_head = (
+                self.model.draft_vocab_size,
+                expected_hidden,
+            )
+            if tuple(self.model.lm_head.weight.shape) != expected_head:
+                raise ValueError(
+                    "Checkpoint-owned DFlash LM-head shape is incompatible: "
+                    f"{tuple(self.model.lm_head.weight.shape)} != {expected_head}"
+                )
+            if self.model.draft_target_ids is None:
+                raise RuntimeError("Reduced-vocabulary DFlash has no d2t mapping")
+        else:
+            self.model.lm_head = target_lm_head
 
     def get_aux_hidden_state_layer_ids(self) -> tuple[int, ...]:
         return tuple(self.aux_hidden_state_layer_ids)

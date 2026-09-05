@@ -28,6 +28,10 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
@@ -41,6 +45,7 @@ from .utils import PPMissingLayer, get_draft_quant_config, maybe_prefix
 logger = init_logger(__name__)
 
 _FULL_ATTENTION = "full_attention"
+_SLIDING_ATTENTION = "sliding_attention"
 _MASK_EMBEDDING_FILENAME = "mask_embedding.pt"
 _ALLOWED_DFLASH_CONFIG_FIELDS = {
     "causal",
@@ -51,22 +56,68 @@ _ALLOWED_DFLASH_CONFIG_FIELDS = {
 
 
 def _validate_parallel_attention_surface(
-    config: Qwen3Config, method: str
+    config: Qwen3Config,
+    method: str,
+    *,
+    allow_uniform_causal_sliding: bool = False,
 ) -> None:
     layer_types = getattr(config, "layer_types", None)
     if layer_types is None or len(layer_types) != config.num_hidden_layers:
         raise ValueError(
             f"{method} requires one layer_types entry per draft transformer layer"
         )
-    if any(layer_type != _FULL_ATTENTION for layer_type in layer_types):
+    unique_layer_types = set(layer_types)
+    if unique_layer_types == {_FULL_ATTENTION}:
+        if getattr(config, "sliding_window", None) is not None:
+            raise ValueError(
+                f"{method} full-attention layers require sliding_window=None"
+            )
+        return
+    if (
+        allow_uniform_causal_sliding
+        and unique_layer_types == {_SLIDING_ATTENTION}
+    ):
+        sliding_window = getattr(config, "sliding_window", None)
+        if not isinstance(sliding_window, int) or sliding_window <= 0:
+            raise ValueError(
+                f"{method} sliding attention requires a positive sliding_window"
+            )
+        return
+    if len(unique_layer_types) != 1:
         raise NotImplementedError(
-            f"Phase 1/2 {method} supports one uniform full-attention KV group "
+            f"{method} supports one uniform attention KV group "
             f"only; got layer_types={layer_types!r}"
         )
-    if getattr(config, "sliding_window", None) is not None:
-        raise NotImplementedError(
-            f"Phase 1/2 {method} does not support sliding attention"
-        )
+    raise NotImplementedError(
+        f"{method} does not support layer type {next(iter(unique_layer_types))!r}"
+    )
+
+
+def _resolve_dflash_attention(config: Qwen3Config) -> tuple[int | None, bool]:
+    """Resolve the uniform attention mode supported by the old eager ABI."""
+    layer_types = getattr(config, "layer_types", None) or []
+    raw = getattr(config, "dflash_config", None) or {}
+    causal = raw.get("causal", False)
+    if layer_types and set(layer_types) == {_SLIDING_ATTENTION}:
+        return getattr(config, "sliding_window", None), causal
+    return None, causal
+
+
+def _expand_draft_logits_to_target(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor | None,
+    target_vocab_size: int,
+) -> torch.Tensor:
+    """Scatter reduced-vocabulary logits into target-vocabulary space."""
+    if target_ids is None:
+        return logits
+    if target_ids.ndim != 1 or target_ids.numel() != logits.shape[-1]:
+        raise ValueError("DFlash target-id mapping does not match draft logits")
+    target_logits = logits.new_full(
+        (*logits.shape[:-1], target_vocab_size), float("-inf")
+    )
+    target_logits[..., target_ids] = logits
+    return target_logits
 
 
 def _missing_packed_shards(
@@ -154,13 +205,27 @@ def _validate_dflash_attention_config(config: Qwen3Config) -> None:
             "DFlash target_layer_ids must be a non-empty ordered set of "
             f"non-negative integers, got {layer_ids!r}"
         )
-    _validate_parallel_attention_surface(config, "DFlash")
     causal = raw.get("causal", False)
     if not isinstance(causal, bool):
         raise ValueError(f"dflash_config.causal must be bool, got {causal!r}")
-    if causal:
+    _validate_parallel_attention_surface(
+        config, "DFlash", allow_uniform_causal_sliding=True
+    )
+    layer_types = set(config.layer_types)
+    if causal != (layer_types == {_SLIDING_ATTENTION}):
         raise NotImplementedError(
-            "Phase 1 certifies the checkpoint-authored non-causal DFlash path only"
+            "DFlash old eager ABI supports only non-causal full attention or "
+            "causal uniform sliding attention"
+        )
+    draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
+    if (
+        isinstance(draft_vocab_size, bool)
+        or not isinstance(draft_vocab_size, int)
+        or not 0 < draft_vocab_size <= config.vocab_size
+    ):
+        raise ValueError(
+            "DFlash draft_vocab_size must be in "
+            f"[1, {config.vocab_size}], got {draft_vocab_size!r}"
         )
 
 
@@ -218,6 +283,8 @@ class DFlashQwen3Attention(nn.Module):
         head_dim: int | None,
         rms_norm_eps: float,
         attention_bias: bool,
+        sliding_window: int | None,
+        causal: bool,
         is_neox_style: bool,
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
@@ -237,7 +304,7 @@ class DFlashQwen3Attention(nn.Module):
         self.head_dim = head_dim or hidden_size // num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.causal = False
+        self.causal = causal
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -268,6 +335,7 @@ class DFlashQwen3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
+            per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=AttentionType.DECODER,
         )
@@ -311,6 +379,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         set_default_rope_theta(config, default_theta=1000000)
+        sliding_window, causal = _resolve_dflash_attention(config)
         self.self_attn = DFlashQwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -320,6 +389,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=getattr(config, "attention_bias", False),
+            sliding_window=sliding_window,
+            causal=causal,
             is_neox_style=getattr(config, "is_neox_style", True),
             cache_config=cache_config,
             quant_config=quant_config,
@@ -384,9 +455,25 @@ class DFlashQwen3Model(nn.Module):
             if self.parallel_draft_method == "dspark"
             else dflash_aux_capture_layer_ids(self.config)
         )
-        # The certified checkpoint intentionally omits target-owned vocabulary
-        # weights. Avoid allocating large random placeholders before sharing.
-        self.embed_tokens = PPMissingLayer()
+        draft_vocab_size = getattr(
+            self.config, "draft_vocab_size", self.config.vocab_size
+        )
+        # Full-vocabulary DFlash retains the original target-sharing path.
+        # Reduced-vocabulary DFlash checkpoints own a full target-vocabulary
+        # embedding because query anchors/masks are target token ids.
+        if (
+            self.parallel_draft_method == "dflash"
+            and draft_vocab_size < self.config.vocab_size
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                params_dtype=vllm_config.model_config.dtype,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         raw_dflash = getattr(self.config, "dflash_config", None) or {}
         self.mask_token_id = (
             getattr(self.config, "mask_token_id", None)
@@ -688,11 +775,11 @@ class DFlashQwen3Model(nn.Module):
                 getattr(param, "weight_loader", default_weight_loader)(param, loaded_weight)
                 loaded.add(name)
 
-        expected = {
-            name
-            for name in params
-            if not name.startswith("embed_tokens.") and name != "mask_embedding"
-        }
+        expected = {name for name in params if name != "mask_embedding"}
+        if isinstance(self.embed_tokens, PPMissingLayer):
+            expected = {
+                name for name in expected if not name.startswith("embed_tokens.")
+            }
         missing = expected - loaded
         if missing:
             raise ValueError(f"DFlash checkpoint did not initialize weights: {sorted(missing)}")
@@ -739,10 +826,33 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             start_layer_id=start_layer_id,
             prefix=maybe_prefix(prefix, "model"),
         )
-        self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(self.config.vocab_size)
-        self.has_own_embed_tokens = False
-        self.has_own_lm_head = False
+        self.draft_vocab_size = getattr(
+            self.config, "draft_vocab_size", self.config.vocab_size
+        )
+        self.has_own_embed_tokens = self.draft_vocab_size < self.config.vocab_size
+        self.has_own_lm_head = self.has_own_embed_tokens
+        if self.has_own_lm_head:
+            self.lm_head = ParallelLMHead(
+                self.draft_vocab_size,
+                self.config.hidden_size,
+                params_dtype=vllm_config.model_config.dtype,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            self.draft_id_to_target_id = nn.Parameter(
+                torch.zeros(self.draft_vocab_size, dtype=torch.long),
+                requires_grad=False,
+            )
+            self.register_buffer(
+                "draft_target_ids",
+                torch.arange(self.draft_vocab_size, dtype=torch.long),
+                persistent=False,
+            )
+        else:
+            self.lm_head = PPMissingLayer()
+            self.draft_id_to_target_id = None
+            self.register_buffer("draft_target_ids", None, persistent=False)
+        self.logits_processor = LogitsProcessor(self.draft_vocab_size)
 
     @property
     def aux_capture_layer_ids(self) -> tuple[int, ...]:
@@ -770,7 +880,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if isinstance(self.lm_head, PPMissingLayer):
             raise RuntimeError("DFlash target LM head was not injected after load")
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return _expand_draft_logits_to_target(
+            logits,
+            self.draft_target_ids,
+            self.config.vocab_size,
+        )
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.combine_hidden_states(hidden_states)
@@ -793,26 +908,71 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         return [layer.layer_name for layer in self.get_context_kv_attention_layers()]
 
     def get_draft_attn_causal(self) -> list[bool]:
-        return [False] * len(self.model.layers)
+        return [layer.self_attn.causal for layer in self.model.layers]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights: list[tuple[str, torch.Tensor]] = []
+        lm_head_weight: torch.Tensor | None = None
+        d2t_weight: torch.Tensor | None = None
+        t2d_weight: torch.Tensor | None = None
         unexpected: list[str] = []
         for name, loaded_weight in weights:
             if name.startswith("model."):
                 name = name.removeprefix("model.")
-            if name.startswith("lm_head.") or name.startswith("embed_tokens."):
+            if name == "lm_head.weight":
+                lm_head_weight = loaded_weight
+            elif name == "d2t":
+                d2t_weight = loaded_weight
+            elif name == "t2d":
+                t2d_weight = loaded_weight
+            elif name.startswith("lm_head.") or name.startswith(("d2t.", "t2d.")):
                 unexpected.append(name)
-                continue
-            if name in ("d2t", "t2d") or name.startswith(("d2t.", "t2d.")):
-                raise NotImplementedError("Phase 1 DFlash requires an equal full vocabulary")
-            model_weights.append((name, loaded_weight))
+            elif name.startswith("embed_tokens.") and not self.has_own_embed_tokens:
+                unexpected.append(name)
+            else:
+                model_weights.append((name, loaded_weight))
         if unexpected:
             raise ValueError(
-                "This DFlash implementation shares target embeddings/LM head; "
-                f"checkpoint unexpectedly contains {unexpected[:8]}"
+                f"DFlash checkpoint contains unsupported vocabulary weights {unexpected[:8]}"
             )
         self.model.load_weights(model_weights)
+        if self.has_own_lm_head:
+            if lm_head_weight is None or d2t_weight is None or t2d_weight is None:
+                raise ValueError(
+                    "Reduced-vocabulary DFlash requires lm_head.weight, d2t and t2d"
+                )
+            parameter = self.lm_head.weight
+            getattr(parameter, "weight_loader", default_weight_loader)(
+                parameter, lm_head_weight
+            )
+            if tuple(d2t_weight.shape) != (self.draft_vocab_size,):
+                raise ValueError("DFlash d2t shape does not match draft_vocab_size")
+            if tuple(t2d_weight.shape) != (self.config.vocab_size,):
+                raise ValueError("DFlash t2d shape does not match target vocab_size")
+            base = torch.arange(
+                self.draft_vocab_size,
+                dtype=torch.long,
+                device=d2t_weight.device,
+            )
+            target_ids = base + d2t_weight.to(dtype=torch.long)
+            if (
+                bool(torch.any(target_ids < 0))
+                or bool(torch.any(target_ids >= self.config.vocab_size))
+                or torch.unique(target_ids).numel() != self.draft_vocab_size
+            ):
+                raise ValueError("DFlash d2t must map uniquely into the target vocabulary")
+            expected_t2d = torch.zeros(
+                self.config.vocab_size, dtype=torch.bool, device=target_ids.device
+            )
+            expected_t2d[target_ids] = True
+            if not torch.equal(expected_t2d, t2d_weight.to(dtype=torch.bool)):
+                raise ValueError("DFlash t2d membership does not agree with d2t")
+            self.draft_id_to_target_id.data.copy_(d2t_weight)
+            self.draft_target_ids.copy_(target_ids)
+        elif lm_head_weight is not None or d2t_weight is not None or t2d_weight is not None:
+            raise ValueError(
+                "Full-vocabulary DFlash must use target-owned LM head without mappings"
+            )
         mask_embedding = self._read_mask_embedding()
         if mask_embedding is not None:
             if mask_embedding.numel() != self.config.hidden_size:

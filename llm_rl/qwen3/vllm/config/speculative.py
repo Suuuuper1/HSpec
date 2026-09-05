@@ -671,18 +671,50 @@ class SpeculativeConfig:
                 )
 
         layer_types = getattr(draft.hf_text_config, "layer_types", None) or []
-        if any(layer_type != "full_attention" for layer_type in layer_types):
+        draft_num_layers = getattr(
+            draft.hf_text_config, "num_hidden_layers", None
+        )
+        if len(layer_types) != draft_num_layers or not layer_types:
             raise ValueError(
-                f"{self.method} Phase 0 only supports uniform full attention; "
-                f"got layer_types={layer_types}"
+                f"{self.method} requires one layer_types entry per draft layer"
             )
-        if getattr(draft.hf_text_config, "sliding_window", None) is not None:
-            raise ValueError(f"{self.method} Phase 0 does not support sliding window")
+        sliding_window = getattr(draft.hf_text_config, "sliding_window", None)
 
         if self.use_dflash():
             raw_config = getattr(draft.hf_text_config, "dflash_config", {}) or {}
             if not isinstance(raw_config, dict):
                 raise ValueError("dflash_config must be a mapping")
+            causal = raw_config.get("causal", False)
+            full_noncausal = (
+                set(layer_types) == {"full_attention"}
+                and sliding_window is None
+                and causal is False
+            )
+            sliding_causal = (
+                set(layer_types) == {"sliding_attention"}
+                and isinstance(sliding_window, int)
+                and sliding_window > 0
+                and causal is True
+            )
+            if not (full_noncausal or sliding_causal):
+                raise ValueError(
+                    "DFlash supports only uniform full/non-causal attention or "
+                    "uniform sliding/causal attention in the old eager ABI; "
+                    f"layer_types={layer_types}, sliding_window={sliding_window!r}, "
+                    f"causal={causal!r}"
+                )
+            internal_vocab = getattr(
+                draft.hf_text_config, "draft_vocab_size", draft_vocab
+            )
+            if (
+                isinstance(internal_vocab, bool)
+                or not isinstance(internal_vocab, int)
+                or not 0 < internal_vocab <= draft_vocab
+            ):
+                raise ValueError(
+                    "DFlash draft_vocab_size must be in "
+                    f"[1, {draft_vocab}], got {internal_vocab!r}"
+                )
             layer_ids = raw_config.get("target_layer_ids")
             if not layer_ids:
                 raise ValueError("DFlash checkpoint is missing dflash_config.target_layer_ids")
@@ -703,6 +735,14 @@ class SpeculativeConfig:
                 layer_id + 1 for layer_id in layer_ids
             ]
         else:
+            if (
+                set(layer_types) != {"full_attention"}
+                or sliding_window is not None
+            ):
+                raise ValueError(
+                    "DSpark Phase 2 supports uniform full attention only; "
+                    f"layer_types={layer_types}, sliding_window={sliding_window!r}"
+                )
             layer_ids = getattr(
                 draft.hf_text_config, "dspark_target_layer_ids", None
             ) or getattr(draft.hf_text_config, "target_layer_ids", None)

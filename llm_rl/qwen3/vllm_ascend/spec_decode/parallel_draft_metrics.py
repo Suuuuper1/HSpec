@@ -449,6 +449,56 @@ class ParallelDraftMetrics:
         }
 
 
+def _parallel_draft_vocab_surface(speculative_config: Any) -> dict[str, Any]:
+    """Describe internal and externally visible draft vocabulary semantics."""
+
+    draft_model = getattr(speculative_config, "draft_model_config", None)
+    target_model = getattr(speculative_config, "target_model_config", None)
+
+    def model_vocab(model: Any) -> int | None:
+        getter = getattr(model, "get_vocab_size", None)
+        if not callable(getter):
+            return None
+        value = getter()
+        return (
+            int(value)
+            if isinstance(value, int) and not isinstance(value, bool)
+            else None
+        )
+
+    output_vocab_size = model_vocab(draft_model)
+    target_vocab_size = model_vocab(target_model)
+    hf_config = getattr(draft_model, "hf_text_config", None)
+    if hf_config is None:
+        hf_config = getattr(draft_model, "hf_config", None)
+    internal_vocab_size = getattr(hf_config, "draft_vocab_size", output_vocab_size)
+    if not isinstance(internal_vocab_size, int) or isinstance(
+        internal_vocab_size, bool
+    ):
+        internal_vocab_size = output_vocab_size
+
+    target_probability_vocab = (
+        output_vocab_size == target_vocab_size
+        if output_vocab_size is not None and target_vocab_size is not None
+        else True
+    )
+    mapped_reduced_vocab = bool(
+        speculative_config.method == "dflash"
+        and internal_vocab_size is not None
+        and output_vocab_size is not None
+        and internal_vocab_size < output_vocab_size
+        and target_probability_vocab
+    )
+    return {
+        "internal_draft_vocab_size": internal_vocab_size,
+        "output_vocab_size": output_vocab_size,
+        "target_vocab_size": target_vocab_size,
+        "target_probability_vocab": target_probability_vocab,
+        "mapped_reduced_vocab": mapped_reduced_vocab,
+        "mode": "mapped_reduced" if mapped_reduced_vocab else "full",
+    }
+
+
 def phase5_capability_manifest(
     speculative_config: Any,
     *,
@@ -457,6 +507,7 @@ def phase5_capability_manifest(
     certification_state: str = "phase1_production_gate_closed",
 ) -> dict[str, Any]:
     """Return the runtime support surface consumed by the R5 analyzer."""
+    vocabulary = _parallel_draft_vocab_surface(speculative_config)
     manifest = {
         "schema_version": "dflash-dspark.phase5-capability.v1",
         "method": speculative_config.method,
@@ -465,7 +516,10 @@ def phase5_capability_manifest(
             "proposal": speculative_config.draft_sample_method,
             "verification": speculative_config.rejection_sample_method,
             "fixed_k": int(speculative_config.num_speculative_tokens),
-            "full_vocab": True,
+            # Compatibility field: this means the probability/output space,
+            # not necessarily the internal LM-head width.
+            "full_vocab": vocabulary["target_probability_vocab"],
+            "vocabulary": vocabulary,
         },
         "enabled": {
             "sampled_observability": bool(
@@ -513,6 +567,7 @@ def dp_repair_capability_manifest(
 ) -> dict[str, Any]:
     """Strict per-rank capability record for the DP repair analyzer."""
 
+    vocabulary = _parallel_draft_vocab_surface(speculative_config)
     parallel = vllm_config.parallel_config
     effective_dp_size = int(parallel.data_parallel_size)
     requested_dp_size = (
@@ -541,7 +596,11 @@ def dp_repair_capability_manifest(
             "proposal": speculative_config.draft_sample_method,
             "verification": speculative_config.rejection_sample_method,
             "fixed_k": int(speculative_config.num_speculative_tokens),
-            "full_vocab": True,
+            # Compatibility field retained for frozen analyzers. The detailed
+            # record distinguishes mapped internal reduction from the full
+            # target probability/output ABI.
+            "full_vocab": vocabulary["target_probability_vocab"],
+            "vocabulary": vocabulary,
             "draft_tensor_parallel_size": int(
                 speculative_config.draft_parallel_config.tensor_parallel_size
             ),
@@ -554,7 +613,8 @@ def dp_repair_capability_manifest(
             "draft_graph": True,
             "incremental_or_prefix_kv": True,
             "dynamic_k_or_confidence": True,
-            "topk_or_reduced_vocab": True,
+            "dspark_topk": True,
+            "unmapped_reduced_vocab": True,
         },
     }
     if production_dp_gt1_enabled:

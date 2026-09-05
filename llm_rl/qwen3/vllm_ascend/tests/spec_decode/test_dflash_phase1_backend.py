@@ -224,6 +224,144 @@ def test_decoder_fia_selects_causality_from_metadata(monkeypatch, causal):
     assert ("atten_mask" in calls[0]) is causal
 
 
+def test_decoder_fia_causal_sliding_uses_window_sparse_mode(monkeypatch):
+    import vllm_ascend.attention.attention_v1 as attention_module
+
+    calls = []
+
+    def fake_fia(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros_like(kwargs["query"]), None
+
+    monkeypatch.setattr(
+        attention_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(capturing=False),
+    )
+    monkeypatch.setattr(
+        attention_module.torch_npu,
+        "npu_fused_infer_attention_score",
+        fake_fia,
+    )
+    impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+    impl.sliding_window = 2048
+    impl.attn_type = AttentionType.DECODER
+    impl.num_heads = 2
+    impl.num_kv_heads = 1
+    impl.head_size = 4
+    impl.scale = 0.5
+    impl._get_fia_params = MethodType(
+        lambda self, key, value, metadata: (
+            key,
+            value,
+            128,
+            torch.zeros(1, 1),
+            [5],
+        ),
+        impl,
+    )
+    metadata = AscendMetadata(
+        attn_state=AscendAttentionState.ChunkedPrefill,
+        actual_seq_lengths_q=(3,),
+        attn_mask=torch.ones(4, 4, dtype=torch.bool),
+        causal=True,
+    )
+    output = torch.empty(3, 2, 4)
+    impl.forward_fused_infer_attention(
+        torch.randn(3, 8),
+        torch.randn(5, 4),
+        torch.randn(5, 4),
+        metadata,
+        output,
+    )
+
+    assert calls[0]["sparse_mode"] == 4
+    assert calls[0]["pre_tokens"] == 2048
+    assert calls[0]["next_tokens"] == 0
+
+
+def test_causal_sliding_fia_matches_dense_window_reference(monkeypatch):
+    import vllm_ascend.attention.attention_v1 as attention_module
+
+    _require_npu()
+    monkeypatch.setattr(
+        attention_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(capturing=False),
+    )
+    torch.manual_seed(20260905)
+    num_heads = 2
+    num_kv_heads = 1
+    head_size = 128
+    num_tokens = 7
+    sliding_window = 3
+    scale = head_size**-0.5
+    query = torch.randn(
+        num_tokens,
+        num_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device="npu",
+    )
+    key = torch.randn(
+        num_tokens,
+        num_kv_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device="npu",
+    )
+    value = torch.randn_like(key)
+
+    impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+    impl.sliding_window = sliding_window
+    impl.attn_type = AttentionType.DECODER
+    impl.num_heads = num_heads
+    impl.num_kv_heads = num_kv_heads
+    impl.head_size = head_size
+    impl.scale = scale
+    causal_mask = (
+        torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1)
+        .to(torch.int8)
+        .to("npu")
+    )
+    metadata = AscendMetadata(
+        attn_state=AscendAttentionState.PrefillNoCache,
+        actual_seq_lengths_q=(num_tokens,),
+        seq_lens=torch.tensor([num_tokens], dtype=torch.int32, device="npu"),
+        attn_mask=causal_mask,
+        causal=True,
+    )
+    output = torch.empty_like(query)
+    impl.forward_fused_infer_attention(query, key, value, metadata, output)
+    torch.npu.synchronize()
+
+    q = query.float().cpu().transpose(0, 1)
+    k = (
+        key.float()
+        .cpu()
+        .repeat_interleave(num_heads // num_kv_heads, dim=1)
+        .transpose(0, 1)
+    )
+    v = (
+        value.float()
+        .cpu()
+        .repeat_interleave(num_heads // num_kv_heads, dim=1)
+        .transpose(0, 1)
+    )
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+    positions = torch.arange(num_tokens)
+    visible = (positions[None, :] <= positions[:, None]) & (
+        positions[None, :] >= positions[:, None] - sliding_window
+    )
+    reference = torch.matmul(
+        scores.masked_fill(~visible.unsqueeze(0), float("-inf")).softmax(dim=-1),
+        v,
+    ).transpose(0, 1)
+    torch.testing.assert_close(
+        output.float().cpu(), reference, atol=3e-2, rtol=3e-2
+    )
+
+
 def test_noncausal_fia_matches_multi_request_dense_reference(monkeypatch):
     import vllm_ascend.attention.attention_v1 as attention_module
 

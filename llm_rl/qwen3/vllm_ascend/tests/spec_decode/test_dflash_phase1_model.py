@@ -8,6 +8,7 @@ from torch import nn
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
+    _expand_draft_logits_to_target,
     _missing_packed_shards,
     _validate_dflash_attention_config,
     dflash_aux_capture_layer_ids,
@@ -59,6 +60,79 @@ def test_aux_capture_translates_hf_outputs_to_old_qwen_capture_points():
 def test_algorithm_affecting_checkpoint_fields_fail_closed(override, error):
     with pytest.raises((ValueError, NotImplementedError), match=error):
         _validate_dflash_attention_config(_draft_config(**override))
+
+
+def test_uniform_causal_sliding_attention_is_the_only_second_surface():
+    config = _draft_config(causal=True)
+    config.layer_types = ["sliding_attention", "sliding_attention"]
+    config.sliding_window = 32
+    config.draft_vocab_size = 64
+    _validate_dflash_attention_config(config)
+
+    config.dflash_config["causal"] = False
+    with pytest.raises(NotImplementedError, match="causal uniform sliding"):
+        _validate_dflash_attention_config(config)
+
+
+def test_reduced_logits_scatter_preserves_target_space_probability_semantics():
+    logits = torch.tensor([[2.0, -1.0, 4.0]])
+    target_ids = torch.tensor([1, 4, 6])
+    expanded = _expand_draft_logits_to_target(logits, target_ids, 8)
+    assert expanded.shape == (1, 8)
+    assert torch.equal(expanded[:, target_ids], logits)
+    assert torch.isneginf(expanded[:, [0, 2, 3, 5, 7]]).all()
+    probabilities = expanded.softmax(dim=-1)
+    assert torch.equal(probabilities[:, [0, 2, 3, 5, 7]], torch.zeros(1, 5))
+    torch.testing.assert_close(probabilities.sum(dim=-1), torch.ones(1))
+
+
+def test_reduced_vocab_loader_validates_and_precomputes_mapping(monkeypatch):
+    wrapper = DFlashQwen3ForCausalLM.__new__(DFlashQwen3ForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.config = SimpleNamespace(vocab_size=8, hidden_size=3)
+    wrapper.draft_vocab_size = 3
+    wrapper.has_own_embed_tokens = True
+    wrapper.has_own_lm_head = True
+    wrapper.lm_head = nn.Embedding(3, 3)
+    wrapper.draft_id_to_target_id = nn.Parameter(
+        torch.zeros(3, dtype=torch.long), requires_grad=False
+    )
+    wrapper.register_buffer(
+        "draft_target_ids", torch.arange(3, dtype=torch.long), persistent=False
+    )
+    model = SimpleNamespace(
+        load_weights=lambda weights: list(weights),
+        build_fused_context_kv_buffers=lambda: None,
+        mask_token_id=None,
+    )
+    wrapper.model = model
+    monkeypatch.setattr(wrapper, "_read_mask_embedding", lambda: None)
+    offsets = torch.tensor([0, 2, 4], dtype=torch.int64)
+    membership = torch.tensor(
+        [True, False, False, True, False, False, True, False]
+    )
+    wrapper.load_weights(
+        [
+            ("embed_tokens.weight", torch.ones(8, 3)),
+            ("lm_head.weight", torch.arange(9).view(3, 3).float()),
+            ("d2t", offsets),
+            ("t2d", membership),
+        ]
+    )
+    assert wrapper.draft_target_ids.tolist() == [0, 3, 6]
+    assert torch.equal(wrapper.draft_id_to_target_id, offsets)
+
+    bad_membership = membership.clone()
+    bad_membership[7] = True
+    with pytest.raises(ValueError, match="does not agree"):
+        wrapper.load_weights(
+            [
+                ("embed_tokens.weight", torch.ones(8, 3)),
+                ("lm_head.weight", torch.ones(3, 3)),
+                ("d2t", offsets),
+                ("t2d", bad_membership),
+            ]
+        )
 
 
 def test_packed_weight_loader_requires_every_qkv_and_gate_up_shard():

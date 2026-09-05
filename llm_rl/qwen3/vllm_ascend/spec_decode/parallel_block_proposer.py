@@ -72,7 +72,7 @@ class ParallelBlockDPQualification:
 _DP_CERTIFIED_ALTERNATIVE = (
     "Certified alternatives: use model-internal DP=1; or use a DP-compatible "
     "MoE target with a replicated dense DFlash/DSpark draft, draft TP=1, "
-    "PP/PCP/DCP=1, eager fixed-K full-vocabulary proposal and standard rejection."
+    "PP/PCP/DCP=1, eager fixed-K target-vocabulary proposal and standard rejection."
 )
 
 
@@ -224,7 +224,7 @@ def validate_parallel_block_dp_qualification(
     ):
         failures.append("dynamic K/confidence is enabled")
     if _required_attr(spec, "dspark_draft_topk", surface="speculative_config") is not None:
-        failures.append("top-k/reduced-vocabulary drafting is enabled")
+        failures.append("DSpark top-k drafting is enabled")
     if bool(_required_attr(cache, "enable_prefix_caching", surface="cache_config")):
         failures.append("prefix caching is enabled")
     if getattr(vllm_config, "lora_config", None) is not None:
@@ -877,10 +877,17 @@ class ParallelBlockProposer(EagleProposer):
         # stable [B,K] shape. A length of one and PAD slots make their output
         # irrelevant and keep FIA/cache addressing inside the allocation.
         effective.masked_fill_(cannot_speculate, 1)
+        draft_causal = getattr(self, "draft_attn_causal", False)
+        draft_attn_mask = getattr(self, "_draft_attn_mask", None)
+        if draft_causal and draft_attn_mask is None:
+            raise RuntimeError(
+                "Causal parallel-block attention requires an initialization-time "
+                "NPU attention mask"
+            )
 
         # Construct the narrow eager metadata directly. The generic old builder
         # pins/copies query_start_loc and materializes CPU lists on every call;
-        # neither is needed by the non-causal TND FIA path.
+        # neither is needed by the parallel TND FIA path.
         return AscendMetadata(
             num_actual_tokens=batch_size * self.num_queries,
             num_decode_tokens=0,
@@ -895,9 +902,9 @@ class ParallelBlockProposer(EagleProposer):
             max_query_len=self.num_queries,
             actual_seq_lengths_q=self._actual_query_lengths[batch_size - 1],
             slot_mapping=query_slot_mapping,
-            attn_mask=None,
+            attn_mask=draft_attn_mask,
             attn_state=AscendAttentionState.ChunkedPrefill,
-            causal=False,
+            causal=draft_causal,
             model_runner_type=self.vllm_config.model_config.runner_type,
         )
 
