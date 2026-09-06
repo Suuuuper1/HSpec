@@ -33,6 +33,7 @@ readonly SEED=20260829
 readonly SPECULATIVE_K=7
 readonly TRAINING_STEPS=2
 readonly PROBABILITY_BUDGET_MB=512
+readonly GPU_MEMORY_UTILIZATION=0.72
 readonly TRACE_LIMIT=256
 readonly HCCL_BUFFER_MB=800
 readonly HCCL_HOST_PORT_COUNT=32
@@ -73,15 +74,18 @@ export HYDRA_FULL_ERROR=1
 export VLLM_USE_V1=1
 export VLLM_DP_SIZE=${DP_SIZE}
 export VLLM_LOGGING_LEVEL=INFO
-export VLLM_LOG_STATS_INTERVAL=0.1
 export VLLM_CONFIGURE_LOGGING=1
 export VLLM_LOGGING_STREAM='ext://sys.stdout'
-unset VLLM_LOGGING_CONFIG_PATH
+export VLLM_LOGGING_CONFIG_PATH="${PROJECT_ROOT}/HSpec_research_doc/repair/DFlash_DSpark_migrate/phase3/vllm_logging_config.json"
+unset VLLM_LOG_STATS_INTERVAL
 export RAY_DEDUP_LOGS=0
 export USE_HSPEC_DECODE=0
 export HSPEC_PROFILE=0
 export VLLM_ASCEND_PARALLEL_DRAFT_DP_TRACE=1
 export VLLM_ASCEND_PARALLEL_DRAFT_DP_TRACE_LIMIT=${TRACE_LIMIT}
+export HSPEC_S7_ENGINE_TIMING=1
+export HSPEC_S7_OBSERVER_SCHEMA=v2
+export HSPEC_S7_OBSERVER_SAMPLE_EVERY=256
 export VERL_SPECULATIVE_LIFECYCLE_DIR=${LIFECYCLE_DIR}
 export VERL_DP_REPAIR_PHASE3_PRELUDE=1
 export VERL_DP_REPAIR_PHASE3_PRELUDE_DIR=${PRELUDE_DIR}
@@ -131,7 +135,7 @@ export ROLLOUT_TOP_K=50
 export ROLLOUT_TOP_P=0.9
 export ROLLOUT_ENABLE_PREFIX_CACHING=False
 export ROLLOUT_ENABLE_CHUNKED_PREFILL=True
-export GPU_MEMORY_UTILIZATION=0.87
+export GPU_MEMORY_UTILIZATION
 
 echo "DP_REPAIR_PHASE3_ARM_BEGIN method=${METHOD} dp=${DP_SIZE} steps=${TRAINING_STEPS} proposal=probabilistic k=${SPECULATIVE_K} seed=${SEED}"
 
@@ -164,9 +168,9 @@ bash "${SCRIPT_DIR}/train_grpo_qwen3_30b_hspec.sh" \
     trainer.total_training_steps=${TRAINING_STEPS} \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_DP_SIZE="'${DP_SIZE}'" \
     ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_LEVEL=INFO \
-    +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOG_STATS_INTERVAL="'0.1'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_CONFIGURE_LOGGING="'1'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_STREAM=ext://sys.stdout \
+    +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_CONFIG_PATH="'${VLLM_LOGGING_CONFIG_PATH}'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_ASCEND_PARALLEL_DRAFT_DP_TRACE="'1'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_ASCEND_PARALLEL_DRAFT_DP_TRACE_LIMIT="'${TRACE_LIMIT}'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECULATIVE_LIFECYCLE_DIR="'${LIFECYCLE_DIR}'" \

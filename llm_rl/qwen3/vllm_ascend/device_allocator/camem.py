@@ -17,6 +17,7 @@
 # CANN-mem-based pytorch pluggable allocator to implement sleep mode.
 #
 import dataclasses
+import gc
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -191,6 +192,11 @@ class CaMemAllocator:
 
         assert isinstance(offload_tags, tuple)
 
+        # Target FULL_DECODE_ONLY graph replay and eager draft kernels are
+        # asynchronous. Drain every consumer before invalidating the physical
+        # mappings that back weights and KV cache.
+        torch.npu.synchronize()
+
         for ptr, data in self.pointer_to_data.items():
             handle = data.handle
             if data.tag in offload_tags:
@@ -202,6 +208,13 @@ class CaMemAllocator:
                 memcpy(cpu_ptr, dest_max, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
+
+        # Released CaMem mappings can otherwise remain stranded behind Python
+        # references and the torch-npu caching allocator. A long RL rollout is
+        # enough to make the next KV remap fail despite the mappings above
+        # having been released.
+        gc.collect()
+        torch.npu.empty_cache()
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         """

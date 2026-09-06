@@ -5,12 +5,38 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Any
 
 import torch
+
+
+class _Phase3StatsNoiseFilter(logging.Filter):
+    """Drop only the two high-frequency vLLM summaries replaced by JSONL."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not (
+            message.startswith("SpecDecoding metrics: ")
+            or (
+                message.startswith("Engine ")
+                and "Avg prompt throughput:" in message
+                and "Avg generation throughput:" in message
+            )
+        )
+
+
+def install_phase3_stats_noise_filter() -> None:
+    """Install one process-local exact-message filter on vLLM's stats logger."""
+    stats_logger = logging.getLogger("vllm.v1.metrics.loggers")
+    marker = "_verl_phase3_stats_noise_filter_installed"
+    if getattr(stats_logger, marker, False):
+        return
+    stats_logger.addFilter(_Phase3StatsNoiseFilter())
+    setattr(stats_logger, marker, True)
 
 
 def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
@@ -151,6 +177,104 @@ def _rng_summary() -> dict[str, Any]:
     }
 
 
+def _prometheus_counter_value(counter: Any) -> int:
+    value = getattr(counter, "_value", None)
+    if value is None or not hasattr(value, "get"):
+        raise TypeError("Prometheus counter has no readable value")
+    result = float(value.get())
+    if result < 0 or not result.is_integer():
+        raise ValueError(f"invalid Prometheus counter value {result!r}")
+    return int(result)
+
+
+def spec_decode_counter_snapshot(inference_engine: Any) -> dict[str, Any]:
+    """Read exact host-side cumulative speculative counters without a sync."""
+    try:
+        manager = inference_engine.llm_engine.logger_manager
+        prometheus = next(
+            logger.spec_decoding_prom
+            for logger in manager.stat_loggers
+            if hasattr(logger, "spec_decoding_prom")
+        )
+        drafts_by_engine = prometheus.counter_spec_decode_num_drafts
+        engine_index = next(iter(drafts_by_engine))
+        position_counters = (
+            prometheus.counter_spec_decode_num_accepted_tokens_per_pos[
+                engine_index
+            ]
+        )
+        return {
+            "schema_version": "dflash-dspark.phase3-acceptance-cumulative.v1",
+            "available": True,
+            "num_drafts": _prometheus_counter_value(
+                drafts_by_engine[engine_index]
+            ),
+            "num_draft_tokens": _prometheus_counter_value(
+                prometheus.counter_spec_decode_num_draft_tokens[engine_index]
+            ),
+            "num_accepted_tokens": _prometheus_counter_value(
+                prometheus.counter_spec_decode_num_accepted_tokens[engine_index]
+            ),
+            "num_accepted_tokens_per_pos": [
+                _prometheus_counter_value(counter)
+                for counter in position_counters
+            ],
+        }
+    except Exception as error:
+        return {
+            "schema_version": "dflash-dspark.phase3-acceptance-cumulative.v1",
+            "available": False,
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+
+def spec_decode_counter_delta(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Subtract two cumulative counter snapshots and validate conservation."""
+    if not previous or not current:
+        return None
+    if not previous.get("available") or not current.get("available"):
+        return None
+    scalar_names = ("num_drafts", "num_draft_tokens", "num_accepted_tokens")
+    per_pos_before = previous.get("num_accepted_tokens_per_pos")
+    per_pos_after = current.get("num_accepted_tokens_per_pos")
+    if not isinstance(per_pos_before, list) or not isinstance(per_pos_after, list):
+        return None
+    if len(per_pos_before) != len(per_pos_after):
+        return None
+    delta = {
+        name: int(current[name]) - int(previous[name]) for name in scalar_names
+    }
+    delta_per_pos = [
+        int(after) - int(before)
+        for before, after in zip(per_pos_before, per_pos_after)
+    ]
+    values = [*delta.values(), *delta_per_pos]
+    monotonic = all(value >= 0 for value in values)
+    positional = all(
+        delta_per_pos[index] >= delta_per_pos[index + 1]
+        for index in range(len(delta_per_pos) - 1)
+    )
+    conserved = (
+        monotonic
+        and positional
+        and delta["num_accepted_tokens"] == sum(delta_per_pos)
+        and delta["num_accepted_tokens"] <= delta["num_draft_tokens"]
+        and delta["num_draft_tokens"]
+        <= delta["num_drafts"] * len(delta_per_pos)
+    )
+    return {
+        "schema_version": "dflash-dspark.phase3-acceptance-delta.v1",
+        **delta,
+        "num_accepted_tokens_per_pos": delta_per_pos,
+        "counter_monotonic": monotonic,
+        "position_monotonic": positional,
+        "conserved": conserved,
+    }
+
+
 def _draft_method_state(method: str | None, drafter: Any) -> dict[str, Any] | None:
     if method != "dspark" or drafter is None:
         return None
@@ -185,6 +309,7 @@ class SpeculativeLifecycleAudit:
         self.rollouts = 0
         self._draft_reference: str | None = None
         self._target_sync_reference: str | None = None
+        self._acceptance_reference: dict[str, Any] | None = None
         self._kv_pointer_reference: str | None = None
         self._terminal_request_ids: set[str] = set()
         self.path: Path | None = None
@@ -196,6 +321,7 @@ class SpeculativeLifecycleAudit:
                 "speculative_lifecycle_audit requires "
                 "VERL_SPECULATIVE_LIFECYCLE_DIR"
             )
+        install_phase3_stats_noise_filter()
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         directory = Path(output)
         directory.mkdir(parents=True, exist_ok=True)
@@ -327,6 +453,9 @@ class SpeculativeLifecycleAudit:
             "request_identities_available": request_identities_available,
             "hspec_collection_enabled": bool(getattr(runner, "_hspec_collect", False)),
             "draft_probability_cache": probability_cache,
+            "spec_decode_counters": spec_decode_counter_snapshot(
+                inference_engine
+            ),
             "draft_observability": draft_observability,
             "draft_capability": draft_capability,
             "rng_state": _rng_summary(),
@@ -428,6 +557,8 @@ class SpeculativeLifecycleAudit:
         record = self._snapshot(inference_engine, "after_load")
         self._check_parallel_draft(record)
         self._require_quiescent_terminal_cache(record, "after_load")
+        self._target_sync_reference = self._digest(record, "target_checksum")
+        self._acceptance_reference = record.get("spec_decode_counters")
         self._write(record)
 
     def after_wake(self, inference_engine, tags: list[str]) -> None:
@@ -459,8 +590,13 @@ class SpeculativeLifecycleAudit:
         self._check_parallel_draft(record)
         self._require_quiescent_terminal_cache(record, "after_target_update")
         digest = self._digest(record, "target_checksum")
-        if self.strict and self._target_sync_reference == digest:
-            raise RuntimeError("target checksum did not change after an actor update")
+        if self.strict and digest is None:
+            raise RuntimeError("target checksum is unavailable after actor synchronization")
+        record["target_checksum_changed_from_previous"] = (
+            self._target_sync_reference != digest
+            if self._target_sync_reference is not None
+            else None
+        )
         self._target_sync_reference = digest
         self._write(record)
 
@@ -487,6 +623,24 @@ class SpeculativeLifecycleAudit:
             "after_rollout",
             flush_draft_metrics=self.method in {"dflash", "dspark"},
         )
+        acceptance_delta = spec_decode_counter_delta(
+            self._acceptance_reference,
+            record.get("spec_decode_counters"),
+        )
+        if (
+            self.strict
+            and self.method in {"dflash", "dspark"}
+            and self.manifest.get("draft_sample_method") == "probabilistic"
+            and (
+                acceptance_delta is None
+                or not acceptance_delta.get("conserved")
+            )
+        ):
+            raise RuntimeError(
+                "Phase-3 exact speculative acceptance counters are unavailable "
+                "or violate conservation"
+            )
+        record["spec_decode_acceptance_delta"] = acceptance_delta
         self._check_parallel_draft(record)
         request_ids = self._request_ids(record, "after_rollout")
         leaked = request_ids & self._terminal_request_ids
@@ -497,6 +651,7 @@ class SpeculativeLifecycleAudit:
             )
         self._terminal_request_ids = request_ids
         self._write(record)
+        self._acceptance_reference = record.get("spec_decode_counters")
         self.rollouts += 1
 
     def after_dp_repair_prelude(
@@ -526,6 +681,7 @@ class SpeculativeLifecycleAudit:
                 f"{sorted(leaked)}"
             )
         self._terminal_request_ids = request_ids
+        self._acceptance_reference = record.get("spec_decode_counters")
         self._write(record)
 
     def after_sleep(self, *, reset_prefix_cache_succeeded: bool) -> None:
