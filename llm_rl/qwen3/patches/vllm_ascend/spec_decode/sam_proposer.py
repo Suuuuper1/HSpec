@@ -145,6 +145,12 @@ class SAMDecodingProposer(Proposer):
         self.n_predicts = int(
             vllm_config.speculative_config.num_speculative_tokens
         )
+        if not 1 <= self.n_predicts <= 15:
+            raise ValueError(
+                "SAM on Ascend requires 1 <= num_speculative_tokens <= 15 "
+                "because the verify round, including its bonus token, is "
+                "limited to 16 tokens"
+            )
         self.max_model_len = int(vllm_config.model_config.max_model_len)
         self.all_proposers: dict[str, SAM] = {}
         self.name = SpecDcodeType.SAM

@@ -415,6 +415,13 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
+            if self.rejection_sample_method is None:
+                self.rejection_sample_method = "standard"
+            elif self.rejection_sample_method != "standard":
+                raise ValueError(
+                    "SAM requires rejection_sample_method='standard' to "
+                    "preserve the target sampling distribution"
+                )
         elif self.method in ("hspec", "[hspec]"):
             # Non-model proposer implemented by platform plugins.
             # No prompt-lookup parameters are required for HSpec.
@@ -1106,15 +1113,15 @@ class SpeculativeConfig:
                         "EAGLE/EAGLE3 draft_load_config cannot use dummy weights"
                     )
             if self.rejection_sample_method is not None:
-                if self.method not in ("eagle", "eagle3"):
+                if self.method not in ("sam", "eagle", "eagle3"):
                     raise ValueError(
                         "rejection_sample_method is only supported for "
-                        "EAGLE/EAGLE3/DFlash/DSpark in this runtime"
+                        "SAM/EAGLE/EAGLE3/DFlash/DSpark in this runtime"
                     )
                 if self.rejection_sample_method != "standard":
                     raise ValueError(
-                        "EAGLE/EAGLE3 explicit rejection_sample_method must be "
-                        "'standard'"
+                        "SAM/EAGLE/EAGLE3 rejection_sample_method must be "
+                        "'standard' in this runtime"
                     )
             if self.draft_sample_method != "greedy":
                 raise ValueError(

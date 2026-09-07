@@ -4,8 +4,9 @@ Date: Mon, 26 Jan 2026 19:50:53 +0800
 Subject: [PATCH] enable sam decoding in vllm
 
 ---
- llm_rl/qwen3/vllm/config/speculative.py | 5 ++++-
- 1 file changed, 4 insertions(+), 1 deletion(-)
+ llm_rl/qwen3/vllm/config/speculative.py         | 10 ++++++++++
+ llm_rl/qwen3/vllm/v1/worker/gpu_model_runner.py | 5 +++++
+ 2 files changed, 15 insertions(+)
 
 diff --git a/llm_rl/qwen3/vllm/config/speculative.py b/llm_rl/qwen3/vllm/config/speculative.py
 index cba00da..cd4cced 100644
@@ -28,15 +29,35 @@ index cba00da..cd4cced 100644
              else:
                  raise ValueError(
                      "num_speculative_tokens was provided but without speculative model."
-@@ -286,7 +289,7 @@ class SpeculativeConfig:
-         ):
-             self.method = "ngram"
- 
--        if self.method in ("ngram", "[ngram]"):
-+        if self.method in ("ngram", "[ngram]", "sam"):
-             # Unified to "ngram" internally
-             self.method = "ngram"
-             # Set default values if not provided
+@@ -321,6 +324,13 @@ class SpeculativeConfig:
+             # draft related config as None here.
+             self.draft_model_config = self.target_model_config
+             self.draft_parallel_config = self.target_parallel_config
++        elif self.method == "sam":
++            # SAM is implemented by the platform plugin. Preserve its method
++            # identity and reuse the target limits/parallel configuration.
++            self.prompt_lookup_max = 0
++            self.prompt_lookup_min = 0
++            self.draft_model_config = self.target_model_config
++            self.draft_parallel_config = self.target_parallel_config
+         elif self.method == "suffix":
+             self._validate_suffix_decoding()
+         else:
+diff --git a/llm_rl/qwen3/vllm/v1/worker/gpu_model_runner.py b/llm_rl/qwen3/vllm/v1/worker/gpu_model_runner.py
+index 71aba26..9c86718 100644
+--- a/llm_rl/qwen3/vllm/v1/worker/gpu_model_runner.py
++++ b/llm_rl/qwen3/vllm/v1/worker/gpu_model_runner.py
+@@ -449,6 +449,11 @@ class GPUModelRunner(
+                 self.drafter = MedusaProposer(
+                     vllm_config=self.vllm_config, device=self.device
+                 )
++            elif self.speculative_config.method == "sam":
++                # SAM is supplied by a platform plugin. Defer construction so
++                # the platform runner can install its proposer after this base
++                # initializer has created the shared buffers and metadata.
++                pass
+             else:
+                 raise ValueError(
+                     "Unknown speculative decoding method: "
 -- 
 2.45.1.windows.1
-

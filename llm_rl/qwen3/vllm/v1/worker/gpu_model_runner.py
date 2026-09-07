@@ -449,12 +449,11 @@ class GPUModelRunner(
                 self.drafter = MedusaProposer(
                     vllm_config=self.vllm_config, device=self.device
                 )
-            elif self.speculative_config.method == "hspec":
-                # Platform plugins may need to defer HSpec drafter
-                # initialization until after the base GPU runner finishes
-                # constructing core buffers and metadata. Leave the drafter
-                # unset here so subclasses (for example vllm-ascend's
-                # NPUModelRunner) can install their own proposer after
+            elif self.speculative_config.method in ("sam", "hspec"):
+                # Platform plugins may need to defer proposer initialization
+                # until after the base GPU runner finishes constructing core
+                # buffers and metadata. Leave the drafter unset here so a
+                # subclass can install its platform implementation after
                 # super().__init__() completes.
                 pass
             else:
