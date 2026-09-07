@@ -48,6 +48,23 @@ from vllm_ascend.utils import enable_sp, shared_expert_dp_enabled
 _PREPARE_INPUTS_BLOCK_SIZE = 4
 
 
+def _with_eagle_draft_load_config(vllm_config: VllmConfig) -> VllmConfig:
+    """Use the independent draft loader without losing target metadata.
+
+    EAGLE model construction deliberately uses the target model's layer count
+    to give its attention layer a collision-free name.  The draft TP group is
+    patched separately by ``tp_group_context``.  Replacing either config here
+    makes the one-layer draft look like the target and can also break target
+    TP semantics; only the weight-loading policy is draft-owned.
+    """
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    if speculative_config.draft_load_config is None:
+        return vllm_config
+    return replace(vllm_config,
+                   load_config=speculative_config.draft_load_config)
+
+
 # TODO: Remove it when the bug of fx-graph is solved
 # patch vllm_config to be in CompilationMode.NONE temporarily
 @contextmanager
@@ -169,25 +186,23 @@ class EagleProposer(VllmEagleProposer):
                                         DeepseekV32IndexerCache).keys())
 
         with self.maybe_eager_context:
-            draft_load_config = self.speculative_config.draft_load_config
-            draft_vllm_config = self.vllm_config
             draft_model_config = self.speculative_config.draft_model_config
-            if draft_load_config is not None:
-                # Verl hybrid rollout intentionally initializes the target with
-                # dummy weights before actor synchronization.  A checkpointed
-                # EAGLE head is independent and must use its own real loader.
-                draft_model_config = copy.copy(
-                    self.speculative_config.draft_model_config
-                )
-                if self.speculative_config.enforce_eager is not None:
-                    draft_model_config.enforce_eager = bool(
-                        self.speculative_config.enforce_eager
-                    )
-                draft_vllm_config = replace(
-                    self.vllm_config,
-                    model_config=draft_model_config,
-                    load_config=draft_load_config,
-                    parallel_config=self.speculative_config.draft_parallel_config,
+            draft_vllm_config = _with_eagle_draft_load_config(self.vllm_config)
+            if self.speculative_config.draft_load_config is not None:
+                logger.info(
+                    "Resolved EAGLE draft load context: "
+                    "target_load_format=%s draft_load_format=%s "
+                    "target_layers=%s draft_layers=%s "
+                    "target_config_preserved=%s target_parallel_config_preserved=%s",
+                    self.vllm_config.load_config.load_format,
+                    draft_vllm_config.load_config.load_format,
+                    getattr(self.vllm_config.model_config.hf_text_config,
+                            "num_hidden_layers", None),
+                    getattr(draft_model_config.hf_text_config,
+                            "num_hidden_layers", None),
+                    draft_vllm_config.model_config is self.vllm_config.model_config,
+                    draft_vllm_config.parallel_config is
+                    self.vllm_config.parallel_config,
                 )
             self.model = get_model(
                 vllm_config=draft_vllm_config,
@@ -204,16 +219,10 @@ class EagleProposer(VllmEagleProposer):
         draft_attn_layer_names = draft_attn_layer_names - draft_indexer_layer_names
         assert len(draft_attn_layer_names) == 1
         self.attn_layer_names = list(sorted(draft_attn_layer_names))
-        self.piece_all_attn_layer_name = []
-        for _ in range(self.num_speculative_tokens):
-            self.piece_all_attn_layer_name.append([
-                name for name in self.attn_layer_names])
-        self.attn_layer_names = list(sorted(draft_attn_layer_names))
-
-        self.piece_all_attn_layer_name = []
-        for _ in range(self.num_speculative_tokens):
-            self.piece_all_attn_layer_name.append([
-                name for name in self.attn_layer_names])
+        self.piece_all_attn_layer_name = [
+            list(self.attn_layer_names)
+            for _ in range(self.num_speculative_tokens)
+        ]
 
         if supports_multimodal(model):
             # handle multimodality
@@ -455,6 +464,7 @@ class EagleProposer(VllmEagleProposer):
         num_decode_reqs=0,
         scheduler_output: SchedulerOutput = None,
         num_scheduled_tokens: int = 0,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
         num_tokens = target_token_ids.shape[0]
@@ -468,6 +478,16 @@ class EagleProposer(VllmEagleProposer):
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
+
+        # Draft metadata is mutated for every autoregressive draft step. Keep
+        # those changes local so proposal cannot corrupt the target runner's
+        # sequence-length bookkeeping.
+        common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+        common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+        common_attn_metadata.seq_lens_cpu = \
+            common_attn_metadata.seq_lens_cpu.clone()
+        common_attn_metadata.num_computed_tokens_cpu = \
+            common_attn_metadata.num_computed_tokens_cpu.clone()
 
         # Shift the input ids by one token.
         # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
@@ -536,6 +556,16 @@ class EagleProposer(VllmEagleProposer):
         for layer_name in self.attn_layer_names:
             per_layer_attn_metadata[layer_name] = attn_metadata
         multi_steps_attn_metadata = [per_layer_attn_metadata]
+
+        # Padded verification includes rejected tokens in its temporary target
+        # sequence length. They are valid inputs for the first draft update, but
+        # must not remain in the context used by subsequent draft steps.
+        if self.num_speculative_tokens > 1 and \
+                num_rejected_tokens_gpu is not None:
+            rejected = num_rejected_tokens_gpu[:batch_size]
+            common_attn_metadata.seq_lens[:batch_size].sub_(rejected)
+            common_attn_metadata.seq_lens_cpu[:batch_size].sub_(
+                rejected.to(device="cpu", non_blocking=False))
 
         # Copy the old attn_metadata and update
         for draft_step in range(1, self.num_speculative_tokens):
@@ -1046,7 +1076,13 @@ class EagleProposer(VllmEagleProposer):
         common_attn_metadata: CommonAttentionMetadata,
         spec_decode_metadata: SpecDecodeMetadata,
         valid_sampled_tokens_count: torch.Tensor,
-    ) -> tuple[CommonAttentionMetadata, torch.Tensor, torch.Tensor]:
+        num_rejected_tokens_out: torch.Tensor | None = None,
+    ) -> tuple[
+        CommonAttentionMetadata,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """
         This function is used to prepare the inputs for speculative decoding
         It updates the common_attn_metadata for speculative decoding,
@@ -1055,13 +1091,23 @@ class EagleProposer(VllmEagleProposer):
         used as padding and filtered out later by `token_indices_to_sample`.
         No blocking CPU operations should be introduced in this function.
         """
+        num_reqs = common_attn_metadata.num_reqs
+        device = valid_sampled_tokens_count.device
         if HAS_TRITON:
-            num_reqs = common_attn_metadata.num_reqs
-            device = valid_sampled_tokens_count.device
-
             token_indices_to_sample = torch.empty((num_reqs, ),
                                                   dtype=torch.int32,
                                                   device=device)
+            if num_rejected_tokens_out is None:
+                num_rejected_tokens_gpu = torch.empty(
+                    (num_reqs,), dtype=torch.int32, device=device)
+            else:
+                if (num_rejected_tokens_out.dtype != torch.int32
+                        or num_rejected_tokens_out.device != device
+                        or num_rejected_tokens_out.numel() < num_reqs):
+                    raise ValueError(
+                        "num_rejected_tokens_out must be an int32 device tensor "
+                        f"with at least {num_reqs} elements")
+                num_rejected_tokens_gpu = num_rejected_tokens_out[:num_reqs]
 
             num_blocks_needed = triton.cdiv(num_reqs,
                                             _PREPARE_INPUTS_BLOCK_SIZE)
@@ -1074,6 +1120,7 @@ class EagleProposer(VllmEagleProposer):
                 valid_sampled_tokens_count,
                 common_attn_metadata.query_start_loc,
                 token_indices_to_sample,
+                num_rejected_tokens_gpu,
                 num_reqs,
                 BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
             )
@@ -1084,11 +1131,16 @@ class EagleProposer(VllmEagleProposer):
                 spec_decode_metadata.cu_num_draft_tokens[:-1],
             ])
 
-            num_rejected_tokens_gpu = torch.where(
+            computed_rejected_tokens = torch.where(
                 num_draft_tokens_gpu > 0,
                 num_draft_tokens_gpu + 1 - valid_sampled_tokens_count,
                 torch.zeros_like(num_draft_tokens_gpu),
             )
+            if num_rejected_tokens_out is None:
+                num_rejected_tokens_gpu = computed_rejected_tokens
+            else:
+                num_rejected_tokens_gpu = num_rejected_tokens_out[:num_reqs]
+                num_rejected_tokens_gpu.copy_(computed_rejected_tokens)
 
             token_indices_to_sample = (
                 common_attn_metadata.query_start_loc[1:] - 1 -
@@ -1108,7 +1160,7 @@ class EagleProposer(VllmEagleProposer):
         spec_common_attn_metadata = AscendCommonAttentionMetadata(
             query_start_loc=common_attn_metadata.query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens_cpu=common_attn_metadata.seq_lens_cpu,
+            seq_lens_cpu=common_attn_metadata.seq_lens_cpu.clone(),
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=common_attn_metadata.num_actual_tokens
             if self.pcp_size > 1 else total_num_tokens,
@@ -1121,11 +1173,16 @@ class EagleProposer(VllmEagleProposer):
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,
             num_computed_tokens_cpu=common_attn_metadata.
-            num_computed_tokens_cpu,
-            seq_lens=common_attn_metadata.seq_lens,
+            num_computed_tokens_cpu.clone(),
+            seq_lens=common_attn_metadata.seq_lens.clone(),
             max_seq_len=0)
 
-        return spec_common_attn_metadata, token_indices, token_indices_to_sample
+        return (
+            spec_common_attn_metadata,
+            token_indices,
+            token_indices_to_sample,
+            num_rejected_tokens_gpu,
+        )
 
     def _split_pcp_input(self, req_scheduled_tokens, input_ids,
                          target_hidden_states):

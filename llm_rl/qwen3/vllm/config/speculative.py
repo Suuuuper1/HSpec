@@ -118,7 +118,8 @@ class SpeculativeConfig:
     rejected at proposer startup instead of failing inside a rollout."""
     rejection_sample_method: RejectionSampleMethod | None = None
     """Verifier mode. Unset retains the historical mode for old methods and
-    resolves to standard rejection for DFlash/DSpark."""
+    resolves to standard rejection for DFlash/DSpark. EAGLE/EAGLE3 may select
+    standard explicitly when lossless random-sampling semantics are required."""
     sample_from_anchor: bool | None = None
     """DSpark layout override. If unset, the checkpoint value is authoritative."""
     parallel_draft_profile_enabled: bool = False
@@ -1105,10 +1106,16 @@ class SpeculativeConfig:
                         "EAGLE/EAGLE3 draft_load_config cannot use dummy weights"
                     )
             if self.rejection_sample_method is not None:
-                raise ValueError(
-                    "rejection_sample_method is only supported for DFlash/DSpark "
-                    "in the old-ABI implementation"
-                )
+                if self.method not in ("eagle", "eagle3"):
+                    raise ValueError(
+                        "rejection_sample_method is only supported for "
+                        "EAGLE/EAGLE3/DFlash/DSpark in this runtime"
+                    )
+                if self.rejection_sample_method != "standard":
+                    raise ValueError(
+                        "EAGLE/EAGLE3 explicit rejection_sample_method must be "
+                        "'standard'"
+                    )
             if self.draft_sample_method != "greedy":
                 raise ValueError(
                     "draft_sample_method is only supported for DFlash/DSpark "

@@ -28,7 +28,6 @@ from vllm_ascend.attention.attention_v1 import (
     AscendMetadata,
 )
 from vllm_ascend.attention.context_kv import PAD_SLOT_ID
-from vllm_ascend.ops.triton.spec_decode.utils import compute_rejected_tokens_kernel
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.probabilistic import (
     estimate_draft_probability_bytes,
@@ -836,21 +835,18 @@ class ParallelBlockProposer(EagleProposer):
         spec_decode_metadata: SpecDecodeMetadata,
         valid_sampled_tokens_count: torch.Tensor,
     ) -> tuple[CommonAttentionMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
-        metadata, token_indices, token_indices_to_sample = super().prepare_inputs_padded(
+        num_reqs = common_attn_metadata.num_reqs
+        rejected = self._num_rejected_tokens[:num_reqs]
+        (
+            metadata,
+            token_indices,
+            token_indices_to_sample,
+            rejected,
+        ) = super().prepare_inputs_padded(
             common_attn_metadata,
             spec_decode_metadata,
             valid_sampled_tokens_count,
-        )
-        num_reqs = metadata.num_reqs
-        rejected = self._num_rejected_tokens[:num_reqs]
-        block_size = 128
-        grid = (max(1, triton.cdiv(num_reqs, block_size)),)
-        compute_rejected_tokens_kernel[grid](
-            spec_decode_metadata.cu_num_draft_tokens,
-            valid_sampled_tokens_count,
-            rejected,
-            num_reqs,
-            BLOCK_SIZE=block_size,
+            num_rejected_tokens_out=rejected,
         )
         return metadata, token_indices, token_indices_to_sample, rejected
 

@@ -128,12 +128,12 @@ def test_parallel_metadata_rejects_causal_mode_without_persistent_mask():
         )
 
 
-def test_old_and_parallel_padded_abis_remain_separate():
+def test_eagle_and_parallel_padded_abis_include_rejected_counts():
     old = inspect.signature(EagleProposer.prepare_inputs_padded).return_annotation
     new = inspect.signature(
         ParallelBlockProposer.prepare_parallel_inputs_padded
     ).return_annotation
-    assert str(old).count("torch.Tensor") == 2
+    assert str(old).count("torch.Tensor") == 3
     assert str(new).count("torch.Tensor") == 3
 
 
@@ -176,12 +176,12 @@ def test_phase1_hot_paths_have_no_host_sync_or_step_weight_concatenation():
     assert "validate_slot_range=False" in inspect.getsource(DFlashProposer._propose)
 
 
-def test_rejected_count_launch_scales_past_one_tile():
+def test_parallel_rejected_count_reuses_persistent_output_buffer():
     source = inspect.getsource(
         ParallelBlockProposer.prepare_parallel_inputs_padded
     )
-    assert "triton.cdiv(num_reqs, block_size)" in source
-    assert "compute_rejected_tokens_kernel[grid]" in source
+    assert "self._num_rejected_tokens[:num_reqs]" in source
+    assert "num_rejected_tokens_out=rejected" in source
 
 
 def test_parallel_backbone_samples_exactly_k_rows_from_one_forward():

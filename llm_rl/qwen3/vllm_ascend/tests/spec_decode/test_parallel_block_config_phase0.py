@@ -519,7 +519,7 @@ def test_dflash_reduced_vocab_causal_sliding_config_is_supported(
     assert draft.dflash_config["causal"] is True
 
 
-def test_hspec_defaults_and_old_eagle_three_value_abi(checkpoint_paths):
+def test_hspec_defaults_and_eagle_rejected_count_abi(checkpoint_paths):
     target, _, _ = checkpoint_paths
     target_config = _target(target)
     hspec = SpeculativeConfig(
@@ -538,7 +538,7 @@ def test_hspec_defaults_and_old_eagle_three_value_abi(checkpoint_paths):
     returns = [node for node in ast.walk(tree) if isinstance(node, ast.Return)]
     tuple_returns = [node.value for node in returns if isinstance(node.value, ast.Tuple)]
     assert tuple_returns
-    assert all(len(value.elts) == 3 for value in tuple_returns)
+    assert all(len(value.elts) == 4 for value in tuple_returns)
 
     scheduler_source = inspect.getsource(Scheduler.__init__)
     assert "vllm_config.num_lookahead_tokens" in scheduler_source

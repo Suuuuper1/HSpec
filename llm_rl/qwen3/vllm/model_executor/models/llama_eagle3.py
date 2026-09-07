@@ -35,6 +35,47 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def validate_eagle3_vocab_mapping(
+    d2t: torch.Tensor | None,
+    t2d: torch.Tensor | None,
+    draft_vocab_size: int,
+    target_vocab_size: int,
+) -> None:
+    """Validate the offset-encoded draft-to-target vocabulary mapping."""
+    if d2t is None:
+        if draft_vocab_size != target_vocab_size:
+            raise ValueError(
+                "Reduced-vocabulary EAGLE3 checkpoint is missing d2t"
+            )
+        if t2d is not None:
+            raise ValueError("EAGLE3 checkpoint has t2d without d2t")
+        return
+    if d2t.dtype != torch.int64 or tuple(d2t.shape) != (draft_vocab_size,):
+        raise ValueError(
+            "EAGLE3 d2t must be int64 with shape "
+            f"({draft_vocab_size},), got dtype={d2t.dtype} shape={tuple(d2t.shape)}"
+        )
+
+    d2t_cpu = d2t.detach().cpu()
+    target_ids = torch.arange(draft_vocab_size, dtype=torch.int64) + d2t_cpu
+    if target_ids.min().item() < 0 or target_ids.max().item() >= target_vocab_size:
+        raise ValueError("EAGLE3 d2t maps outside the target vocabulary")
+    if target_ids.unique().numel() != draft_vocab_size:
+        raise ValueError("EAGLE3 d2t does not map draft tokens uniquely")
+
+    if t2d is None:
+        return
+    if t2d.dtype != torch.bool or tuple(t2d.shape) != (target_vocab_size,):
+        raise ValueError(
+            "EAGLE3 t2d must be bool with shape "
+            f"({target_vocab_size},), got dtype={t2d.dtype} shape={tuple(t2d.shape)}"
+        )
+    expected_membership = torch.zeros(target_vocab_size, dtype=torch.bool)
+    expected_membership[target_ids] = True
+    if not torch.equal(expected_membership, t2d.detach().cpu()):
+        raise ValueError("EAGLE3 t2d membership does not agree with d2t")
+
+
 class LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
         self,
@@ -268,8 +309,14 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         if getattr(self.config, "draft_vocab_size", None) is None:
             base_vocab_size = getattr(self.config, "vocab_size", None)
             self.config.draft_vocab_size = base_vocab_size
-        target_layer_num = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        target_model_config = speculative_config.target_model_config
+        target_parallel_config = speculative_config.target_parallel_config
+        assert target_model_config is not None
+        assert target_parallel_config is not None
+        target_layer_num = target_model_config.get_num_layers(
+            target_parallel_config
         )
 
         # Store target layer count in draft config for
@@ -347,10 +394,14 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         model_weights = {}
         includes_draft_id_mapping = False
         includes_embed_tokens = False
+        d2t_weight = None
+        t2d_weight = None
         for name, loaded_weight in weights:
             if "t2d" in name:
+                t2d_weight = loaded_weight
                 continue
             if "d2t" in name:
+                d2t_weight = loaded_weight
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
             elif "lm_head" not in name:
@@ -359,6 +410,13 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
                 includes_embed_tokens = True
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
+
+        validate_eagle3_vocab_mapping(
+            d2t_weight,
+            t2d_weight,
+            self.config.draft_vocab_size,
+            self.config.vocab_size,
+        )
 
         skip_substrs = []
         if not includes_draft_id_mapping:

@@ -149,7 +149,9 @@ class MtpProposer(EagleProposer):
         num_decode_reqs=0,
         scheduler_output: SchedulerOutput = None,
         num_scheduled_tokens: int = 0,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del num_rejected_tokens_gpu
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
 

@@ -118,6 +118,9 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
                     if raw_draft_load_format is not None
                     else None
                 ),
+                "rejection_sample_method": raw_spec_dict.get(
+                    "rejection_sample_method"
+                ),
                 "target_tensor_parallel_size": int(
                     config.get("tensor_model_parallel_size", 1)
                 ),

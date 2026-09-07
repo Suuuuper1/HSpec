@@ -483,6 +483,11 @@ class NPUModelRunner(GPUModelRunner):
                 self.rejection_sampler = AscendRejectionSampler(
                     self.sampler, verifier_mode
                 )
+                logger.info(
+                    "Resolved Ascend speculative verifier: method=%s mode=%s",
+                    self.speculative_config.method,
+                    verifier_mode,
+                )
             self.actual_seq_lengths_q = list(
                 range(self.decode_token_per_req, self.max_num_tokens + 1,
                       self.decode_token_per_req))
@@ -1805,6 +1810,7 @@ class NPUModelRunner(GPUModelRunner):
                     long_seq_metadata = None  # type: ignore
                     num_prefill_reqs = 0
                     num_decode_reqs = 0
+                num_rejected_tokens_gpu = None
                 if spec_decode_metadata is None:
                     # update pcp related params
                     if self.pcp_size > 1:
@@ -1866,12 +1872,16 @@ class NPUModelRunner(GPUModelRunner):
                                 valid_sampled_tokens_count,
                             )
                         else:
-                            common_attn_metadata, token_indices, \
-                                token_indices_to_sample =\
-                                    self.drafter.prepare_inputs_padded(
-                                        common_attn_metadata,
-                                        spec_decode_metadata,
-                                        valid_sampled_tokens_count)
+                            (
+                                common_attn_metadata,
+                                token_indices,
+                                token_indices_to_sample,
+                                num_rejected_tokens_gpu,
+                            ) = self.drafter.prepare_inputs_padded(
+                                common_attn_metadata,
+                                spec_decode_metadata,
+                                valid_sampled_tokens_count,
+                            )
                     if self.pcp_size > 1:
                         target_token_ids = input_ids_pcp_full[token_indices]
                         target_positions = positions
@@ -1910,7 +1920,6 @@ class NPUModelRunner(GPUModelRunner):
                     num_rejected_tokens_gpu=(
                         num_rejected_tokens_gpu
                         if spec_decode_metadata is not None
-                        and self.speculative_config.uses_parallel_block_drafter()
                         else None
                     ),
                 )
