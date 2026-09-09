@@ -745,6 +745,34 @@ def hspec_desc_extents(
     return extents
 
 
+def limit_hspec_desc_to_output(
+    desc_obj: HSpecTrajectoryDesc | Dict[str, Any], output_length: int,
+) -> HSpecTrajectoryDesc:
+    """Keep only the final emitted prefix, without copying sealed storage.
+
+    Verification may produce tokens beyond EOS/stop/response limits before the
+    output processor truncates them. Those rows must not become history entries.
+    A shorter/gapped descriptor stays short/gapped; this never fabricates rows.
+    """
+    desc = coerce_hspec_desc(desc_obj)
+    if output_length < 0:
+        raise ValueError("output_length must be nonnegative")
+    keep = min(int(output_length), desc.length)
+    if keep == desc.length:
+        return desc
+    remaining = keep
+    extents = []
+    for extent in hspec_desc_extents(desc):
+        take = min(remaining, extent.length)
+        if take:
+            extents.append(replace(extent, length=take))
+            remaining -= take
+        if remaining == 0:
+            break
+    return desc.with_updates(length=keep, extents=tuple(extents) or None,
+                             chunk_count=max(len(extents), 1))
+
+
 @dataclass(frozen=True)
 class HSpecSegmentKey:
     node_id: str

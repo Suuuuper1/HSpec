@@ -38,7 +38,9 @@ from verl.utils.ray_resource import (
     evaluate_resource_pool_capacity,
     format_resource_capacity_error,
 )
-from verl.workers.config.rollout import resolve_rollout_speculative_method
+from verl.workers.config.rollout import (
+    resolve_rollout_speculative_method, rollout_uses_hspec_data_plane,
+)
 
 
 def build_resource_pool_spec(config) -> dict[str, list[int]]:
@@ -77,6 +79,13 @@ def main(config):
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
+    if os.environ.get("HSPEC_I0_AUDIT", "0") == "1":
+        from vllm_ascend.spec_decode.hspec_i0_audit import atomic_json
+        run_dir = os.environ.get("HSPEC_I0_RUN_DIR")
+        if not run_dir:
+            raise ValueError("I0 audit requires HSPEC_I0_RUN_DIR")
+        atomic_json(os.path.join(run_dir, "resolved_hydra.json"),
+                    OmegaConf.to_container(config, resolve=True))
     try:
         run_ppo(config)
     finally:
@@ -117,7 +126,7 @@ def run_ppo(config) -> None:
 
     validate_ray_resource_pool_spec(build_resource_pool_spec(config))
 
-    if resolve_rollout_speculative_method(config.actor_rollout_ref.rollout) == "hspec":
+    if rollout_uses_hspec_data_plane(config.actor_rollout_ref.rollout):
         from vllm_ascend.spec_decode.hspec_table import (
             hspec_allow_legacy_table_prefetch_enabled,
             hspec_zmq_query_enabled,

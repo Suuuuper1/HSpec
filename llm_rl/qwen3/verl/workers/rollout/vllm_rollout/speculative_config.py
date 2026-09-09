@@ -8,7 +8,9 @@ from typing import Any
 
 from vllm.config.load import LoadConfig
 
-from verl.workers.config.rollout import resolve_rollout_speculative_method
+from verl.workers.config.rollout import (
+    resolve_rollout_speculative_method, rollout_uses_hspec_data_plane,
+)
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,10 @@ class ResolvedRolloutSpeculation:
     @property
     def uses_hspec(self) -> bool:
         return self.method == "hspec"
+
+    @property
+    def uses_hspec_data_plane(self) -> bool:
+        return self.uses_hspec or bool(self.manifest.get("hspec_collect_only", False))
 
     @property
     def uses_parallel_draft(self) -> bool:
@@ -53,6 +59,8 @@ def _remove_explicit_llm_duplicates(config, engine_kwargs: dict[str, Any]) -> No
 def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
     """Resolve one authoritative method into the old vLLM engine ABI."""
     method = resolve_rollout_speculative_method(config)
+    rollout_uses_hspec_data_plane(config)
+    collect_only = bool(config.get("hspec_collect_only", False))
     engine_kwargs = {
         key: value
         for key, value in _dict(
@@ -63,6 +71,14 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
     _remove_explicit_llm_duplicates(config, engine_kwargs)
 
     raw_spec = engine_kwargs.get("speculative_config")
+    if collect_only and raw_spec is not None:
+        raise ValueError("hspec_collect_only cannot use engine speculative_config")
+    additional = _dict(engine_kwargs.get("additional_config", {}))
+    if "hspec_collect_only" in additional and bool(additional["hspec_collect_only"]) != collect_only:
+        raise ValueError("additional_config.hspec_collect_only conflicts with rollout config")
+    if collect_only:
+        additional["hspec_collect_only"] = True
+        engine_kwargs["additional_config"] = additional
     if method is not None and raw_spec is not None:
         raise ValueError(
             "speculative_method/use_hspec_decode conflicts with "
@@ -143,8 +159,12 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
     speculative_config: dict[str, Any] | None = None
     if method == "hspec":
         legacy = bool(config.get("use_hspec_decode", False))
+        hspec_verifier = str(config.get("hspec_rejection_sample_method", "legacy"))
+        if hspec_verifier not in {"standard", "legacy"}:
+            raise ValueError("hspec_rejection_sample_method must be standard or legacy")
         speculative_config = {
             "method": "hspec",
+            "rejection_sample_method": hspec_verifier,
             "num_speculative_tokens": int(
                 config.get("hspec_num_speculative_tokens", 5)
                 if legacy
@@ -204,6 +224,7 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
     if speculative_config is not None:
         engine_kwargs["speculative_config"] = speculative_config
     manifest = {
+        "hspec_collect_only": collect_only,
         "source": (
             "legacy_use_hspec_decode"
             if bool(config.get("use_hspec_decode", False))
@@ -245,8 +266,8 @@ def resolve_rollout_speculation(config) -> ResolvedRolloutSpeculation:
             else None
         ),
         "rejection_sample_method": (
-            str(config.get("rejection_sample_method", "standard"))
-            if method in {"dflash", "dspark"}
+            speculative_config.get("rejection_sample_method")
+            if speculative_config is not None
             else None
         ),
         "parallel_draft_profile_enabled": (

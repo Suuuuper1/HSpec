@@ -173,6 +173,9 @@ class MegatronVLLMShardingManager(BaseShardingManager):
 
             patch_vllm_moe_model_weight_loader(model)
             loaded_params = model.load_weights(per_tensor_param)
+            if os.environ.get("HSPEC_I0_AUDIT", "0") == "1":
+                from vllm_ascend.spec_decode.hspec_i0_audit import record_weight_update
+                record_weight_update(self.model_runner, len(loaded_params) if loaded_params is not None else -1)
             info = f"vLLM load weights, loaded_params: {len(loaded_params)}"
             logger.info(info)
 

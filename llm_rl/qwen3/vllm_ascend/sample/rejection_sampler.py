@@ -148,6 +148,11 @@ def rejection_sample(
         device=device,
     )
     output_token_ids.fill_(PLACEHOLDER_TOKEN_ID)
+    # All-abstain batches still emit the already sampled AR/bonus token. Avoid
+    # empty gathers/argmax in the PyTorch fallback and zero-grid kernel launches.
+    if num_tokens == 0:
+        output_token_ids[:, 0] = bonus_token_ids.reshape(-1)
+        return output_token_ids
 
     if sampling_metadata.all_greedy:
         is_greedy = None
@@ -556,7 +561,7 @@ def rejection_random_sample_pytorch(
                                       dtype=torch.float32)
     zero_threshold = zero_threshold_cpu.to(device, non_blocking=True)
 
-    acceptance_condition = (draft_token_probs > zero_threshold) & (
+    acceptance_condition = (draft_token_probs > zero_threshold) & (target_token_probs > 0) & (
         target_token_probs / draft_token_probs >= uniform_token_probs)
 
     first_rejection = (~acceptance_condition) & valid_mask

@@ -380,6 +380,20 @@ class NPUWorker(WorkerBase):
             return False
         return bool(self.model_runner.hspec_set_collection_enabled(enabled))
 
+    def hspec_i0_runtime_snapshot(self) -> dict:
+        from vllm_ascend.spec_decode.hspec_i0_audit import runtime_snapshot
+        return runtime_snapshot(self.model_runner)
+
+    def hspec_i0_flush_descriptors(self, prompt_ids: dict, epoch: int, step: int) -> dict:
+        if self.model_runner._hspec_i0_audit is None:
+            raise ValueError("I0 descriptor RPC requires HSPEC_I0_AUDIT=1")
+        if not self.model_runner._hspec_collect:
+            return {}
+        from dataclasses import asdict
+        from vllm_ascend.spec_decode.hspec_utils import hspec_flush_and_get_descriptors
+        return {k: asdict(v) for k, v in hspec_flush_and_get_descriptors(
+            request_id_to_prompt_id=prompt_ids, epoch=epoch, global_step=step).items()}
+
     def hspec_set_collection_context(self, epoch: int | None = None) -> bool:
         if self.model_runner is None or not hasattr(
                 self.model_runner, "hspec_set_collection_context"):

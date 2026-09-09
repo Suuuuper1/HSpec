@@ -201,6 +201,10 @@ class HSpecSurvivalConfig:
                     source.get("HSPEC_SELECT_EXECUTION_LEVEL", "")
                 ).strip().lower()
                 expected_execution = {
+                    "i0_correctness": (
+                        "hspec.i0.execution-permit.v1",
+                        "CORRECTNESS_SMOKE_ONLY",
+                    ),
                     "functional": (
                         "hspec.s13.functional-shadow-gate.v2",
                         "READY_FOR_1P5B_EXECUTION_SMOKE",
@@ -233,7 +237,8 @@ class HSpecSurvivalConfig:
                 )
                 if not (
                     execution_gate.get("schema_version") == expected_execution[0]
-                    and execution_gate.get("status") == "PASS"
+                    and execution_gate.get("status") == (
+                        "PERMITTED" if execution_level == "i0_correctness" else "PASS")
                     and execution_gate.get("decision") == expected_execution[1]
                     and isinstance(execution_gate.get("checks"), dict)
                     and bool(execution_gate["checks"])
@@ -244,6 +249,12 @@ class HSpecSurvivalConfig:
                     raise ValueError(
                         "execution gate does not authorize this S13 online level"
                     )
+                if execution_level == "i0_correctness" and not (
+                    source.get("HSPEC_I0_AUDIT") == "1"
+                    and execution_gate.get("required_verifier") == "standard"
+                    and execution_gate.get("performance_authorized") is False
+                ):
+                    raise ValueError("I0 permit requires audited standard correctness-only execution")
                 execution_gate_path = str(execution_path.resolve())
             if tuple(artifact.get("feature_names", ())) != HSPEC_SURVIVAL_FEATURES:
                 raise ValueError("survival feature order differs from frozen S13 order")

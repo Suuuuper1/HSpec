@@ -179,7 +179,7 @@ def rejection_random_sample_kernel(
                     uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
                     # NOTE(woosuk): While the draft probability should never be 0,
                     # we check it to avoid NaNs. If it happens to be 0, we reject.
-                    if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
+                    if (draft_prob > 0 and target_prob > 0) and target_prob / draft_prob >= uniform_prob:
                         # Accept.
                         token_id = draft_token_id
                     else:

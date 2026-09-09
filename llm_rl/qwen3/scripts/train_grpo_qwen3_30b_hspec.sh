@@ -6,7 +6,6 @@ set -euo pipefail
 # export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 # export ASCEND_LAUNCH_BLOCKING=1
 
-HOME=$(pwd)
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 source "${SCRIPT_DIR}/hspec_selector_profiles.sh"
@@ -241,6 +240,10 @@ export HSPEC_PROFILE_BUILD_CPU_MIN_BATCH_MS="${HSPEC_PROFILE_BUILD_CPU_MIN_BATCH
 export HSPEC_PROFILE_BUILD_CPU_EVERY_EPOCHS="${HSPEC_PROFILE_BUILD_CPU_EVERY_EPOCHS:-0}"
 
 export USE_HSPEC_DECODE="${USE_HSPEC_DECODE:-1}"
+export HSPEC_COLLECT_ONLY="${HSPEC_COLLECT_ONLY:-0}"
+export HSPEC_REJECTION_SAMPLE_METHOD="${HSPEC_REJECTION_SAMPLE_METHOD:-legacy}"
+export HSPEC_I0_AUDIT="${HSPEC_I0_AUDIT:-0}"
+export HSPEC_I0_RUN_DIR="${HSPEC_I0_RUN_DIR:-}"
 # HSpec table/cache readiness is rank-local. Keep one authoritative proposer
 # per tensor-parallel group and share its draft ids over vLLM's TP message queue.
 export HSPEC_TP_DRAFT_SYNC="${HSPEC_TP_DRAFT_SYNC:-1}"
@@ -254,7 +257,7 @@ export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 
 # model / dataset defaults.
-CONFIG_DIR="${CONFIG_DIR:-${HOME}/verl/trainer/config}"
+CONFIG_DIR="${CONFIG_DIR:-${PROJECT_ROOT}/verl/trainer/config}"
 MODEL_PATH="${MODEL_PATH:-/home/data/Qwen3-30B-A3B}"
 TRAIN_FILE="${TRAIN_FILE:-/data/deepscaler/train.parquet}"
 TEST_FILE="${TEST_FILE:-/data/deepscaler/test.parquet}"
@@ -529,7 +532,7 @@ fi
 
 set -x
 
-env \
+HSPEC_TRAIN_COMMAND=( env \
     ROLLOUT_LENGTH_DIR="${ROLLOUT_LENGTH_DIR}" \
     TENSORBOARD_DIR="${TENSORBOARD_DIR}" \
     python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
@@ -583,6 +586,10 @@ env \
     actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.use_hspec_decode="${USE_HSPEC_DECODE}" \
+    actor_rollout_ref.rollout.hspec_collect_only="${HSPEC_COLLECT_ONLY}" \
+    actor_rollout_ref.rollout.hspec_rejection_sample_method="${HSPEC_REJECTION_SAMPLE_METHOD}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I0_AUDIT='"'"${HSPEC_I0_AUDIT}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I0_RUN_DIR='"'"${HSPEC_I0_RUN_DIR}"'"' \
     actor_rollout_ref.rollout.hspec_num_speculative_tokens=15 \
     actor_rollout_ref.rollout.hspec_similarity_threshold=0.85 \
     actor_rollout_ref.rollout.hspec_min_match_len=1 \
@@ -822,6 +829,25 @@ env \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_ACCUMULATE='"'"${HSPEC_ASYNC_HS_ACCUMULATE}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_ASYNC_HS_COPY_STREAM='"'"${HSPEC_ASYNC_HS_COPY_STREAM}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_SPECULATIVE_BATCH_SIZE_THRE='"'"${VLLM_SPECULATIVE_BATCH_SIZE_THRE}"'"' \
-    >> "${OUT}" 2>&1 "$@"
+    "$@" )
+
+# Capture shell-local values and the *final* argument vector, including "$@".
+# This opt-in plan path resolves Bash/profile values but never imports the
+# training entrypoint or initializes Ray/NPU workers.
+if [ "${HSPEC_I0_AUDIT}" = 1 ] || [ "${HSPEC_LAUNCH_DRY_RUN:-0}" = 1 ]; then
+    set +x
+    HSPEC_SHELL_ARGS=()
+    while IFS= read -r HSPEC_SHELL_NAME; do
+        HSPEC_SHELL_ARGS+=( --shell-value "${HSPEC_SHELL_NAME}=${!HSPEC_SHELL_NAME-}" )
+    done < <(python3 "${SCRIPT_DIR}/write_hspec_launcher_metadata.py" --list-shell-names --launcher-script "${BASH_SOURCE[0]}")
+    python3 "${SCRIPT_DIR}/write_hspec_launcher_metadata.py" \
+        --output "${HSPEC_LAUNCHER_METADATA_PATH}" --launcher-script "${BASH_SOURCE[0]}" \
+        "${HSPEC_SHELL_ARGS[@]}" --effective-argv "${HSPEC_TRAIN_COMMAND[@]}"
+    if [ "${HSPEC_LAUNCH_DRY_RUN:-0}" = 1 ]; then
+        echo "I0 plan saved: ${HSPEC_LAUNCHER_METADATA_PATH}"
+        exit 0
+    fi
+fi
+"${HSPEC_TRAIN_COMMAND[@]}" >> "${OUT}" 2>&1
 
 echo "OK: training finished. See log at ${OUT}"

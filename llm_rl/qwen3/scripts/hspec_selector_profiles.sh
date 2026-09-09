@@ -8,6 +8,34 @@ hspec_apply_selector_profile() {
 
     export HSPEC_SELECTOR_PROFILE="${profile}"
     case "${profile}" in
+        i0_ar|i0_collect|i0_p0|i0_r1|i0_p3a)
+            # Independent research identity; legacy release gates confer no
+            # standard-verifier performance qualification.
+            case "${profile}" in
+                i0_p3a) HSPEC_SELECTOR_PROFILE=production_p3a ;;
+                i0_r1) HSPEC_SELECTOR_PROFILE=production_r1 ;;
+                *) HSPEC_SELECTOR_PROFILE=p0_performance ;;
+            esac
+            hspec_apply_selector_profile
+            export HSPEC_SELECTOR_PROFILE="${profile}"
+            export HSPEC_I0_AUDIT=1
+            export HSPEC_REJECTION_SAMPLE_METHOD=standard
+            export HSPEC_COLLECT_ONLY=0
+            export USE_HSPEC_DECODE=1
+            if [ "${profile}" = i0_ar ] || [ "${profile}" = i0_collect ]; then
+                export USE_HSPEC_DECODE=0
+            fi
+            if [ "${profile}" = i0_collect ]; then
+                export HSPEC_COLLECT_ONLY=1
+            fi
+            if [ "${profile}" = i0_p3a ]; then
+                export HSPEC_SELECT_EXECUTION_LEVEL=i0_correctness
+                export HSPEC_SELECT_EXECUTION_GATE_PATH="${HSPEC_I0_PERMIT_PATH:?I0 permit required}"
+                export HSPEC_SELECT_EXECUTION_GATE_SHA256="${HSPEC_I0_PERMIT_SHA256:?I0 permit hash required}"
+            fi
+            export HSPEC_SELECT_D2H_STRATEGY=pinned_two_async
+            export HSPEC_MAX_DRAFT_TOKENS_PER_BATCH=384
+            ;;
         production_p3a)
             # S17 memory-policy-v3 global default: the exact P3A envelope that
             # passed S13 execution authorization and the two-task 30B gate.

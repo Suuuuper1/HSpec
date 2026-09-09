@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import hashlib
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,15 +56,40 @@ def atomic_write(path: Path, payload: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output")
     parser.add_argument("--launcher-script", required=True)
+    parser.add_argument("--list-shell-names", action="store_true")
+    parser.add_argument("--shell-value", action="append", default=[])
+    parser.add_argument("--effective-argv", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    launcher = Path(args.launcher_script).resolve()
+    if args.list_shell_names:
+        sources = [launcher, launcher.parent / "hspec_selector_profiles.sh",
+                   launcher.parent / "hspec_store_lifecycle.sh"]
+        names = set()
+        for source in sources:
+            text = source.read_text()
+            names.update(re.findall(r"(?m)^\s*(?:export |local )?([A-Z][A-Z0-9_]*)=", text))
+            names.update(re.findall(r"env_vars\.([A-Z][A-Z0-9_]*)=", text))
+        print("\n".join(sorted(names - {"HSPEC_TRAIN_COMMAND", "HSPEC_SHELL_ARGS"})))
+        return 0
+    if not args.output:
+        parser.error("--output is required unless --list-shell-names")
     assignments = {
         output: os.environ.get(environment, "")
         for output, environment in LAUNCHER_FIELDS.items()
     }
     payload = {
         "schema_version": "hspec.launcher-metadata.v1",
+        "launcher_sha256": hashlib.sha256(launcher.read_bytes()).hexdigest(),
+        "shell_values": dict(value.split("=", 1) for value in args.shell_value),
+        "effective_argv": args.effective_argv,
+        "exported_environment": {
+            key: os.environ[key] for key in
+            (value.split("=", 1)[0] for value in args.shell_value)
+            if key in os.environ
+        },
+        "configuration_scope": "shell_and_argv_not_resolved_hydra",
         "created_at_utc": datetime.now(timezone.utc).replace(
             microsecond=0
         ).isoformat().replace("+00:00", "Z"),

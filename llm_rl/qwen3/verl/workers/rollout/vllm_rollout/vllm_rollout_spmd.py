@@ -685,7 +685,7 @@ class vLLMRollout(BaseRollout):
         batch_size = idx.size(0)
         global_step = prompts.meta_info.get("global_steps")
         hspec_epoch = prompts.meta_info.get("hspec_epoch", -1)
-        use_hspec = self._resolved_speculation.uses_hspec
+        use_hspec = self._resolved_speculation.uses_hspec_data_plane
         is_validate = prompts.meta_info.get("validate", False)
         do_sample = prompts.meta_info.get("do_sample", True)
         collect_hspec = use_hspec and not is_validate and bool(do_sample)
@@ -1002,6 +1002,9 @@ class vLLMRollout(BaseRollout):
                                 if hs is None:
                                     if legacy_hspec_dataproto_hs:
                                         hs_source = "none"
+                                if hspec_desc is not None:
+                                    from vllm_ascend.spec_decode.hspec_store import limit_hspec_desc_to_output
+                                    hspec_desc = limit_hspec_desc_to_output(hspec_desc, len(response_ids))
                                 rollout_hidden_states_list.append(hs)
                                 rollout_hspec_token_ids_list.append(hspec_token_ids)
                                 rollout_hspec_desc_list.append(hspec_desc)
@@ -1127,6 +1130,15 @@ class vLLMRollout(BaseRollout):
                 _dbg_arr = np.empty((len(rollout_debug_list),), dtype=object)
                 _dbg_arr[:] = rollout_debug_list
                 non_tensor_batch["hspec_rollout_debug"] = _dbg_arr
+
+            if os.environ.get("HSPEC_I0_AUDIT", "0") == "1":
+                from vllm_ascend.spec_decode.hspec_i0_audit import write_rollout_evidence
+                ordinal = getattr(self, "_hspec_i0_round", 0)
+                write_rollout_evidence(
+                    self.inference_engine, self._resolved_speculation, self.config,
+                    non_tensor_batch, step=int(global_step or 0), epoch=int(hspec_epoch),
+                    rank=rank, validate=is_validate, ordinal=ordinal)
+                self._hspec_i0_round = ordinal + 1
 
             if use_hspec and not collect_hspec:
                 try:
@@ -1394,6 +1406,10 @@ class vLLMRollout(BaseRollout):
                     "vLLM rollout weight synchronization loaded 0 parameters. "
                     "Generation would continue with dummy/random weights."
                 )
+        if os.environ.get("HSPEC_I0_AUDIT", "0") == "1":
+            from vllm_ascend.spec_decode.hspec_i0_audit import record_weight_update
+            i0_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
+            record_weight_update(i0_runner, -1)
         self._lifecycle_audit.after_target_update(self.inference_engine)
 
 

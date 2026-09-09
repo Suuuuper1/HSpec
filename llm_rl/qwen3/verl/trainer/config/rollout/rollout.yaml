@@ -311,6 +311,9 @@ profiler:
 
 # HSpec config
 use_hspec_decode: False
+hspec_collect_only: False
+# Independent of the generic learned-drafter verifier. Research I0 sets standard.
+hspec_rejection_sample_method: legacy
 hspec_num_speculative_tokens: 5
 hspec_similarity_threshold: 0.9
 hspec_min_match_len: 1

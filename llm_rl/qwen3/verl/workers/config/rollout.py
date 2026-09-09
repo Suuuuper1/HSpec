@@ -58,6 +58,18 @@ def resolve_rollout_speculative_method(config) -> Optional[str]:
     return "hspec" if legacy_hspec else explicit
 
 
+def rollout_uses_hspec_data_plane(config) -> bool:
+    """Collection-only AR shares the HSpec store, never the speculative engine."""
+    method = resolve_rollout_speculative_method(config)
+    collect_only = bool(config.get("hspec_collect_only", False))
+    if collect_only and method is not None:
+        raise ValueError("hspec_collect_only requires speculative decoding disabled")
+    if collect_only and (config.get("name", "vllm") != "vllm"
+                         or config.get("mode", "sync") != "sync"):
+        raise ValueError("hspec_collect_only requires sync vllm rollout")
+    return method == "hspec" or collect_only
+
+
 @dataclass
 class SamplingConfig(BaseConfig):
     temperature: float = 1.0
@@ -213,6 +225,10 @@ class RolloutConfig(BaseConfig):
     # HSpec (Hidden State based Speculative Decoding)
     # These are optional knobs; when disabled they add near-zero overhead.
     use_hspec_decode: bool = False
+    hspec_collect_only: bool = False
+    # Explicit compatibility default. The generic field belongs to learned
+    # drafters; changing its old default must not migrate a frozen HSpec release.
+    hspec_rejection_sample_method: str = "legacy"
     hspec_num_speculative_tokens: int = 5
     hspec_similarity_threshold: float = 0.9
     hspec_min_match_len: int = 1
@@ -269,6 +285,9 @@ class RolloutConfig(BaseConfig):
             )
         if method == "hspec" and self.speculative_model is not None:
             raise ValueError("HSpec does not accept speculative_model")
+        rollout_uses_hspec_data_plane(self)
+        if self.hspec_rejection_sample_method not in {"standard", "legacy"}:
+            raise ValueError("hspec_rejection_sample_method must be standard or legacy")
         if method in {"dflash", "dspark"}:
             if not self.speculative_model:
                 raise ValueError(f"{method} requires speculative_model")

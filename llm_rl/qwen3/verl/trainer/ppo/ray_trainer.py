@@ -1276,6 +1276,10 @@ class RayPPOTrainer:
         if not bool(barrier.timed_out):
             print(f"HSpec: swap at epoch={epoch} (promote building -> active)")
             metrics = self.hspec_tables.swap(epoch=epoch)
+            if os.environ.get("HSPEC_I0_AUDIT", "0") == "1":
+                from vllm_ascend.spec_decode.hspec_i0_audit import record_trainer_event
+                record_trainer_event("table_published", self.global_steps, epoch,
+                                     timed_out=False, metrics=metrics)
             self._hspec_force_phase4_metrics_next = True
             return metrics
 
@@ -2043,7 +2047,7 @@ class RayPPOTrainer:
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
-        from verl.workers.config.rollout import resolve_rollout_speculative_method
+        from verl.workers.config.rollout import rollout_uses_hspec_data_plane
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -2052,11 +2056,9 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        use_hspec_decode = (
-            resolve_rollout_speculative_method(
-                self.config.actor_rollout_ref.rollout
-            )
-            == "hspec"
+        # Historical name: this flag controls collection/build, not proposals.
+        use_hspec_decode = rollout_uses_hspec_data_plane(
+            self.config.actor_rollout_ref.rollout
         )
         if use_hspec_decode and self.async_rollout_mode:
             raise NotImplementedError(
@@ -2685,6 +2687,10 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        if os.environ.get("HSPEC_I0_AUDIT", "0") == "1":
+                            from vllm_ascend.spec_decode.hspec_i0_audit import record_trainer_event
+                            record_trainer_event("actor_updated", self.global_steps, epoch,
+                                                 update_seconds=float(timing_raw["update_actor"]))
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

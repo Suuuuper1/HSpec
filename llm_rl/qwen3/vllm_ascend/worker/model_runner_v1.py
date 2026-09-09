@@ -440,6 +440,10 @@ class NPUModelRunner(GPUModelRunner):
         torch.npu.synchronize()
 
     def _set_up_drafter(self):
+        self._hspec_i0_audit = None
+        if os.environ.get("HSPEC_I0_AUDIT", "0") == "1":
+            from vllm_ascend.spec_decode.hspec_i0_audit import HSpecI0Audit
+            self._hspec_i0_audit = HSpecI0Audit()
         # Set up speculative decoding.
         '''
         self.speculative_auto_bs_thre = int(os.environ.get('VLLM_SPECULATIVE_BATCH_SIZE_THRE', "-1"))
@@ -480,6 +484,8 @@ class NPUModelRunner(GPUModelRunner):
                 verifier_mode = (
                     self.speculative_config.rejection_sample_method or "legacy"
                 )
+                if os.environ.get("HSPEC_I0_AUDIT", "0") == "1" and self.speculative_config.method == "hspec" and verifier_mode != "standard":
+                    raise ValueError("I0 HSpec research requires explicit standard verifier")
                 self.rejection_sampler = AscendRejectionSampler(
                     self.sampler, verifier_mode
                 )
@@ -515,7 +521,9 @@ class NPUModelRunner(GPUModelRunner):
         self._hspec_collect = (
             self.speculative_config is not None
             and getattr(self.speculative_config, "method", "") == "hspec"
-        )
+        ) or bool((self.vllm_config.additional_config or {}).get("hspec_collect_only", False))
+        if self._hspec_collect and self.use_async_scheduling:
+            raise ValueError("HSpec collection requires synchronous scheduling")
         if self._hspec_collect:
             from vllm_ascend.spec_decode.hspec_utils import hspec_set_collection_enabled
 
@@ -2080,6 +2088,9 @@ class NPUModelRunner(GPUModelRunner):
         has_lora = len(self.input_batch.lora_id_to_lora_request) > 0
         aclgraph_runtime_mode, batch_descriptor = \
             self.cudagraph_dispatcher.dispatch(num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora)
+        if self._hspec_i0_audit is not None:
+            self._hspec_i0_audit.shape(aclgraph_runtime_mode, total_num_scheduled_tokens,
+                                       batch_descriptor.num_tokens, self.input_batch.num_reqs)
 
         if self.ascend_config.enable_async_exponential:
             self.sampler.do_async_exponential(
@@ -2639,6 +2650,11 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     valid_sampled_token_ids,
                 )
+
+            if self._hspec_i0_audit is not None:
+                self._hspec_i0_audit.outcome(
+                    self.input_batch.req_ids, scheduler_output.scheduled_spec_decode_tokens,
+                    valid_sampled_token_ids, accepted_prefix_lengths)
 
             if HSPEC_S1_PARITY_ENABLED:
                 parity_req_ids = list(self.input_batch.req_ids)
