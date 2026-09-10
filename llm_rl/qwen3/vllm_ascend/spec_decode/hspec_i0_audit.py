@@ -61,6 +61,29 @@ def record_trainer_event(kind, step, epoch, **details):
                  'step': int(step), 'epoch': int(epoch), **details})
 
 
+def config_values(config):
+    """Snapshot existing values without revalidating runtime dataclass types."""
+    from dataclasses import fields, is_dataclass
+    from collections.abc import Mapping
+    from enum import Enum
+    from omegaconf import OmegaConf
+    if OmegaConf.is_config(config):
+        return config_values(OmegaConf.to_container(config, resolve=True))
+    if is_dataclass(config) and not isinstance(config, type):
+        return {field.name: config_values(getattr(config, field.name)) for field in fields(config)}
+    if isinstance(config, Mapping):
+        return {key: config_values(value) for key, value in config.items()}
+    if isinstance(config, (list, tuple)):
+        return [config_values(value) for value in config]
+    if isinstance(config, Enum):
+        return config_values(config.value)
+    if isinstance(config, Path):
+        return str(config)
+    if config is None or isinstance(config, (str, bool, int, float)):
+        return config
+    raise TypeError(f'Unsupported I0 config value type: {type(config).__qualname__}')
+
+
 def write_rollout_evidence(engine, resolved, config, non_tensor_batch, *, step, epoch, rank, validate, ordinal):
     """Control plane only, after flush/finalize. Failure must be visible in I0."""
     from omegaconf import OmegaConf
@@ -69,13 +92,10 @@ def write_rollout_evidence(engine, resolved, config, non_tensor_batch, *, step, 
         raise ValueError('HSPEC_I0_AUDIT requires HSPEC_I0_RUN_DIR')
     workers = engine.llm_engine.collective_rpc('hspec_i0_runtime_snapshot', args=())
     descriptors = non_tensor_batch.get('hspec_desc', [])
-    if not OmegaConf.is_config(config):
-        from dataclasses import is_dataclass
-        config = OmegaConf.structured(config) if is_dataclass(config) else OmegaConf.create(config)
     payload = {'schema_version': 'hspec.i0.rollout.v1', 'step': step, 'epoch': epoch,
                'rollout_rank': rank, 'validate': bool(validate), 'ordinal': ordinal,
                'resolved_speculation': resolved.manifest,
-               'rollout_config': OmegaConf.to_container(config, resolve=True),
+               'rollout_config': config_values(config),
                'descriptor_count': sum(d is not None for d in descriptors),
                'workers': workers}
     atomic_json(Path(run_dir) / 'runtime' / f'rank{rank}_round{ordinal}.json', payload)

@@ -22,6 +22,7 @@ VerifierMode = Literal["standard", "block", "legacy"]
 _VERIFIER_MODE: ContextVar[VerifierMode] = ContextVar(
     "ascend_speculative_verifier_mode", default="legacy"
 )
+_I1_PROBABILITY_OBSERVER: ContextVar = ContextVar("hspec_i1_probability_observer", default=None)
 
 
 @contextmanager
@@ -41,10 +42,15 @@ class AscendRejectionSampler(RejectionSampler):
             raise ValueError(f"Unknown speculative verifier mode: {mode!r}")
         super().__init__(sampler)
         self.verifier_mode = mode
+        self.i1_probability_observer = None
 
     def forward(self, *args, **kwargs):
-        with verifier_mode(self.verifier_mode):
-            return super().forward(*args, **kwargs)
+        observer_token = _I1_PROBABILITY_OBSERVER.set(self.i1_probability_observer)
+        try:
+            with verifier_mode(self.verifier_mode):
+                return super().forward(*args, **kwargs)
+        finally:
+            _I1_PROBABILITY_OBSERVER.reset(observer_token)
 
 
 def apply_sampling_constraints(
@@ -135,6 +141,9 @@ def rejection_sample(
     assert target_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
+    observer = _I1_PROBABILITY_OBSERVER.get()
+    if observer is not None:
+        observer(num_draft_tokens, target_probs)
 
     mode = _VERIFIER_MODE.get()
     # ``legacy`` exactly preserves the old Ascend K>=3 behavior. New methods

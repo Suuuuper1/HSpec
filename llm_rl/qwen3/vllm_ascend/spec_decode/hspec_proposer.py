@@ -371,6 +371,8 @@ class _CachedPromptTable:
     """
 
     __slots__ = (
+        "i1_lineage",
+        "i1_table_ref",
         "mean_cpu",
         "components_t_cpu",
         "keys_cpu",
@@ -435,6 +437,8 @@ class _CachedPromptTable:
         rollout_draft_sum: np.ndarray | None = None,
     ):
         self.mean_cpu = mean_cpu                      # (D,) float32, CPU
+        self.i1_lineage = None
+        self.i1_table_ref = None
         self.components_t_cpu = components_t_cpu      # (D,K) float32, CPU
         self.keys_cpu = keys_cpu                      # (M,K) table dtype or float32, CPU
         self.key_norm_cpu = key_norm_cpu              # optional (M,) float32, CPU
@@ -4282,6 +4286,18 @@ class HSpecProposer(Proposer):
             draft_prefix_lens=draft_prefix_lens,
             metric_prefix="descriptor",
         )
+        if getattr(self.runner, "_hspec_i1_observer", None) is not None:
+            from vllm_ascend.spec_decode.hspec_i1_trace import digest
+            cached.i1_lineage = desc.rollout_lineage
+            cached.i1_table_ref = {"descriptor": desc.to_dict(),
+                                   "descriptor_sha256": digest(desc.to_dict())}
+            from pathlib import Path
+            manifest_path = Path(desc.table_file).parent / "manifest.json"
+            if manifest_path.exists():
+                import json
+                table_manifest = json.loads(manifest_path.read_text())
+                cached.i1_table_ref["table_sha256"] = table_manifest.get("i1_table_sha256")
+                cached.i1_table_ref["sealed"] = table_manifest.get("status") == "sealed"
         self._record_proposer_metric(
             "descriptor_materialize_ms", _ns_to_ms(t1_materialize - t0_materialize))
         if self._prefix_cache_enabled:
@@ -4680,6 +4696,9 @@ class HSpecProposer(Proposer):
             batch_size = len(valid_sampled_token_ids)
             group = self._get_tp_draft_sync_group()
             if group is None or int(group.rank_in_group) == 0:
+                observer = getattr(self.runner, "_hspec_i1_observer", None)
+                if observer is not None:
+                    observer.begin(list(self.runner.input_batch.req_ids[:batch_size]))
                 draft_token_ids = self._generate_token_ids_impl(
                     valid_sampled_token_ids=valid_sampled_token_ids,
                     sampling_metadata=sampling_metadata,
@@ -4691,6 +4710,8 @@ class HSpecProposer(Proposer):
                     attn_metadata=attn_metadata,
                     aux_hidden_states=aux_hidden_states,
                 )
+                if observer is not None:
+                    observer.proposed(list(self.runner.input_batch.req_ids[:batch_size]), draft_token_ids, self)
             else:
                 draft_token_ids = [[] for _ in range(batch_size)]
             return self._sync_tp_draft_token_ids(
@@ -5167,7 +5188,9 @@ class HSpecProposer(Proposer):
         with hspec_record_function("hspec/proposal/device_to_host_sync", use_npu_stream=True):
             t1_stack = _now_ns() if observe_selector_clock else 0
             t0_copy = _now_ns() if observe_selector_clock else 0
-            if self._survival_config.enabled:
+            if self._survival_config.enabled or (
+                getattr(self.runner, "_hspec_i1_observer", None) is not None and query_norms is not None
+            ):
                 if query_norms is None:
                     raise RuntimeError("topk_utility cosine query norm is unavailable")
                 (
@@ -5210,6 +5233,11 @@ class HSpecProposer(Proposer):
             t1_copy = _now_ns() if observe_selector_clock else 0
 
         s4_trace_query_ids: Optional[List[Optional[str]]] = None
+        observer = getattr(self.runner, "_hspec_i1_observer", None)
+        if observer is not None:
+            observer.candidates(self, active_batch_indices, active_cached_tables,
+                                candidate_scores_cpu, candidate_idxs_cpu, sims_cpu,
+                                query_norms_cpu, req_ids)
         s4_projected_cpu: Optional[np.ndarray] = None
         if HSPEC_S4_TRACE_ENABLED:
             s4_trace_query_ids = [None for _ in active_batch_indices]
@@ -7227,6 +7255,9 @@ class HSpecProposer(Proposer):
 
     def _cancel_pending_request(self, req_id: str, reason: str) -> bool:
         """Close one unverified proposal without treating it as a rejection."""
+        observer = getattr(self.runner, "_hspec_i1_observer", None)
+        if observer is not None:
+            observer.cancel(req_id, reason)
         self._accept_lengths.pop(req_id, None)
         meta = self._pending_verify_meta.pop(req_id, None)
         if meta is not None:

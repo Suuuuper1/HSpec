@@ -335,6 +335,7 @@ class vLLMRollout(BaseRollout):
 
         model_path = model_config.local_path
         tokenizer = model_config.tokenizer
+        self._hspec_i1_tokenizer = tokenizer
         model_hf_config = model_config.hf_config
         trust_remote_code = model_config.trust_remote_code
         self.lora_kwargs = (
@@ -825,6 +826,26 @@ class vLLMRollout(BaseRollout):
 
         try:
             with self.update_sampling_params(**kwargs):
+                i1_context = None
+                if os.environ.get("HSPEC_I1_TRACE", "0") == "1":
+                    from vllm_ascend.spec_decode.hspec_i1_trace import digest
+                    i1_context = {
+                        "run": os.environ["HSPEC_RUN_UID"],
+                        "campaign": os.environ["HSPEC_I1_CAMPAIGN"],
+                        "trace_dir": os.environ["HSPEC_I1_TRACE_DIR"],
+                        "actor_version": int(global_step) - 1,
+                        "actor_version_semantics": "completed_optimizer_updates_before_rollout",
+                        "epoch": int(hspec_epoch), "step": int(global_step), "rollout_rank": int(rank),
+                        "checkpoint_base": str(getattr(self._hspec_i1_tokenizer, "name_or_path", "unknown")),
+                        "verifier": self._resolved_speculation.manifest.get("rejection_sample_method", "standard"),
+                        "recipe": {key: getattr(self.sampling_params, key) for key in
+                                   ("temperature", "top_p", "top_k", "min_p", "repetition_penalty",
+                                    "presence_penalty", "frequency_penalty", "ignore_eos", "max_tokens")},
+                        "validate": bool(is_validate),
+                        "chat_template_sha256": digest(getattr(self._hspec_i1_tokenizer, "chat_template", None)),
+                        "tokenizer_sha256": digest(self._hspec_i1_tokenizer.get_vocab()),
+                    }
+                    self.inference_engine.llm_engine.collective_rpc("hspec_i1_context", args=(i1_context,))
                 if use_hspec:
                     try:
                         self.inference_engine.llm_engine.collective_rpc(
@@ -853,12 +874,24 @@ class vLLMRollout(BaseRollout):
                         lora_request=lora_requests,
                         use_tqdm=True,
                     )
+                if i1_context is not None:
+                    from vllm_ascend.spec_decode.hspec_i1_trace import atomic_json
+                    from pathlib import Path
+                    ordinal = getattr(self, "_hspec_i1_round", 0)
+                    atomic_json(Path(i1_context["trace_dir"]) / f"frontend_rank{rank}_round{ordinal}.json",
+                        {"schema": "hspec.i1.frontend.v1", "lineage": i1_context,
+                         "outputs": [{"request_id": x.request_id, "prompt_tokens": list(x.prompt_token_ids),
+                                      "sequences": [{"tokens": list(y.token_ids), "finish_reason": y.finish_reason,
+                                                     "stop_reason": y.stop_reason} for y in x.outputs]} for x in outputs]})
+                    self._hspec_i1_round = ordinal + 1
                 if use_hspec:
                     with hspec_record_function("hspec/rollout/round_finalize"):
                         self.inference_engine.llm_engine.collective_rpc(
                             "hspec_finalize_rollout_round",
                             args=(),
                         )
+                if i1_context is not None:
+                    self.inference_engine.llm_engine.collective_rpc("hspec_i1_seal", args=())
                 if (
                     self._resolved_speculation.method in {"dflash", "dspark"}
                     and self._resolved_speculation.manifest.get("draft_sample_method")
@@ -1005,6 +1038,12 @@ class vLLMRollout(BaseRollout):
                                 if hspec_desc is not None:
                                     from vllm_ascend.spec_decode.hspec_store import limit_hspec_desc_to_output
                                     hspec_desc = limit_hspec_desc_to_output(hspec_desc, len(response_ids))
+                                    if i1_context is not None:
+                                        from vllm_ascend.spec_decode.hspec_store import coerce_hspec_desc
+                                        hspec_desc = coerce_hspec_desc(hspec_desc).with_updates(lineage={
+                                            **i1_context, "request_id": str(output.request_id),
+                                            "terminal": output.outputs[sample_id].finish_reason,
+                                            "committed_length": len(response_ids)})
                                 rollout_hidden_states_list.append(hs)
                                 rollout_hspec_token_ids_list.append(hspec_token_ids)
                                 rollout_hspec_desc_list.append(hspec_desc)

@@ -380,6 +380,35 @@ class NPUWorker(WorkerBase):
             return False
         return bool(self.model_runner.hspec_set_collection_enabled(enabled))
 
+    def hspec_i1_context(self, context: dict) -> bool:
+        observer = getattr(self.model_runner, "_hspec_i1_observer", None)
+        if observer is None:
+            raise RuntimeError("I1 trace was not enabled in worker")
+        from vllm.distributed import get_tp_group
+        config=self.model_runner.speculative_config
+        if config is None or config.method != 'hspec' or config.rejection_sample_method != 'standard':
+            raise ValueError('I1 on-policy observer requires actual standard HSpec')
+        actual = dict(context, tp_rank=int(get_tp_group().rank_in_group),
+                      tp_ranks=list(get_tp_group().ranks))
+        from vllm_ascend.spec_decode.hspec_i1_trace import digest
+        actual.update(
+            feature_schema="hspec.original_p3a.features18.v1",
+            anchor_schema="hidden_producing_current_token;value_offset=t+1",
+            selector_model=os.getenv("HSPEC_SELECT_MODEL_SHA256") or None,
+            calibrator_identity=os.getenv("HSPEC_SELECT_MODEL_SHA256") or None,
+            actual_verifier=config.rejection_sample_method,
+            target_config_sha256=digest(self.model_runner.model_config.hf_config.to_dict()),
+            weight_load_count=getattr(self.model_runner,"_hspec_i0_weight_updates",None),
+            sampled_weight_fingerprint=getattr(self.model_runner,"_hspec_i0_weight_fingerprint",None),
+            probability_backend="ascend_custom",
+        )
+        observer.configure(actual)
+        return True
+
+    def hspec_i1_seal(self) -> dict | None:
+        observer = getattr(self.model_runner, "_hspec_i1_observer", None)
+        return observer.finish("rollout_boundary") if observer else None
+
     def hspec_i0_runtime_snapshot(self) -> dict:
         from vllm_ascend.spec_decode.hspec_i0_audit import runtime_snapshot
         return runtime_snapshot(self.model_runner)

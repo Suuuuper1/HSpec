@@ -651,6 +651,8 @@ class HSpecTrajectoryDesc:
     reward: float | None = None
     has_gap: bool = False
     gap_reasons: tuple[str, ...] | None = None
+    # Optional I1 control-plane sidecar; absent legacy source age stays unknown.
+    lineage: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         length = int(self.length)

@@ -301,6 +301,7 @@ class HSpecPromptTableDesc:
     max_wnd: int = 28
     min_wnd: int = 2
     created_time_ns: int = 0
+    rollout_lineage: tuple[dict[str, Any] | None, ...] | None = None
 
     def __post_init__(self) -> None:
         if int(self.schema_version) != TABLE_STORE_SCHEMA_VERSION:
@@ -358,6 +359,10 @@ class HSpecPromptTableDesc:
         object.__setattr__(self, "shard_id", int(self.shard_id))
         object.__setattr__(self, "n_entries", int(self.n_entries))
         object.__setattr__(self, "n_rollouts", int(self.n_rollouts))
+        if self.rollout_lineage is not None:
+            if len(self.rollout_lineage) != int(self.n_rollouts):
+                raise ValueError("I1 rollout lineage must align with every source rollout")
+            object.__setattr__(self, "rollout_lineage", tuple(self.rollout_lineage))
         object.__setattr__(self, "hidden_dim", int(self.hidden_dim))
         object.__setattr__(self, "n_components", int(self.n_components))
         object.__setattr__(self, "n_samples", int(self.n_samples))
@@ -418,6 +423,7 @@ def prompt_table_desc_to_dict(desc: HSpecPromptTableDesc) -> dict[str, Any]:
         "max_wnd": int(desc.max_wnd),
         "min_wnd": int(desc.min_wnd),
         "created_time_ns": int(desc.created_time_ns),
+        "rollout_lineage": desc.rollout_lineage,
     }
     return payload
 
@@ -483,6 +489,7 @@ def coerce_prompt_table_desc(obj: Any) -> HSpecPromptTableDesc:
         max_wnd=int(obj.get("max_wnd", 28)),
         min_wnd=int(obj.get("min_wnd", 2)),
         created_time_ns=int(obj.get("created_time_ns", 0)),
+        rollout_lineage=(tuple(obj["rollout_lineage"]) if obj.get("rollout_lineage") is not None else None),
     )
 
 
@@ -891,6 +898,12 @@ class HSpecTableStoreWriter:
             }
             if extra_metrics:
                 manifest.update(extra_metrics)
+            if os.environ.get("HSPEC_I1_TRACE", "0") == "1":
+                from vllm_ascend.spec_decode.hspec_i1_trace import file_sha
+                hash_start = time.perf_counter()
+                manifest["i1_table_sha256"] = file_sha(self.table_file)
+                manifest["i1_prompt_index_sha256"] = file_sha(self.prompt_index_path)
+                manifest["i1_hash_seconds"] = time.perf_counter() - hash_start
             try:
                 _write_json_atomic(self.manifest_path, manifest)
             except Exception:

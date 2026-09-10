@@ -440,6 +440,11 @@ class NPUModelRunner(GPUModelRunner):
         torch.npu.synchronize()
 
     def _set_up_drafter(self):
+        self._hspec_i1_observer = None
+        if os.environ.get("HSPEC_I1_TRACE", "0") == "1":
+            from vllm_ascend.spec_decode.hspec_i1_trace import I1Observer
+            self._hspec_i1_observer = I1Observer(self,
+                probability=float(os.environ.get("HSPEC_I1_SAMPLE_PROBABILITY", ".02")))
         self._hspec_i0_audit = None
         if os.environ.get("HSPEC_I0_AUDIT", "0") == "1":
             from vllm_ascend.spec_decode.hspec_i0_audit import HSpecI0Audit
@@ -2091,6 +2096,11 @@ class NPUModelRunner(GPUModelRunner):
         if self._hspec_i0_audit is not None:
             self._hspec_i0_audit.shape(aclgraph_runtime_mode, total_num_scheduled_tokens,
                                        batch_descriptor.num_tokens, self.input_batch.num_reqs)
+        if self._hspec_i1_observer is not None:
+            self._hspec_i1_observer.shape = {
+                "graph_mode": str(aclgraph_runtime_mode), "logical_rows": int(total_num_scheduled_tokens),
+                "padded_rows": int(batch_descriptor.num_tokens), "batch_size": int(self.input_batch.num_reqs),
+                "uniform_decode": bool(uniform_decode)}
 
         if self.ascend_config.enable_async_exponential:
             self.sampler.do_async_exponential(
@@ -2518,6 +2528,10 @@ class NPUModelRunner(GPUModelRunner):
                         0 if draft_probs is None else draft_probs.shape[0],
                         0 if draft_probs is None else draft_probs.shape[1],
                     )
+            if self._hspec_i1_observer is not None:
+                self.rejection_sampler.i1_probability_observer = self._hspec_i1_observer.capture_probabilities
+            else:
+                self.rejection_sampler.i1_probability_observer = None
             sampler_output = self.rejection_sampler(
                 spec_decode_metadata,
                 draft_probs,
@@ -2653,6 +2667,10 @@ class NPUModelRunner(GPUModelRunner):
 
             if self._hspec_i0_audit is not None:
                 self._hspec_i0_audit.outcome(
+                    self.input_batch.req_ids, scheduler_output.scheduled_spec_decode_tokens,
+                    valid_sampled_token_ids, accepted_prefix_lengths)
+            if self._hspec_i1_observer is not None:
+                self._hspec_i1_observer.outcomes(
                     self.input_batch.req_ids, scheduler_output.scheduled_spec_decode_tokens,
                     valid_sampled_token_ids, accepted_prefix_lengths)
 

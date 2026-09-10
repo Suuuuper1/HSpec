@@ -1152,6 +1152,7 @@ def build_prompt_table_to_store(
             max_wnd=int(max_wnd),
             min_wnd=int(min_wnd),
             created_time_ns=time.time_ns(),
+            rollout_lineage=tuple(item.desc.lineage for item in plan.items),
         )
         writer.commit_prompt(table_desc)
         metrics.total_ms = float((time.perf_counter() - t_total) * 1000.0)

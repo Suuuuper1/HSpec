@@ -244,6 +244,11 @@ export HSPEC_COLLECT_ONLY="${HSPEC_COLLECT_ONLY:-0}"
 export HSPEC_REJECTION_SAMPLE_METHOD="${HSPEC_REJECTION_SAMPLE_METHOD:-legacy}"
 export HSPEC_I0_AUDIT="${HSPEC_I0_AUDIT:-0}"
 export HSPEC_I0_RUN_DIR="${HSPEC_I0_RUN_DIR:-}"
+export HSPEC_I1_TRACE="${HSPEC_I1_TRACE:-0}"
+export HSPEC_I1_CAMPAIGN="${HSPEC_I1_CAMPAIGN:-}"
+export HSPEC_I1_TRACE_DIR="${HSPEC_I1_TRACE_DIR:-}"
+export HSPEC_I1_SAMPLE_PROBABILITY="${HSPEC_I1_SAMPLE_PROBABILITY:-0.02}"
+export HSPEC_I1_SEED="${HSPEC_I1_SEED:-90117}"
 # HSpec table/cache readiness is rank-local. Keep one authoritative proposer
 # per tensor-parallel group and share its draft ids over vLLM's TP message queue.
 export HSPEC_TP_DRAFT_SYNC="${HSPEC_TP_DRAFT_SYNC:-1}"
@@ -590,6 +595,11 @@ HSPEC_TRAIN_COMMAND=( env \
     actor_rollout_ref.rollout.hspec_rejection_sample_method="${HSPEC_REJECTION_SAMPLE_METHOD}" \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I0_AUDIT='"'"${HSPEC_I0_AUDIT}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I0_RUN_DIR='"'"${HSPEC_I0_RUN_DIR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I1_TRACE='"'"${HSPEC_I1_TRACE}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I1_CAMPAIGN='"'"${HSPEC_I1_CAMPAIGN}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I1_TRACE_DIR='"'"${HSPEC_I1_TRACE_DIR}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I1_SAMPLE_PROBABILITY='"'"${HSPEC_I1_SAMPLE_PROBABILITY}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I1_SEED='"'"${HSPEC_I1_SEED}"'"' \
     actor_rollout_ref.rollout.hspec_num_speculative_tokens=15 \
     actor_rollout_ref.rollout.hspec_similarity_threshold=0.85 \
     actor_rollout_ref.rollout.hspec_min_match_len=1 \
