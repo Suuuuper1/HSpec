@@ -478,7 +478,50 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
 def merge_megatron_ckpt_gptmodel_qwen_moe(
     wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False
 ):
-    raise NotImplementedError("merge_megatron_ckpt_gptmodel_qwen_moe is not implemented")
+    """Export Qwen3 MoE using the same resharder as Megatron -> vLLM.
+
+    Every rank must exhaust the iterator (PP/TP/EP collectives). Only global
+    rank zero retains CPU copies. Use the *actual* transformer config so uneven
+    PP and virtual-pipeline offsets are identical to weight synchronization.
+    Rollout-only AllToAll resharding produces rank-local experts and is therefore
+    disabled for this full HF export, then restored even on failure.
+    """
+    import os
+
+    from verl.models.mcore.weight_converter import McoreToHFWeightConverterQwen3Moe
+    from verl.utils.megatron_utils import get_model_config, per_tensor_generator
+
+    if getattr(config, "model_type", None) != "qwen3_moe" or is_value_model:
+        raise NotImplementedError("HF MoE export currently supports Qwen3Moe causal LM only")
+    models = list(wrapped_models) if isinstance(wrapped_models, (list, tuple)) else [wrapped_models]
+    transformer_config = get_model_config(models[0])
+    converter = McoreToHFWeightConverterQwen3Moe(config, transformer_config)
+    mapping = {"qkv_layer_name": "self_attention.linear_qkv.", "gate_proj_layer_name": "linear_fc1."}
+    previous = os.environ.get("ALL_TO_ALL_RESHARD")
+    state_dict = {}
+    seen = set()
+    try:
+        os.environ["ALL_TO_ALL_RESHARD"] = "0"
+        for name, tensor in per_tensor_generator(models, config, converter, transformer_config, mapping):
+            if name in seen:
+                raise ValueError(f"duplicate HF checkpoint parameter: {name}")
+            seen.add(name)
+            if name in ("model.embed_tokens.weight", "lm_head.weight"):
+                if tensor.shape[0] < config.vocab_size:
+                    raise ValueError(f"incomplete vocabulary in HF checkpoint parameter: {name}")
+                tensor = tensor[:config.vocab_size]
+            if dist.get_rank() == 0:
+                # clone is necessary on CPU too: yielded views/buffers may be reused.
+                state_dict[name] = tensor.detach().to(device="cpu", dtype=dtype, copy=True).contiguous()
+    finally:
+        if previous is None:
+            os.environ.pop("ALL_TO_ALL_RESHARD", None)
+        else:
+            os.environ["ALL_TO_ALL_RESHARD"] = previous
+    if dist.get_rank() == 0 and tie_word_embeddings and "lm_head.weight" not in state_dict:
+        state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"].clone()
+    dist.barrier()
+    return state_dict
 
 
 def merge_megatron_ckpt_gptmodel_qwen2_5_vl(
