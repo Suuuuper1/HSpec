@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -177,7 +178,14 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
-        if not self.enable_caching or request.skip_reading_prefix_cache:
+        # Ascend's fused prefill/paged-attention cache-read path is not
+        # numerically interchangeable with a fresh prefill for every model
+        # shape.  HSpec can request a correctness-first read policy while the
+        # cache remains allocated (and therefore can be re-enabled after a
+        # validated kernel fix).  This is deliberately opt-in and leaves the
+        # normal vLLM policy unchanged.
+        if (not self.enable_caching or request.skip_reading_prefix_cache
+                or os.environ.get("HSPEC_ASCEND_SAFE_PREFIX_CACHE", "0") == "1"):
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
