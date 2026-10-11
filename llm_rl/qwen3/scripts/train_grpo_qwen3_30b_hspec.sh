@@ -149,6 +149,10 @@ export HSPEC_ALIGN_DEBUG_PREVIEW="${HSPEC_ALIGN_DEBUG_PREVIEW:-8}"
 export HSPEC_ENTRY="${HSPEC_ENTRY:-0}"
 export MATCH_WND="${MATCH_WND:-16}"
 hspec_apply_selector_profile
+export HSPEC_I4_MODE="${HSPEC_I4_MODE:-off}"
+export HSPEC_I4_BUNDLE="${HSPEC_I4_BUNDLE:-}"
+export HSPEC_I4_BUNDLE_SHA256="${HSPEC_I4_BUNDLE_SHA256:-}"
+export HSPEC_I4_RECORD_LIMIT="${HSPEC_I4_RECORD_LIMIT:-0}"
 export HSPEC_SELECT_MODE="${HSPEC_SELECT_MODE:-topk_position}"
 export HSPEC_SELECT_TOPK="${HSPEC_SELECT_TOPK:-8}"
 export HSPEC_SELECT_SIM_MODE="${HSPEC_SELECT_SIM_MODE:-cosine}"
@@ -593,6 +597,10 @@ HSPEC_TRAIN_COMMAND=( env \
     actor_rollout_ref.rollout.use_hspec_decode="${USE_HSPEC_DECODE}" \
     actor_rollout_ref.rollout.hspec_collect_only="${HSPEC_COLLECT_ONLY}" \
     actor_rollout_ref.rollout.hspec_rejection_sample_method="${HSPEC_REJECTION_SAMPLE_METHOD}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I4_MODE='"'"${HSPEC_I4_MODE}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I4_BUNDLE='"'"${HSPEC_I4_BUNDLE}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I4_BUNDLE_SHA256='"'"${HSPEC_I4_BUNDLE_SHA256}"'"' \
+    +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I4_RECORD_LIMIT='"'"${HSPEC_I4_RECORD_LIMIT}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I0_AUDIT='"'"${HSPEC_I0_AUDIT}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I0_RUN_DIR='"'"${HSPEC_I0_RUN_DIR}"'"' \
     +ray_kwargs.ray_init.runtime_env.env_vars.HSPEC_I1_TRACE='"'"${HSPEC_I1_TRACE}"'"' \
@@ -844,7 +852,7 @@ HSPEC_TRAIN_COMMAND=( env \
 # Capture shell-local values and the *final* argument vector, including "$@".
 # This opt-in plan path resolves Bash/profile values but never imports the
 # training entrypoint or initializes Ray/NPU workers.
-if [ "${HSPEC_I0_AUDIT}" = 1 ] || [ "${HSPEC_LAUNCH_DRY_RUN:-0}" = 1 ]; then
+if [ "${HSPEC_I0_AUDIT}" = 1 ] || [ "${HSPEC_LAUNCH_DRY_RUN:-0}" = 1 ] || [ "${HSPEC_RECORD_LAUNCH_METADATA:-0}" = 1 ]; then
     set +x
     HSPEC_SHELL_ARGS=()
     while IFS= read -r HSPEC_SHELL_NAME; do

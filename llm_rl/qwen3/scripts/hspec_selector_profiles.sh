@@ -7,6 +7,7 @@ hspec_apply_selector_profile() {
     local root="${PROJECT_ROOT:?PROJECT_ROOT must be set before selector profile}"
 
     export HSPEC_SELECTOR_PROFILE="${profile}"
+    case "${profile}" in i4_shadow|i4_execute) ;; *) export HSPEC_I4_MODE=off ;; esac
     case "${profile}" in
         i0_ar|i0_collect|i0_p0|i0_r1|i0_p3a)
             # Independent research identity; legacy release gates confer no
@@ -35,6 +36,17 @@ hspec_apply_selector_profile() {
             fi
             export HSPEC_SELECT_D2H_STRATEGY=pinned_two_async
             export HSPEC_MAX_DRAFT_TOKENS_PER_BATCH=384
+            ;;
+        i4_shadow|i4_execute)
+            local i4_requested="${profile}"
+            HSPEC_SELECTOR_PROFILE=production_r1
+            hspec_apply_selector_profile
+            export HSPEC_SELECTOR_PROFILE="${i4_requested}"
+            export HSPEC_I4_MODE="${i4_requested#i4_}"
+            export HSPEC_I4_BUNDLE="${HSPEC_I4_BUNDLE:?I4 bundle required}"
+            export HSPEC_I4_BUNDLE_SHA256="${HSPEC_I4_BUNDLE_SHA256:?I4 bundle hash required}"
+            export HSPEC_REJECTION_SAMPLE_METHOD=standard
+            export HSPEC_I4_RECORD_LIMIT="${HSPEC_I4_RECORD_LIMIT:-0}"
             ;;
         production_p3a)
             # S17 memory-policy-v3 global default: the exact P3A envelope that

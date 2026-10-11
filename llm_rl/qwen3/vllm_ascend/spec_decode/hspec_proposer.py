@@ -1047,6 +1047,25 @@ class HSpecProposer(Proposer):
             os.environ.get("HSPEC_PROPOSER_HOT_PATH_STRICT", "1") != "0"
         )
         self._in_generate_token_ids: bool = False
+        # Independent I4 research identity. No import/load on normal profiles.
+        self._i4_selector = None
+        self._i4_init_error = None
+        i4_mode = os.environ.get("HSPEC_I4_MODE", "off")
+        if i4_mode != "off":
+            try:
+                if getattr(spec_config, "rejection_sample_method", None) != "standard":
+                    raise ValueError("I4 requires standard verifier")
+                if self._survival_config.enabled or not self._r1_config.executes_topk:
+                    raise ValueError("I4 requires independent R1-frozen baseline profile")
+                from vllm_ascend.spec_decode.hspec_selector_i4 import load_i4
+                i4_runtime = load_i4(os.environ["HSPEC_I4_BUNDLE"],
+                    os.environ["HSPEC_I4_BUNDLE_SHA256"], i4_mode,
+                    _get_env_int("HSPEC_I4_RECORD_LIMIT", 0))
+                i4_runtime.validate_runtime(vllm_config)
+                self._i4_selector = i4_runtime
+            except Exception as exc:
+                self._i4_init_error = str(exc)
+                logger.warning("I4 init disabled; retaining R1/P0: %s", exc)
 
         # Async prefetch state (never blocking in hot loop)
         # Each entry: (ray.ObjectRef, [prompt_ids]) where the future
@@ -1124,6 +1143,8 @@ class HSpecProposer(Proposer):
         self._stat_accept_count = 0
         self._proposer_metric_deltas = defaultdict(float)
         self._proposer_metric_gauges: Dict[str, float] = {}
+        if self._i4_init_error:
+            self._record_proposer_metric("i4_init_fallback_count", 1)
         if self._r1_config.fallback_reason:
             self._record_proposer_metric("selector_config_fallback_count", 1)
         if self._survival_requested and not self._survival_config.enabled:
@@ -2189,7 +2210,8 @@ class HSpecProposer(Proposer):
         # immutable baseline decision therefore share the same two pinned
         # payload transfers and one synchronization boundary.
         payload_width = self._r1_config.topk + 1 + int(
-            self._survival_config.enabled
+            self._survival_config.enabled or self._i4_selector is not None
+            or os.environ.get("HSPEC_I4_HARNESS") == "1"
         )
         self._r1_host_scores = torch.empty(
             (max_rows, payload_width),
@@ -4159,7 +4181,9 @@ class HSpecProposer(Proposer):
         entry_bias = np.zeros((n_entries,), dtype=np.int8)
         entry_hits = np.zeros((n_entries,), dtype=np.uint16)
         key_norm_cpu = None
-        if self._survival_config.enabled:
+        if (self._survival_config.enabled
+                or getattr(self, "_i4_selector", None) is not None
+                or os.getenv("HSPEC_I4_HARNESS", "0") == "1"):
             key_norm_cpu = np.ascontiguousarray(
                 np.linalg.norm(
                     keys_np[:n_entries].astype(np.float32, copy=False), axis=1
@@ -4519,6 +4543,8 @@ class HSpecProposer(Proposer):
         cached_tables: List[_CachedPromptTable],
     ) -> tuple[Any, Any, Any, Any, Any, Any]:
         """Build typed ragged CPU views once with the prefetch batch cache."""
+        if self._i4_selector is not None:
+            self._i4_selector.bind_tables(cached_tables)
         if (
             not self._survival_config.enabled
             or score_utility_batch_numba is None
@@ -5188,7 +5214,7 @@ class HSpecProposer(Proposer):
         with hspec_record_function("hspec/proposal/device_to_host_sync", use_npu_stream=True):
             t1_stack = _now_ns() if observe_selector_clock else 0
             t0_copy = _now_ns() if observe_selector_clock else 0
-            if self._survival_config.enabled or (
+            if self._survival_config.enabled or self._i4_selector is not None or (
                 getattr(self.runner, "_hspec_i1_observer", None) is not None and query_norms is not None
             ):
                 if query_norms is None:
@@ -5633,6 +5659,34 @@ class HSpecProposer(Proposer):
                 execute_batch_sequence=self._utility_execute_batch_sequence,
             )
 
+        i4_decision = None
+        if self._i4_selector is not None:
+            self._record_proposer_metric("i4_attempted_queries", len(active_batch_indices))
+            try:
+                prefill_pending = bool(scheduler_output is not None and any(
+                    int(input_batch.num_computed_tokens_cpu[i]) + int(scheduler_output.num_scheduled_tokens.get(rid, 0))
+                    < len(getattr(req_states[i], "prompt_token_ids", ()))
+                    for i, rid in enumerate(req_ids[:batch_size])
+                ))
+                i4_decision = self._i4_selector.prepare(self, active_batch_indices,
+                    active_cached_tables, candidate_scores_cpu, candidate_idxs_cpu,
+                    query_norms_cpu, req_states, active_base_positions, decoded_lens,
+                    raw_gate_hits, batch_size,prefill_pending=prefill_pending)
+            except Exception:
+                self._i4_selector.last = None
+                self._i4_selector.counts["runtime_batch_failure"] += 1
+                i4_decision = None
+            if i4_decision is not None:
+                self._record_proposer_metric("i4_queries", len(active_batch_indices))
+                self._record_proposer_metric("i4_valid_queries", int(np.count_nonzero(i4_decision["valid"])))
+                self._record_proposer_metric("i4_abstain_count", int(np.count_nonzero(i4_decision["valid"] & (i4_decision["length"] == 0))))
+                self._record_proposer_metric("i4_row_fallback_count", int(np.count_nonzero(~i4_decision["valid"])))
+            else:
+                self._record_proposer_metric("i4_batch_fallback_queries", len(active_batch_indices))
+            if i4_decision is not None and self._i4_selector.mode == "execute":
+                # Valid abstain is complete, too. Only failed rows execute R1.
+                r1_rows_mask &= ~i4_decision["valid"]
+
         r1_cpu_t0 = _now_ns() if selector_timing_enabled else 0
         for row_value in np.flatnonzero(r1_rows_mask):
             row = int(row_value)
@@ -5685,6 +5739,18 @@ class HSpecProposer(Proposer):
         r1_cpu_rerank_ms = (
             _ns_to_ms(_now_ns() - r1_cpu_t0) if r1_cpu_t0 else 0.0
         )
+        if not self._r1_config.shadow:
+            if i4_decision is not None and self._i4_selector.mode == "execute":
+                for row in np.flatnonzero(i4_decision["valid"]):
+                    entry = int(i4_decision["entry"][row])
+                    length = int(i4_decision["length"][row])
+                    selected_valid[row] = bool(raw_gate_hits[row] and entry >= 0 and length > 0)
+                    if selected_valid[row]:
+                        decision_idxs_cpu[row] = entry
+                        slot = int(i4_decision["slot"][row])
+                        selected_rank_cpu[row] = slot
+                        decision_scores_cpu[row] = candidate_scores_cpu[row, slot]
+
         if self._survival_config.executes_utility:
             fallback_queries = int(np.count_nonzero(
                 raw_gate_hits & (utility_status_cpu != 0)
@@ -5874,6 +5940,8 @@ class HSpecProposer(Proposer):
                     utility_idxs_cpu[j],
                     self._survival_config.executes_utility,
                 )
+                if i4_decision is not None and self._i4_selector.mode == "execute" and i4_decision["valid"][j]:
+                    effective_wnd = min(effective_wnd, int(i4_decision["length"][j]))
                 if s7_caps is not None:
                     effective_wnd = min(
                         max(int(s7_caps[j]), 0), int(self.max_draft_tokens)
@@ -5971,6 +6039,8 @@ class HSpecProposer(Proposer):
                     utility_idxs_cpu[j],
                     self._survival_config.executes_utility,
                 )
+                if i4_decision is not None and self._i4_selector.mode == "execute" and i4_decision["valid"][j]:
+                    pre_budget_effective_wnd = min(pre_budget_effective_wnd, int(i4_decision["length"][j]))
                 if s7_caps is not None:
                     pre_budget_effective_wnd = min(
                         max(int(s7_caps[j]), 0),
@@ -6345,6 +6415,15 @@ class HSpecProposer(Proposer):
                         s9_pending_meta_ms += _ns_to_ms(
                             _now_ns() - s9_pending_meta_t0
                         )
+                if i4_decision is not None and self._i4_selector.mode == "execute":
+                    pending_meta["i4_gain_prefix"] = self._i4_selector.scorer.gains[j, int(i4_decision["slot"][j])].copy() if int(i4_decision["slot"][j]) >= 0 else None
+                    pending_meta["i4_terminal_depth"] = int(self._i4_selector.terminals[j, int(i4_decision["slot"][j])]) if int(i4_decision["slot"][j]) >= 0 else 0
+                    pending_meta["i4_versions"] = (self._i4_selector.scorer.model_version,
+                        int(self._cache_version), int(self._cache_generation),
+                        self._i4_selector.bundle["cost"]["domain_hash"])
+                    # Keep immutable CPU table alive until actual verification
+                    # closes this existing pending record.
+                    pending_meta["i4_table_pin"] = cached
                 self._pending_verify_meta[req_id] = pending_meta
                 if self._r1_config.computes_topk and self._sample_r1_metadata():
                     logger.info(
@@ -6387,6 +6466,9 @@ class HSpecProposer(Proposer):
                 })
                 self._hspec_gen_timing = td
 
+        if self._i4_selector is not None:
+            self._i4_selector.finish(self, results, active_batch_indices,
+                req_ids, decoded_lens, active_cached_tables)
         self._record_s13_shadow_batch(
             results=results,
             req_ids=req_ids,
@@ -7031,11 +7113,31 @@ class HSpecProposer(Proposer):
                 and outcome_idx < len(emitted_token_ids)
                 else []
             )
-            if prompt_id:
+            i4_version = meta.get("i4_versions")
+            old_i4_table = bool(i4_version and (
+                int(i4_version[1]) != int(self._cache_version)
+                or int(i4_version[2]) != int(self._cache_generation)))
+            if old_i4_table:
+                # Preserve the old query's feedback domain and release its pin
+                # when this local meta dies; never update a new epoch's table.
+                pinned = meta.get("i4_table_pin")
+                if pinned is not None:
+                    pinned.update_entry_bias_after_verification(
+                        entry_idx=int(meta.get("matched_entry_idx", -1)),
+                        accept_length=apl, drafted_len=observed_drafted_len)
+                self._record_proposer_metric("i4_old_version_outcomes", 1)
+            if i4_version and meta.get("i4_gain_prefix") is not None:
+                prefix_gain = meta["i4_gain_prefix"]
+                meta["i4_actual_expected_gain"] = float(prefix_gain[min(observed_drafted_len, len(prefix_gain)-1)])
+                terminal_depth = int(meta.get("i4_terminal_depth", 0))
+                if terminal_depth > 0 and observed_drafted_len >= terminal_depth:
+                    meta["i4_actual_expected_gain"] -= float(prefix_gain[terminal_depth]-prefix_gain[terminal_depth-1])
+                meta["i4_tail_censored"] = observed_drafted_len < expected_drafted_len
+            if prompt_id and not old_i4_table:
                 self._update_prompt_window_after_verification(
                     prompt_id=prompt_id,
                     accept_length=apl,
-                    drafted_len=int(meta.get("drafted_len", 0)),
+                    drafted_len=observed_drafted_len if i4_version else int(meta.get("drafted_len", 0)),
                     wnd_size_at_match=int(meta.get("wnd_size_at_match", 0)),
                     min_wnd=int(meta.get("min_wnd", 2)),
                     max_wnd=int(meta.get("max_wnd", 28)),
@@ -7044,7 +7146,7 @@ class HSpecProposer(Proposer):
                     prompt_id=prompt_id,
                     entry_idx=int(meta.get("matched_entry_idx", -1)),
                     accept_length=apl,
-                    drafted_len=int(meta.get("drafted_len", 0)),
+                    drafted_len=observed_drafted_len if i4_version else int(meta.get("drafted_len", 0)),
                 )
             self._entry_pending_verify_count += 1
             self._entry_pending_accept_len_sum += apl

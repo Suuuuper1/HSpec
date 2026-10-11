@@ -5590,6 +5590,14 @@ class GlobalHSpecTableGroup:
             "select_r1_rank_one_based_sum",
             "select_r1_suffix_sum",
             "select_r1_cpu_rerank_samples",
+            "i4_queries",
+            "i4_attempted_queries",
+            "i4_valid_queries",
+            "i4_batch_fallback_queries",
+            "i4_abstain_count",
+            "i4_row_fallback_count",
+            "i4_init_fallback_count",
+            "i4_old_version_outcomes",
         }
         interval = {
             key: float(agg.get(key, 0.0))

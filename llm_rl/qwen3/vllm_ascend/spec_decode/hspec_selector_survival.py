@@ -349,6 +349,7 @@ def _extract_features_python_impl(
     base_pos: int,
     decoded_len: int,
     n_entries: int,
+    allow_masked: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     """Extract the exact frozen 18-feature full-top8 block."""
     width = int(candidate_scores.shape[0])
@@ -356,7 +357,7 @@ def _extract_features_python_impl(
     suffixes = np.zeros((width,), dtype=np.int16)
     abs_deltas = np.zeros((width,), dtype=np.int32)
     remaining = np.zeros((width,), dtype=np.int32)
-    if width != HSPEC_SURVIVAL_TOPK or candidate_indices.shape[0] != width:
+    if (width != HSPEC_SURVIVAL_TOPK and (not allow_masked or width<1 or width>HSPEC_SURVIVAL_TOPK)) or candidate_indices.shape[0] != width:
         return features, suffixes, abs_deltas, remaining, 1
     if n_entries < width or rollout_offsets.shape[0] != rollout_lens.shape[0]:
         return features, suffixes, abs_deltas, remaining, 2
@@ -415,7 +416,7 @@ def _extract_features_python_impl(
             sorted_scores[cursor + 1] = sorted_scores[cursor]
             cursor -= 1
         sorted_scores[cursor + 1] = value
-    median = 0.5 * (sorted_scores[width // 2 - 1] + sorted_scores[width // 2])
+    median = sorted_scores[width // 2] if width%2 else 0.5 * (sorted_scores[width // 2 - 1] + sorted_scores[width // 2])
     deviations = np.empty((width,), dtype=np.float64)
     for slot in range(width):
         deviations[slot] = abs(scores[slot] - median)
@@ -426,10 +427,10 @@ def _extract_features_python_impl(
             deviations[cursor + 1] = deviations[cursor]
             cursor -= 1
         deviations[cursor + 1] = value
-    mad = 0.5 * (deviations[width // 2 - 1] + deviations[width // 2])
+    mad = deviations[width // 2] if width%2 else 0.5 * (deviations[width // 2 - 1] + deviations[width // 2])
     mad = max(mad, 1.0e-6)
     denominator = max(abs(scores[0]), 1.0e-12)
-    margin = max(scores[0] - scores[1], 0.0)
+    margin = max(scores[0] - scores[1], 0.0) if width>1 else 0.0
     current_end = int(current_tokens.shape[0]) - 1
 
     for slot in range(width):
