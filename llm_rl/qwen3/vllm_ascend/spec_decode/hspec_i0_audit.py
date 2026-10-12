@@ -119,6 +119,8 @@ class HSpecI0Audit:
         paths = [list(scheduled.get(r, [])) for r in request_ids]
         kind = 'spec' if any(paths) else 'ar'
         self.counts[kind + '_batches'] += 1
+        self.counts['output_opportunities'] += sum(bool(ids) for ids in emitted)
+        self.counts['matched_proposals'] += sum(int(a)>0 for a in accepted)
         self.counts['scheduled_tokens'] += sum(map(len, paths))
         self.counts['emitted_tokens'] += sum(map(len, emitted))
         self.counts['accepted_tokens'] += sum(accepted)

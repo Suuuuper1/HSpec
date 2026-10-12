@@ -220,7 +220,12 @@ class I4Runtime:
             ctx=len(getattr(req,'prompt_token_ids',()))+len(current)
             context.append(ctx if self.surface else (0 if ctx<=1024 else (1 if 8192<=ctx<=17408 else -1)))
             if ctx>int(p.runner.max_model_len):self.status[r]=1
-            if req is None or temp!=.9 or top_p!=.9:self.status[r]=1
+            if req is None or temp!=.9 or top_p!=.9 or getattr(sp,'stop',None):self.status[r]=1
+            if 'i5' in self.bundle and not self.bundle['i5'].get('functional_recipe_fixture',False):
+                # SamplingParams normalizes API top_k=-1 (disabled) to 0.
+                if getattr(sp,'top_k',-1) not in (-1,0):self.status[r]=1
+                if any(getattr(sp,key,default)!=default for key,default in (('min_p',0.),('repetition_penalty',1.),('presence_penalty',0.),('frequency_penalty',0.),('ignore_eos',False),('min_tokens',0))):self.status[r]=1
+                if getattr(sp,'allowed_token_ids',None) or getattr(sp,'bad_words',None) or getattr(sp,'logit_bias',None):self.status[r]=1
             tr=self.bound_ids[id(c)];self.table_rows[r]=tr;self.table_params[tr,0]=c.wnd_size
             self.basepos[r]=int(base_positions[r]);self.decoded[r]=int(decoded[i])
             n=min(len(current),8);self.tail_lens[r]=n;self.tails[r,:]=0
@@ -325,4 +330,8 @@ class I4Runtime:
 def load_i4(path,expected_sha,mode,record_limit=0):
     with open(path,'rb') as f:raw=f.read()
     if not expected_sha or hashlib.sha256(raw).hexdigest()!=expected_sha:raise ValueError('I4 bundle hash mismatch')
-    return I4Runtime(json.loads(raw),mode,record_limit)
+    bundle=json.loads(raw)
+    if 'i5' in bundle:
+        from .hspec_selector_i5 import I5Runtime
+        return I5Runtime(bundle,mode,record_limit)
+    return I4Runtime(bundle,mode,record_limit)

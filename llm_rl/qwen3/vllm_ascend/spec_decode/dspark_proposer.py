@@ -190,7 +190,13 @@ class DSparkProposer(DFlashProposer):
             tuple(own_embedding.weight.shape),
             tuple(own_lm_head.weight.shape),
         )
-        if target_shapes[0] != target_shapes[1] or own_shapes != target_shapes:
+        # The draft is TP1 even when target vocabulary tensors are TP-sharded.
+        # Check logical vocabulary/hidden dimensions, not equal local shapes.
+        expected_hidden = self.model.config.hidden_size
+        expected_vocab = self.model.config.vocab_size
+        if (target_shapes[0] != target_shapes[1] or own_shapes[0] != own_shapes[1]
+            or own_shapes[0][1] != expected_hidden or own_shapes[0][0] < expected_vocab
+            or target_shapes[0][1] != expected_hidden):
             raise ValueError(
                 "DSpark target/draft vocabulary tensor shapes are incompatible: "
                 f"target={target_shapes}, draft={own_shapes}"

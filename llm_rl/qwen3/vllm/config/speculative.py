@@ -1113,17 +1113,17 @@ class SpeculativeConfig:
                         "EAGLE/EAGLE3 draft_load_config cannot use dummy weights"
                     )
             if self.rejection_sample_method is not None:
-                if self.method not in ("hspec", "sam", "eagle", "eagle3"):
+                if self.method not in ("hspec", "sam", "eagle", "eagle3", "ngram", "suffix"):
                     raise ValueError(
                         "rejection_sample_method is only supported for "
-                        "HSpec/SAM/EAGLE/EAGLE3/DFlash/DSpark in this runtime"
+                        "HSpec/SAM/EAGLE/EAGLE3/DFlash/DSpark/NGRAM/SUFFIX in this runtime"
                     )
                 if self.method == "hspec":
                     if self.rejection_sample_method not in ("standard", "legacy"):
                         raise ValueError("HSpec verifier must be standard or legacy")
                 elif self.rejection_sample_method != "standard":
                     raise ValueError(
-                        "SAM/EAGLE/EAGLE3 rejection_sample_method must be "
+                        "Non-HSpec rejection_sample_method must be "
                         "'standard' in this runtime"
                     )
             if self.draft_sample_method != "greedy":

@@ -904,8 +904,28 @@ class HSpecTableStoreWriter:
                 manifest["i1_table_sha256"] = file_sha(self.table_file)
                 manifest["i1_prompt_index_sha256"] = file_sha(self.prompt_index_path)
                 manifest["i1_hash_seconds"] = time.perf_counter() - hash_start
+            if os.environ.get("HSPEC_I5_METRICS", "0") == "1":
+                # Seal-time research provenance, never decode-time I/O. The
+                # journal survives version GC without retaining large tables.
+                import hashlib
+                hash_start = time.perf_counter()
+                for name, path in (("table", self.table_file), ("index", self.prompt_index_path)):
+                    if not path.exists():
+                        if entry_count:
+                            raise ValueError(f"Sealed nonempty table lost {name}: {path}")
+                        manifest[f"i5_{name}_sha256"] = None
+                        continue
+                    h = hashlib.sha256()
+                    with path.open("rb") as source:
+                        for chunk in iter(lambda: source.read(4 << 20), b""):
+                            h.update(chunk)
+                    manifest[f"i5_{name}_sha256"] = h.hexdigest()
+                manifest["i5_hash_seconds"] = time.perf_counter() - hash_start
             try:
                 _write_json_atomic(self.manifest_path, manifest)
+                if "i5_table_sha256" in manifest:
+                    with (self.shard_root / "i5_versions.jsonl").open("a") as journal:
+                        journal.write(json.dumps(manifest, sort_keys=True) + "\n")
             except Exception:
                 hspec_record_store_metric("table_store_manifest_write_error", 1)
                 raise

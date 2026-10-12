@@ -148,7 +148,9 @@ class DFlashProposer(ParallelBlockProposer):
         lm_head_shape = tuple(target_lm_head.weight.shape)
         expected_hidden = self.model.config.hidden_size
         expected_vocab = self.model.config.vocab_size
-        if embedding_shape[1] != expected_hidden or embedding_shape[0] < expected_vocab:
+        if embedding_shape[1] != expected_hidden or (
+            not self.model.has_own_embed_tokens and embedding_shape[0] < expected_vocab
+        ):
             raise ValueError(
                 f"Target embedding shape {embedding_shape} is incompatible with "
                 f"DFlash vocab/hidden ({expected_vocab}, {expected_hidden})"
@@ -160,10 +162,10 @@ class DFlashProposer(ParallelBlockProposer):
             )
         if self.model.has_own_embed_tokens:
             own_embedding_shape = tuple(self.model.model.embed_tokens.weight.shape)
-            if own_embedding_shape != embedding_shape:
+            if own_embedding_shape[1] != expected_hidden or own_embedding_shape[0] < expected_vocab:
                 raise ValueError(
-                    "Checkpoint-owned DFlash embedding shape differs from target: "
-                    f"{own_embedding_shape} != {embedding_shape}"
+                    "Checkpoint-owned DFlash embedding must contain the full target vocabulary: "
+                    f"{own_embedding_shape}, expected at least ({expected_vocab}, {expected_hidden})"
                 )
         else:
             self.model.model.embed_tokens = target_embedding

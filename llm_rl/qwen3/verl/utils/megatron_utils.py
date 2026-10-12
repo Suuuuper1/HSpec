@@ -820,13 +820,15 @@ def default_tp_concat_fn(
         up_pp_lst = []
         if not _use_alltoall_expert_reshard():
             for infer_param in infer_params:
-                split_size = [
-                    model_config.moe_intermediate_size,
-                    model_config.moe_intermediate_size,
-                ] * (num_experts // mpu.get_expert_tensor_and_model_parallel_world_size())
-                experts_weight = infer_param.split(split_size, dim=1)
-                gate_pp_lst.extend(experts_weight[::2])
-                up_pp_lst.extend(experts_weight[1::2])
+                # GroupedMLP.forward interprets the flat allocation using
+                # view(E_local, H, 2I), regardless of its nominal [H,E*2I]
+                # parameter shape. Splitting nominal columns mixes experts.
+                local_experts = num_experts // mpu.get_expert_tensor_and_model_parallel_world_size()
+                experts = infer_param.view(local_experts, infer_param.shape[0], -1)
+                for expert in experts:
+                    gate, up = expert.chunk(2, dim=1)
+                    gate_pp_lst.append(gate)
+                    up_pp_lst.append(up)
             infer_params = [tensor.transpose(0, 1) for pair in zip(gate_pp_lst, up_pp_lst) for tensor in pair]
         else:
             # To optimize memory, only the params for the current rank are non-empty; others are empty tensors
@@ -1226,9 +1228,7 @@ def ep_param_reshard_by_alltoallv(
         # view the tensor to a correct shape before using it.
         # Also, training phase and rollout phase expect different layouts for `w13`, with inversed dimension
         # order of `hidden_size` and `moe_intermediate_size`, necessiting the `transpose` and `contiguous` here.
-        # GroupedMLP stores [hidden, experts * (gate + up)], not
-        # [experts, hidden, gate + up]. Preserve each expert's columns.
-        ep_param_train = ep_param_train.view(hidden_size, num_experts_train, -1).permute(1, 2, 0).contiguous()
+        ep_param_train = ep_param_train.view(num_experts_train, hidden_size, -1).transpose(1, 2).contiguous()
 
         split_size = num_experts_train // micro_ep_size
         rollout_weight_shape = [split_size, ep_param_train.shape[1], hidden_size]

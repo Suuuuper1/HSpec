@@ -889,7 +889,9 @@ class ParallelBlockProposer(EagleProposer):
             num_decode_tokens=0,
             num_prefills=batch_size,
             num_decodes=0,
-            block_tables=common_attn_metadata.block_table_tensor,
+            # The target can retain graph-bucket padding (e.g. 16 rows for
+            # 15 live requests). Draft TND FIA is eager and uses live B.
+            block_tables=common_attn_metadata.block_table_tensor[:batch_size],
             query_start_loc=self._query_start_loc[: batch_size + 1],
             seq_lens=effective,
             # torch-npu FIA accepts this device tensor despite the legacy type

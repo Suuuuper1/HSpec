@@ -237,7 +237,12 @@ class FileLogger:
 
     def log(self, data, step):
         data = {"step": step, "data": data}
+        if os.getenv("HSPEC_I5_METRICS", "0") == "1":
+            import time
+            data["timestamp_unix"] = time.time()
         self.fp.write(json.dumps(data) + "\n")
+        if "timestamp_unix" in data:
+            self.fp.flush()
 
     def finish(self):
         self.fp.close()

@@ -1049,6 +1049,7 @@ class HSpecProposer(Proposer):
         self._in_generate_token_ids: bool = False
         # Independent I4 research identity. No import/load on normal profiles.
         self._i4_selector = None
+        self._i5_metrics_enabled = os.environ.get('HSPEC_I5_METRICS','0') == '1'
         self._i4_init_error = None
         i4_mode = os.environ.get("HSPEC_I4_MODE", "off")
         if i4_mode != "off":
@@ -1137,6 +1138,8 @@ class HSpecProposer(Proposer):
         self._stat_queries = 0
         self._stat_hits = 0
         self._stat_total_draft_len = 0
+        self._stat_i5_verified_tokens = 0
+        self._stat_i5_accepted_tokens = 0
         self._stat_prefetch_fired = 0
         self._stat_prefetch_ready = 0
         self._stat_accept_sum = 0
@@ -4773,6 +4776,8 @@ class HSpecProposer(Proposer):
         ``(P, 2)`` and numpy slices, then shares draft ids through vLLM's local
         TP message queue.
         """
+        if getattr(self,'_i5_metrics_enabled',False):
+            self._record_proposer_metric('i5_decode_opportunities',sum(bool(ids) for ids in valid_sampled_token_ids))
         batch_size = len(valid_sampled_token_ids)
         if batch_size == 0:
             return []
@@ -5744,7 +5749,8 @@ class HSpecProposer(Proposer):
                 for row in np.flatnonzero(i4_decision["valid"]):
                     entry = int(i4_decision["entry"][row])
                     length = int(i4_decision["length"][row])
-                    selected_valid[row] = bool(raw_gate_hits[row] and entry >= 0 and length > 0)
+                    calibrated_admission = bool(getattr(self._i4_selector, 'i5', {}).get('calibrated_gate', False))
+                    selected_valid[row] = bool((raw_gate_hits[row] or calibrated_admission) and entry >= 0 and length > 0)
                     if selected_valid[row]:
                         decision_idxs_cpu[row] = entry
                         slot = int(i4_decision["slot"][row])
@@ -5883,7 +5889,7 @@ class HSpecProposer(Proposer):
             active_table_version=int(self._cache_version),
         )
         selector_stop_reasons: Dict[str, int] = {
-            "score_gate": int(np.count_nonzero(~raw_gate_hits)),
+            "score_gate": int(np.count_nonzero(~raw_gate_hits & ~selected_valid)),
             "utility_abstain": int(np.count_nonzero(
                 raw_gate_hits
                 & (utility_status_cpu == 0)
@@ -6415,8 +6421,11 @@ class HSpecProposer(Proposer):
                         s9_pending_meta_ms += _ns_to_ms(
                             _now_ns() - s9_pending_meta_t0
                         )
-                if i4_decision is not None and self._i4_selector.mode == "execute":
+                if (i4_decision is not None and self._i4_selector.mode == "execute"
+                        and i4_decision['valid'][j] and int(i4_decision['slot'][j]) >= 0):
                     pending_meta["i4_gain_prefix"] = self._i4_selector.scorer.gains[j, int(i4_decision["slot"][j])].copy() if int(i4_decision["slot"][j]) >= 0 else None
+                    if getattr(self,'_i5_metrics_enabled',False) and hasattr(self._i4_selector,"calibration_sample"):
+                        pending_meta["i5_calibration_sample"]=self._i4_selector.calibration_sample()
                     pending_meta["i4_terminal_depth"] = int(self._i4_selector.terminals[j, int(i4_decision["slot"][j])]) if int(i4_decision["slot"][j]) >= 0 else 0
                     pending_meta["i4_versions"] = (self._i4_selector.scorer.model_version,
                         int(self._cache_version), int(self._cache_generation),
@@ -7133,6 +7142,26 @@ class HSpecProposer(Proposer):
                 if terminal_depth > 0 and observed_drafted_len >= terminal_depth:
                     meta["i4_actual_expected_gain"] -= float(prefix_gain[terminal_depth]-prefix_gain[terminal_depth-1])
                 meta["i4_tail_censored"] = observed_drafted_len < expected_drafted_len
+                if meta.get('i5_calibration_sample') and observed_drafted_len>0 and not old_i4_table:
+                    # Raw G predicts accepted drafts, including an accepted
+                    # EOS. The solver's terminal correction predicts emitted
+                    # progress and must not be compared to accepted count A.
+                    d=min(observed_drafted_len,len(prefix_gain)-1)
+                    predicted=float(prefix_gain[d]);error=predicted-apl
+                    for key,value in (('i5_cal_count',1),('i5_cal_expected_G',predicted),('i5_cal_accepted_G',apl),('i5_cal_G_error',error),('i5_cal_G_abs_error',abs(error))):self._record_proposer_metric(key,value)
+                    for horizon in (1,2,4,8,15):
+                        if horizon>d:continue
+                        survival=float(prefix_gain[horizon]-prefix_gain[horizon-1]);outcome=int(apl>=horizon)
+                        for key,value in (('count',1),('predicted',survival),('success',outcome),('brier',(survival-outcome)**2)):
+                            self._record_proposer_metric(f'i5_cal_S{horizon}_{key}',value)
+
+            if getattr(self,'_i5_metrics_enabled',False) and emitted_tokens>0:
+                self._record_proposer_metric('i5_scheduled_draft_tokens',observed_drafted_len)
+                if i4_version and observed_drafted_len>0:
+                    self._stat_i5_verified_tokens += observed_drafted_len
+                    self._stat_i5_accepted_tokens += apl
+                    self._record_proposer_metric('i5_learned_verified_proposals',1)
+                    self._record_proposer_metric('i5_learned_verified_tokens',observed_drafted_len)
             if prompt_id and not old_i4_table:
                 self._update_prompt_window_after_verification(
                     prompt_id=prompt_id,

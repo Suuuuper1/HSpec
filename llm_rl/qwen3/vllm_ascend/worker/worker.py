@@ -409,6 +409,15 @@ class NPUWorker(WorkerBase):
         observer = getattr(self.model_runner, "_hspec_i1_observer", None)
         return observer.finish("rollout_boundary") if observer else None
 
+    def hspec_i5_evaluation_mode(self, enabled: bool) -> bool:
+        """Boundary-only isolation of training telemetry from held-out eval."""
+        import os
+        proposer = self.model_runner.drafter
+        if proposer is None or not hasattr(proposer, "_i5_metrics_enabled"):
+            return False
+        proposer._i5_metrics_enabled = (os.environ.get("HSPEC_I5_METRICS", "0") == "1" and not enabled)
+        return True
+
     def hspec_i0_runtime_snapshot(self) -> dict:
         from vllm_ascend.spec_decode.hspec_i0_audit import runtime_snapshot
         return runtime_snapshot(self.model_runner)

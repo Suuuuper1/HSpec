@@ -773,7 +773,12 @@ class vLLMRollout(BaseRollout):
                     "hspec_set_collection_context",
                     args=(int(hspec_epoch) if hspec_epoch is not None else -1,),
                 )
+                if os.environ.get("HSPEC_I5_METRICS", "0") == "1":
+                    self.inference_engine.llm_engine.collective_rpc(
+                        "hspec_i5_evaluation_mode", args=(bool(is_validate),))
             except Exception:
+                if os.environ.get("HSPEC_I5_METRICS", "0") == "1":
+                    raise
                 logger.debug("HSpec collection mode update failed", exc_info=True)
 
         if collect_hspec:
