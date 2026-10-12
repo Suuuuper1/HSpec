@@ -730,6 +730,13 @@ def broadcast_str_from_megatron_pp(obj: Any):
     return obj_output[0]
 
 
+def _use_alltoall_expert_reshard():
+    # A vLLM EP process group also exists when experts use tensor parallelism.
+    # In that case every rank owns every expert; EP-local export is incomplete.
+    return (os.getenv('ALL_TO_ALL_RESHARD', '0') != '0'
+            and os.getenv('VLLM_ENABLE_EXPERT_PARALLEL', '1') != '0')
+
+
 def default_tp_concat_fn(
     layer_name_mapping,
     name,
@@ -811,7 +818,7 @@ def default_tp_concat_fn(
     elif "mlp.experts.weight1" in name:     # for moe group matmul
         gate_pp_lst = []
         up_pp_lst = []
-        if os.getenv('ALL_TO_ALL_RESHARD', '0') == '0':
+        if not _use_alltoall_expert_reshard():
             for infer_param in infer_params:
                 split_size = [
                     model_config.moe_intermediate_size,
@@ -826,7 +833,7 @@ def default_tp_concat_fn(
             infer_params = get_rollout_expert_after_resharding(infer_params, model_config, is_weight1=True)
     elif "mlp.experts.weight2" in name:     # for moe group matmul
         down_pp_lst = []
-        if os.getenv('ALL_TO_ALL_RESHARD', '0') == '0':
+        if not _use_alltoall_expert_reshard():
             for infer_param in infer_params:
                 split_size = [
                     model_config.moe_intermediate_size
@@ -970,7 +977,7 @@ def per_tensor_generator(
         elif ".mlp.experts.weight" in cur_name and ep_size > 1:
             if etp_size > 1:
                 raise NotImplementedError("Reshard for ETP params when using MoE Group Matmul not supported for now.")
-            if os.getenv('ALL_TO_ALL_RESHARD', '0') == '0':
+            if not _use_alltoall_expert_reshard():
                 ep_params = [torch.empty_like(broad_pp_tensor) for _ in range(ep_size)]
                 torch.distributed.all_gather(ep_params, broad_pp_tensor, group=etmp_group)
             else:
@@ -988,11 +995,14 @@ def per_tensor_generator(
                 broad_pp_tensor,
                 ep_params,
                 model_config,
-                convert_qkv_gate_up_by_simple_split
+                weight_converter.hf_config,
+                convert_qkv_gate_up_by_simple_split,
             )
             converted_names, converted_params = weight_converter.convert_param(cur_name, merge_params)
 
-            yield from zip(converted_names, converted_params)
+            # Preserve names of remote EP placeholders. The consumer checks
+            # actual target expert ownership; never silently drop local weights.
+            yield from zip(converted_names, converted_params, strict=True)
             continue
 
         # tp all gather
@@ -1216,7 +1226,9 @@ def ep_param_reshard_by_alltoallv(
         # view the tensor to a correct shape before using it.
         # Also, training phase and rollout phase expect different layouts for `w13`, with inversed dimension
         # order of `hidden_size` and `moe_intermediate_size`, necessiting the `transpose` and `contiguous` here.
-        ep_param_train = ep_param_train.view(num_experts_train, hidden_size, -1).transpose(1, 2).contiguous()
+        # GroupedMLP stores [hidden, experts * (gate + up)], not
+        # [experts, hidden, gate + up]. Preserve each expert's columns.
+        ep_param_train = ep_param_train.view(hidden_size, num_experts_train, -1).permute(1, 2, 0).contiguous()
 
         split_size = num_experts_train // micro_ep_size
         rollout_weight_shape = [split_size, ep_param_train.shape[1], hidden_size]

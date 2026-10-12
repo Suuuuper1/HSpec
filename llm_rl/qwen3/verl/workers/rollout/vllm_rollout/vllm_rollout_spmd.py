@@ -1424,8 +1424,6 @@ class vLLMRollout(BaseRollout):
             model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
             model = model_runner.get_model()
             patch_vllm_moe_model_weight_loader(model)
-            loaded_params = model.load_weights(weights)
-
             model_config = model_runner.vllm_config.model_config
             device_config = model_runner.vllm_config.device_config
             load_config = model_runner.vllm_config.load_config
@@ -1433,7 +1431,19 @@ class vLLMRollout(BaseRollout):
                 device_config.device if load_config.device is None else load_config.device
             )
             target_device = torch.device(load_device)
-            process_weights_after_loading(model, model_config, target_device)
+            hf_config = model_config.hf_text_config
+            if getattr(hf_config, 'model_type', None) == 'qwen3_moe':
+                from verl.utils.vllm.weight_sync import ExpertWeightCoverage, ascend_moe_reload_views
+                coverage = ExpertWeightCoverage(model, hf_config.hidden_size, hf_config.moe_intermediate_size)
+                with ascend_moe_reload_views(model, hf_config.hidden_size) as restore:
+                    loaded_params = model.load_weights(coverage.wrap(weights))
+                    evidence = coverage.finish()
+                    restore()
+                    process_weights_after_loading(model, model_config, target_device)
+                logger.warning('WEIGHT_SYNC_EXPERT_COVERAGE %s', evidence)
+            else:
+                loaded_params = model.load_weights(weights)
+                process_weights_after_loading(model, model_config, target_device)
 
             loaded_count = len(loaded_params) if loaded_params is not None else -1
             logger.warning(
