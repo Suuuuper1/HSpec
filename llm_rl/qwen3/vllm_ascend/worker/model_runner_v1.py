@@ -899,7 +899,8 @@ class NPUModelRunner(GPUModelRunner):
         self,
         num_tokens: int,
         with_prefill: bool = False,
-        is_draft_model: bool = False
+        is_draft_model: bool = False,
+        uniform_decode: Optional[bool] = None,
     ) -> tuple[int, Optional[torch.Tensor], bool]:
         # TODO: In vLLM, the only thing that needs to be synced is num_tokens, but in
         # our case, we still need to sync the other two flags as well. So we need to
@@ -907,10 +908,20 @@ class NPUModelRunner(GPUModelRunner):
         # even if we are running in eager mode, which harms performance.
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
+        # A FULL graph contains DP MoE collectives. Every DP rank, including
+        # an idle rank's dummy forward, must use the same graph routine. Token
+        # padding alone cannot align graph-captured and eager HCCL operations.
+        self._dp_uniform_decode = (uniform_decode and not with_prefill
+                                   if uniform_decode is not None else None)
         if self.dp_size == 1:
             return num_tokens, None, with_prefill
 
-        if self._skip_all_reduce_across_dp_group(is_draft_model):
+        skip_sync = self._skip_all_reduce_across_dp_group(is_draft_model)
+        # Dense targets do not contain cross-DP model collectives and retain
+        # their independent local dispatch/skip fast path.
+        needs_routine_consensus = (uniform_decode is not None
+                                  and is_moe_model(self.vllm_config))
+        if skip_sync and not needs_routine_consensus:
             num_tokens_after_padding = torch.tensor([num_tokens] *
                                                     self.dp_size,
                                                     device="cpu",
@@ -924,7 +935,13 @@ class NPUModelRunner(GPUModelRunner):
                                          dtype=torch.int32,
                                          device="cpu")
 
-        flags_tensor = torch.tensor([int(with_prefill)],
+        # Callers for a separate drafter retain the original wire format.
+        # Target actual/dummy calls both supply uniform_decode and piggyback
+        # consensus on this existing CPU collective (no new RPC/barrier).
+        flags = [int(with_prefill)]
+        if uniform_decode is not None:
+            flags.append(int(not uniform_decode))
+        flags_tensor = torch.tensor(flags,
                                     dtype=torch.int32,
                                     device="cpu")
 
@@ -934,10 +951,13 @@ class NPUModelRunner(GPUModelRunner):
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
 
         # Unpack the results
-        num_tokens_across_dp = packed_tensor[:-1]
-        synced_flags = packed_tensor[-1:]
+        num_tokens_across_dp = packed_tensor[:self.dp_size]
+        synced_flags = packed_tensor[self.dp_size:]
         max_tokens_across_dp = torch.max(num_tokens_across_dp).item()
         global_with_prefill = bool(synced_flags[0])
+        if uniform_decode is not None:
+            self._dp_uniform_decode = (not bool(synced_flags[1])
+                                       and not global_with_prefill)
 
         # Create a tensor for num_tokens_after_padding
         num_tokens_after_padding = torch.tensor([max_tokens_across_dp] *
@@ -1086,7 +1106,9 @@ class NPUModelRunner(GPUModelRunner):
         # Get info across DP ranks.
         (num_input_tokens, num_tokens_across_dp,
          with_prefill) = self._sync_metadata_across_dp(num_input_tokens,
-                                                       with_prefill)
+             with_prefill,
+             uniform_decode=(max_num_scheduled_tokens == self.uniform_decode_query_len
+                 and total_num_scheduled_tokens == num_reqs * self.uniform_decode_query_len))
         self.with_prefill = with_prefill
 
         # Hot-Swap lora model
@@ -1356,8 +1378,7 @@ class NPUModelRunner(GPUModelRunner):
             # 2. get `num_reqs_padded`, this depends on dispatcher and which is why we have the
             #    following simplified `dispatch` logic here, we try to minimize the impact
             # 3. query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]
-            uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len) \
-                and (total_num_scheduled_tokens == max_num_scheduled_tokens * num_reqs)
+            uniform_decode = self._dp_uniform_decode
 
             # TODO: We should make this official ASAP. Also note that if we pad here,
             # the builders won’t need to add any extra padding.
@@ -2080,9 +2101,7 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 self.debugger.start()
 
-        uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
-            scheduler_output.total_num_scheduled_tokens
-            == self.input_batch.num_reqs * max_query_len)
+        uniform_decode = self._dp_uniform_decode
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         '''
         # Adaptive SD
@@ -3079,7 +3098,9 @@ class NPUModelRunner(GPUModelRunner):
         # Padding for DP
         (num_tokens, num_tokens_across_dp,
          with_prefill) = self._sync_metadata_across_dp(
-             batch_descriptor.num_tokens, with_prefill)
+             batch_descriptor.num_tokens, with_prefill,
+             uniform_decode=uniform_decode)
+        uniform_decode = self._dp_uniform_decode
 
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.seperate_routine(). This means that we are using
@@ -3126,7 +3147,9 @@ class NPUModelRunner(GPUModelRunner):
         if not is_profile and self.dynamic_eplb:
             self.eplb_updator.forward_before()
 
-        if num_tokens != batch_descriptor.num_tokens:
+        # Consensus may change the routine even when token padding is equal.
+        if (num_tokens != batch_descriptor.num_tokens
+                or uniform_decode != batch_descriptor.uniform):
             _ag_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 uniform_decode=uniform_decode,
