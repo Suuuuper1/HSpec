@@ -12,19 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import logging
 import os
 import random
-from collections.abc import Callable
-from dataclasses import asdict
 
 import numpy as np
 import torch
 import torch.distributed
 from megatron.core import mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
-from megatron.core.transformer.enums import AttnBackend
 from transformers import GenerationConfig
 
 from verl.models.weight_loader_registry import get_weight_saver
@@ -39,6 +35,7 @@ from verl.utils.megatron_utils import (
 )
 
 from .checkpoint_manager import BaseCheckpointManager
+from .config_serialization import serialize_checkpoint_config, write_checkpoint_config
 
 # Setup logging
 logger = logging.getLogger(__file__)
@@ -360,6 +357,13 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 )
 
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+        # Hydra overrides can leave nested DictConfig/ListConfig inside the
+        # Megatron dataclass (e.g. pipeline_num_transformer_layers). Convert on
+        # every rank before destructive retention or expensive tensor saves.
+        # This is checkpoint-only CPU work; the live model/config is untouched.
+        transformer_config_json = (
+            serialize_checkpoint_config(self.transformer_config) if self.should_save_extra else None
+        )
         # record the previous global step
         self.previous_global_step = global_step
 
@@ -459,23 +463,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         if self.should_save_extra:
             if self.rank == 0:
                 # Save transformer config
-                print(self.transformer_config)
-                transformer_config_dict = asdict(self.transformer_config)
-                to_convert_types = {torch.dtype: str, AttnBackend: str}
-                ignore_types = [Callable]
-                pop_keys = []
-                for key, value in transformer_config_dict.items():
-                    if type(value) in to_convert_types:
-                        transformer_config_dict[key] = to_convert_types[type(value)](value)
-                    if type(value) in ignore_types:
-                        pop_keys.append(key)
-                    if callable(value):
-                        pop_keys.append(key)
-                for key in pop_keys:
-                    transformer_config_dict.pop(key)
                 transformer_config_path = get_transformer_config_checkpoint_path(local_path)
-                with open(transformer_config_path, "w") as f:
-                    json.dump(transformer_config_dict, f, indent=2)
+                write_checkpoint_config(transformer_config_path, transformer_config_json)
 
         if self.should_save_hf_model and not self.use_hf_checkpoint:
             # wait for everyone to dump to local
